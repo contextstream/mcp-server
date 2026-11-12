@@ -16,11 +16,15 @@ Merge a "prepare MCP X.Y.Z" change to `main`. It needs:
 - the same stable version in `Cargo.toml`, `package.json` and `server.json`;
 - a `## X.Y.Z` section in `CHANGELOG.md`, which becomes the GitHub release notes.
 
-That push releases it. Nothing else is needed.
+The merge prepares the release; it does not start it. A push to `main` starts nothing: a maintainer starts the
+release run from the release tooling, on `main`, with mode `release`. Until that run is started, nothing is published,
+so after merging the release commit, ask a maintainer who can start it. The run releases what `main` holds when it
+starts.
 
 ```mermaid
 flowchart TD
-  M["merge to main<br/>(prepare MCP X.Y.Z)"] --> P{"plan<br/>is vX.Y.Z out on<br/>every channel?"}
+  M["merge to main<br/>(prepare MCP X.Y.Z)"] --> S["a maintainer starts the release run<br/>(mode release, on main)"]
+  S --> P{"plan<br/>is vX.Y.Z out on<br/>every channel?"}
   P -- "yes" --> N["nothing to do"]
   P -- "no, R2 already holds<br/>the complete bundle" --> F["fetch the bundle from R2"]
   P -- "no" --> G1["gate: rust<br/>fmt, clippy, tests, smoke"]
@@ -45,9 +49,9 @@ flowchart TD
 
 ### Jobs
 
-1. **plan** (2 CPUs, a few seconds) reads the version at the pushed commit and checks what every public channel
+1. **plan** (2 CPUs, a few seconds) reads the version at `main`'s head and checks what every public channel
    holds for it: npm, the MCP Registry, the GitHub release, R2 `mcp/vX.Y.Z/` and `mcp/latest/`.
-   - A version that is out everywhere ships nothing, so ordinary pushes cost one small job.
+   - A version that is out everywhere ships nothing, so a run started on an already released version costs one small job.
    - A version older than npm `latest` is refused.
    - If tag `vX.Y.Z` exists, the tag's commit is the release, whatever `main` holds since.
 2. **gate** runs two parts side by side.
@@ -119,7 +123,8 @@ whatever mode it asks for: a branch, or a local run with a patch.
 
 ## Re-running after a failure
 
-Fix the cause, then start the release again from the release tooling with mode `release`, or push to `main`. Nothing needs cleaning up first.
+Fix the cause on `main`, then have the release run started again from the release tooling with mode `release`. Nothing
+needs cleaning up first.
 
 Every step skips what is already done with the same bytes, and stops at different bytes:
 

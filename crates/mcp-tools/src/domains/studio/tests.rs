@@ -835,6 +835,12 @@ async fn status_reports_progress_while_it_waits_and_result_shows_the_pieces() {
         .unwrap();
     let text = text_of(&result);
     assert!(text.contains("Idea: Two rising notes."), "{text}");
+    let watch = format!("https://ctxproduct.com/studio?open={JOB}&workspace={WORKSPACE}");
+    assert!(
+        text.contains(&format!("Watch and share it in the studio: {watch}")),
+        "{text}"
+    );
+    assert_eq!(structured(&result)["studio_url"], json!(watch));
     assert!(
         text.contains("How it was made: Drawn by the engine."),
         "{text}"
@@ -971,6 +977,44 @@ async fn refusals_are_plain_and_nothing_is_spent() {
         text_of(&made),
         "Not made: Not enough credits: this needs up to 412 and the account has 100. Add credits, then make it again. Nothing was charged."
     );
+}
+
+#[test]
+fn every_making_links_to_the_studio_in_its_own_team() {
+    let stub_config = TestFixtures::test_config();
+    let client = ContextStreamClient::new(stub_config.clone());
+    let session = Arc::new(SessionManager::new(client.clone(), stub_config));
+    let tool = StudioTool::new(client, session, Arc::new(StudioGate::new()));
+    let workspace: Uuid = WORKSPACE.parse().unwrap();
+    let url = format!("https://ctxproduct.com/studio?open={JOB}&workspace={WORKSPACE}");
+
+    // While it is being made: the link is there to pass on, not said yet.
+    let running = tool.status_result(workspace, &job("generating", false), &[]);
+    assert_eq!(structured(&running)["studio_url"], json!(url));
+    assert!(
+        !text_of(&running).contains("ctxproduct.com"),
+        "{}",
+        text_of(&running)
+    );
+
+    // Once it has made something: said, for the person to watch it there.
+    let done = tool.status_result(workspace, &job("succeeded", true), &[]);
+    assert_eq!(structured(&done)["studio_url"], json!(url));
+    assert!(
+        text_of(&done).contains(&format!("Watch it in the studio: {url}")),
+        "{}",
+        text_of(&done)
+    );
+
+    // Nothing made: nothing to watch.
+    let failed = tool.status_result(workspace, &job("failed", false), &[]);
+    assert!(
+        !text_of(&failed).contains("Watch it"),
+        "{}",
+        text_of(&failed)
+    );
+
+    assert!(TOOL_REFERENCE.contains("studio_url opens the making in the studio at ctxproduct.com"));
 }
 
 #[test]

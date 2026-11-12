@@ -610,6 +610,13 @@ pub(crate) fn campaign_url(campaign_id: &str) -> String {
     format!("{STUDIO_APP}/studio/email/campaigns/{campaign_id}")
 }
 
+/// Where the person watches and shares a making: the studio opens it in its own team,
+/// whichever team the browser was last on, and keeps the link through signing in
+/// (contextstudio packages/web/src/lib/opening.ts).
+pub(crate) fn making_url(workspace_id: Uuid, make_id: &str) -> String {
+    format!("{STUDIO_APP}/studio?open={make_id}&workspace={workspace_id}")
+}
+
 /// What keeps a connection from sending, in words.
 fn missing_words(missing: &Value) -> Vec<&'static str> {
     missing

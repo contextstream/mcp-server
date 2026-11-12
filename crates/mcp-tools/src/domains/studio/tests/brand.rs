@@ -534,10 +534,16 @@ async fn result_names_the_files_and_their_library_item_without_links_by_default(
         text.contains("Download links are made on request and expire"),
         "{text}"
     );
+    // The studio's own link (where the person watches it) is the one link a result always carries.
+    let studio_link = "https://ctxproduct.com/studio?open=";
+    assert!(text.contains(studio_link), "{text}");
+    let text = text.replace(studio_link, "");
     for leak in ["http://", "https://", "X-Amz", "links valid", "Link (valid"] {
         assert!(!text.contains(leak), "{leak} in {text}");
     }
-    let shape = serde_json::to_string(&structured(&result)).unwrap();
+    let shape = serde_json::to_string(&structured(&result))
+        .unwrap()
+        .replace(studio_link, "");
     for leak in [
         "http://",
         "https://",

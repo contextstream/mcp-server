@@ -258,7 +258,11 @@ impl ProgressTool {
             });
             mcp_client::agent_handle::agent_handle(folder.as_deref())
         };
-        agent_identity(handle, crate::client_identity::current_client_name())
+        agent_identity(
+            handle,
+            crate::client_identity::current_client_name(),
+            &session_part(is_http),
+        )
     }
 
     async fn report(&self, input: ProgressInput) -> Result<ToolResult> {
@@ -301,7 +305,14 @@ impl ProgressTool {
         // The last word on a run is worth one more try; a step is not.
         let retries = u32::from(report.is_terminal());
         match self.client.report_run_progress(&report.body, retries).await {
-            Ok(answer) => {
+            Ok(mut answer) => {
+                // What stands for this session and the key this report went
+                // to: ContextStream's hooks read them from the answer, so the
+                // signals they send land on the same run under the same agent.
+                if let Some(fields) = answer.as_object_mut() {
+                    fields.insert("session".into(), json!(context.session));
+                    fields.insert("run_key".into(), json!(report.run_key));
+                }
                 let run_id = answer
                     .pointer("/run/run_id")
                     .and_then(Value::as_str)
@@ -1023,20 +1034,138 @@ fn forget_oldest(runs: &mut HashMap<String, RunMemo>) {
     }
 }
 
-/// The `agent` of a report: `name` is the configured agent name, else the
-/// client's name; `runtime` is always `mcp`; `client` is the connected
-/// client's name when it gave one.
-pub(crate) fn agent_identity(handle: Option<String>, client: Option<String>) -> Value {
-    let name = handle
-        .or_else(|| client.clone())
-        .unwrap_or_else(|| DEFAULT_AGENT_NAME.to_string());
+/// The `agent` of a report. A configured agent name is the agent as the
+/// person named it. Otherwise the agent is this session of the client: its
+/// name is the client's name and four characters of the session part
+/// ("Claude Code 3fa9"), its `id` the client and eight, so two sessions are
+/// two agents and one session is always the same one. Nothing of the machine
+/// (no folder, no host name) is in either. `runtime` is always `mcp`;
+/// `client` is the connected client's name when it gave one.
+pub(crate) fn agent_identity(
+    handle: Option<String>,
+    client: Option<String>,
+    session: &str,
+) -> Value {
     let mut agent = Map::new();
-    agent.insert("name".into(), json!(name));
+    match handle {
+        Some(handle) => {
+            agent.insert("name".into(), json!(handle));
+        }
+        None => {
+            let shown = client
+                .as_deref()
+                .map(shown_client_name)
+                .unwrap_or_else(|| DEFAULT_AGENT_NAME.to_string());
+            match session_tag(session) {
+                Some(tag) => {
+                    let client_id = client.as_deref().unwrap_or(MCP_RUNTIME);
+                    agent.insert("id".into(), json!(format!("{client_id}:{}", &tag[..8])));
+                    agent.insert("name".into(), json!(format!("{shown} {}", &tag[..4])));
+                }
+                None => {
+                    agent.insert("name".into(), json!(shown));
+                }
+            }
+        }
+    }
     agent.insert("runtime".into(), json!(MCP_RUNTIME));
     if let Some(client) = client {
         agent.insert("client".into(), json!(client));
     }
     Value::Object(agent)
+}
+
+/// The agent a session is reported as, for callers outside this module (the
+/// hooks' tests hold the hooks to it).
+pub fn agent_for_session(handle: Option<String>, client: Option<String>, session: &str) -> Value {
+    agent_identity(handle, client, session)
+}
+
+/// The run key a report without `run_key` goes to (see [`run_key_of`]).
+pub fn default_run_key(session: &str, ticket_id: Option<Uuid>) -> String {
+    run_key_of(None, session, ticket_id)
+}
+
+/// The run key a report goes to: the one the call gave, else the default.
+pub fn run_key_for(given: Option<&str>, session: &str, ticket_id: Option<Uuid>) -> String {
+    run_key_of(given, session, ticket_id)
+}
+
+/// How `init`'s text names the session for ContextStream's hooks: this label,
+/// a colon, and the `run_progress` object on the same line. A local server's
+/// answers reach a hook as text only, so the hooks read it there.
+pub const IDENTITY_LINE: &str =
+    "Live progress identity (read by ContextStream's hooks; nothing for you to do)";
+
+/// The hexadecimal part of a session part (`s-` and `c-` mark where the
+/// hosted gateway took it from), when it has one.
+fn session_tag(session: &str) -> Option<&str> {
+    let tag = session
+        .strip_prefix("s-")
+        .or_else(|| session.strip_prefix("c-"))
+        .unwrap_or(session);
+    (tag.len() >= 8 && tag.chars().all(|c| c.is_ascii_hexdigit())).then_some(tag)
+}
+
+/// A client's self-reported name as a person reads it: the usual clients by
+/// their product names, any other as it named itself.
+fn shown_client_name(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    let known = if lower == "claude-code" || lower == "claude code" {
+        "Claude Code"
+    } else if lower.starts_with("claude") {
+        "Claude"
+    } else if lower.starts_with("cursor") {
+        "Cursor"
+    } else if lower.starts_with("codex") {
+        "Codex"
+    } else if lower.starts_with("windsurf") {
+        "Windsurf"
+    } else if lower.starts_with("vscode") || lower.starts_with("visual studio code") {
+        "VS Code"
+    } else if lower.starts_with("gemini") {
+        "Gemini CLI"
+    } else if lower.starts_with("antigravity") {
+        "Antigravity"
+    } else if lower.starts_with("github-copilot") || lower.starts_with("copilot") {
+        "GitHub Copilot"
+    } else if lower.starts_with("opencode") {
+        "OpenCode"
+    } else if lower.starts_with("cline") {
+        "Cline"
+    } else if lower == "zed" {
+        "Zed"
+    } else {
+        return crate::client_identity::display_client_name(raw).unwrap_or_else(|| raw.to_string());
+    };
+    known.to_string()
+}
+
+/// What `init` tells ContextStream's hooks about this session's runs: the
+/// session part default run keys start with, and the agent reports name.
+/// `None` when live progress is off on this machine.
+pub(crate) async fn session_identity(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+) -> Option<Value> {
+    if !reporting_enabled() {
+        return None;
+    }
+    let is_http = client.config().await.is_http_transport;
+    let part = session_part(is_http);
+    let folder = session.state().await.folder_path;
+    let handle = if is_http {
+        mcp_client::agent_handle::agent_handle_of_folder(folder.as_deref())
+    } else {
+        let folder = folder.or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+        });
+        mcp_client::agent_handle::agent_handle(folder.as_deref())
+    };
+    let agent = agent_identity(handle, crate::client_identity::current_client_name(), &part);
+    Some(json!({ "session": part, "agent": agent }))
 }
 
 /// Whether reporting is on: off only when `CONTEXTSTREAM_RUN_PROGRESS` says so.

@@ -23,6 +23,8 @@ pub async fn handle() -> Result<()> {
     }
 
     let input = read_stdin_json()?;
+    // The session is over: its open runs end now, honestly.
+    super::run_progress::session_ended(&input, &super::common::extract_cwd(&input)).await;
 
     let session_id = input
         .get("session_id")

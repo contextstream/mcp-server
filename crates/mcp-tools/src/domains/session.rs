@@ -3262,6 +3262,15 @@ impl ToolHandler for InitTool {
             // Some clients show only the structured content: it carries the hint too.
             result["resume_hint"] = Value::String(hint);
         }
+        // Who this session's runs are reported as. ContextStream's hooks read
+        // it here, so the runs they keep alive (or start when a ticket is
+        // taken up) are the ones the `progress` tool reports on, under the
+        // same agent.
+        if let Some(identity) = super::progress::session_identity(&self.client, &self.session).await
+        {
+            text.push_str(&format!("\n{}: {identity}", super::progress::IDENTITY_LINE));
+            result["run_progress"] = identity;
+        }
         // Zero-touch auto-provisioning: surface the server's one-liner as a
         // positive fact ("project created — no setup needed"), never as a
         // [PROJECT_ROUTING] warning.

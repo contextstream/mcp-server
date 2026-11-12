@@ -403,6 +403,8 @@ pub async fn handle() -> Result<()> {
     let input: Value =
         serde_json::from_reader(std::io::stdin().lock()).unwrap_or_else(|_| serde_json::json!({}));
     let editor = detect_editor(&input);
+    // The person spoke: this session's waiting runs are at work again.
+    super::run_progress::prompt_submitted(&input, &extract_cwd(&input));
 
     if std::env::var("CONTEXTSTREAM_REMINDER_ENABLED")
         .map(|v| v == "false")

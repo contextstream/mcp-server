@@ -77,6 +77,7 @@ pub async fn handle() -> Result<()> {
     // Read stdin JSON
     let input: Value =
         serde_json::from_reader(std::io::stdin().lock()).unwrap_or_else(|_| serde_json::json!({}));
+    super::run_progress::subagent_started(&input);
 
     let agent_type = input
         .get("agent_type")

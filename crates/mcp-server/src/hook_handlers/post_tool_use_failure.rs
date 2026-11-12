@@ -18,6 +18,7 @@ const MAX_FAILURE_COUNTER_ENTRIES: usize = 200;
 /// Handle the PostToolUseFailure hook.
 pub async fn handle() -> Result<()> {
     let input = read_stdin_json()?;
+    super::run_progress::tool_failed(&input);
     let cwd = extract_cwd(&input);
     let config = load_config(&cwd);
 

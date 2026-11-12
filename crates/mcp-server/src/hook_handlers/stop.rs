@@ -21,6 +21,8 @@ pub async fn handle() -> Result<()> {
     let input = read_stdin_json()?;
     let cwd = extract_cwd(&input);
     let config = load_config(&cwd);
+    // The turn is over: this session's runs wait on a person.
+    super::run_progress::turn_ended(&input, &cwd);
 
     if config.is_configured() {
         let session_id = input

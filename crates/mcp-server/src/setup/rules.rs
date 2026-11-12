@@ -203,6 +203,8 @@ People watch agents' work live in ContextStream. Report yours with `progress(...
 - when you are blocked or need a person: `progress(waiting={"on":"person","question":"..."})`
 - when you finish: `progress(status="completed|partial|failed|stopped|cancelled", summary="what was done and what was not")`
 
+ContextStream's hooks, where installed, start a run when you take up a ticket, keep it alive and end it with the session. The title, step, checklist, links and summary are still yours to report.
+
 Give `percent` only when it is real. If the call says progress was not recorded, carry on with your work and do not retry it."#;
 
 /// Canonical plan/task persistence policy shared across generated rules.
@@ -4416,6 +4418,8 @@ mod tests {
                     "when you are blocked or need a person",
                     "when you finish",
                     "summary=\"what was done and what was not\"",
+                    "keep it alive and end it with the session",
+                    "are still yours to report",
                     "Give `percent` only when it is real",
                     "do not retry it",
                 ] {

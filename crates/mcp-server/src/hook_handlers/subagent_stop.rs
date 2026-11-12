@@ -18,6 +18,8 @@ const MAX_PLAN_DESCRIPTION_LEN: usize = 12_000;
 pub async fn handle() -> Result<()> {
     let input = read_stdin_json()?;
     let cwd = extract_cwd(&input);
+    // The subagent is over: its own runs end with it.
+    super::run_progress::subagent_stopped(&input, &cwd);
     let config = load_config(&cwd);
 
     if !config.is_configured() {

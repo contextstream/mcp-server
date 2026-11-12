@@ -2460,6 +2460,8 @@ pub async fn handle() -> Result<()> {
     let mcp_server_name = extract_mcp_server_name(&input);
     let normalized_contextstream_tool = normalize_contextstream_tool_name(&tool);
     let tool_lower = tool.to_ascii_lowercase();
+    // A run this session has open hears that a tool call starts (no network).
+    super::run_progress::tool_started(&input, &cwd, &tool);
     // A shell command that a tool the account has says it takes is handed to
     // `contextstream-mcp run`, which sends it there or runs it here. Nothing
     // else about the call changes, and a command no tool takes is left alone.

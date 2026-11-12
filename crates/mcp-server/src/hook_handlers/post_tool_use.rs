@@ -209,6 +209,16 @@ fn first_text_block(blocks: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The words a tool result carries: a bare string, the first text block of a
+/// content array, or of the MCP `{"content": [...]}` object.
+fn response_text(tool_response: &Value) -> Option<String> {
+    tool_response
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| first_text_block(tool_response))
+        .or_else(|| tool_response.get("content").and_then(first_text_block))
+}
+
 /// The JSON object a tool result carries: structured content, a bare object,
 /// or JSON in a text block (a content array, a JSON string, or the MCP
 /// `{"content": [...]}` object).
@@ -883,6 +893,21 @@ pub async fn handle() -> Result<()> {
     let mcp_server_name = extract_mcp_server_name(&input);
     let normalized_tool_name = normalize_contextstream_tool_name(&tool_name);
     let cwd = extract_cwd(&input);
+
+    // What the call means for this session's live runs (no network): who the
+    // server says the session is, a run the model reported, a ticket taken up.
+    super::run_progress::tool_finished(
+        &input,
+        &cwd,
+        is_contextstream_server_call(&mcp_server_name, &tool_name)
+            .then_some(normalized_tool_name.as_str()),
+        &tool_input,
+        super::run_progress::Answer {
+            succeeded: tool_call_succeeded(&tool_response),
+            json: response_json(&tool_response).as_ref(),
+            text: response_text(&tool_response).as_deref(),
+        },
+    );
 
     if is_contextstream_server_call(&mcp_server_name, &tool_name) {
         // Notices a `context`/`init` result showed are not shown again mid-run.

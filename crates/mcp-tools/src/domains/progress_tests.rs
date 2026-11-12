@@ -86,7 +86,11 @@ impl Fixture {
             workspace_id: self.workspace,
             project_id: Some(self.project),
             session: "sess".to_string(),
-            agent: agent_identity(Some("cinder".to_string()), Some("claude-code".to_string())),
+            agent: agent_identity(
+                Some("cinder".to_string()),
+                Some("claude-code".to_string()),
+                "sess",
+            ),
             heartbeat_s: 30,
         }
     }
@@ -313,23 +317,68 @@ async fn the_hosted_gateway_names_the_session_by_a_digest_of_what_the_transport_
 }
 
 #[test]
-fn the_agent_is_named_by_its_handle_else_by_its_client() {
+fn the_agent_is_named_by_its_handle_else_by_its_client_and_session() {
+    let local = "3fa9c2d17e0b5a66aa11bb22cc33dd44";
+    // A name the person configured is the agent, whatever the session.
     assert_eq!(
-        agent_identity(Some("cc-qa".to_string()), Some("claude-code".to_string())),
+        agent_identity(
+            Some("cc-qa".to_string()),
+            Some("claude-code".to_string()),
+            local
+        ),
         json!({"name": "cc-qa", "runtime": "mcp", "client": "claude-code"})
     );
     assert_eq!(
-        agent_identity(None, Some("codex-cli".to_string())),
-        json!({"name": "codex-cli", "runtime": "mcp", "client": "codex-cli"})
-    );
-    assert_eq!(
-        agent_identity(Some("cc-qa".to_string()), None),
+        agent_identity(Some("cc-qa".to_string()), None, local),
         json!({"name": "cc-qa", "runtime": "mcp"})
     );
+    // Otherwise it is this session of the client.
     assert_eq!(
-        agent_identity(None, None),
+        agent_identity(None, Some("claude-code".to_string()), local),
+        json!({"id": "claude-code:3fa9c2d1", "name": "Claude Code 3fa9", "runtime": "mcp", "client": "claude-code"})
+    );
+    // The hosted gateway's session part carries a mark; the tag does not.
+    assert_eq!(
+        agent_identity(None, Some("codex-cli".to_string()), "s-77b2aa0011223344"),
+        json!({"id": "codex-cli:77b2aa00", "name": "Codex 77b2", "runtime": "mcp", "client": "codex-cli"})
+    );
+    assert_eq!(
+        agent_identity(None, None, "c-0123456789abcdef"),
+        json!({"id": "mcp:01234567", "name": "MCP agent 0123", "runtime": "mcp"})
+    );
+    // Two sessions of one client are two agents; one session is always one.
+    let other = agent_identity(None, Some("claude-code".to_string()), "77b2aa0011223344");
+    let same = agent_identity(None, Some("claude-code".to_string()), local);
+    assert_ne!(other["id"], same["id"]);
+    assert_ne!(other["name"], same["name"]);
+    assert_eq!(
+        same,
+        agent_identity(None, Some("claude-code".to_string()), local)
+    );
+    assert_eq!(
+        same,
+        agent_for_session(None, Some("claude-code".to_string()), local)
+    );
+    // Nothing stands for the session: the client's name alone.
+    assert_eq!(
+        agent_identity(None, Some("some-client".to_string()), "mcp"),
+        json!({"name": "some-client", "runtime": "mcp", "client": "some-client"})
+    );
+    assert_eq!(
+        agent_identity(None, None, "mcp"),
         json!({"name": "MCP agent", "runtime": "mcp"})
     );
+    // A client is shown by its product name, or as it named itself.
+    assert_eq!(shown_client_name("cursor-vscode"), "Cursor");
+    assert_eq!(shown_client_name("Visual Studio Code"), "VS Code");
+    assert_eq!(shown_client_name("my-own-client/1.0"), "my-own-client/1.0");
+    // The default run key the hooks reuse is the tool's own.
+    let ticket = Uuid::new_v4();
+    assert_eq!(
+        default_run_key(local, Some(ticket)),
+        run_key_of(None, local, Some(ticket))
+    );
+    assert_eq!(default_run_key(local, None), format!("{local}:session"));
 }
 
 #[test]

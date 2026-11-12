@@ -1317,6 +1317,9 @@ fn is_contextstream_read_only_operation(tool_name: &str, tool_input: &Value) -> 
         "reminder" => matches!(action.as_str(), "list" | "active"),
         "instruct" | "flash" | "ram" => matches!(action.as_str(), "get" | "stats"),
         "context" | "init" => true,
+        // A progress report (or a read of runs) changes nothing a grounded
+        // read depends on: it is a note for the people watching.
+        "progress" => true,
         _ => false,
     }
 }
@@ -2275,7 +2278,10 @@ fn allowed_before_context_without_clearing(
     is_contextstream_call: bool,
     normalized_tool: &str,
 ) -> bool {
-    is_contextstream_call && normalized_tool == "init"
+    // init(...) comes before context(...) on a session's first message. A
+    // progress report says what the agent is doing to the people watching:
+    // it neither needs the turn's context nor stands in for it.
+    is_contextstream_call && matches!(normalized_tool, "init" | "progress")
 }
 
 /// Whether a call's workspace/project differs from this repo's configured
@@ -4687,6 +4693,34 @@ mod tests {
             !allowed_before_context_without_clearing(false, "init"),
             "foreign init-like tools must not bypass the context gate"
         );
+    }
+
+    #[test]
+    fn a_progress_report_neither_waits_for_context_nor_counts_as_a_change() {
+        // A report made before context() is not a missed context() call, and
+        // it leaves the gate for the next tool.
+        assert!(allowed_before_context_without_clearing(true, "progress"));
+        assert!(!clears_context_gate(true, "progress"));
+        assert!(!allowed_before_context_without_clearing(false, "progress"));
+        // It is not a state change either, whatever it reports, so the reads
+        // that follow it need no new grounding.
+        for input in [
+            serde_json::json!({"step": "Running the tests"}),
+            serde_json::json!({"action": "report", "status": "completed", "summary": "Done."}),
+            serde_json::json!({"action": "list"}),
+        ] {
+            assert!(
+                !is_likely_state_changing_tool("progress", &input, true, "progress"),
+                "{input}"
+            );
+        }
+        // Other ContextStream writes still are.
+        assert!(is_likely_state_changing_tool(
+            "session",
+            &serde_json::json!({"action": "attach_ticket"}),
+            true,
+            "session"
+        ));
     }
 
     #[test]

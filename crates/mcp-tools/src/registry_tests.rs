@@ -841,6 +841,8 @@ mod constants_tests {
         assert!(CONSOLIDATED_TOOLS.contains(&"project"));
         assert!(CONSOLIDATED_TOOLS.contains(&"coordination"));
         assert!(STANDARD_TOOLS.contains(&"coordination"));
+        assert!(CONSOLIDATED_TOOLS.contains(&"progress"));
+        assert!(STANDARD_TOOLS.contains(&"progress"));
         assert!(CONSOLIDATED_TOOLS.contains(&"feed"));
         assert!(STANDARD_TOOLS.contains(&"feed"));
     }

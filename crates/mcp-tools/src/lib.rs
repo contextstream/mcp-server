@@ -16,6 +16,7 @@
 #![allow(clippy::should_implement_trait)]
 
 pub mod atlas_flags;
+pub mod client_identity;
 pub mod domains;
 pub mod input_shape;
 pub mod notices;

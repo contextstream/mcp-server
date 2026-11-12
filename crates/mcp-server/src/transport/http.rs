@@ -1336,6 +1336,9 @@ async fn serve_mcp_streamable(
         } else {
             None
         };
+    let call_client_name = (request.method == "tools/call")
+        .then(|| tool_call_client_name(&headers, &request.params))
+        .flatten();
     // The class of the error a tool call was answered with, set where the error
     // becomes the answer (`tool_call_error_response`), for telemetry (#490).
     let ((result, api_calls), call_error_class) = TOOL_CALL_ERROR_CLASS
@@ -1398,13 +1401,16 @@ async fn serve_mcp_streamable(
                         }
                         "tools/list" => handle_list_tools_method(&state, request_registry.clone()).await,
                         "tools/call" => {
-                            handle_call_tool_method(
-                                &state,
-                                request.params,
-                                request.id.clone(),
-                                wire_observation.clone(),
-                                stateless_request,
-                                request_registry,
+                            mcp_tools::client_identity::run_with_client_name(
+                                call_client_name,
+                                handle_call_tool_method(
+                                    &state,
+                                    request.params,
+                                    request.id.clone(),
+                                    wire_observation.clone(),
+                                    stateless_request,
+                                    request_registry,
+                                ),
                             )
                             .await
                         }
@@ -2604,6 +2610,17 @@ fn session_client_identity(headers: &HeaderMap) -> (String, String) {
     header_str(headers, "mcp-session-id")
         .and_then(|id| SESSION_CLIENTS.lock().ok()?.get(id).cloned())
         .unwrap_or_else(|| ("unknown".to_string(), String::new()))
+}
+
+/// The client's own name for one tool call, for the tools that say which
+/// client an agent runs in (`progress`): what a stateless request carries in
+/// its `_meta`, else what this session's `initialize` said on this replica.
+/// Display data only; never used for authorization.
+fn tool_call_client_name(headers: &HeaderMap, params: &Value) -> Option<String> {
+    mcp_tools::client_identity::client_name_from_params(params).or_else(|| {
+        let (name, _) = session_client_identity(headers);
+        (name != "unknown").then_some(name)
+    })
 }
 
 tokio::task_local! {
@@ -7433,6 +7450,26 @@ mod tests {
         assert_eq!(
             session_client_identity(&HeaderMap::new()),
             ("unknown".to_string(), String::new())
+        );
+        // A tool call is told the same name; a stateless call's own `_meta`
+        // comes first, and an unknown client has none.
+        assert_eq!(
+            tool_call_client_name(&headers, &json!({"name": "progress"})).as_deref(),
+            Some("mcporter")
+        );
+        assert_eq!(
+            tool_call_client_name(
+                &headers,
+                &json!({"name": "progress", "_meta": {
+                    mcp_types::MCP_META_CLIENT_INFO: {"name": "claude-code", "version": "2.1"}
+                }})
+            )
+            .as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            tool_call_client_name(&HeaderMap::new(), &json!({"name": "progress"})),
+            None
         );
         // Unprintable client names are reduced like the unrecognized-client log.
         assert_eq!(

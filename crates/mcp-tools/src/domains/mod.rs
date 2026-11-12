@@ -26,6 +26,7 @@ pub(crate) mod lookup;
 pub mod media;
 pub mod memory;
 pub(crate) mod plan_loops;
+pub mod progress;
 pub mod project;
 pub mod project_brief;
 pub mod qa;

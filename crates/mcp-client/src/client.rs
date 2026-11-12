@@ -4206,6 +4206,19 @@ impl ContextStreamClient {
         self.request("POST", path, Some(body), Some(options)).await
     }
 
+    /// Make a POST request with options and no session-refresh replay: a 403
+    /// is passed on as it is. For side-channel writes (run progress) that
+    /// must never re-initialize the session or hold the caller for it.
+    pub(crate) async fn post_without_session_refresh<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: B,
+        options: RequestOptions,
+    ) -> Result<T> {
+        self.request_with_replay("POST", path, Some(body), Some(options), false)
+            .await
+    }
+
     /// Make a PUT request.
     pub async fn put<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: B) -> Result<T> {
         self.request("PUT", path, Some(body), None).await
@@ -18395,13 +18408,14 @@ impl ContextStreamClient {
             serde_json::json!({"name":"search","category":"search","description":"Search indexed source code with keyword, semantic, pattern, refactor, and exhaustive modes.","key_parameters":["query","mode","project_id","workspace_id","include_content"],"example":"search(query=\"AuthService\", mode=\"refactor\", output_format=\"paths\")"}),
             serde_json::json!({"name":"answer","category":"ai","description":"Ask a natural-language question across authorized ContextStream knowledge with current-truth, evidence, freshness, and coverage metadata.","actions":["query","recent_changes"],"key_parameters":["action","question","workspace_ids","project_ids","visibility","timezone"],"example":"answer(action=\"recent_changes\", question=\"What changed recently?\")"}),
             serde_json::json!({"name":"instruct","category":"session","description":"Read and acknowledge session-scoped injected instructions.","actions":["get","ack"],"key_parameters":["action","session_id","ids"],"example":"instruct(action=\"get\", session_id=\"session-123\")"}),
-            serde_json::json!({"name":"session","category":"session","description":"Ground, capture, recall, and restore durable session context; manage lessons, plans and plan loops; access Daily Recaps.","actions":["capture","retro_capture","capture_lesson","get_lessons","update_lesson","delete_lesson","recall","ground","set_account_mode","remember","user_context","summary","compress","delta","smart_search","decision_trace","restore_context","resume_list","resume","capture_plan","get_plan","update_plan","list_plans","start_loop","loop_status","advance_loop","resolve_gate","abort_loop","resume_loop","list_loops","list_recaps","trigger_recap","list_suggested_rules","suggested_rule_action","suggested_rules_stats","list_coached_rules","add_coached_rule"],"key_parameters":["action","workspace_id","project_id","session_id"],"example":"session(action=\"ground\", user_message=\"continue the refactor\")"}),
+            serde_json::json!({"name":"session","category":"session","description":"Ground, capture, recall, and restore durable session context; manage lessons, plans, plan loops and the tickets on a loop; access Daily Recaps.","actions":["capture","retro_capture","capture_lesson","get_lessons","update_lesson","delete_lesson","recall","ground","set_account_mode","remember","user_context","summary","compress","delta","smart_search","decision_trace","restore_context","resume_list","resume","capture_plan","get_plan","update_plan","list_plans","start_loop","loop_status","advance_loop","resolve_gate","abort_loop","resume_loop","list_loops","attach_ticket","detach_ticket","loop_tickets","list_recaps","trigger_recap","list_suggested_rules","suggested_rule_action","suggested_rules_stats","list_coached_rules","add_coached_rule"],"key_parameters":["action","workspace_id","project_id","session_id"],"example":"session(action=\"ground\", user_message=\"continue the refactor\")"}),
             serde_json::json!({"name":"memory","category":"memory","description":"Manage durable nodes, events, tasks, todos, docs, diagrams, and transcripts.","key_parameters":["action","workspace_id","project_id"],"example":"memory(action=\"list_docs\", doc_type=\"runbook\")"}),
             serde_json::json!({"name":"graph","category":"graph","description":"Inspect dependencies, impact, code health, complexity, cycles, and unused code.","key_parameters":["action","project_id","target_type","target_id"],"example":"graph(action=\"circular_dependencies\", project_id=\"<uuid>\")"}),
             serde_json::json!({"name":"project","category":"project","description":"List, inspect, create, index, and manage projects.","key_parameters":["action","project_id","folder_path"],"example":"project(action=\"index_status\")"}),
             serde_json::json!({"name":"workspace","category":"workspace","description":"List, inspect, create, and associate workspaces.","key_parameters":["action","workspace_id","folder_path"],"example":"workspace(action=\"list\")"}),
             serde_json::json!({"name":"reminder","category":"reminders","description":"List, create, snooze, complete, dismiss, and delete reminders.","key_parameters":["action","reminder_id","due_at"],"example":"reminder(action=\"active\")"}),
             serde_json::json!({"name":"coordination","category":"memory","description":"Coordinate live agents across workspaces and projects. Distinct from handoffs and capsules.","actions":["check_in","inbox","list","get","share","ack","dismiss","settings"],"key_parameters":["action","workspace_id","project_id","session_id","notice_id","title"],"example":"coordination(action=\"inbox\")"}),
+            serde_json::json!({"name":"progress","category":"session","description":"Report what you are doing now so people can watch your work live: the current step, your checklist, links you open, when you are blocked, and how it ended. Also reads runs.","actions":["report","get","list"],"key_parameters":["action","step","plan","ticket_id","links","waiting","status","summary"],"example":"progress(step=\"Running the tests\", plan=[{\"title\":\"Fix the parser\",\"state\":\"done\"},{\"title\":\"Run the tests\",\"state\":\"in_progress\"}])"}),
             serde_json::json!({"name":"feed","category":"memory","description":"Read, follow, post to, share, and curate Context Feeds: curated workspace, project, and topic activity streams.","actions":["list","ensure","get","update","archive","items","post","follow","unfollow","read","share","unshare","feedback","curate","runs","sources","ground"],"key_parameters":["action","feed_id","workspace_id","project_id","view","item_id","title","content"],"example":"feed(action=\"items\", feed_id=\"<uuid>\", view=\"unread\")"}),
             serde_json::json!({"name":"integration","category":"integrations","description":"Query and manage connected GitHub, Slack, Notion, Jira, and Linear data.","key_parameters":["action","workspace_id","project_id"],"example":"integration(action=\"status\", workspace_id=\"<uuid>\")"}),
             serde_json::json!({"name":"media","category":"memory","description":"Index, search, list, inspect, and clip images, video, audio, and documents.","key_parameters":["action","content_type","file_path","query"],"example":"media(action=\"search\", query=\"architecture diagram\", content_types=[\"image\"])"}),
@@ -24493,6 +24507,8 @@ mod tests {
             ("POST", "/api/v1/plan-loops/5c1e/advance"),
             ("POST", "/api/v1/plan-loops/5c1e/gates/9a7b/resolve"),
             ("POST", "/api/v1/plan-loops/5c1e/resume"),
+            ("POST", "/api/v1/plan-loops/5c1e/tickets"),
+            ("DELETE", "/api/v1/plan-loops/5c1e/tickets/9a7b"),
         ] {
             assert!(is_agent_write_request(method, path), "{method} {path}");
         }
@@ -24500,6 +24516,11 @@ mod tests {
             ("GET", "/api/v1/plans"),
             ("GET", "/api/v1/plan-loops/5c1e"),
             ("GET", "/api/v1/plan-loops?workspace_id=5c1e"),
+            ("GET", "/api/v1/plan-loops/5c1e/tickets"),
+            // Run progress reports are frequent and replay-safe by design:
+            // they carry no idempotency key and never use the API's key store.
+            ("POST", "/api/v1/run-progress/report"),
+            ("GET", "/api/v1/run-progress/runs?workspace_id=5c1e"),
             ("GET", "/api/v1/docs/5c1e"),
             ("POST", "/api/v1/search/hybrid"),
             ("POST", "/api/v1/context/smart"),
@@ -30767,11 +30788,13 @@ mod tests {
             })
             .unwrap_or_default();
 
-        // Canonical catalog: 24 tools (including Context Feeds, Answer and Agents).
+        // Canonical catalog: 25 tools (including Context Feeds, Answer, Agents
+        // and live progress).
         // Aliases atlas_chart / atlas_job / slipstream remain accepted at call-time
         // for back-compat but are intentionally absent. The dropped `ram` alias
         // must NOT reappear.
-        assert_eq!(names.len(), 24);
+        assert_eq!(names.len(), 25);
+        assert!(names.contains(&"progress"));
         assert!(names.contains(&"agents"));
         assert!(!names.contains(&"slipstream"));
         assert!(names.contains(&"answer"));

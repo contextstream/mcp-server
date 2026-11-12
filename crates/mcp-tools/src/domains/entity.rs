@@ -1004,7 +1004,7 @@ const ENTITY_TOOL_REFERENCE: &str = "Structured taxonomy entities — tickets, h
                 'create a ticket' / 'file a bug' / 'track a feature' / 'log a chore' / \
                 'assign a ticket' / 'link a doc or plan to a ticket' \
                 (kind=ticket, body.kind=bug|feature|task|chore|epic; \
-                body.assignees=[{user_id?, email?, handle?, entity_type=human|agent, role?}]; \
+                body.assignees=[{user_id?, email?, handle?, name?, entity_type=human|agent, role?}] (an agent is {entity_type: agent, handle, name}; [] clears them); \
                 body.linked_items=[{kind=doc|diagram|plan|task|todo|handoff|runbook|capsule, id, \
                 title_snapshot?, status_snapshot?, updated_at?}]) · \
                 'log an incident' / 'open a sev1' (kind=incident) · \
@@ -1512,7 +1512,7 @@ impl ToolHandler for EntityTool {
                 "JSON body for create / update. Free-form; see API schema per kind. \
                  For kind=handoff create: title, summary, scope, and next_steps preserve the \
                  handoff; to_user_id is optional and must be omitted rather than invented. \
-                 For kind=ticket: assignees (hybrid user_id/email/handle, entity_type human|agent) \
+                 For kind=ticket: assignees (hybrid user_id/email/handle plus name, entity_type human|agent; [] clears them) \
                  and linked_items (indexed refs: kind+id+title_snapshot+status_snapshot+updated_at; \
                  no URLs). Linked kinds: doc, diagram, plan, task, todo, handoff, runbook, capsule.",
                 false,
@@ -1928,6 +1928,108 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("contextstream, mcp-server"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ticket_assignees_the_api_stores_are_shown_and_not_reported() {
+        // Contract v1.3: the API stores assignees and answers with them.
+        let mut stored = stored_ticket(false, MCP_SERVER_PROJECT_ID);
+        stored["assignee_id"] = serde_json::json!(null);
+        stored["assignees"] = serde_json::json!([
+            {"entity_type": "agent", "handle": "cinder", "name": "Cinder"},
+            {"entity_type": "human", "email": "ada@example.com", "role": "reviewer"},
+        ]);
+        let (tool, server) = entity_tool_with_http_sequence(vec![
+            ("201 Created", stored.clone()),
+            ("200 OK", stored),
+        ])
+        .await;
+
+        let created = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "create",
+                "workspace_id": WORKSPACE_ID,
+                "project_id": MCP_SERVER_PROJECT_ID,
+                "body": {
+                    "title": "Fix the hook",
+                    "kind": "bug",
+                    "assignees": [
+                        {"entity_type": "Agent", "handle": "cinder", "name": "Cinder"},
+                        {"email": "ada@example.com", "role": "reviewer"},
+                    ]
+                }
+            }))
+            .await
+            .expect("create succeeds");
+        let updated = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "update",
+                "id": TICKET_ID,
+                "body": {"assignees": {"handle": "cinder", "entity_type": "agent"}}
+            }))
+            .await
+            .expect("update succeeds");
+
+        let requests = server.await.expect("entity request server");
+        assert!(
+            requests[0].starts_with("POST /api/v1/tickets "),
+            "{}",
+            requests[0]
+        );
+        // Sent in the API's shape, an agent with its name among them.
+        assert_eq!(
+            request_body(&requests[0])["assignees"],
+            serde_json::json!([
+                {"entity_type": "agent", "handle": "cinder", "name": "Cinder"},
+                {"entity_type": "human", "email": "ada@example.com", "role": "reviewer"},
+            ])
+        );
+        assert!(
+            requests[1].starts_with("PATCH /api/v1/tickets/"),
+            "{}",
+            requests[1]
+        );
+        assert_eq!(
+            request_body(&requests[1])["assignees"],
+            serde_json::json!([{"entity_type": "agent", "handle": "cinder"}])
+        );
+        for result in [&created, &updated] {
+            let text = result_text(result);
+            assert!(!text.contains("Not saved"), "{text}");
+            assert!(
+                text.contains("assignees: cinder [agent], ada@example.com (reviewer)"),
+                "{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_assignees_an_older_api_dropped_are_still_reported() {
+        let (tool, server) = entity_tool_with_http_sequence(vec![(
+            "200 OK",
+            stored_ticket(false, MCP_SERVER_PROJECT_ID),
+        )])
+        .await;
+        let result = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "update",
+                "id": TICKET_ID,
+                "body": {"assignees": [{"entity_type": "agent", "handle": "cinder"}]}
+            }))
+            .await
+            .expect("update succeeds");
+        let requests = server.await.expect("entity request server");
+        assert_eq!(
+            request_body(&requests[0])["assignees"][0]["handle"],
+            "cinder"
+        );
+        let text = result_text(&result);
+        assert!(text.contains("Not saved: assignees."), "{text}");
+        assert!(text.contains("set assignee_id instead"), "{text}");
+        assert!(!text.contains("assignees: cinder"), "{text}");
     }
 
     #[tokio::test]

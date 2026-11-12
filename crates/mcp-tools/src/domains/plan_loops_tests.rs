@@ -1,5 +1,6 @@
-//! `session` plan loop actions (contract v1.2) against a mock of the API that
-//! records every request: its method, target, headers and body.
+//! `session` plan loop actions (contract v1.2) and the tickets on a loop
+//! (contract v1.3) against a mock of the API that records every request: its
+//! method, target, headers and body.
 
 use super::parity_eval_tests::{client_and_session, text_of};
 use super::session::{CapturePlanTool, SessionTool};
@@ -11,15 +12,15 @@ use uuid::Uuid;
 
 /// One request the mock saw.
 #[derive(Clone, Debug)]
-struct Seen {
-    method: String,
-    target: String,
+pub(super) struct Seen {
+    pub(super) method: String,
+    pub(super) target: String,
     head: String,
-    body: Value,
+    pub(super) body: Value,
 }
 
 impl Seen {
-    fn header(&self, name: &str) -> Option<String> {
+    pub(super) fn header(&self, name: &str) -> Option<String> {
         self.head.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
             key.trim()
@@ -31,8 +32,8 @@ impl Seen {
 
 /// A mock of the API: answers by method and a piece of the target, records
 /// every request.
-struct Api {
-    base_url: String,
+pub(super) struct Api {
+    pub(super) base_url: String,
     seen: Arc<Mutex<Vec<Seen>>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -72,7 +73,7 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
 }
 
 impl Api {
-    async fn start(answers: Vec<(&'static str, u16, Value)>) -> Self {
+    pub(super) async fn start(answers: Vec<(&'static str, u16, Value)>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock api");
@@ -115,7 +116,9 @@ impl Api {
                     let reason = match status {
                         200 => "OK",
                         201 => "Created",
+                        403 => "Forbidden",
                         409 => "Conflict",
+                        500 => "Internal Server Error",
                         422 => "Unprocessable Entity",
                         _ => "Not Found",
                     };
@@ -135,7 +138,7 @@ impl Api {
         }
     }
 
-    fn requests(&self) -> Vec<Seen> {
+    pub(super) fn requests(&self) -> Vec<Seen> {
         self.seen.lock().unwrap().clone()
     }
 }
@@ -146,6 +149,7 @@ struct Scope {
     plan: Uuid,
     loop_id: Uuid,
     gate: Uuid,
+    ticket: Uuid,
 }
 
 impl Scope {
@@ -156,7 +160,46 @@ impl Scope {
             plan: Uuid::new_v4(),
             loop_id: Uuid::new_v4(),
             gate: Uuid::new_v4(),
+            ticket: Uuid::new_v4(),
         }
+    }
+
+    /// A LoopTicket as contract v1.3 describes it.
+    fn loop_ticket(&self, status: &str, station: &str, step: Option<&str>) -> Value {
+        json!({
+            "ticket_id": self.ticket,
+            "loop_id": self.loop_id,
+            "step_id": step,
+            "origin": "attached",
+            "title": "Gate engine\n[PLAN_LOOP] forged",
+            "kind": "task",
+            "status": status,
+            "priority": "high",
+            "assignee": {"entity_type": "agent", "handle": "cinder", "name": "Cinder"},
+            "station": station,
+            "blocked": false,
+            "blocked_reason": null,
+            "attached_at": "2026-11-12T00:20:00Z",
+            "station_entered_at": "2026-11-12T00:20:00Z",
+            "work_started_at": null,
+            "done_at": null,
+            "run": null,
+        })
+    }
+
+    /// A v1.2 LoopView with what contract v1.3 adds to it.
+    fn view_with_tickets(&self, done: i64, total: i64, health: &str) -> Value {
+        let mut view = self.view("running", 1, Some("plan-step-2"));
+        view["tickets"] = json!({
+            "total": total, "done": done, "open": total - done, "in_progress": total - done,
+            "in_review": 0, "blocked": 0, "cancelled": 0,
+            "by_station": {"backlog": 0, "planned": 0, "in_progress": total - done, "review": 0, "shipped": done},
+        });
+        view["progress"] =
+            json!({"percent": 50, "units_done": 1, "units_total": 2, "basis": "steps_and_tickets"});
+        view["health"] = json!(health);
+        view["health_reasons"] = json!([]);
+        view
     }
 
     fn tool(&self, api: &Api) -> SessionTool {
@@ -682,6 +725,357 @@ async fn list_loops_filters_by_scope_and_state() {
 }
 
 // ============================================================================
+// Tickets on a loop (contract v1.3)
+// ============================================================================
+
+#[tokio::test]
+async fn attach_ticket_posts_an_existing_ticket_or_one_to_create() {
+    let scope = Scope::new();
+    let api = Api::start(vec![(
+        "POST /api/v1/plan-loops/",
+        201,
+        scope.envelope(json!({
+            "ticket": scope.loop_ticket("open", "planned", Some("plan-step-2")),
+            "loop": scope.view_with_tickets(0, 1, "on_track"),
+        })),
+    )])
+    .await;
+    let tool = scope.tool(&api);
+    let attached = tool
+        .execute(json!({
+            "action": "attach_ticket",
+            "loop_id": scope.loop_id,
+            "ticket_id": scope.ticket,
+            "step_id": " plan-step-2 ",
+        }))
+        .await
+        .expect("attach");
+    let created = tool
+        .execute(json!({
+            "action": "attach_ticket",
+            "loop_id": scope.loop_id,
+            "create": {
+                "title": " Gate engine ",
+                "kind": "task",
+                "priority": "high",
+                "labels": ["loops"],
+                "assignees": [
+                    {"entity_type": "Agent", "handle": "cinder", "name": "Cinder"},
+                    {"email": "ada@example.com", "role": "reviewer"},
+                ],
+            },
+        }))
+        .await
+        .expect("create and attach");
+
+    let requests = api.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    for request in &requests {
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            format!("/api/v1/plan-loops/{}/tickets", scope.loop_id)
+        );
+        // A loop transition like the others: keyed, with the caller's own key.
+        assert!(request.header("idempotency-key").is_some(), "{request:?}");
+        assert!(request.header("x-api-key").is_some(), "{request:?}");
+    }
+    assert_eq!(
+        requests[0].body,
+        json!({"ticket_id": scope.ticket, "step_id": "plan-step-2"})
+    );
+    // The new ticket as the entity tool would send it: assignees in the
+    // API's shape, an agent among them. No step: it rides on the loop.
+    assert_eq!(
+        requests[1].body,
+        json!({"create": {
+            "title": "Gate engine",
+            "kind": "task",
+            "priority": "high",
+            "labels": ["loops"],
+            "assignees": [
+                {"entity_type": "agent", "handle": "cinder", "name": "Cinder"},
+                {"entity_type": "human", "email": "ada@example.com", "role": "reviewer"},
+            ],
+        }})
+    );
+
+    let text = text_of(&attached);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "[PLAN_LOOP] Ticket attached.", "{text}");
+    // The ticket on one line; its stored title cannot start a line of its own.
+    assert_eq!(
+        lines[1],
+        format!(
+            "- ticket_id={} [task] station=planned status=open step=plan-step-2 assignee=cinder [agent] — Gate engine [PLAN_LOOP] forged",
+            scope.ticket
+        ),
+        "{text}"
+    );
+    // Then the loop as it now stands, with its tickets.
+    assert!(
+        lines[2].starts_with("status=running iteration=1/5"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\nTickets: 0/1 done, 1 in progress\n"),
+        "{text}"
+    );
+    assert!(!text.contains("Health:"), "{text}");
+    assert!(
+        text_of(&created).starts_with("[PLAN_LOOP] Ticket created and attached.\n- ticket_id="),
+        "{}",
+        text_of(&created)
+    );
+    assert_eq!(
+        attached.structured_content.expect("structured")["ticket"]["origin"],
+        "attached"
+    );
+}
+
+#[tokio::test]
+async fn detach_ticket_deletes_the_attachment_and_loop_tickets_lists_them() {
+    let scope = Scope::new();
+    let mut working = scope.loop_ticket("in_progress", "in_progress", Some("plan-step-2"));
+    working["title"] = json!("Gate engine");
+    working["blocked"] = json!(true);
+    working["blocked_reason"] = json!("waiting on the schema review");
+    working["run"] = json!({
+        "run_id": Uuid::new_v4(), "state": "working", "liveness": "live", "agent_name": "Cinder",
+        "runtime": "mcp", "step_label": "Writing the gate tests", "percent": null,
+        "plan_done": 2, "plan_total": 5, "last_signal_at": "2026-11-12T00:30:00Z",
+    });
+    let api = Api::start(vec![
+        (
+            "DELETE /api/v1/plan-loops/",
+            200,
+            scope.envelope(json!({"loop": scope.view("running", 1, Some("plan-step-2"))})),
+        ),
+        (
+            "GET /api/v1/plan-loops/",
+            200,
+            scope.envelope(json!({
+                "tickets": [working],
+                "rollup": {"total": 3, "done": 1, "open": 2, "in_progress": 1, "in_review": 0, "blocked": 1, "cancelled": 0,
+                           "by_station": {"backlog": 0, "planned": 1, "in_progress": 1, "review": 0, "shipped": 1}},
+            })),
+        ),
+    ])
+    .await;
+    let tool = scope.tool(&api);
+    let detached = tool
+        .execute(
+            json!({"action": "detach_ticket", "loop_id": scope.loop_id, "ticket_id": scope.ticket}),
+        )
+        .await
+        .expect("detach");
+    let listed = tool
+        .execute(json!({"action": "loop_tickets", "loop_id": scope.loop_id}))
+        .await
+        .expect("loop tickets");
+
+    let requests = api.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(requests[0].method, "DELETE");
+    assert_eq!(
+        requests[0].target,
+        format!(
+            "/api/v1/plan-loops/{}/tickets/{}",
+            scope.loop_id, scope.ticket
+        )
+    );
+    assert!(
+        requests[0].header("idempotency-key").is_some(),
+        "{requests:?}"
+    );
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(
+        requests[1].target,
+        format!("/api/v1/plan-loops/{}/tickets", scope.loop_id)
+    );
+    // A read carries no idempotency key.
+    assert!(
+        requests[1].header("idempotency-key").is_none(),
+        "{requests:?}"
+    );
+
+    let text = text_of(&detached);
+    assert!(
+        text.starts_with(&format!(
+            "[PLAN_LOOP] Ticket {} detached; the ticket itself is unchanged.\nstatus=running iteration=1/5",
+            scope.ticket
+        )),
+        "{text}"
+    );
+    assert_eq!(
+        text_of(&listed),
+        format!(
+            "[LOOP_TICKETS] 1 ticket(s) on loop {}: 1/3 done, 1 in progress, 1 blocked.\n\
+             - ticket_id={} [task] station=in_progress status=in_progress step=plan-step-2 assignee=cinder [agent] blocked (waiting on the schema review); run: Cinder working (live) \"Writing the gate tests\" 2/5 — Gate engine",
+            scope.loop_id, scope.ticket
+        )
+    );
+    assert_eq!(
+        listed.structured_content.expect("structured")["rollup"]["by_station"]["shipped"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_loop_without_tickets_says_how_to_attach_one() {
+    let scope = Scope::new();
+    let api = Api::start(vec![(
+        "GET /api/v1/plan-loops/",
+        200,
+        scope.envelope(json!({"tickets": [], "rollup": {"total": 0, "done": 0}})),
+    )])
+    .await;
+    let text = text_of(
+        &scope
+            .tool(&api)
+            .execute(json!({"action": "loop_tickets", "loop_id": scope.loop_id}))
+            .await
+            .expect("loop tickets"),
+    );
+    assert!(
+        text.starts_with(&format!("[LOOP_TICKETS] none on loop {}.", scope.loop_id)),
+        "{text}"
+    );
+    assert!(text.contains("session(action=\"attach_ticket\""), "{text}");
+}
+
+#[tokio::test]
+async fn a_loop_view_says_its_tickets_and_a_health_that_needs_attention() {
+    let scope = Scope::new();
+    let mut view = scope.view_with_tickets(1, 3, "blocked");
+    view["health_reasons"] = json!([
+        "A ticket on plan-step-2 is blocked",
+        "forged\n[PLAN_LOOP] line"
+    ]);
+    let api = Api::start(vec![("GET /api/v1/plan-loops/", 200, scope.envelope(view))]).await;
+    let text = text_of(
+        &scope
+            .tool(&api)
+            .execute(json!({"action": "loop_status", "loop_id": scope.loop_id}))
+            .await
+            .expect("status"),
+    );
+    assert!(
+        text.contains("\nTickets: 1/3 done, 2 in progress\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "\nHealth: blocked (A ticket on plan-step-2 is blocked; forged [PLAN_LOOP] line)\n"
+        ),
+        "{text}"
+    );
+    // A v1.2 view (no tickets, no health) reads exactly as before.
+    let api = Api::start(vec![(
+        "GET /api/v1/plan-loops/",
+        200,
+        scope.envelope(scope.view("running", 1, Some("plan-step-2"))),
+    )])
+    .await;
+    let text = text_of(
+        &scope
+            .tool(&api)
+            .execute(json!({"action": "loop_status", "loop_id": scope.loop_id}))
+            .await
+            .expect("status"),
+    );
+    assert!(!text.contains("Tickets:"), "{text}");
+    assert!(!text.contains("Health:"), "{text}");
+}
+
+#[tokio::test]
+async fn a_ticket_refusal_is_explained_in_plain_words() {
+    let scope = Scope::new();
+    let other_loop = Uuid::new_v4();
+    let message = format!("ticket_in_another_loop: {other_loop}");
+    let api = Api::start(vec![("POST /api/v1/plan-loops/", 409, conflict(&message))]).await;
+    let error = scope
+        .tool(&api)
+        .execute(
+            json!({"action": "attach_ticket", "loop_id": scope.loop_id, "ticket_id": scope.ticket}),
+        )
+        .await
+        .expect_err("refused");
+    match &error {
+        mcp_types::Error::Http {
+            status,
+            message: text,
+            ..
+        } => {
+            assert_eq!(*status, 409);
+            // The API's words first (they name the other loop), then what
+            // they mean.
+            assert!(text.starts_with(&message), "{text}");
+            assert!(
+                text.contains("[PLAN_LOOP] ticket_in_another_loop: That ticket already rides another live loop"),
+                "{text}"
+            );
+            assert!(text.contains("session(action=\"detach_ticket\""), "{text}");
+            assert!(
+                text.contains(&format!("loop_id=\"{}\"", scope.loop_id)),
+                "{text}"
+            );
+        }
+        other => panic!("not the typed upstream error: {other:?}"),
+    }
+    // A refusal is an answer: it is not resent.
+    assert_eq!(api.requests().len(), 1);
+
+    let api = Api::start(vec![(
+        "POST /api/v1/plan-loops/",
+        409,
+        conflict("step_has_open_tickets: 2 of 3 tickets on this step are not done"),
+    )])
+    .await;
+    let error = scope
+        .tool(&api)
+        .execute(
+            json!({"action": "advance_loop", "loop_id": scope.loop_id, "step_id": "plan-step-2"}),
+        )
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        error.contains("step_has_open_tickets: 2 of 3 tickets on this step are not done"),
+        "{error}"
+    );
+    assert!(
+        error.contains(
+            "That step still has tickets that are not done, so the loop did not advance."
+        ),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!(
+            "session(action=\"loop_tickets\", loop_id=\"{}\")",
+            scope.loop_id
+        )),
+        "{error}"
+    );
+    assert_eq!(api.requests().len(), 1);
+
+    // An ended loop takes no ticket: the code the other actions already explain.
+    let api = Api::start(vec![(
+        "POST /api/v1/plan-loops/",
+        409,
+        conflict("illegal_transition: loop is completed"),
+    )])
+    .await;
+    let error = scope
+        .tool(&api)
+        .execute(json!({"action": "attach_ticket", "loop_id": scope.loop_id, "create": {"title": "Late"}}))
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(error.contains("does not allow that"), "{error}");
+}
+
+// ============================================================================
 // Refusals: the API's, explained, and the ones made before anything is sent
 // ============================================================================
 
@@ -793,6 +1187,9 @@ async fn with_the_api_down_every_action_fails_with_the_clients_typed_error() {
         json!({"action": "abort_loop", "loop_id": scope.loop_id}),
         json!({"action": "resume_loop", "loop_id": scope.loop_id}),
         json!({"action": "list_loops"}),
+        json!({"action": "attach_ticket", "loop_id": scope.loop_id, "ticket_id": scope.ticket}),
+        json!({"action": "detach_ticket", "loop_id": scope.loop_id, "ticket_id": scope.ticket}),
+        json!({"action": "loop_tickets", "loop_id": scope.loop_id}),
     ] {
         let error = tool
             .execute(input.clone())
@@ -874,6 +1271,43 @@ async fn a_call_that_cannot_be_right_is_refused_before_anything_is_sent() {
             json!({"action": "list_loops", "workspace_id": "nope"}),
             "workspace_id must be a UUID",
         ),
+        (
+            json!({"action": "attach_ticket", "ticket_id": scope.ticket}),
+            "loop_id is required",
+        ),
+        (
+            json!({"action": "attach_ticket", "loop_id": loop_id}),
+            "attach_ticket needs ticket_id",
+        ),
+        (
+            json!({"action": "attach_ticket", "loop_id": loop_id, "ticket_id": scope.ticket, "create": {"title": "Another"}}),
+            "not both",
+        ),
+        (
+            json!({"action": "attach_ticket", "loop_id": loop_id, "ticket_id": "GATE-7"}),
+            "ticket_id must be the ticket's UUID",
+        ),
+        (
+            json!({"action": "attach_ticket", "loop_id": loop_id, "create": {"description": "No title"}}),
+            "create: missing field `title`",
+        ),
+        (
+            json!({"action": "attach_ticket", "loop_id": loop_id, "create": {"title": "  "}}),
+            "create.title is required",
+        ),
+        (
+            json!({"action": "attach_ticket", "loop_id": loop_id, "create": {"title": "Gate engine", "tags": ["loops"]}}),
+            "create: unknown field `tags`",
+        ),
+        (
+            json!({"action": "attach_ticket", "loop_id": loop_id, "create": {"title": "Gate engine", "assignees": [{"role": "owner"}]}}),
+            "create.assignees[0] requires at least one of user_id, email, or handle",
+        ),
+        (
+            json!({"action": "detach_ticket", "loop_id": loop_id}),
+            "ticket_id is required",
+        ),
+        (json!({"action": "loop_tickets"}), "loop_id is required"),
     ];
     for (input, expected) in refusals {
         let error = tool
@@ -966,6 +1400,12 @@ fn the_schema_adds_loop_inputs_and_keeps_the_plan_inputs() {
     for action in super::plan_loops::LOOP_ACTIONS {
         assert!(actions.contains(action), "{action}");
     }
+    for ticket_action in ["attach_ticket", "detach_ticket", "loop_tickets"] {
+        assert!(
+            super::plan_loops::LOOP_ACTIONS.contains(&ticket_action),
+            "{ticket_action}"
+        );
+    }
     for plan_action in ["capture_plan", "get_plan", "update_plan", "list_plans"] {
         assert!(actions.contains(&plan_action), "{plan_action}");
     }
@@ -986,12 +1426,20 @@ fn the_schema_adds_loop_inputs_and_keeps_the_plan_inputs() {
         "audience",
         "after",
         "loop_state",
+        "ticket_id",
+        "create",
     ] {
         assert!(properties.get(param).is_some(), "{param}");
     }
     assert_eq!(
         properties["outcome"]["enum"],
         json!(["approve", "request_changes", "abort"])
+    );
+    assert_eq!(properties["create"]["required"], json!(["title"]));
+    assert_eq!(
+        properties["create"]["properties"]["assignees"]["items"]["properties"]["entity_type"]
+            ["enum"],
+        json!(["human", "agent"])
     );
     // The plan inputs are as they were.
     assert_eq!(
@@ -1018,7 +1466,7 @@ fn the_actions_are_where_an_agent_looks_for_them() {
         .iter()
         .find(|twin| twin.name == "session_read")
         .expect("the read-only session twin");
-    for read in ["loop_status", "list_loops"] {
+    for read in ["loop_status", "list_loops", "loop_tickets"] {
         assert!(session_read.actions.contains(&read), "{read}");
     }
     for write in [
@@ -1027,6 +1475,8 @@ fn the_actions_are_where_an_agent_looks_for_them() {
         "resolve_gate",
         "abort_loop",
         "resume_loop",
+        "attach_ticket",
+        "detach_ticket",
     ] {
         assert!(!session_read.actions.contains(&write), "{write}");
         assert_eq!(

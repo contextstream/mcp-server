@@ -1,6 +1,7 @@
 //! Plan loops on the `session` tool (contract v1.2): `start_loop`,
 //! `loop_status`, `advance_loop`, `resolve_gate`, `abort_loop`, `resume_loop`
-//! and `list_loops`.
+//! and `list_loops`; and the tickets that ride a loop (contract v1.3):
+//! `attach_ticket`, `detach_ticket` and `loop_tickets`.
 //!
 //! A thin client. Each action is one call to the ContextStream API (a title
 //! given as `plan_id` is looked up first, as `update_plan` does, and
@@ -12,7 +13,8 @@
 //! is sent; the rest is the API's to judge.
 
 use mcp_client::{
-    ContextStreamClient, GateResolution, PlanLoopConfig, PlanLoopConflict, PlanLoopGate,
+    ContextStreamClient, GateResolution, LoopTicketAttachment, NewLoopTicket, PlanLoopConfig,
+    PlanLoopConflict, PlanLoopGate,
 };
 use mcp_session::SessionManager;
 use mcp_types::{tool::ToolResult, Error, Result};
@@ -32,6 +34,9 @@ pub(crate) const LOOP_ACTIONS: &[&str] = &[
     "abort_loop",
     "resume_loop",
     "list_loops",
+    "attach_ticket",
+    "detach_ticket",
+    "loop_tickets",
 ];
 
 /// `resolve_gate` takes the affected step ids as `step_ids`; `steps` given
@@ -83,6 +88,9 @@ pub(crate) async fn execute(
         "abort_loop" => abort_loop(client, input).await,
         "resume_loop" => resume_loop(client, input).await,
         "list_loops" => list_loops(client, input).await,
+        "attach_ticket" => attach_ticket(client, input).await,
+        "detach_ticket" => detach_ticket(client, input).await,
+        "loop_tickets" => loop_tickets(client, input).await,
         other => Err(Error::Validation(format!(
             "Unknown loop action: {other}. Use one of: {}.",
             LOOP_ACTIONS.join(", ")
@@ -320,6 +328,74 @@ async fn list_loops(client: &ContextStreamClient, input: SessionInput) -> Result
     Ok(ToolResult::with_structured(list_text(&result), result))
 }
 
+async fn attach_ticket(client: &ContextStreamClient, input: SessionInput) -> Result<ToolResult> {
+    let loop_id = loop_uuid(input.loop_id.as_deref())?;
+    let step_id = non_empty(input.step_id.as_deref()).map(str::to_string);
+    let ticket = non_empty(input.ticket_id.as_deref());
+    let create = input.create.as_ref().filter(|create| !create.is_null());
+    let (attachment, headline) = match (ticket, create) {
+        (Some(_), Some(_)) => {
+            return Err(Error::Validation(
+                "attach_ticket takes ticket_id (a ticket that exists) or create (a new one), not both."
+                    .to_string(),
+            ))
+        }
+        (Some(ticket), None) => (
+            LoopTicketAttachment {
+                ticket_id: Some(ticket_uuid(Some(ticket))?),
+                step_id,
+                ..LoopTicketAttachment::default()
+            },
+            "Ticket attached.",
+        ),
+        (None, Some(create)) => (
+            LoopTicketAttachment {
+                create: Some(new_ticket(create)?),
+                step_id,
+                ..LoopTicketAttachment::default()
+            },
+            "Ticket created and attached.",
+        ),
+        (None, None) => {
+            return Err(Error::Validation(
+                "attach_ticket needs ticket_id (a ticket that exists; entity(kind=\"ticket\", action=\"list\") shows ids) or create={\"title\": \"...\"} for a new one in the loop's project."
+                    .to_string(),
+            ))
+        }
+    };
+    let result = client
+        .attach_plan_loop_ticket(loop_id, &attachment)
+        .await
+        .map_err(|error| explain_conflict(error, &format!("loop_id=\"{loop_id}\"")))?;
+    Ok(ToolResult::with_structured(
+        ticket_change_text(headline, &result),
+        result,
+    ))
+}
+
+async fn detach_ticket(client: &ContextStreamClient, input: SessionInput) -> Result<ToolResult> {
+    let loop_id = loop_uuid(input.loop_id.as_deref())?;
+    let ticket_id = ticket_uuid(input.ticket_id.as_deref())?;
+    let result = client
+        .detach_plan_loop_ticket(loop_id, ticket_id)
+        .await
+        .map_err(|error| explain_conflict(error, &format!("loop_id=\"{loop_id}\"")))?;
+    let headline = format!("Ticket {ticket_id} detached; the ticket itself is unchanged.");
+    Ok(ToolResult::with_structured(
+        ticket_change_text(&headline, &result),
+        result,
+    ))
+}
+
+async fn loop_tickets(client: &ContextStreamClient, input: SessionInput) -> Result<ToolResult> {
+    let loop_id = loop_uuid(input.loop_id.as_deref())?;
+    let result = client.plan_loop_tickets(loop_id).await?;
+    Ok(ToolResult::with_structured(
+        tickets_text(&result, loop_id),
+        result,
+    ))
+}
+
 // ============================================================================
 // Input checks
 // ============================================================================
@@ -341,6 +417,45 @@ fn loop_uuid(raw: Option<&str>) -> Result<Uuid> {
                 .to_string(),
         )
     })
+}
+
+fn ticket_uuid(raw: Option<&str>) -> Result<Uuid> {
+    let raw = non_empty(raw).ok_or_else(|| {
+        Error::Validation(
+            "ticket_id is required: the ticket's id (entity(kind=\"ticket\", action=\"list\") and loop_tickets show it)."
+                .to_string(),
+        )
+    })?;
+    Uuid::parse_str(raw).map_err(|_| {
+        Error::Validation(
+            "ticket_id must be the ticket's UUID (entity(kind=\"ticket\", action=\"list\") and loop_tickets show it)."
+                .to_string(),
+        )
+    })
+}
+
+/// The ticket `attach_ticket` creates, from the call's `create` object.
+fn new_ticket(create: &Value) -> Result<NewLoopTicket> {
+    let mut ticket: NewLoopTicket = serde_json::from_value(create.clone()).map_err(|error| {
+        Error::Validation(format!(
+            "create: {error}. A new ticket is {{title, description, kind: bug|feature|task|chore|incident|epic, priority, labels, assignees}}."
+        ))
+    })?;
+    ticket.title = ticket.title.trim().to_string();
+    if ticket.title.is_empty() {
+        return Err(Error::Validation(
+            "create.title is required: the new ticket's title.".to_string(),
+        ));
+    }
+    if let Some(assignees) = ticket.assignees.take() {
+        let assignees =
+            mcp_client::normalize_assignees(&assignees).map_err(|error| match error {
+                Error::Validation(message) => Error::Validation(format!("create.{message}")),
+                other => other,
+            })?;
+        ticket.assignees = Some(assignees);
+    }
+    Ok(ticket)
 }
 
 fn scope_uuid(raw: Option<&str>, field: &str) -> Result<Option<Uuid>> {
@@ -446,6 +561,12 @@ fn explain_conflict(error: Error, target: &str) -> Error {
         ),
         PlanLoopConflict::IllegalTransition => format!(
             "The loop's state does not allow that: it may be completed or aborted, the gate may not be open, or it is not blocked (only a blocked loop resumes). Nothing was changed; read it with session(action=\"loop_status\", {target})."
+        ),
+        PlanLoopConflict::TicketInAnotherLoop => format!(
+            "That ticket already rides another live loop (the API names it above); a ticket rides one live loop at a time, so it was not attached here. Take it off that loop first with session(action=\"detach_ticket\", loop_id=\"<that loop>\", ticket_id=\"<the ticket>\"), then attach it to this one ({target})."
+        ),
+        PlanLoopConflict::StepHasOpenTickets => format!(
+            "That step still has tickets that are not done, so the loop did not advance. session(action=\"loop_tickets\", {target}) lists them: finish them (a ticket is done when it is resolved or closed), or detach the ones that no longer belong to the step, then advance again."
         ),
     };
     match error {
@@ -665,6 +786,17 @@ fn loop_view_text(headline: &str, view: &Value) -> String {
     if let Some(gate) = gate {
         lines.push(gate_line(view, gate));
     }
+    if let Some(rollup) = view.get("tickets").and_then(rollup_words) {
+        lines.push(format!("Tickets: {rollup}"));
+    }
+    if let Some(health) = text_field(view, &["health"]).filter(|health| *health != "on_track") {
+        let reasons = string_list(view.get("health_reasons"));
+        lines.push(if reasons.is_empty() {
+            format!("Health: {}", one_line(health))
+        } else {
+            format!("Health: {} ({})", one_line(health), reasons.join("; "))
+        });
+    }
     if let Some(replan) = replan_lines(view) {
         lines.push(replan);
     }
@@ -714,6 +846,130 @@ fn loop_view_text(headline: &str, view: &Value) -> String {
         lines.push(format!("Plan: {}", one_line(link)));
     }
     lines.join("\n")
+}
+
+/// A ticket rollup in words: how many of a loop's (or a step's) live tickets
+/// are done, and the ones that need attention. `None` without tickets.
+fn rollup_words(rollup: &Value) -> Option<String> {
+    let total = int_field(rollup, "total").filter(|total| *total > 0)?;
+    let mut words = format!("{}/{total} done", int_field(rollup, "done").unwrap_or(0));
+    for (key, label) in [
+        ("in_progress", "in progress"),
+        ("in_review", "in review"),
+        ("blocked", "blocked"),
+    ] {
+        if let Some(count) = int_field(rollup, key).filter(|count| *count > 0) {
+            words.push_str(&format!(", {count} {label}"));
+        }
+    }
+    Some(words)
+}
+
+/// One ticket riding a loop on one line: where it stands, who has it, and
+/// its newest run.
+fn ticket_line(ticket: &Value) -> String {
+    let mut line = format!(
+        "- ticket_id={}",
+        text_field(ticket, &["ticket_id", "id"])
+            .map(one_line)
+            .unwrap_or_else(|| "?".to_string())
+    );
+    if let Some(kind) = text_field(ticket, &["kind"]) {
+        line.push_str(&format!(" [{}]", one_line(kind)));
+    }
+    if let Some(station) = text_field(ticket, &["station"]) {
+        line.push_str(&format!(" station={}", one_line(station)));
+    }
+    if let Some(status) = text_field(ticket, &["status"]) {
+        line.push_str(&format!(" status={}", one_line(status)));
+    }
+    if let Some(step) = text_field(ticket, &["step_id"]) {
+        line.push_str(&format!(" step={}", one_line(step)));
+    }
+    if let Some(assignee) = ticket
+        .get("assignee")
+        .filter(|assignee| assignee.is_object())
+    {
+        if let Some(name) = text_field(assignee, &["handle", "name", "user_id"]) {
+            line.push_str(&format!(" assignee={}", one_line(name)));
+            if text_field(assignee, &["entity_type"]) == Some("agent") {
+                line.push_str(" [agent]");
+            }
+        }
+    }
+    if ticket.get("blocked").and_then(Value::as_bool) == Some(true) {
+        match text_field(ticket, &["blocked_reason"]) {
+            Some(reason) => line.push_str(&format!(" blocked ({})", one_line(reason))),
+            None => line.push_str(" blocked"),
+        }
+    }
+    if let Some(run) = ticket.get("run").filter(|run| run.is_object()) {
+        let mut words = vec![text_field(run, &["agent_name"])
+            .map(one_line)
+            .unwrap_or_else(|| "an agent".to_string())];
+        if let Some(state) = text_field(run, &["state"]) {
+            words.push(one_line(state));
+        }
+        if let Some(liveness) = text_field(run, &["liveness"]) {
+            words.push(format!("({})", one_line(liveness)));
+        }
+        if let Some(step) = text_field(run, &["step_label"]) {
+            words.push(format!("{:?}", one_line(step)));
+        }
+        if let (Some(done), Some(total)) =
+            (int_field(run, "plan_done"), int_field(run, "plan_total"))
+        {
+            if total > 0 {
+                words.push(format!("{done}/{total}"));
+            }
+        }
+        line.push_str(&format!("; run: {}", words.join(" ")));
+    }
+    if let Some(title) = text_field(ticket, &["title"]) {
+        line.push_str(&format!(" — {}", one_line(title)));
+    }
+    line
+}
+
+/// An attach or a detach: what was done, the ticket, and the loop after it.
+fn ticket_change_text(headline: &str, result: &Value) -> String {
+    let mut lines = vec![format!("[PLAN_LOOP] {headline}")];
+    if let Some(ticket) = result.get("ticket").filter(|ticket| ticket.is_object()) {
+        lines.push(ticket_line(ticket));
+    }
+    if let Some(view) = result.get("loop").filter(|view| view.is_object()) {
+        // The loop's own lines, under this answer's headline.
+        let text = loop_view_text(headline, view);
+        lines.extend(text.lines().skip(1).map(str::to_string));
+    }
+    lines.join("\n")
+}
+
+/// The tickets riding a loop, one line each, under their rollup.
+fn tickets_text(result: &Value, loop_id: Uuid) -> String {
+    let tickets = result
+        .get("tickets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if tickets.is_empty() {
+        return format!(
+            "[LOOP_TICKETS] none on loop {loop_id}. Attach one with session(action=\"attach_ticket\", loop_id=\"{loop_id}\", ticket_id=\"<id>\"), or create one there with create={{\"title\": \"...\"}}."
+        );
+    }
+    let mut text = format!(
+        "[LOOP_TICKETS] {} ticket(s) on loop {loop_id}",
+        tickets.len()
+    );
+    match result.get("rollup").and_then(rollup_words) {
+        Some(rollup) => text.push_str(&format!(": {rollup}.")),
+        None => text.push('.'),
+    }
+    for ticket in &tickets {
+        text.push('\n');
+        text.push_str(&ticket_line(ticket));
+    }
+    text
 }
 
 /// A page of loop events, one line each.

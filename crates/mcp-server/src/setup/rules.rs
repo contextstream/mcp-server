@@ -93,6 +93,7 @@ const TOOL_NAMES: &[&str] = &[
     "capsule",
     "entity",
     "skill",
+    "progress",
     "help",
     "generate_rules",
 ];
@@ -190,6 +191,19 @@ When the user asks to prepare/create a handoff, hand work over, or continue in a
 - If the user explicitly requests a local handoff file, create the ContextStream handoff first, then write the exact requested file as an additional artifact.
 - If the user explicitly requests a capsule, create a real capsule; never replace that request with only a handoff entity or prose.
 "#;
+
+/// When to report live progress, shared by every generated rules mode. The
+/// moments are the ones the `progress` tool's own description names.
+const PROGRESS_GUIDANCE: &str = r#"## Live Progress
+
+People watch agents' work live in ContextStream. Report yours with `progress(...)`; one quick call each time:
+- when you start work on a ticket, a plan step or any multi-step task: `progress(title="...", ticket_id="<id, when there is one>", step="what you are doing now", plan=[{"title":"...","state":"in_progress"},{"title":"...","state":"next"}])`
+- whenever your step or checklist changes: `progress(step="...", plan=[...])`
+- when you open a PR, a preview or a deploy: `progress(links=[{"kind":"pr","url":"..."}])`
+- when you are blocked or need a person: `progress(waiting={"on":"person","question":"..."})`
+- when you finish: `progress(status="completed|partial|failed|stopped|cancelled", summary="what was done and what was not")`
+
+Give `percent` only when it is real. If the call says progress was not recorded, carry on with your work and do not retry it."#;
 
 /// Canonical plan/task persistence policy shared across generated rules.
 const PLANS_AND_TASKS_GUIDANCE: &str = r#"## Plans and Tasks
@@ -2164,6 +2178,7 @@ fn generate_bootstrap_rules(editor: &Editor, workspace_name: &str, workspace_id:
 {simple_ops}
 
 {handoff_guidance}
+{progress_guidance}
 
 **Why?** `context()` delivers task-specific rules, lessons from past mistakes, and relevant decisions. When `context` is not exposed, `session(action="ground", user_message="...")` is the supported fallback for that grounding bundle.
 
@@ -2201,6 +2216,7 @@ fn generate_bootstrap_rules(editor: &Editor, workspace_name: &str, workspace_id:
         workspace_id = workspace_id,
         simple_ops = SIMPLE_OPS_LIST,
         handoff_guidance = HANDOFF_GUIDANCE,
+        progress_guidance = PROGRESS_GUIDANCE,
         knowledge_first = KNOWLEDGE_FIRST_GUIDANCE,
         past_sessions = PAST_SESSIONS_GUIDANCE,
         project_scope = PROJECT_SCOPE_GUIDANCE,
@@ -2230,6 +2246,7 @@ fn generate_minimal_rules(editor: &Editor, workspace_name: &str, workspace_id: &
 {simple_ops}
 
 {handoff_guidance}
+{progress_guidance}
 
 ## Why These Rules?
 
@@ -2272,6 +2289,7 @@ These should be followed exactly as they contain real-time context.
         workspace_id = workspace_id,
         simple_ops = SIMPLE_OPS_LIST,
         handoff_guidance = HANDOFF_GUIDANCE,
+        progress_guidance = PROGRESS_GUIDANCE,
         knowledge_first = KNOWLEDGE_FIRST_GUIDANCE,
         past_sessions = PAST_SESSIONS_GUIDANCE,
         project_scope = PROJECT_SCOPE_GUIDANCE,
@@ -2301,6 +2319,7 @@ fn generate_full_rules(editor: &Editor, workspace_name: &str, workspace_id: &str
 {simple_ops}
 
 {handoff_guidance}
+{progress_guidance}
 
 ## Why These Rules?
 
@@ -2418,6 +2437,7 @@ When `context()` returns `context_pressure.level: "high"`:
         workspace_id = workspace_id,
         simple_ops = SIMPLE_OPS_LIST,
         handoff_guidance = HANDOFF_GUIDANCE,
+        progress_guidance = PROGRESS_GUIDANCE,
         knowledge_first = KNOWLEDGE_FIRST_GUIDANCE,
         past_sessions = PAST_SESSIONS_GUIDANCE,
         project_scope = PROJECT_SCOPE_GUIDANCE,
@@ -4379,6 +4399,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn every_rules_mode_says_when_to_report_live_progress() {
+        for editor in Editor::all() {
+            for mode in [RulesMode::Bootstrap, RulesMode::Minimal, RulesMode::Full] {
+                let rules = generate_rule_content(editor, None, None, mode);
+                // The same moments the `progress` tool's description names.
+                for required in [
+                    "## Live Progress",
+                    "People watch agents' work live in ContextStream",
+                    "when you start work on a ticket, a plan step or any multi-step task",
+                    "whenever your step or checklist changes",
+                    "when you open a PR, a preview or a deploy",
+                    "when you are blocked or need a person",
+                    "when you finish",
+                    "summary=\"what was done and what was not\"",
+                    "Give `percent` only when it is real",
+                    "do not retry it",
+                ] {
+                    assert!(
+                        rules.contains(required),
+                        "{} {:?} rules must say when to report progress: {required}",
+                        editor.display_name(),
+                        mode
+                    );
+                }
+                assert_eq!(
+                    rules.matches("## Live Progress").count(),
+                    1,
+                    "{} {:?}",
+                    editor.display_name(),
+                    mode
+                );
+            }
+        }
+        // One short block: it stays a small part of every rules file.
+        assert!(
+            PROGRESS_GUIDANCE.len() < 1_100,
+            "{} bytes",
+            PROGRESS_GUIDANCE.len()
+        );
+        // Claude Code is taught the tool under the name it is exposed by.
+        let claude = generate_rule_content(&Editor::ClaudeCode, None, None, RulesMode::Bootstrap);
+        assert!(claude.contains("`mcp__contextstream__progress(step=\"...\", plan=[...])`"));
+        assert!(
+            !claude.contains("`progress("),
+            "Claude must never be taught an unexposed bare progress tool name"
+        );
+        let codex = generate_rule_content(&Editor::Codex, None, None, RulesMode::Bootstrap);
+        assert!(codex.contains("`progress(step=\"...\", plan=[...])`"));
+        // The compact Antigravity plugin rules keep their budget: the block
+        // is in the skill's full reference instead.
+        assert!(!global_rules_content(&Editor::Antigravity).contains("## Live Progress"));
+        assert!(antigravity_skill_files()
+            .reference
+            .contains("## Live Progress"));
     }
 
     #[test]

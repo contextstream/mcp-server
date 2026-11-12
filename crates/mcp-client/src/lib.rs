@@ -31,6 +31,7 @@ pub mod json;
 pub mod parity;
 pub mod plan_loops;
 pub mod retry;
+pub mod run_progress;
 pub mod studio;
 pub mod ticket;
 
@@ -230,8 +231,12 @@ pub use parity::{
     normalize_decisions_envelope, CreateDecisionParams, CreateLessonParams, DecisionActionParams,
     ListDecisionsParams, ListLessonsParams, UpdateLessonParams, DECISION_ACTIONS,
 };
-pub use plan_loops::{GateResolution, PlanLoopConfig, PlanLoopConflict, PlanLoopGate};
+pub use plan_loops::{
+    GateResolution, LoopTicketAttachment, NewLoopTicket, PlanLoopConfig, PlanLoopConflict,
+    PlanLoopGate,
+};
 pub use retry::IngestFailure;
+pub use run_progress::RunFilter;
 pub use ticket::{
     append_ticket_extras, canonical_linked_item_kind, format_linked_summary,
     format_ticket_assignee_summary, format_ticket_fields_not_saved, format_ticket_linked_summary,

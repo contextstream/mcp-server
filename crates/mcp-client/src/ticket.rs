@@ -11,7 +11,8 @@ pub const LINKED_ITEM_KINDS: &[&str] = &[
 /// Canonical linked artifact kinds for plans.
 pub const PLAN_LINKED_ITEM_KINDS: &[&str] = &["doc", "diagram", "runbook", "handoff"];
 
-/// Assignee entity types (human now; agent reserved for future use).
+/// Assignee entity types: a person, or an agent
+/// (`{entity_type: "agent", handle: "cinder", name: "Cinder"}`).
 pub const ASSIGNEE_ENTITY_TYPES: &[&str] = &["human", "agent"];
 
 /// Summary of linked items on a ticket, grouped by kind.
@@ -291,8 +292,8 @@ pub fn format_ticket_fields_not_saved(fields: &[&str]) -> Option<String> {
                  name the linked items in the description instead.",
             ),
             "assignees" => Some(
-                "Not saved: assignees. The API keeps a single assignee as assignee_id \
-                 (a user id); set assignee_id instead.",
+                "Not saved: assignees. This API answered without them: it keeps a single \
+                 assignee as assignee_id (a user id); set assignee_id instead.",
             ),
             _ => None,
         })
@@ -334,11 +335,16 @@ pub fn format_ticket_assignee_summary(item: &Value) -> Option<String> {
                 .or_else(|| obj.get("kind"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("human");
-            let label = obj
-                .get("email")
-                .or_else(|| obj.get("handle"))
-                .or_else(|| obj.get("user_id"))
-                .and_then(|v| v.as_str())
+            // An address or a handle names an assignee best; a display name
+            // comes before a bare user id.
+            let label = ["email", "handle", "name", "user_id"]
+                .into_iter()
+                .find_map(|key| {
+                    obj.get(key)
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
                 .unwrap_or("unknown");
             let role = obj
                 .get("role")
@@ -582,6 +588,66 @@ mod tests {
         });
         assert!(ticket_fields_not_saved(&request, &result).is_empty());
         assert!(format_ticket_fields_not_saved(&[]).is_none());
+    }
+
+    #[test]
+    fn assignees_the_api_stores_are_not_reported_and_ones_it_drops_still_are() {
+        // Contract v1.3: the API stores assignees and returns them, an agent
+        // among them, so nothing is reported.
+        let ada = uuid::Uuid::new_v4().to_string();
+        let request = json!({
+            "title": "Gate engine",
+            "assignees": [
+                {"entity_type": "agent", "handle": "cinder", "name": "Cinder"},
+                {"entity_type": "human", "user_id": ada, "name": "Ada"}
+            ]
+        });
+        let stored = json!({
+            "id": "t-4",
+            "title": "Gate engine",
+            "assignee_id": null,
+            "assignees": [
+                {"entity_type": "agent", "handle": "cinder", "name": "Cinder"},
+                {"entity_type": "human", "user_id": ada, "name": "Ada"}
+            ]
+        });
+        assert!(ticket_fields_not_saved(&request, &stored).is_empty());
+        assert_eq!(
+            format_ticket_assignee_summary(&stored).as_deref(),
+            Some("assignees: cinder [agent], Ada")
+        );
+        // An API that predates it answers without them (or with an empty
+        // list): that is still said, in the same words as before.
+        for dropped in [
+            json!({"id": "t-4", "title": "Gate engine"}),
+            json!({"id": "t-4", "title": "Gate engine", "assignees": []}),
+            json!({"ticket": {"id": "t-4", "assignees": null}}),
+        ] {
+            assert_eq!(
+                ticket_fields_not_saved(&request, &dropped),
+                vec!["assignees"],
+                "{dropped}"
+            );
+        }
+        let text = format_ticket_fields_not_saved(&["assignees"]).unwrap();
+        assert!(text.starts_with("Not saved: assignees."), "{text}");
+        assert!(text.contains("set assignee_id instead"), "{text}");
+    }
+
+    #[test]
+    fn an_agent_assignee_keeps_its_name_and_handle() {
+        let mut body = json!({
+            "assignees": [{"entity_type": "Agent", "handle": " cinder ", "name": "Cinder"}]
+        });
+        normalize_ticket_body(&mut body).unwrap();
+        assert_eq!(
+            body["assignees"],
+            json!([{"entity_type": "agent", "handle": "cinder", "name": "Cinder"}])
+        );
+        // `assignees: []` clears them and is sent as given.
+        let mut cleared = json!({"assignees": []});
+        normalize_ticket_body(&mut cleared).unwrap();
+        assert_eq!(cleared["assignees"], json!([]));
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! Plan loops (contract v1.2): a saved plan run as a loop that walks the
-//! plan's steps and stops at review gates for a person.
+//! Plan loops (contract v1.2, with the tickets of v1.3): a saved plan run as
+//! a loop that walks the plan's steps and stops at review gates for a person.
 //!
 //! The ContextStream API is the only place loop state lives. These calls carry
 //! one request each, under the client's `/api/v1` base and with the caller's
@@ -12,7 +12,12 @@
 //! - `POST /plan-loops/:loop_id/advance` `{step_id, summary?}`;
 //! - `POST /plan-loops/:loop_id/gates/:gate_id/resolve` `{outcome, note, steps?}`;
 //! - `POST /plan-loops/:loop_id/abort` `{reason?}` and `POST /plan-loops/:loop_id/resume`
-//!   `{max_iterations?}`.
+//!   `{max_iterations?}`;
+//! - `GET /plan-loops/:loop_id/tickets` lists the tickets riding a loop with
+//!   their rollup, `POST /plan-loops/:loop_id/tickets` attaches an existing
+//!   ticket (`{ticket_id, step_id?}`) or creates one in the loop's project and
+//!   attaches it (`{create, step_id?}`), and
+//!   `DELETE /plan-loops/:loop_id/tickets/:ticket_id` detaches one.
 //!
 //! A transition the API refuses is a 409 whose message starts with its code
 //! ([`PlanLoopConflict`]); an invalid config is a 422.
@@ -96,6 +101,41 @@ pub struct GateResolution {
     pub steps: Option<Vec<String>>,
 }
 
+/// A ticket to create in the loop's project and attach (the `create` of
+/// `POST /plan-loops/:loop_id/tickets`). Unknown fields are refused, so a
+/// typo (`labels` as `tags`) is said instead of dropped.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewLoopTicket {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// bug|feature|task|chore|incident|epic; the API's default when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+    /// `[{entity_type: human|agent, user_id?, email?, handle?, name?, role?}]`,
+    /// as [`crate::normalize_assignees`] writes them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignees: Option<Value>,
+}
+
+/// The body of `POST /plan-loops/:loop_id/tickets`: an existing ticket of
+/// the loop's workspace, or one to create, on the loop or on one of its
+/// steps. Attaching an attached ticket with another `step_id` moves it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct LoopTicketAttachment {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create: Option<NewLoopTicket>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+}
+
 /// The codes a refused loop transition (409) starts its message with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanLoopConflict {
@@ -108,17 +148,26 @@ pub enum PlanLoopConflict {
     /// The gate was already resolved with another outcome.
     GateAlreadyResolved,
     /// The loop's state does not allow this action (a finished loop, a gate
-    /// that is not open, a resume of a loop that is not blocked).
+    /// that is not open, a resume of a loop that is not blocked, a ticket
+    /// attached to an ended loop).
     IllegalTransition,
+    /// The ticket already rides another live loop; the message names it
+    /// (`ticket_in_another_loop: <loop_id>`).
+    TicketInAnotherLoop,
+    /// The step advanced still has tickets that are not done
+    /// (`step_has_open_tickets: 2 of 3 tickets on this step are not done`).
+    StepHasOpenTickets,
 }
 
 impl PlanLoopConflict {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::LoopAlreadyRunning,
         Self::StepOutOfOrder,
         Self::PlanVersionConflict,
         Self::GateAlreadyResolved,
         Self::IllegalTransition,
+        Self::TicketInAnotherLoop,
+        Self::StepHasOpenTickets,
     ];
 
     /// The code as the API writes it.
@@ -129,6 +178,8 @@ impl PlanLoopConflict {
             Self::PlanVersionConflict => "plan_version_conflict",
             Self::GateAlreadyResolved => "gate_already_resolved",
             Self::IllegalTransition => "illegal_transition",
+            Self::TicketInAnotherLoop => "ticket_in_another_loop",
+            Self::StepHasOpenTickets => "step_has_open_tickets",
         }
     }
 
@@ -275,6 +326,32 @@ impl ContextStreamClient {
         let body = strip_nulls(serde_json::json!({ "max_iterations": max_iterations }));
         self.post(&plan_loop_path(loop_id, "/resume"), body).await
     }
+
+    /// The tickets riding a loop, with their rollup.
+    /// Endpoint: `GET /plan-loops/:loop_id/tickets`, answered `{tickets, rollup}`.
+    pub async fn plan_loop_tickets(&self, loop_id: Uuid) -> Result<Value> {
+        self.get(&plan_loop_path(loop_id, "/tickets")).await
+    }
+
+    /// Attach a ticket to a loop, or create one there and attach it.
+    /// Endpoint: `POST /plan-loops/:loop_id/tickets` (201), answered
+    /// `{ticket, loop}`.
+    pub async fn attach_plan_loop_ticket(
+        &self,
+        loop_id: Uuid,
+        attachment: &LoopTicketAttachment,
+    ) -> Result<Value> {
+        self.post(&plan_loop_path(loop_id, "/tickets"), attachment)
+            .await
+    }
+
+    /// Take a ticket off a loop; the ticket itself is untouched.
+    /// Endpoint: `DELETE /plan-loops/:loop_id/tickets/:ticket_id`, answered
+    /// `{loop}`.
+    pub async fn detach_plan_loop_ticket(&self, loop_id: Uuid, ticket_id: Uuid) -> Result<Value> {
+        self.delete(&plan_loop_path(loop_id, &format!("/tickets/{ticket_id}")))
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +368,21 @@ mod tests {
         assert_eq!(
             PlanLoopConflict::from_error(&wrapped),
             Some(PlanLoopConflict::PlanVersionConflict)
+        );
+        // The two ticket codes of contract v1.3, as the API words them.
+        assert_eq!(
+            PlanLoopConflict::from_error(&Error::http(
+                409,
+                format!("ticket_in_another_loop: {}", Uuid::new_v4())
+            )),
+            Some(PlanLoopConflict::TicketInAnotherLoop)
+        );
+        assert_eq!(
+            PlanLoopConflict::from_error(&Error::http(
+                409,
+                "step_has_open_tickets: 2 of 3 tickets on this step are not done"
+            )),
+            Some(PlanLoopConflict::StepHasOpenTickets)
         );
         // Another status, or a 409 that names no loop code, is not one.
         assert_eq!(
@@ -337,5 +429,39 @@ mod tests {
             "step_id": "plan-step-2", "reviewers": ["product"]
         }));
         assert!(typo.unwrap_err().to_string().contains("reviewers"));
+    }
+
+    #[test]
+    fn an_attachment_is_an_existing_ticket_or_one_to_create() {
+        let ticket = Uuid::new_v4();
+        assert_eq!(
+            serde_json::to_value(LoopTicketAttachment {
+                ticket_id: Some(ticket),
+                step_id: Some("plan-step-2".into()),
+                ..LoopTicketAttachment::default()
+            })
+            .unwrap(),
+            serde_json::json!({"ticket_id": ticket, "step_id": "plan-step-2"})
+        );
+        let create: NewLoopTicket = serde_json::from_value(serde_json::json!({
+            "title": "Gate engine", "kind": "task",
+            "assignees": [{"entity_type": "agent", "handle": "cinder", "name": "Cinder"}],
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(LoopTicketAttachment {
+                create: Some(create),
+                ..LoopTicketAttachment::default()
+            })
+            .unwrap(),
+            serde_json::json!({"create": {
+                "title": "Gate engine", "kind": "task",
+                "assignees": [{"entity_type": "agent", "handle": "cinder", "name": "Cinder"}],
+            }})
+        );
+        let typo = serde_json::from_value::<NewLoopTicket>(serde_json::json!({
+            "title": "Gate engine", "tags": ["loop"]
+        }));
+        assert!(typo.unwrap_err().to_string().contains("tags"));
     }
 }

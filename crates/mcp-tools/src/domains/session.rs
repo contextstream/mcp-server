@@ -17415,6 +17415,12 @@ pub struct SessionInput {
     /// For `list_loops`: running|awaiting_review|blocked|completed|aborted.
     #[serde(default)]
     pub loop_state: Option<String>,
+    // Tickets on a loop (attach_ticket, detach_ticket, loop_tickets).
+    #[serde(default)]
+    pub ticket_id: Option<String>,
+    /// For `attach_ticket`: a ticket to create in the loop's project.
+    #[serde(default)]
+    pub create: Option<Value>,
 }
 
 /// Unified session tool handler.
@@ -17443,7 +17449,7 @@ const SESSION_TOOL_DESCRIPTION: &str = "Session and memory — NOT for codebase/
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const SESSION_TOOL_REFERENCE: &str = "Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). Lesson maintenance is supported via action='update_lesson' and action='supersede_lesson' (to delete one: the `delete` tool, action=\"session.delete_lesson\") with lesson_id (UUID or title; delete and supersede need a UUID or the exact title); lessons go to the typed /lessons endpoints first and fall back to memory events only when the server answers 404 (stated with a [PARTIAL] line). DECISIONS: action='capture' with event_type='decision' plus rationale/alternatives/scope/confidence routes to the typed decision create (same as memory(action=\"create_decision\")). PAST SESSIONS LIVE HERE: transcripts of every prior session are captured + indexed and are queryable. `context()` auto-surfaces `[GROUNDING]` prior-work hits; when that grounding is fresh, relevant, and sufficient, do not immediately call action='recall' for the same request. Call action='recall' as the first explicit escalation when `[GROUNDING]` is absent, thin, stale, off-topic, or when the user explicitly requests broader or session-specific history. For after-the-fact durable saves, use action='retro_capture' with title plus content and/or query/transcript_id; it stores the capture rationale, source query, transcript IDs, and source snippets in provenance. Use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills + git) outside context(). Also `memory(action=\"list_transcripts\"|\"search_transcripts\"|\"get_transcript\")` for chronological + full-text access. Save a session_snapshot at turning points so the NEXT session can pick up: action='capture', event_type='session_snapshot'. To pick up earlier work call action='resume' (most recent earlier session; resume_id picks another) or action='resume_list' (recent sessions, newest first), always with session_id set to the id init returned, so your own session is left out. Daily Recaps run around 23:00 in the user's timezone, not at MCP session boundaries; use list_recaps for timestamped history and trigger_recap for a manual asynchronous run. Team/personal mode: action='set_account_mode' with account_mode=team|personal|auto. Actions: capture, retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons, update_lesson, supersede_lesson, recall (retrieve past conversation context when auto-grounding is insufficient), ground (one-shot prior-work bundle — requires user_message or query), remember, user_context, summary, compress, delta, smart_search (searches MEMORY/conversation history only, not code), decision_trace, list_recaps, trigger_recap, restore_context, resume_list (recent sessions, newest first; pass session_id), resume (one session's saved state and newest messages; resume_id picks one, default latest; pass session_id), set_account_mode. Plan actions: capture_plan, get_plan, update_plan, list_plans. Use capture_plan for plans; do not use action='capture' with event_type='plan'. capture_plan requires structured steps and creates linked tasks by default with plan_id and plan_step_id. Plan loop actions (a saved plan run step by step that stops at review gates for a person; ContextStream holds every bit of loop state, and each action is one call with your own key): start_loop (plan_id = UUID or title; optional config: max_iterations 1-20, default 5; review_policy explicit|every_step|every_n|milestone_only with review_every_n for every_n; gates [{step_id, type human_review|status_report, required, reviewer_roles, reviewer_user_ids, channel coflow|contextstream|both, sla_hours}]; report_cadence_minutes 0 for off or 5-10080; audience role labels), loop_status (loop_id, or plan_id for the plan's latest loop; after = an events cursor, 0 for the first page, also lists the loop's events), advance_loop (loop_id, step_id = the step the loop expects, once it is done, summary), resolve_gate (loop_id, gate_id, outcome approve|request_changes|abort, note required for request_changes, step_ids = the steps to redo), abort_loop (loop_id, reason), resume_loop (loop_id, optional higher max_iterations; only a blocked loop resumes), list_loops (workspace_id, project_id, loop_state, limit). Status awaiting_review means stop until the open gate is resolved; when the loop carries a replan_context, use its review note on the next pass. A refused transition (409) says what it means: step_out_of_order, plan_version_conflict (the plan changed: call resume_loop), gate_already_resolved, loop_already_running, illegal_transition. Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Coaching rules (standing instructions the person gives you; they appear in the [COACHING] block of `context()` and of the prompt hook): add_coached_rule with rule_text (one instruction in the person's own words, up to 500 characters; holds in every project of the workspace, or in one project with scope='project'; the same rule said again is kept once), list_coached_rules (the person's rules, learned ones included, with source and scope).";
+const SESSION_TOOL_REFERENCE: &str = "Session and memory management — NOT for codebase/file search (use the 'search' tool for that). LESSONS LIVE HERE: when a mistake or correction happens, call action='capture_lesson' (NEVER write lessons to ~/.claude/.../memory/, .cursorrules, or other local markdown — local files are invisible to [LESSONS_WARNING] auto-surfacing on future turns and across sessions). Lesson maintenance is supported via action='update_lesson' and action='supersede_lesson' (to delete one: the `delete` tool, action=\"session.delete_lesson\") with lesson_id (UUID or title; delete and supersede need a UUID or the exact title); lessons go to the typed /lessons endpoints first and fall back to memory events only when the server answers 404 (stated with a [PARTIAL] line). DECISIONS: action='capture' with event_type='decision' plus rationale/alternatives/scope/confidence routes to the typed decision create (same as memory(action=\"create_decision\")). PAST SESSIONS LIVE HERE: transcripts of every prior session are captured + indexed and are queryable. `context()` auto-surfaces `[GROUNDING]` prior-work hits; when that grounding is fresh, relevant, and sufficient, do not immediately call action='recall' for the same request. Call action='recall' as the first explicit escalation when `[GROUNDING]` is absent, thin, stale, off-topic, or when the user explicitly requests broader or session-specific history. For after-the-fact durable saves, use action='retro_capture' with title plus content and/or query/transcript_id; it stores the capture rationale, source query, transcript IDs, and source snippets in provenance. Use action='ground' with user_message for a one-shot bundle (recall + docs + decisions + lessons + skills + git) outside context(). Also `memory(action=\"list_transcripts\"|\"search_transcripts\"|\"get_transcript\")` for chronological + full-text access. Save a session_snapshot at turning points so the NEXT session can pick up: action='capture', event_type='session_snapshot'. To pick up earlier work call action='resume' (most recent earlier session; resume_id picks another) or action='resume_list' (recent sessions, newest first), always with session_id set to the id init returned, so your own session is left out. Daily Recaps run around 23:00 in the user's timezone, not at MCP session boundaries; use list_recaps for timestamped history and trigger_recap for a manual asynchronous run. Team/personal mode: action='set_account_mode' with account_mode=team|personal|auto. Actions: capture, retro_capture (after-the-fact decision/note/snapshot capture from prior work with source provenance), capture_lesson (mistakes/corrections — title+trigger+impact+prevention), get_lessons, update_lesson, supersede_lesson, recall (retrieve past conversation context when auto-grounding is insufficient), ground (one-shot prior-work bundle — requires user_message or query), remember, user_context, summary, compress, delta, smart_search (searches MEMORY/conversation history only, not code), decision_trace, list_recaps, trigger_recap, restore_context, resume_list (recent sessions, newest first; pass session_id), resume (one session's saved state and newest messages; resume_id picks one, default latest; pass session_id), set_account_mode. Plan actions: capture_plan, get_plan, update_plan, list_plans. Use capture_plan for plans; do not use action='capture' with event_type='plan'. capture_plan requires structured steps and creates linked tasks by default with plan_id and plan_step_id. Plan loop actions (a saved plan run step by step that stops at review gates for a person; ContextStream holds every bit of loop state, and each action is one call with your own key): start_loop (plan_id = UUID or title; optional config: max_iterations 1-20, default 5; review_policy explicit|every_step|every_n|milestone_only with review_every_n for every_n; gates [{step_id, type human_review|status_report, required, reviewer_roles, reviewer_user_ids, channel coflow|contextstream|both, sla_hours}]; report_cadence_minutes 0 for off or 5-10080; audience role labels), loop_status (loop_id, or plan_id for the plan's latest loop; after = an events cursor, 0 for the first page, also lists the loop's events), advance_loop (loop_id, step_id = the step the loop expects, once it is done, summary), resolve_gate (loop_id, gate_id, outcome approve|request_changes|abort, note required for request_changes, step_ids = the steps to redo), abort_loop (loop_id, reason), resume_loop (loop_id, optional higher max_iterations; only a blocked loop resumes), list_loops (workspace_id, project_id, loop_state, limit). Tickets on a loop (a ticket rides one live loop at a time, on the loop or on one of its steps; a step that has tickets is done when they are): attach_ticket (loop_id, and ticket_id for a ticket that exists or create={title, description, kind bug|feature|task|chore|incident|epic, priority, labels, assignees [{entity_type human|agent, user_id, email, handle, name, role}]} for a new one in the loop's project; optional step_id; attaching again with another step_id moves it), detach_ticket (loop_id, ticket_id; the ticket itself is unchanged), loop_tickets (loop_id: each ticket with its station backlog|planned|in_progress|review|shipped|scrapped, its assignee and its newest run, under the rollup). Status awaiting_review means stop until the open gate is resolved; when the loop carries a replan_context, use its review note on the next pass. A refused transition (409) says what it means: step_out_of_order, plan_version_conflict (the plan changed: call resume_loop), gate_already_resolved, loop_already_running, illegal_transition, ticket_in_another_loop (detach it there first), step_has_open_tickets (finish or detach the step's tickets, then advance). Suggested rules actions: list_suggested_rules, suggested_rule_action, suggested_rules_stats. Coaching rules (standing instructions the person gives you; they appear in the [COACHING] block of `context()` and of the prompt hook): add_coached_rule with rule_text (one instruction in the person's own words, up to 500 characters; holds in every project of the workspace, or in one project with scope='project'; the same rule said again is kept once), list_coached_rules (the person's rules, learned ones included, with source and scope).";
 
 #[async_trait]
 impl ToolHandler for SessionTool {
@@ -18420,7 +18426,8 @@ impl ToolHandler for SessionTool {
                 }
             }
             action @ ("start_loop" | "loop_status" | "advance_loop" | "resolve_gate"
-            | "abort_loop" | "resume_loop" | "list_loops") => {
+            | "abort_loop" | "resume_loop" | "list_loops" | "attach_ticket"
+            | "detach_ticket" | "loop_tickets") => {
                 super::plan_loops::execute(&self.client, self.session.as_ref(), action, input)
                     .await
             }
@@ -18524,7 +18531,7 @@ impl ToolHandler for SessionTool {
                 ))
             }
             _ => Err(Error::Validation(format!(
-                "Unknown action: {}. Use 'capture', 'retro_capture', 'capture_lesson', 'get_lessons', 'update_lesson', 'delete_lesson', 'supersede_lesson', 'recall', 'ground', 'set_account_mode', 'remember', 'user_context', 'summary', 'compress', 'delta', 'smart_search', 'decision_trace', 'list_recaps', 'trigger_recap', 'restore_context', 'resume_list', 'resume', 'capture_plan', 'get_plan', 'update_plan', 'list_plans', 'start_loop', 'loop_status', 'advance_loop', 'resolve_gate', 'abort_loop', 'resume_loop', 'list_loops', 'list_suggested_rules', 'suggested_rule_action', 'suggested_rules_stats', 'list_coached_rules', or 'add_coached_rule'.",
+                "Unknown action: {}. Use 'capture', 'retro_capture', 'capture_lesson', 'get_lessons', 'update_lesson', 'delete_lesson', 'supersede_lesson', 'recall', 'ground', 'set_account_mode', 'remember', 'user_context', 'summary', 'compress', 'delta', 'smart_search', 'decision_trace', 'list_recaps', 'trigger_recap', 'restore_context', 'resume_list', 'resume', 'capture_plan', 'get_plan', 'update_plan', 'list_plans', 'start_loop', 'loop_status', 'advance_loop', 'resolve_gate', 'abort_loop', 'resume_loop', 'list_loops', 'attach_ticket', 'detach_ticket', 'loop_tickets', 'list_suggested_rules', 'suggested_rule_action', 'suggested_rules_stats', 'list_coached_rules', or 'add_coached_rule'.",
                 input.action
             ))),
         }
@@ -18588,6 +18595,9 @@ impl ToolHandler for SessionTool {
                     "abort_loop",
                     "resume_loop",
                     "list_loops",
+                    "attach_ticket",
+                    "detach_ticket",
+                    "loop_tickets",
                 ],
                 true,
             )
@@ -18866,7 +18876,7 @@ impl ToolHandler for SessionTool {
             // plan_id (a UUID or a title), the other loop actions loop_id.
             .string(
                 "loop_id",
-                "Loop ID (for loop_status, advance_loop, resolve_gate, abort_loop, resume_loop); start_loop, loop_status and list_loops show it",
+                "Loop ID (for loop_status, advance_loop, resolve_gate, abort_loop, resume_loop, attach_ticket, detach_ticket, loop_tickets); start_loop, loop_status and list_loops show it",
                 false,
             )
             .string(
@@ -18876,7 +18886,7 @@ impl ToolHandler for SessionTool {
             )
             .string(
                 "step_id",
-                "The step the loop expects, once it is done (for advance_loop); loop_status names it",
+                "The step the loop expects, once it is done (for advance_loop); loop_status names it. For attach_ticket: the step the ticket rides on (left out, it rides on the loop)",
                 false,
             )
             .string(
@@ -18959,6 +18969,43 @@ impl ToolHandler for SessionTool {
                 "loop_state",
                 "Loop state filter (for list_loops)",
                 mcp_client::plan_loops::LOOP_STATES,
+                false,
+            )
+            // Tickets on a loop.
+            .string(
+                "ticket_id",
+                "Ticket ID (for attach_ticket: a ticket that exists; for detach_ticket); entity(kind=\"ticket\", action=\"list\") and loop_tickets show it",
+                false,
+            )
+            .property(
+                "create",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "A ticket to create in the loop's project and attach (for attach_ticket, instead of ticket_id)",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "description": { "type": "string" },
+                        "kind": { "type": "string", "description": "bug, feature, task, chore, incident or epic" },
+                        "priority": { "type": "string", "description": "low, medium, high or urgent" },
+                        "labels": { "type": "array", "items": { "type": "string" } },
+                        "assignees": {
+                            "type": "array",
+                            "description": "Who has the ticket: people and agents",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "entity_type": { "type": "string", "enum": mcp_client::ASSIGNEE_ENTITY_TYPES },
+                                    "user_id": { "type": "string" },
+                                    "email": { "type": "string" },
+                                    "handle": { "type": "string", "description": "An agent's handle, e.g. cinder" },
+                                    "name": { "type": "string" },
+                                    "role": { "type": "string" }
+                                }
+                            }
+                        }
+                    },
+                    "required": ["title"]
+                }),
                 false,
             )
             .build()

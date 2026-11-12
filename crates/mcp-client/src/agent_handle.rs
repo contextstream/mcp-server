@@ -50,6 +50,13 @@ pub fn agent_handle(folder: Option<&str>) -> Option<String> {
     agent_handle_from(env.as_deref(), folder)
 }
 
+/// The handle a working folder named `agent-<handle>` gives, without this
+/// process's environment: for a server that serves other people's sessions
+/// (the hosted gateway), whose own environment says nothing about them.
+pub fn agent_handle_of_folder(folder: Option<&str>) -> Option<String> {
+    agent_handle_from(None, folder)
+}
+
 fn agent_handle_from(env: Option<&str>, folder: Option<&str>) -> Option<String> {
     if let Some(handle) = env.and_then(normalize_agent_handle) {
         return Some(handle);
@@ -84,5 +91,10 @@ mod tests {
         );
         assert_eq!(agent_handle_from(None, Some("/home/dev/project")), None);
         assert_eq!(agent_handle_from(None, None), None);
+        assert_eq!(
+            agent_handle_of_folder(Some("/tmp/x/agent-mcp-eng2c")).as_deref(),
+            Some("mcp-eng2c")
+        );
+        assert_eq!(agent_handle_of_folder(Some("/home/dev/project")), None);
     }
 }

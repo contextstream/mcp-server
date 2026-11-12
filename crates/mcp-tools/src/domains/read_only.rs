@@ -111,10 +111,11 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
         name: "session_read",
         tool: "session",
         title: "Read Session History",
-        description: "Read lessons, plans, plan loops, recaps, past sessions and decision traces \
-                      without changing anything. Same arguments as session(action=...) for these \
-                      actions. Use `session` to capture, update or resume, and to start, \
-                      advance or resolve a loop.",
+        description: "Read lessons, plans, plan loops and their tickets, recaps, past sessions \
+                      and decision traces without changing anything. Same arguments as \
+                      session(action=...) for these actions. Use `session` to capture, update \
+                      or resume, to start, advance or resolve a loop, and to attach or detach \
+                      a ticket.",
         actions: &[
             "get_lessons",
             "recall",
@@ -127,6 +128,7 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
             "list_plans",
             "loop_status",
             "list_loops",
+            "loop_tickets",
             "list_suggested_rules",
             "suggested_rules_stats",
             "list_coached_rules",

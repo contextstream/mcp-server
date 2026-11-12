@@ -456,6 +456,8 @@ fn write_observation_labels(name: &str, input: &Value) -> Option<(&'static str, 
                 "resolve_gate" => "resolve_gate",
                 "abort_loop" => "abort_loop",
                 "resume_loop" => "resume_loop",
+                "attach_ticket" => "attach_ticket",
+                "detach_ticket" => "detach_ticket",
                 "retro_capture" => "retro_capture",
                 "remember" => "remember",
                 "update_lesson" => "update_lesson",
@@ -498,6 +500,11 @@ fn write_observation_labels(name: &str, input: &Value) -> Option<(&'static str, 
             },
         )),
         "entity" => Some(("entity", entity_write_action_label(input)?)),
+        // A call without an action reports; get and list are reads.
+        "progress" => match input_action(input) {
+            None | Some("report") => Some(("progress", "report")),
+            _ => None,
+        },
         "capture_plan" => Some(("capture_plan", "capture_plan")),
         "session_capture" => Some(("session_capture", capture_action_label(input))),
         "session_capture_lesson" => Some(("session_capture_lesson", "capture_lesson")),
@@ -2635,6 +2642,32 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
             parallel_safe: false,
             batch_safe: false,
         },
+        "progress" => DiscoveryHints {
+            aliases: &[
+                "report progress",
+                "live progress",
+                "status update",
+                "what are you working on",
+                "run progress",
+                "heartbeat",
+                "show my work",
+                "tracking view",
+            ],
+            tags: &["progress", "live", "status", "ticket", "run", "tracking"],
+            when_to_use: "Report what you are doing so people can watch it live: when you start work on a ticket, a plan step or any multi-step task, whenever your step or checklist changes, when you open a PR, preview or deploy, when you are blocked or need a person, and when you finish (status and an honest summary). Also reads a run or lists the runs in a workspace.",
+            avoid_when: "Do not use it to save plans (session capture_plan), notes or decisions (session capture), or to message another agent (coordination). If it says progress was not recorded, carry on; do not retry it.",
+            examples: &[
+                "report that I started on this ticket",
+                "update my checklist: tests are done",
+                "I opened a pull request",
+                "I am blocked and need a person",
+                "mark this run completed with a summary",
+                "what are agents working on in this workspace",
+            ],
+            latency_class: "fast",
+            parallel_safe: false,
+            batch_safe: false,
+        },
         _ => DiscoveryHints {
             aliases: &[],
             tags: default_category_tags(metadata.category),
@@ -2717,6 +2750,8 @@ const STANDARD_TOOLS: &[&str] = &[
     "reminders_list",
     "reminders_active",
     "coordination",
+    // Live run progress: what an agent is doing now, for people watching.
+    "progress",
     // Context Feeds
     "feed",
     // Integrations
@@ -2826,6 +2861,8 @@ const CONSOLIDATED_TOOLS: &[&str] = &[
     "integration",
     "reminder",
     "coordination",
+    // Live run progress (report, get, list).
+    "progress",
     "feed",
     "media",
     "skill",
@@ -2894,7 +2931,7 @@ const CORE_BUNDLE: &[&str] = &[
 
 /// Tool bundles for progressive disclosure
 static TOOL_BUNDLES: phf::Map<&'static str, &'static [&'static str]> = phf::phf_map! {
-    "core" => &["init", "context", "session", "search", "answer", "help", "generate_rules", "media", "coordination"],
+    "core" => &["init", "context", "session", "search", "answer", "help", "generate_rules", "media", "coordination", "progress"],
     "session" => &["session_capture", "session_recall", "session_compress", "instruct"],
     "memory" => &["memory", "memory_search", "memory_decisions", "memory_timeline", "memory_create_node"],
     "search" => &["search", "search_semantic", "search_hybrid", "search_keyword"],

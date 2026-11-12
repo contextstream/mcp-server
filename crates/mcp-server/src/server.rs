@@ -109,6 +109,10 @@ pub fn build_registry(
         client.clone(),
         session.clone(),
     );
+    // Live run progress: what an agent is doing now, for the people watching.
+    // A local server keeps a reported run alive on a timer; the hosted
+    // gateway runs none (the tool reads the transport from the client config).
+    domains::progress::register_progress_tools(&mut registry, client.clone(), session.clone());
     domains::feed::register_feed_tools(&mut registry, client.clone(), session.clone());
     // Phase 1-3 taxonomy expansion: unified entity CRUD across tickets,
     // handoffs, backlog_views, incidents, releases, experiments, goals,
@@ -255,6 +259,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "session" => "Updating ContextStream session".to_string(),
         "entity" => "Updating ContextStream entity".to_string(),
         "reminder" => "Setting reminder in ContextStream".to_string(),
+        "progress" => "Reporting progress to ContextStream".to_string(),
         "integration" => "Updating ContextStream integration".to_string(),
         "vcs" => "Linking VCS with ContextStream".to_string(),
         "feed" => "Updating ContextStream feed".to_string(),
@@ -294,6 +299,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "session" => "ContextStream session updated".to_string(),
         "entity" => "ContextStream entity updated".to_string(),
         "reminder" => "Reminder saved to ContextStream".to_string(),
+        "progress" => "Progress reported to ContextStream".to_string(),
         "integration" => "ContextStream integration updated".to_string(),
         "vcs" => "VCS linked with ContextStream".to_string(),
         "feed" => "ContextStream feed updated".to_string(),
@@ -361,6 +367,9 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "abort_loop": "Aborting plan loop in ContextStream",
             "resume_loop": "Resuming plan loop in ContextStream",
             "list_loops": "Listing ContextStream plan loops",
+            "attach_ticket": "Attaching ticket to plan loop in ContextStream",
+            "detach_ticket": "Detaching ticket from plan loop in ContextStream",
+            "loop_tickets": "Listing plan loop tickets in ContextStream",
             "summary": "Loading ContextStream session summary",
             "compress": "Compressing ContextStream session",
             "delta": "Loading ContextStream session delta",
@@ -375,6 +384,12 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "add_coached_rule": "Saving coaching rule to ContextStream",
             "user_context": "Loading ContextStream user context",
             "remember_user": "Saving user context to ContextStream"
+        });
+    } else if name == domains::progress::TOOL_NAME {
+        metadata["actions"] = serde_json::json!({
+            "report": "Reporting progress to ContextStream",
+            "get": "Loading a run from ContextStream",
+            "list": "Listing ContextStream runs"
         });
     } else if name == "memory" {
         metadata["actions"] = serde_json::json!({
@@ -1127,6 +1142,8 @@ struct QueuedToolCall {
     params: serde_json::Value,
     client_can_elicit: bool,
     client_protocol: Option<String>,
+    /// The name the client gave itself at initialize, when it gave one.
+    client_name: Option<String>,
     announces_tool_changes: bool,
 }
 
@@ -1175,6 +1192,9 @@ async fn run_stdio_transport(
     // and the protocol revision it asked for (which form fields it can show).
     let mut client_can_elicit = false;
     let mut client_protocol: Option<String> = None;
+    // The name the client gave itself at initialize (display data for the
+    // tools that say which client an agent runs in; never authorization).
+    let mut client_name: Option<String> = None;
 
     while let Some(line) = incoming.recv().await {
         // Parse JSON-RPC request
@@ -1216,6 +1236,7 @@ async fn run_stdio_transport(
                 )
                 .to_string(),
             );
+            client_name = mcp_tools::client_identity::client_name_from_params(&params);
         }
 
         if is_tool_call {
@@ -1224,6 +1245,7 @@ async fn run_stdio_transport(
                 params,
                 client_can_elicit,
                 client_protocol: client_protocol.clone(),
+                client_name: client_name.clone(),
                 announces_tool_changes,
             };
             if tool_calls.send(call).await.is_err() {
@@ -1293,6 +1315,7 @@ async fn run_stdio_tool_calls(
             params,
             client_can_elicit,
             client_protocol,
+            client_name,
             announces_tool_changes,
         } = call;
         let wire_observation = mcp_tools::wire_tokens::WireTokenObservation::default();
@@ -1320,7 +1343,15 @@ async fn run_stdio_tool_calls(
         if stateless && mcp_tools::peer::CallPeer::stateless_client_can_elicit(&params) {
             call_peer = call_peer.with_inline_input(&params);
         }
-        let response = mcp_tools::peer::run_with_call_peer(call_peer, handled).await;
+        // A stateless call names its client in its own `_meta`; an
+        // initialize-era session named it at initialize.
+        let client_name =
+            mcp_tools::client_identity::client_name_from_params(&params).or(client_name);
+        let response = mcp_tools::client_identity::run_with_client_name(
+            client_name,
+            mcp_tools::peer::run_with_call_peer(call_peer, handled),
+        )
+        .await;
 
         if !response.is_empty() {
             let mut observed_wire = response.as_bytes().to_vec();
@@ -3293,6 +3324,9 @@ mod tests {
         "memory_read",
         "memory_update_doc",
         "memory_update_task",
+        // Live run progress (plan loops contract v1.3): a new tool; no
+        // existing tool changes for it.
+        "progress",
         "project",
         "project_read",
         "qa",
@@ -3477,6 +3511,12 @@ mod tests {
             "afbb3233e8a5d08967ea18f4c6da6e9ee2d0f36e492a6faf12348c69ccbee025",
         ),
         (
+            // New row for plan loops contract v1.3: the live progress tool
+            // (report, get, list). No argument is required.
+            "progress",
+            "69c1b73f6eb4c40a97d45f84da1fc29cdafcd198a131765024902e84042a74a1",
+        ),
+        (
             // Additive: action=working_set with `add`, `remove` and `clear`
             // (related projects for cross-project work). Every earlier field
             // and action still accepted. Additive: `offset` for list (#381).
@@ -3508,8 +3548,12 @@ mod tests {
             // Advanced for plan loops (contract v1.2): seven loop actions and
             // their inputs. Additive only: without them it is Wave 3b's
             // contract (plan_loop_inputs_only_add_to_the_session_schemas).
+            // Advanced for the tickets on a loop (contract v1.3):
+            // attach_ticket, detach_ticket, loop_tickets and their inputs
+            // (ticket_id, create). Additive only: without them it is the
+            // v1.2 contract (loop_ticket_inputs_only_add_to_the_session_schemas).
             "session",
-            "a7eba49505de3148bc5157b1cf6d59e91a9d4353c944e661e0635dd8bdc4858f",
+            "4e3f2d1526af0d184aa20b6c0fc10ee9f586415425d3eab5379b03523bf9049d",
         ),
         (
             "session_capture",
@@ -3522,8 +3566,10 @@ mod tests {
         (
             // Advanced for plan loops: loop_status and list_loops, and the
             // loop inputs. Additive only, as for `session`.
+            // Advanced for the tickets on a loop: loop_tickets and the two
+            // ticket inputs. Additive only, as for `session`.
             "session_read",
-            "0cb5d5497838e3b0999995e58f327a85e41420b7fea63c8e3a7bdd7f7c5d378c",
+            "c093db8a16cd8a5f7a8468a2120869529edb639c0a2426ee3d0719fe8b09642e",
         ),
         (
             "session_remember",
@@ -3808,39 +3854,125 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// The plan loop actions and parameters of contract v1.2.
+    const LOOP_ACTIONS: &[&str] = &[
+        "start_loop",
+        "loop_status",
+        "advance_loop",
+        "resolve_gate",
+        "abort_loop",
+        "resume_loop",
+        "list_loops",
+    ];
+    const LOOP_PARAMS: &[&str] = &[
+        "loop_id",
+        "gate_id",
+        "step_id",
+        "summary",
+        "outcome",
+        "note",
+        "step_ids",
+        "reason",
+        "max_iterations",
+        "review_policy",
+        "review_every_n",
+        "gates",
+        "report_cadence_minutes",
+        "audience",
+        "after",
+        "loop_state",
+    ];
+    /// What contract v1.3 (tickets on a loop) added to them.
+    const LOOP_TICKET_ACTIONS: &[&str] = &["attach_ticket", "detach_ticket", "loop_tickets"];
+    const LOOP_TICKET_PARAMS: &[&str] = &["ticket_id", "create"];
+
+    /// The contract hash of `name`'s listed schema without `actions` and
+    /// `params`, each of which it must list today.
+    fn schema_contract_without(
+        tools: &[serde_json::Value],
+        name: &str,
+        actions: &[&str],
+        params: &[&str],
+    ) -> String {
+        let mut schema = tool_by_name(tools, name)["inputSchema"].clone();
+        let properties = schema["properties"]
+            .as_object_mut()
+            .expect("schema properties");
+        for param in params {
+            assert!(properties.remove(*param).is_some(), "{name}: {param}");
+        }
+        let listed = properties["action"]["enum"]
+            .as_array_mut()
+            .expect("action enum");
+        let before = listed.len();
+        listed.retain(|action| !actions.contains(&action.as_str().unwrap_or_default()));
+        // The read-only twin lists only the reads among them.
+        assert!(listed.len() < before, "{name} lists none of {actions:?}");
+        schema_contract_hash(&schema)
+    }
+
+    #[test]
+    fn loop_ticket_inputs_only_add_to_the_session_schemas() {
+        // The tickets of contract v1.3 added three actions and two
+        // parameters to `session` (and the read `loop_tickets` to
+        // `session_read`). Without them both schemas are exactly the
+        // contracts plan loops v1.2 gave them, so every loop action, every
+        // plan action and every other parameter is unchanged.
+        let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        for (name, before) in [
+            (
+                "session",
+                "a7eba49505de3148bc5157b1cf6d59e91a9d4353c944e661e0635dd8bdc4858f",
+            ),
+            (
+                "session_read",
+                "0cb5d5497838e3b0999995e58f327a85e41420b7fea63c8e3a7bdd7f7c5d378c",
+            ),
+        ] {
+            assert_eq!(
+                schema_contract_without(&tools, name, LOOP_TICKET_ACTIONS, LOOP_TICKET_PARAMS),
+                before,
+                "{name}"
+            );
+        }
+        // `session` lists all three; the twin lists the read and no write.
+        let actions_of = |name: &str| -> Vec<String> {
+            tool_by_name(&tools, name)["inputSchema"]["properties"]["action"]["enum"]
+                .as_array()
+                .expect("action enum")
+                .iter()
+                .filter_map(|action| action.as_str().map(str::to_string))
+                .collect()
+        };
+        for action in LOOP_TICKET_ACTIONS {
+            assert!(
+                actions_of("session").contains(&action.to_string()),
+                "{action}"
+            );
+        }
+        let read = actions_of("session_read");
+        assert!(read.contains(&"loop_tickets".to_string()));
+        assert!(!read.contains(&"attach_ticket".to_string()));
+        assert!(!read.contains(&"detach_ticket".to_string()));
+    }
+
     #[test]
     fn plan_loop_inputs_only_add_to_the_session_schemas() {
-        // The plan loop actions (contract v1.2) added actions and parameters
-        // to `session` and `session_read`. Without them both schemas are
-        // exactly the contracts they had before (Wave 3b's), so the plan
-        // actions and every other parameter are unchanged.
-        const LOOP_ACTIONS: &[&str] = &[
-            "start_loop",
-            "loop_status",
-            "advance_loop",
-            "resolve_gate",
-            "abort_loop",
-            "resume_loop",
-            "list_loops",
-        ];
-        const LOOP_PARAMS: &[&str] = &[
-            "loop_id",
-            "gate_id",
-            "step_id",
-            "summary",
-            "outcome",
-            "note",
-            "step_ids",
-            "reason",
-            "max_iterations",
-            "review_policy",
-            "review_every_n",
-            "gates",
-            "report_cadence_minutes",
-            "audience",
-            "after",
-            "loop_state",
-        ];
+        // The plan loop actions (contract v1.2, and the tickets of v1.3)
+        // added actions and parameters to `session` and `session_read`.
+        // Without them both schemas are exactly the contracts they had
+        // before (Wave 3b's), so the plan actions and every other parameter
+        // are unchanged.
+        let actions: Vec<&str> = LOOP_ACTIONS
+            .iter()
+            .chain(LOOP_TICKET_ACTIONS)
+            .copied()
+            .collect();
+        let params: Vec<&str> = LOOP_PARAMS
+            .iter()
+            .chain(LOOP_TICKET_PARAMS)
+            .copied()
+            .collect();
         let tools = contextstream_tools_list(&test_registry(Config::default()), None);
         for (name, before) in [
             (
@@ -3852,21 +3984,70 @@ mod tests {
                 "f1a5d49e80171b683738f5bc40cb1b2feb939869ad5d52a965e238ae0b4689e5",
             ),
         ] {
-            let mut schema = tool_by_name(&tools, name)["inputSchema"].clone();
-            let properties = schema["properties"]
-                .as_object_mut()
-                .expect("schema properties");
-            for param in LOOP_PARAMS {
-                assert!(properties.remove(*param).is_some(), "{name}: {param}");
-            }
-            let actions = properties["action"]["enum"]
-                .as_array_mut()
-                .expect("action enum");
-            let listed = actions.len();
-            actions.retain(|action| !LOOP_ACTIONS.contains(&action.as_str().unwrap_or_default()));
-            assert!(actions.len() < listed, "{name} lists no loop action");
-            assert_eq!(schema_contract_hash(&schema), before, "{name}");
+            assert_eq!(
+                schema_contract_without(&tools, name, &actions, &params),
+                before,
+                "{name}"
+            );
         }
+    }
+
+    #[test]
+    fn the_progress_tool_is_listed_for_every_client_and_asks_for_nothing() {
+        // A new tool of contract v1.3. It is on the default surface, so a
+        // client lists it without asking; no argument is required (a call
+        // with only a step is a report); and it is a write that destroys
+        // nothing and needs no confirmation.
+        let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        let progress = tool_by_name(&tools, "progress");
+        assert!(progress["inputSchema"].get("required").is_none());
+        assert_eq!(
+            progress["inputSchema"]["properties"]["action"]["enum"],
+            serde_json::json!(["report", "get", "list"])
+        );
+        assert_eq!(progress["annotations"]["readOnlyHint"], false);
+        assert_eq!(progress["annotations"]["destructiveHint"], false);
+        assert_eq!(progress["annotations"]["idempotentHint"], true);
+        assert_eq!(
+            progress["_meta"]["contextstream"]["safety"]["requiresConfirmation"],
+            false
+        );
+        assert_eq!(
+            progress["_meta"]["contextstream"]["status"]["actions"]["report"],
+            "Reporting progress to ContextStream"
+        );
+        let description = progress["description"].as_str().expect("description");
+        assert!(description.chars().count() <= PORTABLE_DESCRIPTION_LIMIT);
+        assert!(description.contains("People watch agents' runs"));
+        // The compact OpenAI surface keeps its size: the tool is reached
+        // there through tool_search and execute_operation.
+        let compact = contextstream_tools_list(
+            &test_registry(Config {
+                tool_surface_profile: ToolSurfaceProfile::OpenaiAgentic,
+                ..Config::default()
+            }),
+            None,
+        );
+        assert!(!listed_names(&compact).contains(&"progress"));
+        // A call's title follows its action; a call without one reports.
+        assert_eq!(
+            contextstream_call_title(
+                "progress",
+                "Report Live Progress",
+                false,
+                &serde_json::json!({"action": "list"})
+            ),
+            "Listing ContextStream runs"
+        );
+        assert_eq!(
+            contextstream_call_title(
+                "progress",
+                "Report Live Progress",
+                false,
+                &serde_json::json!({"step": "Running the tests"})
+            ),
+            "Reporting progress to ContextStream"
+        );
     }
 
     /// Every surface a client can be configured into, including the hosted

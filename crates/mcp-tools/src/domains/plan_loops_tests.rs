@@ -269,6 +269,7 @@ async fn start_loop_posts_the_config_to_the_plans_loop_route() {
             ],
             "report_cadence_minutes": 60,
             "audience": ["engineering", " product "],
+            "channel": "ContextStream",
         }))
         .await
         .expect("start");
@@ -291,6 +292,7 @@ async fn start_loop_posts_the_config_to_the_plans_loop_route() {
             ],
             "report_cadence_minutes": 60,
             "audience": ["engineering", "product"],
+            "channel": "contextstream",
         }})
     );
     // The caller's own key, as on every plan call.

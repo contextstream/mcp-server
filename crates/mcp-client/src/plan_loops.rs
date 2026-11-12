@@ -88,6 +88,9 @@ pub struct PlanLoopConfig {
     pub report_cadence_minutes: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audience: Option<Vec<String>>,
+    /// Where the loop's own events are announced: one of [`GATE_CHANNELS`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 /// The body of `POST /plan-loops/:loop_id/gates/:gate_id/resolve`.

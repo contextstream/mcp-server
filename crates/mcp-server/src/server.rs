@@ -3550,10 +3550,11 @@ mod tests {
             // contract (plan_loop_inputs_only_add_to_the_session_schemas).
             // Advanced for the tickets on a loop (contract v1.3):
             // attach_ticket, detach_ticket, loop_tickets and their inputs
-            // (ticket_id, create). Additive only: without them it is the
-            // v1.2 contract (loop_ticket_inputs_only_add_to_the_session_schemas).
+            // (ticket_id, create), and `channel` for start_loop. Additive
+            // only: without them it is the v1.2 contract
+            // (loop_ticket_inputs_only_add_to_the_session_schemas).
             "session",
-            "4e3f2d1526af0d184aa20b6c0fc10ee9f586415425d3eab5379b03523bf9049d",
+            "991725fa0e81b80a5cc9821373571fe5d7ceb5071bf4cd4faf4a921cf8391a9e",
         ),
         (
             "session_capture",
@@ -3567,9 +3568,9 @@ mod tests {
             // Advanced for plan loops: loop_status and list_loops, and the
             // loop inputs. Additive only, as for `session`.
             // Advanced for the tickets on a loop: loop_tickets and the two
-            // ticket inputs. Additive only, as for `session`.
+            // ticket inputs, and `channel`. Additive only, as for `session`.
             "session_read",
-            "c093db8a16cd8a5f7a8468a2120869529edb639c0a2426ee3d0719fe8b09642e",
+            "988bdcf3a414ff68870b4f0cee738455171e985214f91538baef17e5a89153f0",
         ),
         (
             "session_remember",
@@ -3884,7 +3885,7 @@ mod tests {
     ];
     /// What contract v1.3 (tickets on a loop) added to them.
     const LOOP_TICKET_ACTIONS: &[&str] = &["attach_ticket", "detach_ticket", "loop_tickets"];
-    const LOOP_TICKET_PARAMS: &[&str] = &["ticket_id", "create"];
+    const LOOP_TICKET_PARAMS: &[&str] = &["ticket_id", "create", "channel"];
 
     /// The contract hash of `name`'s listed schema without `actions` and
     /// `params`, each of which it must list today.
@@ -3913,9 +3914,10 @@ mod tests {
 
     #[test]
     fn loop_ticket_inputs_only_add_to_the_session_schemas() {
-        // The tickets of contract v1.3 added three actions and two
-        // parameters to `session` (and the read `loop_tickets` to
-        // `session_read`). Without them both schemas are exactly the
+        // Contract v1.3 added three ticket actions and three parameters to
+        // `session` (`ticket_id`, `create`, and `channel` for where a loop's
+        // own events are announced), and the read `loop_tickets` to
+        // `session_read`. Without them both schemas are exactly the
         // contracts plan loops v1.2 gave them, so every loop action, every
         // plan action and every other parameter is unchanged.
         let tools = contextstream_tools_list(&test_registry(Config::default()), None);

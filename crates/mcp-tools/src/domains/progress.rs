@@ -1127,10 +1127,27 @@ fn status_argument(raw: Option<&str>) -> Result<Option<&'static str>> {
     Ok(Some(status))
 }
 
+/// An object an agent sent for an argument the schema lists as a string. The
+/// server's input normalizer hands such an object over as its JSON text, so
+/// without this a step given as `{label, kind}` would be stored with that
+/// JSON as its label.
+fn object_sent_as_text(text: &str) -> Option<Value> {
+    let text = text.trim();
+    if !text.starts_with('{') {
+        return None;
+    }
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .filter(Value::is_object)
+}
+
 fn step_argument(value: Option<&Value>) -> Result<Option<Value>> {
     match value {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(text_argument(Some(text), MAX_LABEL).map(Value::String)),
+        Some(Value::String(text)) => match object_sent_as_text(text) {
+            Some(object) => step_argument(Some(&object)),
+            None => Ok(text_argument(Some(text), MAX_LABEL).map(Value::String)),
+        },
         Some(value @ Value::Object(_)) => {
             let label = text_of(value, &["label", "text", "title", "step", "name"], MAX_LABEL)
                 .ok_or_else(|| {
@@ -1351,7 +1368,10 @@ fn links_argument(
 fn milestone_argument(value: Option<&Value>) -> Result<Option<Value>> {
     match value {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(text_argument(Some(text), MAX_LABEL).map(Value::String)),
+        Some(Value::String(text)) => match object_sent_as_text(text) {
+            Some(object) => milestone_argument(Some(&object)),
+            None => Ok(text_argument(Some(text), MAX_LABEL).map(Value::String)),
+        },
         Some(value @ Value::Object(_)) => {
             let text = text_of(value, &["text", "title", "label"], MAX_LABEL).ok_or_else(|| {
                 Error::Validation(

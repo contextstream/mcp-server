@@ -530,6 +530,29 @@ fn arguments_are_read_as_an_agent_writes_them() {
 }
 
 #[test]
+fn a_step_or_milestone_sent_as_an_object_is_read_as_one_not_stored_as_its_json() {
+    // The schema lists `step` and `milestone` as strings, so the server's
+    // input normalizer hands an object over as its JSON text.
+    let step = step_argument(Some(&json!(
+        "{\"kind\":\"edit\",\"label\":\"Writing the welcome email\"}"
+    )))
+    .unwrap();
+    assert_eq!(
+        step,
+        Some(json!({"label": "Writing the welcome email", "kind": "edit"}))
+    );
+    let milestone = milestone_argument(Some(&json!("{\"text\":\"Tests green\"}"))).unwrap();
+    assert_eq!(milestone, Some(json!({"text": "Tests green"})));
+    // Words that merely start with a brace stay words.
+    assert_eq!(
+        step_argument(Some(&json!("{draft} Writing the email"))).unwrap(),
+        Some(json!("{draft} Writing the email"))
+    );
+    // And an object with no label is still refused, in the same words.
+    assert!(step_argument(Some(&json!("{\"detail\":\"src/lexer.rs\"}"))).is_err());
+}
+
+#[test]
 fn a_heartbeat_says_who_and_which_run_and_nothing_about_the_work() {
     let fixture = Fixture::new();
     let report = report_of(

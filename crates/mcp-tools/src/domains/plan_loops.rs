@@ -506,7 +506,19 @@ fn loop_config(input: &SessionInput) -> Result<PlanLoopConfig> {
                 .collect::<Result<Vec<_>>>()?,
         ),
     };
+    let channel = match non_empty(input.channel.as_deref()).map(str::to_ascii_lowercase) {
+        None => None,
+        Some(channel) if mcp_client::plan_loops::GATE_CHANNELS.contains(&channel.as_str()) => {
+            Some(channel)
+        }
+        Some(other) => {
+            return Err(Error::Validation(format!(
+                "channel must be coflow, contextstream or both, not {other:?}."
+            )))
+        }
+    };
     Ok(PlanLoopConfig {
+        channel,
         max_iterations: checked_max_iterations(input.max_iterations)?,
         review_policy: non_empty(input.review_policy.as_deref()).map(str::to_ascii_lowercase),
         review_every_n: input.review_every_n,

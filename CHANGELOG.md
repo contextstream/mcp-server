@@ -1,12 +1,15 @@
 # Changelog
 
-## X.Y.Z (PLACEHOLDER: set this heading to the release version when it is cut)
+## 1.0.76
 
 - Live progress: a new `progress` tool lets your agent say what it is doing so people can watch it live in ContextStream: the step it is on, its checklist, a real percentage, links it opened (PR, preview, deploy), when it is blocked or needs a person, and how it ended, with an honest summary. `progress(step="...", plan=[...])` reports (the action is `report` when left out), `get` reads one run and `list` the runs in the workspace, filtered by ticket, loop or `active`. Without a `run_key`, one MCP session working one ticket is one run. A local server keeps a reported run alive in the background (a request every 30 seconds that carries no step text) until the run is reported finished, the process exits, or four hours pass without a report; the hosted gateway runs no timer. A server that does not have live progress yet, or cannot be reached, is answered with a short "not recorded" result, never an error, so the agent carries on. `CONTEXTSTREAM_RUN_PROGRESS=off` turns reporting off; see the data-handling doc.
 - Plan loops: tickets can ride a loop. `session(action="attach_ticket", loop_id=..., ticket_id=...)` attaches a ticket (or `create={...}` makes one in the loop's project), on the loop or on one of its steps with `step_id`; `detach_ticket` takes it off; `loop_tickets` (also on `session_read`) lists them with their station, assignee and newest run. `loop_status` shows the loop's tickets and a health that needs attention when the API sends them. Two new refusals are explained in plain words: `ticket_in_another_loop` and `step_has_open_tickets`.
+- Plan loops: `start_loop` takes `channel` (`coflow`, `contextstream` or `both`, the default) for where the loop's own events are announced, so a loop can stay out of Coflow.
 - Tickets: `entity(kind="ticket")` assignees may be agents (`{"entity_type": "agent", "handle": "cinder", "name": "Cinder"}`), and a ticket's summary shows a name when it has no email or handle. "Not saved: assignees" is said only when the API answers without them.
 - Rules: the generated rules gain a short "Live Progress" block that says when to call `progress`. Installed rules files keep working as they are. Until they are refreshed, `context()` on a local server shows `[RULES_NOTICE] Rules content drifted` and `doctor` reports "managed ContextStream rules are stale"; `contextstream-mcp update` refreshes them by itself, and `contextstream-mcp update-rules` does it alone.
 - Hooks: a `progress` call made before `context()` in a turn is not counted as a missed `context()` call, and it does not count as a state change.
+- Studio: `status`, `result` and `library` give `studio_url`, the page where a person watches and shares a finished making in the studio. It is not a signed download link; those are still given only on request.
+- Studio email: `email_draft` asks for the person's request in their own words, with only the facts they stated (the studio's writer does its own research), passes `audience_id` only when the person named one, and draft, revise and suggestion calls wait up to 110 seconds instead of 30.
 
 ## 1.0.75
 

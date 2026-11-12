@@ -16,8 +16,7 @@
 //!   No summary is invented.
 //! - **A run that starts by itself.** When a tool call of the session moves a
 //!   ticket to `in_progress`, a run for that ticket starts. This is the one
-//!   thing here that reports a session whose model never called `progress`;
-//!   [`AUTOMATIC_RUNS_DEFAULT`] decides it.
+//!   thing here that reports a session whose model never called `progress`.
 //! - **Turn state.** When the model's turn ends, the session's runs wait on a
 //!   person (no question text); the next prompt or tool call says working.
 //! - **A coarse step.** Only after ten minutes without a step from the model:
@@ -34,9 +33,13 @@
 //! (`~/.contextstream/run-progress/<digest of the host session id>.json`)
 //! and queue reports there; the detached process sends them.
 //!
-//! `CONTEXTSTREAM_RUN_PROGRESS=off` turns all of it off: no state is written
-//! and nothing is sent. An API that refuses a report (401, 403 or 404) ends
-//! reporting for the session.
+//! All of it is off as shipped ([`AUTOMATIC_REPORTS_DEFAULT`]): the hooks
+//! write no state, start no process and send nothing, and live progress is
+//! only what the model reports through the `progress` tool. A person turns it
+//! on for a machine with `CONTEXTSTREAM_RUN_PROGRESS_AUTO=on`.
+//! `CONTEXTSTREAM_RUN_PROGRESS=off` turns live progress off altogether, the
+//! tool included, whatever the other switch says. An API that refuses a
+//! report (401, 403 or 404) ends reporting for the session.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -48,15 +51,17 @@ use super::common::{self, ApiConfig};
 use super::durable_capture::{sha256_hex, state_dir, with_locked_json};
 use super::run_step_labels::step_for_tool;
 
-/// Whether a run starts by itself when a session takes up a ticket. This is
-/// the one place that decides the default; `CONTEXTSTREAM_RUN_PROGRESS_AUTO`
-/// (`on` or `off`) overrides it on a machine. Keep-alive, the honest end and
-/// the turn state of runs the model reported do not depend on it.
-pub(crate) const AUTOMATIC_RUNS_DEFAULT: bool = true;
+/// Whether the hooks report by themselves: the run that starts on a ticket
+/// take-up, the keep-alive, the turn state, the coarse step and the honest
+/// end. This is the one place that decides the default;
+/// `CONTEXTSTREAM_RUN_PROGRESS_AUTO` (`on` or `off`) overrides it on a
+/// machine. Off as shipped: nothing is reported for a person who has not
+/// asked for it.
+pub(crate) const AUTOMATIC_REPORTS_DEFAULT: bool = false;
 
 /// Turns live progress off on this machine (shared with the `progress` tool).
 const ENABLED_ENV: &str = "CONTEXTSTREAM_RUN_PROGRESS";
-/// Overrides [`AUTOMATIC_RUNS_DEFAULT`] on this machine.
+/// Overrides [`AUTOMATIC_REPORTS_DEFAULT`] on this machine.
 const AUTOMATIC_ENV: &str = "CONTEXTSTREAM_RUN_PROGRESS_AUTO";
 /// Names the session's own process when the hook cannot find it by itself.
 const HOST_PID_ENV: &str = "CONTEXTSTREAM_RUN_PROGRESS_HOST_PID";
@@ -110,10 +115,9 @@ pub(crate) const RECONNECTED: &str = "The session reconnected; its work continue
 /// What this machine allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Settings {
-    /// Off: no state, no process, nothing sent.
+    /// Whether the hooks report at all. Off: no state, no process, nothing
+    /// sent.
     pub enabled: bool,
-    /// Whether a run starts by itself on a ticket take-up.
-    pub automatic: bool,
 }
 
 impl Settings {
@@ -124,11 +128,12 @@ impl Settings {
         )
     }
 
-    pub(crate) fn from_values(enabled: Option<&str>, automatic: Option<&str>) -> Self {
-        let enabled = switch(enabled).unwrap_or(true);
+    /// `live` is what `CONTEXTSTREAM_RUN_PROGRESS` says (off wins over
+    /// everything); `automatic` is what `CONTEXTSTREAM_RUN_PROGRESS_AUTO` says.
+    pub(crate) fn from_values(live: Option<&str>, automatic: Option<&str>) -> Self {
         Self {
-            enabled,
-            automatic: enabled && switch(automatic).unwrap_or(AUTOMATIC_RUNS_DEFAULT),
+            enabled: switch(live).unwrap_or(true)
+                && switch(automatic).unwrap_or(AUTOMATIC_REPORTS_DEFAULT),
         }
     }
 }
@@ -670,7 +675,6 @@ impl SessionFile {
         actor: &Actor,
         ticket: &Value,
         scope: &Scope,
-        settings: Settings,
         now: u64,
     ) {
         self.last_hook_ms = now;
@@ -697,7 +701,7 @@ impl SessionFile {
             });
             return;
         }
-        if !settings.automatic || self.refused || self.runs.len() >= MAX_RUNS {
+        if self.refused || self.runs.len() >= MAX_RUNS {
             return;
         }
         let (Some(session), Some(session_agent)) = (self.session.clone(), self.agent.clone())
@@ -788,8 +792,8 @@ fn prune(dir: &Path) {
     }
 }
 
-/// The session's state file, when live progress is on and the host named its
-/// session.
+/// The session's state file, when the hooks report on this machine and the
+/// host named its session.
 fn session_state(input: &Value) -> Option<(String, PathBuf)> {
     if !Settings::from_env().enabled {
         return None;
@@ -1025,7 +1029,6 @@ pub(crate) fn tool_finished(
     let Some((host, path)) = session_state(input) else {
         return;
     };
-    let settings = Settings::from_env();
     let finding = contextstream_tool.and_then(|tool| classify(tool, tool_input, &answer));
     let now = now_ms();
     let Some(finding) = finding else {
@@ -1064,7 +1067,7 @@ pub(crate) fn tool_finished(
             }
             Finding::Ticket(ticket) => {
                 let scope = default_scope(&host, cwd);
-                file.ticket_changed(&actor, ticket, &scope, settings, now);
+                file.ticket_changed(&actor, ticket, &scope, now);
             }
         }
     });

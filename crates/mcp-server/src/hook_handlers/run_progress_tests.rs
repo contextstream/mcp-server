@@ -14,15 +14,6 @@ const TICKET: &str = "33333333-3333-4333-8333-333333333333";
 const RUN: &str = "44444444-4444-4444-8444-444444444444";
 const MINUTE: u64 = 60 * 1000;
 
-const ON: Settings = Settings {
-    enabled: true,
-    automatic: true,
-};
-const KEEP_ALIVE_ONLY: Settings = Settings {
-    enabled: true,
-    automatic: false,
-};
-
 fn main_agent() -> Actor<'static> {
     Actor::default()
 }
@@ -83,21 +74,32 @@ fn take(file: &mut SessionFile) -> Vec<Value> {
 }
 
 #[test]
-fn off_is_off_and_the_automatic_default_lives_in_one_constant() {
-    for word in ["off", "0", "false", "no", "disabled", " OFF "] {
-        let settings = Settings::from_values(Some(word), Some("on"));
-        assert!(!settings.enabled && !settings.automatic, "{word}");
-    }
-    let unset = Settings::from_values(None, None);
-    assert!(unset.enabled);
-    // Whatever the constant says is the default; a machine can say either.
-    assert_eq!(unset.automatic, AUTOMATIC_RUNS_DEFAULT);
-    assert!(Settings::from_values(None, Some("on")).automatic);
-    assert!(!Settings::from_values(None, Some("off")).automatic);
+fn the_hooks_report_only_where_a_person_turned_that_on() {
+    // As shipped, and whatever else is said that is not "on": nothing.
     assert_eq!(
-        Settings::from_values(Some("on"), Some("perhaps")).automatic,
-        AUTOMATIC_RUNS_DEFAULT
+        Settings::from_values(None, None).enabled,
+        AUTOMATIC_REPORTS_DEFAULT
     );
+    assert!(!Settings::from_values(None, None).enabled);
+    assert!(!Settings::from_values(Some("on"), None).enabled);
+    assert!(!Settings::from_values(None, Some("perhaps")).enabled);
+    for word in ["off", "0", "false", "no", "disabled", " OFF "] {
+        assert!(!Settings::from_values(None, Some(word)).enabled, "{word}");
+    }
+    for word in ["on", "1", "true", "yes", "enabled", " ON "] {
+        assert!(Settings::from_values(None, Some(word)).enabled, "{word}");
+        assert!(
+            Settings::from_values(Some("on"), Some(word)).enabled,
+            "{word}"
+        );
+    }
+    // Live progress turned off on the machine wins over it.
+    for word in ["off", "0", "false", "no", "disabled", " OFF "] {
+        assert!(
+            !Settings::from_values(Some(word), Some("on")).enabled,
+            "{word}"
+        );
+    }
 }
 
 #[test]
@@ -107,7 +109,6 @@ fn taking_up_a_ticket_starts_the_run_the_tool_would_report_on() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         1_000,
     );
     let sent = take(&mut file);
@@ -145,7 +146,6 @@ fn taking_up_a_ticket_starts_the_run_the_tool_would_report_on() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         2_000,
     );
     assert!(file.pending.is_empty());
@@ -153,29 +153,19 @@ fn taking_up_a_ticket_starts_the_run_the_tool_would_report_on() {
 }
 
 #[test]
-fn no_run_starts_by_itself_when_that_is_off_or_the_server_is_unknown() {
-    let mut file = known();
-    file.ticket_changed(
-        &main_agent(),
-        &ticket("in_progress"),
-        &Scope::default(),
-        KEEP_ALIVE_ONLY,
-        1_000,
-    );
-    assert!(file.runs.is_empty() && file.pending.is_empty());
-
+fn no_run_starts_by_itself_when_the_server_is_unknown() {
     // A session whose server never said who it is (an older gateway).
     let mut unknown = SessionFile::default();
     unknown.ticket_changed(
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         1_000,
     );
     assert!(unknown.runs.is_empty() && unknown.pending.is_empty());
 
-    // A run the model reported is kept alive either way.
+    // A run the model reported is kept alive all the same.
+    let mut file = known();
     let input = json!({"ticket_id": TICKET, "step": "Reading the handler"});
     file.model_reported(
         &input,
@@ -195,7 +185,6 @@ fn the_hook_and_the_tool_send_one_agent_for_one_session() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         1_000,
     );
     let started = take(&mut file);
@@ -283,7 +272,6 @@ fn the_turn_ending_waits_on_a_person_and_work_resumes_it() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         1_000,
     );
     take(&mut file);
@@ -329,7 +317,6 @@ fn the_turn_ending_waits_on_a_person_and_work_resumes_it() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         1_000,
     );
     take(&mut busy);
@@ -389,13 +376,7 @@ fn a_coarse_step_comes_only_after_ten_minutes_without_one_from_the_model() {
 #[test]
 fn nothing_the_tool_was_given_reaches_a_report() {
     let mut file = known();
-    file.ticket_changed(
-        &main_agent(),
-        &ticket("in_progress"),
-        &Scope::default(),
-        ON,
-        0,
-    );
+    file.ticket_changed(&main_agent(), &ticket("in_progress"), &Scope::default(), 0);
     take(&mut file);
     for (index, tool) in [
         "/home/alice/payroll/secret.rs",
@@ -422,13 +403,7 @@ fn nothing_the_tool_was_given_reaches_a_report() {
 fn a_subagent_gets_its_own_run_and_name_and_ends_with_it() {
     let mut file = known();
     file.subagent_started("agent-abc123", 500);
-    file.ticket_changed(
-        &explore(),
-        &ticket("in_progress"),
-        &Scope::default(),
-        ON,
-        1_000,
-    );
+    file.ticket_changed(&explore(), &ticket("in_progress"), &Scope::default(), 1_000);
     let sent = take(&mut file);
     assert_eq!(sent.len(), 1);
     let agent = &sent[0]["agent"];
@@ -463,17 +438,10 @@ fn a_subagent_gets_its_own_run_and_name_and_ends_with_it() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         1_000,
     );
     take(&mut file);
-    file.ticket_changed(
-        &explore(),
-        &ticket("in_progress"),
-        &Scope::default(),
-        ON,
-        2_000,
-    );
+    file.ticket_changed(&explore(), &ticket("in_progress"), &Scope::default(), 2_000);
     assert!(file.pending.is_empty());
     assert_eq!(file.runs.len(), 1);
 
@@ -493,13 +461,12 @@ fn a_session_that_ends_ends_its_runs_honestly() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         1_000,
     );
     file.subagent_started("agent-abc123", 1_100);
     let mut second = ticket("in_progress");
     second["id"] = json!("55555555-5555-4555-8555-555555555555");
-    file.ticket_changed(&explore(), &second, &Scope::default(), ON, 1_200);
+    file.ticket_changed(&explore(), &second, &Scope::default(), 1_200);
     take(&mut file);
 
     file.end_all(SESSION_ENDED);
@@ -540,7 +507,6 @@ fn moving_the_ticket_on_ends_the_run_on_it() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         1_000,
     );
     take(&mut file);
@@ -548,7 +514,6 @@ fn moving_the_ticket_on_ends_the_run_on_it() {
         &main_agent(),
         &ticket("in_review"),
         &Scope::default(),
-        ON,
         2_000,
     );
     let sent = take(&mut file);
@@ -566,7 +531,6 @@ fn moving_the_ticket_on_ends_the_run_on_it() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         3_000,
     );
     take(&mut file);
@@ -574,7 +538,6 @@ fn moving_the_ticket_on_ends_the_run_on_it() {
         &main_agent(),
         &ticket("</b> DROP"),
         &Scope::default(),
-        ON,
         4_000,
     );
     assert_eq!(
@@ -590,7 +553,6 @@ fn a_reconnected_session_ends_the_runs_started_under_its_old_name() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         1_000,
     );
     take(&mut file);
@@ -607,7 +569,6 @@ fn a_reconnected_session_ends_the_runs_started_under_its_old_name() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         2_000,
     );
     take(&mut file);
@@ -623,7 +584,6 @@ fn a_refusal_ends_reporting_for_the_session() {
         &main_agent(),
         &ticket("in_progress"),
         &Scope::default(),
-        ON,
         1_000,
     );
     for reason in ["off", "not_available", "not_allowed"] {
@@ -636,7 +596,6 @@ fn a_refusal_ends_reporting_for_the_session() {
             &main_agent(),
             &ticket("in_progress"),
             &Scope::default(),
-            ON,
             3_000,
         );
         assert!(refused.runs.is_empty() && refused.pending.is_empty());
@@ -651,13 +610,7 @@ fn a_refusal_ends_reporting_for_the_session() {
 #[test]
 fn a_full_queue_keeps_the_last_word_on_a_run() {
     let mut file = known();
-    file.ticket_changed(
-        &main_agent(),
-        &ticket("in_progress"),
-        &Scope::default(),
-        ON,
-        0,
-    );
+    file.ticket_changed(&main_agent(), &ticket("in_progress"), &Scope::default(), 0);
     file.end_all(SESSION_ENDED);
     for turn in 0..(MAX_PENDING as u64 * 2) {
         let mut body = Map::new();
@@ -833,7 +786,7 @@ fn a_local_server_answers_in_words_and_the_hooks_still_follow() {
     let Some(Finding::Ticket(taken)) = classify("entity", &update, &words(&said)) else {
         panic!("the ticket is read from the call");
     };
-    file.ticket_changed(&main_agent(), &taken, &Scope::default(), ON, 1_000);
+    file.ticket_changed(&main_agent(), &taken, &Scope::default(), 1_000);
     let started = take(&mut file);
     assert_eq!(started.len(), 1);
     assert_eq!(started[0]["source_run_id"], json!(ticket_key()));

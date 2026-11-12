@@ -143,6 +143,12 @@ Transcript saving and local Git metadata capture are on by default and can be
 turned off. Review [data handling and controls](docs/data-handling.md) before
 connecting sensitive projects.
 
+Live run progress from the hooks (a run that starts when your agent takes up a
+ticket, stays live while the session works and ends with it, without the agent
+having to report) is off by default. Turn it on for yourself with
+`CONTEXTSTREAM_RUN_PROGRESS_AUTO=on` in the environment your editor starts
+with; [what it sends](docs/data-handling.md#live-run-progress-from-the-hooks).
+
 <details>
 <summary><strong>Other installation options and troubleshooting</strong></summary>
 

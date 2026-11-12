@@ -7,8 +7,8 @@
 //!   sentence, and its keep-alive process leaves.
 //! - Two sessions on one machine have a keep-alive each and never report for
 //!   one another.
-//! - With `CONTEXTSTREAM_RUN_PROGRESS=off` nothing is sent and nothing is
-//!   written.
+//! - As shipped (`CONTEXTSTREAM_RUN_PROGRESS_AUTO` unset, or `off`), and with
+//!   `CONTEXTSTREAM_RUN_PROGRESS=off`, nothing is sent and nothing is written.
 //!
 //! Every run gets its own HOME and a made-up key; the API is a listener on
 //! localhost. The "session's process" is a `sleep` this test starts and names
@@ -28,6 +28,8 @@ const PROJECT: &str = "22222222-2222-4222-8222-222222222222";
 const SESSION_A: &str = "3fa9c2d17e0b5a66aa11bb22cc33dd44";
 const SESSION_B: &str = "77b2aa00112233445566778899aabbcc";
 const TICKET_A: &str = "33333333-3333-4333-8333-333333333333";
+/// A sandbox's word for "this variable is not in the hooks' environment".
+const UNSET: &str = "<unset>";
 const TICKET_B: &str = "55555555-5555-4555-8555-555555555555";
 const TERMINAL: &[&str] = &["completed", "partial", "stopped", "failed", "cancelled"];
 
@@ -209,7 +211,8 @@ struct Sandbox {
     home: tempfile::TempDir,
     repo: PathBuf,
     api: FakeApi,
-    /// Extra environment for every hook of this sandbox.
+    /// Extra environment for every hook of this sandbox; [`UNSET`] takes a
+    /// variable out of it.
     env: Vec<(&'static str, &'static str)>,
 }
 
@@ -238,8 +241,8 @@ impl Sandbox {
             .env("CONTEXTSTREAM_API_URL", self.api.url())
             .env("CONTEXTSTREAM_API_KEY", "a-made-up-key-for-this-test")
             .env("CONTEXTSTREAM_REMINDER_ENABLED", "false")
-            // Said here, so these tests hold whichever way the default for
-            // runs that start by themselves is set.
+            // The hooks report only where a person turned that on; the tests
+            // of the switches say otherwise.
             .env("CONTEXTSTREAM_RUN_PROGRESS_AUTO", "on")
             // One heartbeat a second, so a few seconds show the pattern.
             .env("CONTEXTSTREAM_RUN_PROGRESS_BEAT_SECS", "1")
@@ -247,11 +250,17 @@ impl Sandbox {
                 "CONTEXTSTREAM_RUN_PROGRESS_HOST_PID",
                 session.process.id().to_string(),
             )
-            .envs(self.env.iter().copied())
             .current_dir(&self.repo)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (name, value) in &self.env {
+            if *value == UNSET {
+                command.env_remove(name);
+            } else {
+                command.env(name, value);
+            }
+        }
         let mut child = command.spawn().unwrap();
         child
             .stdin
@@ -618,16 +627,10 @@ fn two_sessions_have_a_keep_alive_each_and_report_only_for_themselves() {
 }
 
 #[test]
-fn a_run_the_model_reported_is_kept_alive_and_none_starts_by_itself_when_that_is_off() {
+fn a_run_the_model_reported_through_an_older_server_is_kept_alive_until_it_is_finished() {
     let api = FakeApi::start();
-    let sandbox = Sandbox::new(&api, &[("CONTEXTSTREAM_RUN_PROGRESS_AUTO", "off")]);
+    let sandbox = Sandbox::new(&api, &[]);
     let session = Session::new("host-session-a", SESSION_A);
-
-    // Taking up a ticket starts nothing here.
-    sandbox.init(&session);
-    sandbox.set_ticket(&session, TICKET_A, "in_progress");
-    std::thread::sleep(Duration::from_secs(3));
-    assert!(api.reports().is_empty(), "{:?}", api.reports().len());
 
     // The model reports through a server that says nothing of the session
     // (an older gateway): the run is known by the id the answer names.
@@ -676,9 +679,27 @@ fn a_run_the_model_reported_is_kept_alive_and_none_starts_by_itself_when_that_is
 }
 
 #[test]
+fn nothing_is_sent_or_written_as_shipped() {
+    a_whole_session_leaves_no_trace(&[("CONTEXTSTREAM_RUN_PROGRESS_AUTO", UNSET)]);
+}
+
+#[test]
+fn nothing_is_sent_or_written_when_the_hooks_reports_are_said_off() {
+    a_whole_session_leaves_no_trace(&[("CONTEXTSTREAM_RUN_PROGRESS_AUTO", "off")]);
+}
+
+#[test]
 fn nothing_is_sent_or_written_when_live_progress_is_off() {
+    // The hooks' own switch is on here (the sandbox says so): off still wins.
+    a_whole_session_leaves_no_trace(&[("CONTEXTSTREAM_RUN_PROGRESS", "off")]);
+}
+
+/// Every hook of a session that takes up a ticket, reports through the tool,
+/// works, waits on a person, loses a subagent and ends: with `env`, none of
+/// them may send or write anything.
+fn a_whole_session_leaves_no_trace(env: &[(&'static str, &'static str)]) {
     let api = FakeApi::start();
-    let sandbox = Sandbox::new(&api, &[("CONTEXTSTREAM_RUN_PROGRESS", "off")]);
+    let sandbox = Sandbox::new(&api, env);
     let session = Session::new("host-session-a", SESSION_A);
 
     sandbox.init(&session);

@@ -18,6 +18,7 @@ setup wizard prints the same material before it writes configuration.
 | Mid-run coordination notices | on where hooks are installed | While a session makes tool calls, at most every 35 s a detached background request asks for new coordination notices: session id, workspace/project scope, folder path, agent handle (`CONTEXTSTREAM_AGENT_NAME` or an `agent-<name>` scratch-folder name), and on the first request a 500-character task summary. Without hooks, the local MCP server makes the same request and adds notices to the next ContextStream tool result | `CONTEXTSTREAM_MID_RUN_NOTICES=0`; interval `CONTEXTSTREAM_NOTICE_POLL_SECS` (5–300) |
 | Live run progress | sent when your assistant calls the `progress` tool; where hooks are installed and you turned it on (`CONTEXTSTREAM_RUN_PROGRESS_AUTO=on`; off by default), also the signals in [Live run progress from the hooks](#live-run-progress-from-the-hooks) | The report as your assistant wrote it: a title, the step it is on, its checklist, a percentage, links it opened (PR, preview, deploy), what it waits on and a final summary; the workspace and project, and the ticket, loop, plan and step ids the report names; a run key (on the local server, a random id made for the MCP process plus the ticket id; on the hosted gateway, a digest of the session or caller plus the ticket id; or the key your assistant gave); the agent: the name you configured (`CONTEXTSTREAM_AGENT_NAME` or an `agent-<name>` scratch-folder name), else the name the MCP client gives itself with four characters of the session part ("Claude Code 3fa9") and an id made of the client name and eight of them, so two sessions are two agents; never a folder, user or host name. Workspace members who can read the project see it live. After a report, the local MCP server sends a background request every 30 s with only the workspace, project, run key and agent (no step and none of your assistant's words), so the run is shown as live while the session is open; it stops when the run is reported finished, when the MCP process exits, or after four hours without a report. The hosted gateway sends no background request | `CONTEXTSTREAM_RUN_PROGRESS=off` (the tool then answers that reporting is off and sends nothing) |
 | Usage metadata | on | A random installation ID stored in `~/.contextstream/installation.json` (never derived from a hostname, username, path or hardware), plus the client name and version, OS family and version, and CPU architecture, go in `X-ContextStream-*` headers on the server's API requests; `init` adds the editors setup configured. Two events posted to `/api/v1/activation/events` add workspace, project and session IDs: `first_mcp_action_succeeded` (once per session; tool name and operation category) and `mcp_connection_failed` (stage, error code, HTTP status). The metadata carries no file contents, queries, tool arguments or paths | `CONTEXTSTREAM_ACTIVATION_EVENTS=off` turns off the headers, the `init` fields and the events; the original `CONTEXTSTREAM_ACTIVATION_SCHEMA_VERSION=0` still works |
+| Session header (Claude Code, hosted server) | on where setup wrote Claude Code's hosted entry | One header, `X-ContextStream-Client-Session`, with a random id that `contextstream-mcp hook mcp-headers` prints when Claude Code connects (its `headersHelper`). Never derived from a hostname, username, path, key or the editor's session id. See [The session header](#the-session-header-claude-code) | `CONTEXTSTREAM_RUN_PROGRESS=off` (the command then prints no header) |
 | Local Git capture | on | Event type; commit SHA/time; branch/ref names; aggregate additions, deletions and files changed; first-line commit subject bounded to 256 characters and redacted; opaque `checkout-v1:<uuid>`; canonical credential-free repository remote; optional session/agent label | `CONTEXTSTREAM_GIT_CAPTURE=off`, or set `.contextstream/config.json` `git_capture.enabled=false`; restrict `git_capture.events` |
 
 ## Live run progress from the hooks
@@ -66,6 +67,34 @@ Controls, per machine (set them in the environment your editor starts with):
 - An API that answers 401, 403 or 404 to a report ends reporting for that session.
 - There is no workspace-wide or per-person setting yet. It needs a change to the ContextStream API and is tracked
   there; until it exists, the two switches above are the controls.
+
+## The session header (Claude Code)
+
+Claude Code speaks the stateless form of MCP: it tells a hosted server nothing about which of your sessions a request
+belongs to. Up to 1.0.77 every Claude Code session of one API key was therefore one agent in live progress, on every
+machine. From 1.0.78 setup adds one line to Claude Code's hosted ContextStream entry (`~/.claude.json` and a project's
+`.mcp.json`): `"headersHelper": "<path>/contextstream-mcp hook mcp-headers"`. Claude Code runs that command each time
+it connects and adds the header it prints to the entry's own.
+
+- **What is sent:** one header, `X-ContextStream-Client-Session`, holding 32 random hexadecimal characters. Nothing of
+  the machine, the user, the folder, the key or the editor's own session id is in it.
+- **What it is used for:** the hosted server digests it together with your key into the session part of a live
+  progress report (the agent's id and name, "Claude Code 3fa9", and the default run key). It is never used without
+  the key, so a value chosen under one key cannot name a session of another, and a value of any other shape is
+  ignored.
+- **Local state:** Claude Code names the session's own process to the command (`CLAUDE_CODE_MESSAGING_SOCKET`). The
+  id made for that process is kept in `~/.contextstream/mcp-connections/`, one file of 32 characters per session
+  process, removed a week after its last use, so a session that reconnects keeps its agent. Where the process is not
+  named (Windows), nothing is kept and a reconnect shows as another agent.
+- **If the command cannot run:** Claude Code connects with the entry's own headers, as before, and the session is
+  named by its key as in 1.0.77. The command reads no network and ends itself after two seconds at the latest.
+- **A project's `.mcp.json`:** Claude Code runs a helper from a project file only in a folder whose trust dialog you
+  accepted. In a folder that was never trusted (a headless `claude -p` run in a fresh checkout) it does not run the
+  command, says so in one line on standard error, and connects with the entry's own headers.
+- **Controls:** with `CONTEXTSTREAM_RUN_PROGRESS=off` in the environment Claude Code starts with, the command prints
+  no header and keeps nothing. Setup and update leave a `headersHelper` of your own alone. An existing install gets
+  the line with `contextstream-mcp update`; until then nothing changes for it.
+- Other editors' entries are unchanged. Not run on Windows.
 
 ## VCS minimization boundary
 

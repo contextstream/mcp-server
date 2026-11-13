@@ -6,8 +6,10 @@
                 done ships nothing. Once tag vX.Y.Z exists, its commit is the release, whatever main holds since.
                 Once R2 holds the complete bundle, a re-run publishes those bytes and builds nothing.
   macho-check   Check a darwin binary built on Linux: architecture, linked libraries, minimum macOS, signature.
-  assemble      SBOM, version.json and checksums.txt for the six binaries (release_contract.py rules).
-  fetch-bundle  Download the bundle a previous run put on R2 and verify it against the tag.
+  assemble      SBOM, version.json and checksums.txt for the six binaries (release_contract.py rules). It prints one
+                digest over the six; with --expect-binaries <digest> (the one a dry run of the commit printed) it
+                refuses any other six, before anything is published.
+  fetch-bundle  Download the bundle a previous run put on R2 and verify it against the tag. --expect-binaries as above.
   publish       In this order, each step a no-op when already done with the same bytes: the annotated tag, R2
                 mcp/vX.Y.Z then mcp/latest, a GitHub draft with the nine assets, npm, the MCP Registry, and the
                 GitHub release published as Latest. A dry run packs and validates but publishes nothing.
@@ -72,6 +74,7 @@ DARWIN_DYLIBS = {
 DARWIN_ARCH = {"contextstream-mcp-darwin-arm64": (0x0100000C, (11, 0)), "contextstream-mcp-darwin-x64": (0x01000007, (10, 12))}
 
 SHA = re.compile(r"[0-9a-f]{40}")
+SHA256 = re.compile(r"[0-9a-f]{64}")
 SECRET_NAMES = ("MCP_RELEASE_GITHUB_TOKEN", "MCP_RELEASE_NPM_TOKEN", "MCP_RELEASE_R2_BUCKET_URL",
                 "MCP_RELEASE_R2_ACCESS_KEY_ID", "MCP_RELEASE_R2_SECRET_ACCESS_KEY")
 
@@ -100,7 +103,8 @@ def require(condition, message):
 
 
 def say(**fields):
-    print(json.dumps(fields, sort_keys=True), flush=True)
+    # "at" is when the line was written (UTC), so a run's log tells how long each step took.
+    print(json.dumps({"at": time.strftime("%H:%M:%SZ", time.gmtime()), **fields}, sort_keys=True), flush=True)
 
 
 def secret(name):
@@ -368,11 +372,35 @@ def fetch_tool(url_and_sha, member, work):
     return tool
 
 
+def binaries_digest(dist):
+    """One digest for the six binaries in `dist`: the sha256 of their checksum lines ("<sha256>  <name>\n"), sorted. In
+    a directory that holds them, `sha256sum contextstream-mcp-* | LC_ALL=C sort | sha256sum` prints the same."""
+    lines = sorted("%s  %s\n" % (sha256_file(Path(dist) / name), name) for name in BINARIES)
+    return sha256_bytes("".join(lines).encode())
+
+
+def check_binaries(stage, dist, expected=""):
+    """Print the digest of the six binaries; when the run was told which six to expect, refuse any other.
+
+    A release whose dry run just built the commit exports the same binaries from the builder's cache (gate.Dockerfile,
+    stage build). A build that missed the cache makes other bytes for the binaries that do not build reproducibly, and
+    this is where a run told to ship the dry run's binaries stops."""
+    expected = (expected or "").strip().lower()
+    found = binaries_digest(dist)
+    say(stage=stage, binaries=found, **({"expected": expected} if expected else {}))
+    if expected:
+        require(SHA256.fullmatch(expected), "--expect-binaries takes the 64 hex digits a run printed as \"binaries\", not %r" % expected)
+        require(found == expected, "the six binaries are not the expected ones: their digest is %s, and the run was told to "
+                                   "expect %s (--expect-binaries); this run publishes nothing" % (found, expected))
+    return found
+
+
 def cmd_assemble(args):
     dist = Path(args.dist)
     for name in BINARIES:
         require((dist / name).is_file(), "the build left no " + name)
         (dist / name).chmod(0o755)
+    check_binaries("assemble", dist, args.expect_binaries)
     for name in ("contextstream-mcp-darwin-arm64", "contextstream-mcp-darwin-x64"):
         check_darwin(dist / name, args.version)
     extra = sorted(path.name for path in dist.iterdir() if path.name not in BINARIES)
@@ -399,6 +427,7 @@ def cmd_fetch_bundle(args):
         body = r2_public("v%s/%s" % (args.version, name))
         require(body is not None, "R2 has no v%s/%s" % (args.version, name))
         (dist / name).write_bytes(body)
+    check_binaries("fetch-bundle", dist, args.expect_binaries)
     contract.verify_release_files(dist, args.version, args.commit)
     say(stage="fetch-bundle", version=args.version, commit=args.commit, source="R2 mcp/v" + args.version)
 
@@ -840,6 +869,9 @@ def main(argv=None):
         sub.add_argument("--commit", required=True)
         if name == "publish":
             sub.add_argument("--mode", choices=("release", "dry-run"), required=True)
+        else:
+            sub.add_argument("--expect-binaries", default="", metavar="DIGEST",
+                             help="refuse the six binaries unless their digest (printed as \"binaries\") is this one")
     verify = commands.add_parser("verify")
     verify.add_argument("--dist", required=True)
     verify.add_argument("--version", required=True)

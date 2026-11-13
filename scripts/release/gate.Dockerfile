@@ -53,21 +53,40 @@ USER runner
 # runner's own: a cache mount below it would otherwise make ~/.cache root's, where build.sh keeps its tools.
 RUN mkdir -p /home/runner/.cache/cargo-xwin
 
+# The checkout as the binaries build from it: every file of the commit, without .git. Two checkouts of one commit differ
+# only under .git (the index holds each file's time, the logs the time of the fetch), and nothing build.sh runs reads it.
+# BuildKit keys a COPY by what the files hold, not by their times, so a COPY from this stage is the same layer for the same
+# tree, whichever run and checkout it comes from.
+FROM env AS tree
+COPY --chown=1001:1001 . /home/runner/tree
+RUN rm -rf /home/runner/tree/.git
+
 # One release binary (scripts/release/build.sh <artifact> <version>), exported by the stage binary as /<artifact>.
 # Every cache mount a binary locks is its own (its id names the artifact), so the six binaries of a release build side by
 # side on one builder. Until 1.0.72 cargo-xwin's mount was one for all six, and its lock made each build wait for the one
 # before it: the six ended one after another, each about 5 to 6 minutes after the last.
+#
+# A release reuses the build of its dry run. The sources come from the stage tree, so the build step of a commit that was
+# built before is a cache hit while the builder keeps that layer: same tree, same Dockerfile, RUST_CHANNEL, ARTIFACT, VERSION
+# and SOURCE_DATE_EPOCH, and the release exports, byte for byte, the binary the dry run built and checked. A difference in any
+# of them is a miss and an ordinary build. Until 1.0.77 the stage copied the context, .git included: no run ever hit, and
+# the release compiled for 12 minutes what its dry run had compiled 13 minutes before.
+#
+# The step stamps the sources with its own time before cargo runs. A reused layer of the tree carries the file times of the
+# run that made it, and cargo calls a crate fresh when no source file is newer than its last build in target/, which may
+# since have built another tree. Stamped, a step that runs compiles the workspace crates, as it did from every new checkout.
 FROM build-env AS build
 ENV CARGO_HOME=/home/runner/.cargo CI=true
 WORKDIR /home/runner/src
-COPY --chown=1001:1001 . .
+COPY --from=tree --chown=1001:1001 /home/runner/tree/ .
 ARG ARTIFACT
 ARG VERSION
 ARG SOURCE_DATE_EPOCH
 RUN --mount=type=cache,id=mcp-cargo-home,target=/home/runner/.cargo,uid=1001,gid=1001 \
     --mount=type=cache,id=mcp-build-target-${ARTIFACT},target=/home/runner/src/target,uid=1001,gid=1001,sharing=locked \
     --mount=type=cache,id=mcp-build-xwin-${ARTIFACT},target=/home/runner/.cache/cargo-xwin,uid=1001,gid=1001,sharing=locked \
-    git config --global --add safe.directory '*' && bash scripts/release/build.sh "$ARTIFACT" "$VERSION"
+    find . -path ./target -prune -o -type f -exec touch {} + \
+ && git config --global --add safe.directory '*' && bash scripts/release/build.sh "$ARTIFACT" "$VERSION"
 
 FROM scratch AS binary
 COPY --from=build /home/runner/src/out/ /

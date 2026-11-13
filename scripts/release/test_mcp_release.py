@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""Tests for scripts/release/mcp_release.py: what a run decides to do, and the darwin binary check."""
+"""Tests for scripts/release/mcp_release.py: what a run decides to do, the darwin binary check, the digest of the six
+binaries and the time on every line."""
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import io
+import json
 import struct
 import sys
 import tempfile
@@ -192,6 +197,115 @@ def macho(cputype, dylibs, minos, signed):
     body = b"".join(commands)
     header = struct.pack("<IiiIIIII", 0xFEEDFACF, cputype, 0, 2, len(commands), len(body), 0, 0)
     return header + body + b"contextstream-mcp 1.0.30"
+
+
+def printed(call, *args, **kwargs):
+    """What `call` returned and the lines it printed, parsed."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        result = call(*args, **kwargs)
+    return result, [json.loads(line) for line in out.getvalue().splitlines() if line.startswith("{")]
+
+
+class Lines(unittest.TestCase):
+    def test_every_line_says_when_it_was_written(self):
+        _, lines = printed(release.say, stage="npm", result="published", version="1.0.30")
+        self.assertRegex(lines[0].pop("at"), r"^([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$")
+        self.assertEqual(lines, [{"stage": "npm", "result": "published", "version": "1.0.30"}])
+
+    def test_a_refusal_is_a_line_too(self):
+        with tempfile.TemporaryDirectory() as empty:
+            code, lines = printed(release.main, ["assemble", "--dist", empty, "--version", "1.0.30", "--commit", HEAD])
+        self.assertEqual(code, 1)
+        self.assertEqual((lines[-1]["stage"], lines[-1]["error"][:17], "at" in lines[-1]), ("assemble", "the build left no", True))
+
+
+class Binaries(unittest.TestCase):
+    """One digest names the six binaries a run built; a run told which six to expect refuses any other."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dist = Path(self._tmp.name)
+        for name in release.BINARIES:
+            (self.dist / name).write_bytes(b"binary " + name.encode())
+
+    def test_six_binaries(self):
+        self.assertEqual(len(release.BINARIES), 6)
+        self.assertEqual(len(set(release.BINARIES)), 6)
+
+    def test_the_digest_is_the_sha256_of_the_sorted_checksum_lines(self):
+        lines = ["%s  %s\n" % (hashlib.sha256(b"binary " + name.encode()).hexdigest(), name) for name in release.BINARIES]
+        expected = hashlib.sha256("".join(sorted(lines)).encode()).hexdigest()
+        self.assertEqual(release.binaries_digest(self.dist), expected)
+        self.assertEqual(release.binaries_digest(self.dist), expected, "the same six give the same digest")
+
+    def test_the_digest_does_not_depend_on_the_order_of_the_binaries(self):
+        first = release.binaries_digest(self.dist)
+        listed = release.BINARIES
+        self.addCleanup(setattr, release, "BINARIES", listed)
+        release.BINARIES = tuple(reversed(listed))
+        self.assertEqual(release.binaries_digest(self.dist), first)
+        release.BINARIES = listed[3:] + listed[:3]
+        self.assertEqual(release.binaries_digest(self.dist), first)
+
+    def test_one_changed_binary_changes_the_digest(self):
+        first = release.binaries_digest(self.dist)
+        for name in release.BINARIES:
+            with self.subTest(binary=name):
+                kept = (self.dist / name).read_bytes()
+                (self.dist / name).write_bytes(kept + b"\0")
+                self.assertNotEqual(release.binaries_digest(self.dist), first)
+                (self.dist / name).write_bytes(kept)
+        self.assertEqual(release.binaries_digest(self.dist), first)
+
+    def test_every_run_prints_the_digest(self):
+        found, lines = printed(release.check_binaries, "assemble", self.dist)
+        self.assertEqual(found, release.binaries_digest(self.dist))
+        self.assertEqual({key: value for key, value in lines[0].items() if key != "at"}, {"stage": "assemble", "binaries": found})
+
+    def test_the_expected_binaries_pass(self):
+        digest = release.binaries_digest(self.dist)
+        for given in (digest, " " + digest.upper() + "\n"):
+            found, lines = printed(release.check_binaries, "assemble", self.dist, given)
+            self.assertEqual((found, lines[0]["binaries"], lines[0]["expected"]), (digest, digest, digest))
+
+    def test_other_binaries_are_refused_and_the_reason_names_both_digests(self):
+        expected = release.binaries_digest(self.dist)
+        (self.dist / release.BINARIES[0]).write_bytes(b"built again, other bytes")
+        found = release.binaries_digest(self.dist)
+        self.assertNotEqual(found, expected)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(release.Refused) as refused:
+            release.check_binaries("assemble", self.dist, expected)
+        self.assertIn(found, str(refused.exception))
+        self.assertIn(expected, str(refused.exception))
+
+    def test_an_expectation_that_is_no_digest_is_refused(self):
+        for given in ("yes", "0" * 63, "g" * 64):
+            with self.subTest(given=given), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(release.Refused):
+                release.check_binaries("assemble", self.dist, given)
+
+    def test_assemble_refuses_other_binaries_before_it_assembles_anything(self):
+        # The refusal comes before the darwin check, the SBOM tool's download and every file assemble writes; publish, which
+        # pushes the tag, is a later step of the run.
+        found = release.binaries_digest(self.dist)
+        code, lines = printed(release.main, ["assemble", "--dist", str(self.dist), "--version", "1.0.30", "--commit", HEAD,
+                                             "--expect-binaries", "0" * 64])
+        self.assertEqual(code, 1)
+        self.assertEqual([line["stage"] for line in lines], ["assemble", "assemble"])
+        self.assertEqual((lines[0]["binaries"], lines[0]["expected"]), (found, "0" * 64))
+        self.assertIn(found, lines[1]["error"])
+        self.assertIn("0" * 64, lines[1]["error"])
+        self.assertEqual(sorted(path.name for path in self.dist.iterdir()), sorted(release.BINARIES))
+
+    def test_publish_takes_no_expectation(self):
+        # The expectation is checked where the bundle is made or fetched; publish ships the bundle it is given.
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            release.main(["publish", "--dist", str(self.dist), "--version", "1.0.30", "--commit", HEAD, "--mode", "dry-run",
+                          "--expect-binaries", "0" * 64])
+        for command in ("assemble", "fetch-bundle"):
+            with self.subTest(command=command), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                release.main([command, "--dist", str(self.dist), "--version", "1.0.30", "--commit", HEAD, "--expect-binaries"])
 
 
 class Darwin(unittest.TestCase):

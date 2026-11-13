@@ -8342,6 +8342,104 @@ mod init_scope_resolution_tests {
         assert!(!text_of(&result).contains("[SCOPE_RESOLUTION]"));
     }
 
+    /// A hosted init that names `project` (called "CC", nothing like the
+    /// folder) and is told by the API that the folder relates to nothing.
+    async fn hosted_init_naming_an_unrelated_project(
+        repository_url: Option<&str>,
+    ) -> (mcp_types::tool::ToolResult, Uuid, Vec<Value>) {
+        let workspace_id = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        let mock = ScopeMock::spawn(move |line, _| {
+            if line.starts_with("POST /api/v1/session/init") {
+                let mut answer = init_answer(workspace_id, project, "CC");
+                answer["project_routing"] = json!({
+                    "status": "needs_project_setup",
+                    "reason": "folder_path_has_no_matching_project",
+                    "current_workspace_id": workspace_id,
+                    "current_project_id": project,
+                    "current_project_name": "CC",
+                    "folder_path": RUNNER_CLONE,
+                    "project_switch_signal": false,
+                    "suggested_action": "Create or link a ContextStream project for this folder before project-scoped work.",
+                });
+                (200, answer)
+            } else if line.starts_with(&format!("GET /api/v1/workspaces/{workspace_id}")) {
+                (200, workspace_json(workspace_id, "Engineering"))
+            } else if line.starts_with(&format!("GET /api/v1/projects/{project}")) {
+                (200, project_json(project, workspace_id, "CC"))
+            } else {
+                (404, json!({"error": "not found"}))
+            }
+        })
+        .await;
+        let (client, session) = mock.hosted_client_and_session();
+
+        let mut input = hosted_init_input(workspace_id);
+        input["project_id"] = json!(project);
+        if let Some(repository_url) = repository_url {
+            input["repository_url"] = json!(repository_url);
+        }
+        let result = InitTool::new(client, session)
+            .execute(input)
+            .await
+            .expect("init");
+        (result, project, mock.init_bodies())
+    }
+
+    #[tokio::test]
+    async fn hosted_init_naming_a_project_without_a_remote_is_told_how_to_link_the_repository() {
+        let (result, project, bodies) = hosted_init_naming_an_unrelated_project(None).await;
+
+        assert_eq!(bodies[0]["project_id"], project.to_string());
+        assert_eq!(bodies[0]["scope_provenance"], "explicit");
+        let text = text_of(&result);
+        assert!(
+            text.contains("Continue with the project you named"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("git -C \"{RUNNER_CLONE}\" remote get-url origin")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "project_id=\"{project}\", repository_url=\"<output of the git command>\")"
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Create or link a ContextStream project"),
+            "the caller already named the project: {text}"
+        );
+        let action = result.structured_content.as_ref().unwrap()["project_routing"]
+            ["suggested_action"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(action.contains("repository_url="), "{action}");
+    }
+
+    #[tokio::test]
+    async fn hosted_init_naming_a_project_with_its_remote_keeps_the_apis_answer() {
+        let (result, _project, bodies) = hosted_init_naming_an_unrelated_project(Some(
+            "git@github.com:contextstream/contextcode.git",
+        ))
+        .await;
+
+        assert_eq!(
+            bodies[0]["repository_url"],
+            "https://github.com/contextstream/contextcode.git"
+        );
+        assert_eq!(bodies[0]["scope_provenance"], "explicit");
+        // A current API confirms and records the link; whatever this one
+        // answered is passed on, not rewritten.
+        assert!(
+            !text_of(&result).contains("Continue with the project you named"),
+            "{}",
+            text_of(&result)
+        );
+    }
+
     #[tokio::test]
     async fn hosted_init_creates_for_an_unreadable_folder_only_when_asked_to() {
         let workspace_id = Uuid::new_v4();

@@ -354,7 +354,7 @@ const PROJECT_SCOPE_GUIDANCE: &str = r#"## Project Scope Discipline
 - Reuse the `workspace_id` returned by `init(...)` or `context(...)` for workspace-scoped reads such as `memory(action="decisions")`; pass both `workspace_id` and `project_id` when both ids are available
 - For project-scoped `memory(...)`, `session(...)`, and `skill(...)` calls, pass explicit `workspace_id` and `project_id` instead of guessing from the folder name or title
 - When `[PROJECT_ROUTING]` appears with `uncertain`, `ambiguous`, `needs_project_selection`, or `needs_project_setup`, resolve scope before project-scoped work: choose a surfaced candidate, pass explicit `workspace_id`/`project_id`, or rerun `init(folder_path="...")` / `context(folder_path="...")`
-- If `init(...)` or `context(...)` does not surface a current `project_id`, rerun `init(folder_path="...")` before creating docs, skills, events, tasks, todos, or other project memory
+- If `init(...)` or `context(...)` does not surface a current `project_id`, rerun `init(folder_path="...", repository_url="<git remote get-url origin>")` (the checkout's Git remote finds its project from any clone, on any machine) before creating docs, skills, events, tasks, todos, or other project memory
 - Use `target_project` only after init from a multi-project parent folder
 - `[SCOPE_MISMATCH]` means the project scope is wrong: the folder belongs to another project, the scope is unresolved, or a write targets a project outside this session's working set. Stop project-scoped writes and apply the fix it names before continuing.
 

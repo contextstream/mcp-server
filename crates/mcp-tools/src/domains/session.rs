@@ -2871,16 +2871,23 @@ impl ToolHandler for InitTool {
         // the folder really is new.
         // The client applies the same rule to the request it sends; it is
         // worked out here too so the response can say what happened.
-        let creation_withheld = {
+        let (creation_withheld, folder_readable) = {
             let config = self.client.config().await;
-            mcp_client::session_init_withholds_project_creation(
-                &config,
-                input.folder_path.as_deref(),
-                project_id,
-                repository_url.as_deref(),
-                input.skip_project_creation,
+            (
+                mcp_client::session_init_withholds_project_creation(
+                    &config,
+                    input.folder_path.as_deref(),
+                    project_id,
+                    repository_url.as_deref(),
+                    input.skip_project_creation,
+                ),
+                input
+                    .folder_path
+                    .as_deref()
+                    .is_none_or(|folder| mcp_client::folder_readable_here(&config, folder)),
             )
         };
+        let sent_no_repository = repository_url.is_none();
         let skip_project_creation = if creation_withheld {
             Some(true)
         } else {
@@ -3458,6 +3465,38 @@ impl ToolHandler for InitTool {
                         routing.insert(
                             "suggested_action".to_string(),
                             Value::String(unreadable.suggested_action()),
+                        );
+                    }
+                }
+            }
+        }
+        // The caller named the project for a folder this server cannot read
+        // and sent no remote, so nothing ties the checkout to the project
+        // and the API says the folder has no matching project. Its advice to
+        // create or link one is wrong for a project the caller just named:
+        // say how to link the repository instead, once, for good.
+        if scope_provenance == "explicit" && sent_no_repository && !folder_readable {
+            if let (Some(folder), Some(project)) =
+                (folder_path_owned.as_deref(), resolved_project_id)
+            {
+                let unrelated_folder = result.get("project_routing").is_some_and(|routing| {
+                    routing.get("reason").and_then(Value::as_str)
+                        == Some("folder_path_has_no_matching_project")
+                        && routing.get("current_project_id").and_then(Value::as_str)
+                            == Some(project.to_string().as_str())
+                });
+                if unrelated_folder {
+                    if let Some(routing) = result
+                        .get_mut("project_routing")
+                        .and_then(Value::as_object_mut)
+                    {
+                        routing.insert(
+                            "suggested_action".to_string(),
+                            Value::String(scope_resolution::link_repository_action(
+                                folder,
+                                resolved_workspace_id,
+                                project,
+                            )),
                         );
                     }
                 }

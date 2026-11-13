@@ -428,8 +428,18 @@ impl UnreadableFolderScope<'_> {
         }
     }
 
+    /// What stands in for the remote in a call the agent has yet to make.
+    const REMOTE: &'static str = "repository_url=\"<output of the git command>\"";
+
     fn repository_call(&self) -> String {
-        self.init_call("repository_url=\"<output of the git command>\"")
+        self.init_call(Self::REMOTE)
+    }
+
+    /// The call that names a project and the checkout's remote together. The
+    /// API records the remote on a project that has none, so the next clone
+    /// of the repository resolves without anyone naming the project.
+    fn pick_call(&self, project_id: &str) -> String {
+        self.init_call(&format!("project_id=\"{project_id}\", {}", Self::REMOTE))
     }
 
     fn git_command(&self) -> String {
@@ -443,7 +453,7 @@ impl UnreadableFolderScope<'_> {
     /// One line for `project_routing.suggested_action`.
     pub(crate) fn suggested_action(&self) -> String {
         format!(
-            "No project was created. Run `{}` and call {}, or pass project_id.",
+            "No project was created. Run `{}` and call {}; add project_id when you know the project.",
             self.git_command(),
             self.repository_call()
         )
@@ -465,7 +475,7 @@ impl UnreadableFolderScope<'_> {
                     "run": self.git_command(),
                     "then": self.repository_call(),
                 },
-                "pick": self.init_call("project_id=\"<candidate project_id>\""),
+                "pick": self.pick_call("<candidate project_id>"),
                 "create": self.create_call(),
             },
         })
@@ -483,15 +493,20 @@ impl UnreadableFolderScope<'_> {
             "[SCOPE_RESOLUTION] No project is set for folder `{folder_name}`, and none was created: this server cannot read that folder, and its name matches no project{workspace}. Project-scoped search and memory are off until one is set."
         );
         text.push_str(&format!(
-            "\nIf it is a Git checkout, run `{}` and call {}",
+            "\nRun `{}` and call init again with its output:\n  {}",
             self.git_command(),
             self.repository_call()
         ));
+        if !compact {
+            text.push_str(
+                "\nThat finds the project that holds the repository or is named after it. With neither, it registers this folder as a new project for the repository.",
+            );
+        }
         if !self.candidates.is_empty() {
             text.push_str(if compact {
-                "\nOr pass project_id:"
+                "\nOr name the project in that call:"
             } else {
-                "\nOr, if it belongs to one of these projects, pass its project_id:"
+                "\nIf the folder belongs to one of these projects, name it in that call. The repository is then recorded on it, and later clones resolve by themselves:"
             });
         }
         for (index, candidate) in self.candidates.iter().enumerate() {
@@ -500,15 +515,34 @@ impl UnreadableFolderScope<'_> {
                 index + 1,
                 candidate.name,
                 candidate.id,
-                self.init_call(&format!("project_id=\"{}\"", candidate.id))
+                self.pick_call(&candidate.id.to_string())
             ));
         }
         text.push_str(&format!(
-            "\nOnly if this folder is a new project: {}",
+            "\nNot a Git checkout: pass project_id alone, or for a new project {}",
             self.create_call()
         ));
         text
     }
+}
+
+/// The action for an init that named a project for a folder this server
+/// cannot read, sent no remote, and was told the folder relates to nothing.
+///
+/// The project the caller named is in use; what is missing is the link from
+/// this checkout's repository to it. With the remote in the call the API
+/// records it, and no later session has to name the project.
+pub(crate) fn link_repository_action(
+    folder_path: &str,
+    workspace_id: Option<Uuid>,
+    project_id: Uuid,
+) -> String {
+    let workspace = workspace_id
+        .map(|id| format!("workspace_id=\"{id}\", "))
+        .unwrap_or_default();
+    format!(
+        "Continue with the project you named. To have later clones of this repository find it without a project_id, run `git -C \"{folder_path}\" remote get-url origin` and call init(folder_path=\"{folder_path}\", {workspace}project_id=\"{project_id}\", repository_url=\"<output of the git command>\") once."
+    )
 }
 
 /// An id the caller sent that init set aside, and why. One source for the text
@@ -677,13 +711,19 @@ mod tests {
             notice.contains("git -C \"/runner/contextstream-contextcode\" remote get-url origin"),
             "{notice}"
         );
+        // Picking a project carries the remote too, so the pick is recorded.
         assert!(
             notice.contains(&format!(
-                "init(folder_path=\"/runner/contextstream-contextcode\", workspace_id=\"{workspace_id}\", project_id=\"{}\")",
+                "init(folder_path=\"/runner/contextstream-contextcode\", workspace_id=\"{workspace_id}\", project_id=\"{}\", repository_url=\"<output of the git command>\")",
                 candidate.id
             )),
             "{notice}"
         );
+        assert!(
+            notice.contains("registers this folder as a new project"),
+            "{notice}"
+        );
+        assert!(!scope.notice(true).contains("registers this folder"));
         let value = scope.to_value();
         assert_eq!(value["status"], UnreadableFolderScope::STATUS);
         assert_eq!(value["candidates"][0]["name"], "contextcode");

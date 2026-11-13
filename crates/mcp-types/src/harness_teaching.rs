@@ -236,7 +236,7 @@ fn canonical_steps(harness_id: Option<HarnessId>) -> Vec<HarnessTeachingStep> {
     let init = tool_call(
         prefix,
         "init",
-        "folder_path=\"<project_path>\", workspace_id=\"<id>\", project_id=\"<id>\"",
+        "folder_path=\"<project_path>\", workspace_id=\"<id>\", repository_url=\"<git remote get-url origin>\"",
     );
     let context = tool_call(
         prefix,
@@ -282,7 +282,7 @@ fn canonical_steps(harness_id: Option<HarnessId>) -> Vec<HarnessTeachingStep> {
         HarnessTeachingStep {
             id: HarnessTeachingStepId::InitializeOnce,
             title: "Initialize once".to_string(),
-            requirement: "Initialize before other calls; reuse its scope/session id. workspace_id is mandatory for workspace-scoped calls: use IDs from managed rules or init/context and pass it explicitly to memory, session, entity, and task calls. Never rely on implicit session scope. No placeholder ids; no project_id? Pass init repository_url (git remote).".to_string(),
+            requirement: "Initialize before other calls; reuse its scope/session id. workspace_id is mandatory for workspace-scoped calls: use IDs from managed rules or init/context and pass it explicitly to memory, session, entity, and task calls. Never rely on implicit session scope. No placeholder ids; add project_id once known.".to_string(),
             canonical_calls: vec![init],
         },
         HarnessTeachingStep {
@@ -477,14 +477,19 @@ mod tests {
 
         assert!(initialize.requirement.contains("managed rules"));
         assert!(initialize.requirement.contains("workspace_id is mandatory"));
-        // A fresh clone has no project id in its rules, and a remote server
-        // cannot read the folder: the Git remote is what finds the project.
-        assert!(initialize.requirement.contains("repository_url"));
         assert!(initialize
             .requirement
             .contains("Never rely on implicit session scope"));
         assert!(initialize.canonical_calls[0].contains("workspace_id="));
-        assert!(initialize.canonical_calls[0].contains("project_id="));
+        // The call an agent can fill in from a fresh clone. Its rules carry
+        // no project id, and a remote server cannot read the folder: the
+        // checkout's own Git remote is what finds the project. A project id
+        // is something init returns, so the call does not ask for one (a
+        // call that did was sent with `<id>` in it).
+        assert!(initialize.canonical_calls[0]
+            .contains("repository_url=\"<git remote get-url origin>\""));
+        assert!(!initialize.canonical_calls[0].contains("project_id="));
+        assert!(initialize.requirement.contains("add project_id once known"));
 
         let context = contract
             .steps

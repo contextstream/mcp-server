@@ -20352,11 +20352,62 @@ pub struct SessionInitParams {
     pub scope_provenance: Option<String>,
 }
 
+/// Whether this process can look inside `folder_path`: the path exists here
+/// and the transport may read caller-supplied paths. A hosted gateway cannot,
+/// and neither can a local server handed a path from another machine or
+/// container.
+pub fn folder_readable_here(config: &Config, folder_path: &str) -> bool {
+    config.local_files_allowed() && std::path::Path::new(folder_path.trim()).is_dir()
+}
+
+/// Whether a session init must tell the API not to create a project.
+///
+/// A folder this process cannot read, with no project and no repository to go
+/// by, is known by its name alone. A name that matches no project is not
+/// evidence of a new one: a cloud runner's fresh clone of an existing
+/// repository (`<owner>-<repo>`) looks exactly like that, and creating from it
+/// gave every such clone an empty project of its own. The API still resolves
+/// the folder; it only may not create. An explicit `skip_project_creation`
+/// from the caller, either way, is left as sent.
+pub fn session_init_withholds_project_creation(
+    config: &Config,
+    folder_path: Option<&str>,
+    project_id: Option<Uuid>,
+    repository_url: Option<&str>,
+    skip_project_creation: Option<bool>,
+) -> bool {
+    let Some(folder_path) = folder_path.map(str::trim).filter(|path| !path.is_empty()) else {
+        return false;
+    };
+    skip_project_creation.is_none()
+        && project_id.is_none()
+        && repository_url.is_none()
+        && !folder_readable_here(config, folder_path)
+}
+
 impl SessionInitParams {
     #[allow(dead_code)]
     fn with_defaults(self, config: &Config) -> serde_json::Value {
         let (workspace_id, project_id) =
             scope_ids_with_defaults(self.workspace_id, self.project_id, config);
+        let forwarded_repository_url = self
+            .repository_url
+            .as_deref()
+            .and_then(credential_free_canonical_repository_url);
+        // Every init goes through here (the init tool, the context preflight,
+        // auto-init, the session refresh), so none of them can create a
+        // project for a folder this process cannot read.
+        let skip_project_creation = if session_init_withholds_project_creation(
+            config,
+            self.folder_path.as_deref(),
+            project_id,
+            forwarded_repository_url,
+            self.skip_project_creation,
+        ) {
+            Some(true)
+        } else {
+            self.skip_project_creation
+        };
         let checkout_scope = self
             .folder_path
             .as_deref()
@@ -20388,7 +20439,7 @@ impl SessionInitParams {
         if let Some(v) = self.allow_no_workspace {
             json["allow_no_workspace"] = serde_json::Value::Bool(v);
         }
-        if let Some(v) = self.skip_project_creation {
+        if let Some(v) = skip_project_creation {
             json["skip_project_creation"] = serde_json::Value::Bool(v);
         }
         if let Some(v) = self.client_name {
@@ -30081,6 +30132,78 @@ mod tests {
 
         assert!(body.get("repository_url").is_none());
         assert!(!body.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn session_init_never_lets_an_unreadable_folders_name_create_a_project() {
+        let hosted = Config {
+            is_http_transport: true,
+            ..Config::default()
+        };
+        let local = Config::default();
+        let readable = tempfile::tempdir().expect("tempdir");
+        let readable = readable.path().to_string_lossy().to_string();
+        let runner_clone = "/no-such-runner/workspace/contextstream-contextcode";
+        let body = |config: &Config, params: SessionInitParams| params.with_defaults(config);
+        let folder_only = |folder: &str| SessionInitParams {
+            folder_path: Some(folder.to_string()),
+            ..SessionInitParams::default()
+        };
+
+        // The hosted gateway cannot read any caller folder, even one that
+        // happens to exist on its own disk.
+        for folder in [runner_clone, readable.as_str()] {
+            assert_eq!(
+                body(&hosted, folder_only(folder))["skip_project_creation"],
+                true,
+                "{folder}"
+            );
+        }
+        // A local server: only a folder that is not on this machine.
+        assert_eq!(
+            body(&local, folder_only(runner_clone))["skip_project_creation"],
+            true
+        );
+        assert!(body(&local, folder_only(&readable))
+            .get("skip_project_creation")
+            .is_none());
+
+        // A project, a repository, or the caller's own choice is left as sent.
+        let with_project = SessionInitParams {
+            project_id: Some(Uuid::new_v4()),
+            ..folder_only(runner_clone)
+        };
+        assert!(body(&hosted, with_project)
+            .get("skip_project_creation")
+            .is_none());
+        let with_repository = SessionInitParams {
+            repository_url: Some("https://github.com/contextstream/contextcode.git".to_string()),
+            ..folder_only(runner_clone)
+        };
+        assert!(body(&hosted, with_repository)
+            .get("skip_project_creation")
+            .is_none());
+        let asked_to_create = SessionInitParams {
+            skip_project_creation: Some(false),
+            ..folder_only(runner_clone)
+        };
+        assert_eq!(
+            body(&hosted, asked_to_create)["skip_project_creation"],
+            false
+        );
+        // A remote that would not be forwarded identifies nothing.
+        let with_credentialed_repository = SessionInitParams {
+            repository_url: Some("https://alice:secret@github.com/a/b.git".to_string()),
+            ..folder_only(runner_clone)
+        };
+        assert_eq!(
+            body(&hosted, with_credentialed_repository)["skip_project_creation"],
+            true
+        );
+        // No folder: nothing to create a project from.
+        assert!(body(&hosted, SessionInitParams::default())
+            .get("skip_project_creation")
+            .is_none());
     }
 
     #[test]

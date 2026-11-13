@@ -211,6 +211,7 @@ pub use client::{
     FEED_MAX_PAGE_SIZE,
     VALID_ENTITY_KINDS,
 };
+pub use client::{folder_readable_here, session_init_withholds_project_creation};
 pub use client::{
     local_files_denied, runtime_self_update_disabled, set_local_files_denied,
     set_runtime_self_update_disabled,

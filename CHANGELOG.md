@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Fixed: `init` through the hosted server created an empty project for a fresh clone of a repository that already had one. A cloud runner names a clone `<owner>-<repo>` (`contextstream-contextcode`), the hosted server cannot read the folder, and no project is called that, so the folder matched nothing and a project named after it was created; the session then searched an empty index and saved to the wrong project. Three changes:
+  - A folder named `<owner>-<repo>` resolves to the one project in the workspace whose repository that is, ahead of a project that only shares the folder's name and has no repository. When two projects hold the repository, `init` leaves the choice to the API, which names both.
+  - `init` no longer lets the API create a project for a folder this server cannot read (the hosted server, or a path that is not on this machine) when it was given neither `project_id` nor `repository_url`. The session gets no project, and the answer says so under `[SCOPE_RESOLUTION]` (and in `scope_resolution` of the structured result): the `git remote get-url origin` command to run, the `init(..., repository_url=...)` call to make with its output, near-name projects to pick from, and `skip_project_creation=false` for a folder that really is a new project. This applies to every init the server sends, including the one `context` makes for a session that was not initialized. A folder this server can read is unchanged.
+  - The hosted server no longer reads a Git remote from its own disk when a caller's `folder_path` happens to exist there.
+- `init`: the descriptions of `repository_url`, `folder_path` and `skip_project_creation` say when to pass each. Rules: the "Initialize once" step tells the agent to pass `repository_url` when it has no project id. Installed rules files keep working as they are; `contextstream-mcp update-rules` refreshes them.
+
 ## 1.0.78
 
 - Fixed: live progress from the hooks (`CONTEXTSTREAM_RUN_PROGRESS_AUTO=on`) did nothing in Claude Code as 1.0.77 installed it. The hooks learn a session's runs from the answers of `progress` and `entity`, and the hook registration setup wrote did not name those tools. Setup now builds that registration from the list the hooks read. `contextstream-mcp update` (or `update-hooks`) brings an existing install up to it and says when it changed the registrations. Live progress from the hooks stays off unless you turn it on.

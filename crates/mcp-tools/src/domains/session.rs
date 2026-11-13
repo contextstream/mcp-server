@@ -6,7 +6,7 @@ mod recall_supplements;
 use crate::domains::display_title::one_line;
 use crate::domains::scope_resolution::{
     self, classify_scope_id_arg, refuse_malformed_scope_id, with_scope_repair, ScopeRepair,
-    UnmatchedFolderScope, SCOPE_REPAIRS_KEY,
+    UnmatchedFolderScope, UnreadableFolderScope, SCOPE_REPAIRS_KEY,
 };
 use async_trait::async_trait;
 use mcp_client::{
@@ -1195,7 +1195,41 @@ fn resolve_project_from_catalog(
         .unwrap_or(folder_path)
         .trim()
         .to_string();
+    // A clone a runner named `<owner>-<repo>` belongs to the project that
+    // holds that repository, whatever the project is called. This is checked
+    // before the name: a project that merely shares the folder's name and has
+    // no repository is the empty duplicate an earlier folder-only init left.
     let folder_key = normalize_project_match_key(&folder_name);
+    let named_like_folder = |project: &Project| {
+        let project_name = project.name.trim();
+        project_name.eq_ignore_ascii_case(&folder_name)
+            || normalize_project_match_key(project_name) == folder_key
+    };
+    match scope_resolution::projects_named_after_folder_repository(&folder_name, workspace_projects)
+        .as_slice()
+    {
+        [] => {}
+        [project] => {
+            let rival = workspace_projects.iter().find(|other| {
+                other.id != project.id
+                    && named_like_folder(other)
+                    && other
+                        .repository_url
+                        .as_deref()
+                        .is_some_and(|url| !url.trim().is_empty())
+            });
+            if let Some(rival) = rival {
+                return Err(Error::Validation(format!(
+                    "Folder '{folder_name}' is named after the repository of project '{}' ({}) and is also the name of project '{}' ({}), which has a different repository; pass an explicit project_id or repository_url.",
+                    project.name, project.id, rival.name, rival.id
+                )));
+            }
+            return Ok(Some((project.id, project.name.clone())));
+        }
+        // Several projects hold that repository: a duplicate set. The API
+        // names them and asks; a name match here would pick one silently.
+        _ => return Ok(None),
+    }
     let mut matches = workspace_projects.iter().filter(|project| {
         let project_name = project.name.trim();
         project_name.eq_ignore_ascii_case(&folder_name)
@@ -2432,9 +2466,17 @@ impl ToolHandler for InitTool {
         let force = input.force.unwrap_or(false) || is_post_compact;
         // A repository_url that is not a Git remote is set aside, not fatal:
         // init resolves from folder_path (or the ids) and says what it ignored.
+        // The checkout's own remote is read only where this server may read
+        // the caller's folders: on a hosted gateway the same path, if it
+        // exists at all, is some other checkout on the gateway's own disk.
+        let readable_folder_path = if self.client.config().await.local_files_allowed() {
+            input.folder_path.as_deref()
+        } else {
+            None
+        };
         let (repository_url, repository_url_note) = match resolve_init_repository_url(
             input.repository_url.as_deref(),
-            input.folder_path.as_deref(),
+            readable_folder_path,
         ) {
             Ok(url) => (url, None),
             Err(Error::Validation(_)) => (None, Some(IGNORED_REPOSITORY_URL)),
@@ -2819,7 +2861,31 @@ impl ToolHandler for InitTool {
             }
         }
 
-        let skip_project_creation = input.skip_project_creation;
+        // A folder this server cannot read, with no project and no repository
+        // named, is known by its name alone, and a name that matched no
+        // project is not evidence of a new one: a cloud runner's fresh clone
+        // of an existing repository looks exactly like this. Creating from it
+        // gave each such clone an empty project of its own. The API still
+        // resolves the folder (bindings, repository-named folders); it only
+        // may not create. `skip_project_creation=false` is the caller saying
+        // the folder really is new.
+        // The client applies the same rule to the request it sends; it is
+        // worked out here too so the response can say what happened.
+        let creation_withheld = {
+            let config = self.client.config().await;
+            mcp_client::session_init_withholds_project_creation(
+                &config,
+                input.folder_path.as_deref(),
+                project_id,
+                repository_url.as_deref(),
+                input.skip_project_creation,
+            )
+        };
+        let skip_project_creation = if creation_withheld {
+            Some(true)
+        } else {
+            input.skip_project_creation
+        };
 
         // Track whether session was already initialized (for auto_index decision)
         let was_initialized = self.session.is_initialized().await;
@@ -3345,16 +3411,73 @@ impl ToolHandler for InitTool {
                 }
             }
         }
+        // Nothing matched the unreadable folder and nothing was created: say
+        // so, and give the calls that settle it. The API's own "create or
+        // link a project" line is replaced, since creating is the one step
+        // that is usually wrong here. When the API found candidates of its
+        // own (a duplicate set, a project the message names), its notice
+        // already asks the right question and this one stays out of the way.
+        let api_routing_reason = result
+            .get("project_routing")
+            .and_then(|routing| routing.get("reason"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let unreadable_folder_notice = creation_withheld
+            && resolved_project_id.is_none()
+            && api_routing_reason
+                .as_deref()
+                .is_none_or(|reason| reason == "folder_path_has_no_matching_project");
+        if unreadable_folder_notice {
+            if let Some(folder) = folder_path_owned.as_deref() {
+                let candidates = match resolved_workspace_id {
+                    Some(workspace) => {
+                        scope_resolution::candidates_for_folder(
+                            &self.client,
+                            workspace,
+                            folder,
+                            None,
+                        )
+                        .await
+                    }
+                    None => Vec::new(),
+                };
+                let unreadable = UnreadableFolderScope {
+                    folder_path: folder,
+                    workspace_id: resolved_workspace_id,
+                    workspace_name: resolved_workspace_id.map(|_| workspace_name.as_str()),
+                    candidates: &candidates,
+                };
+                text.push_str("\n\n");
+                text.push_str(&unreadable.notice(concise_text));
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("scope_resolution".to_string(), unreadable.to_value());
+                    if let Some(routing) = object
+                        .get_mut("project_routing")
+                        .and_then(Value::as_object_mut)
+                    {
+                        routing.insert(
+                            "suggested_action".to_string(),
+                            Value::String(unreadable.suggested_action()),
+                        );
+                    }
+                }
+            }
+        }
         // Init resolved this scope itself, so soft switch-hints are muted
         // unless the folder demonstrably belongs elsewhere. The notice (when
         // one survives) always emits at init and is recorded so identical
         // per-turn context() notices dedupe against it.
         let init_scope_authoritative = scope_provenance != "unresolved";
-        if let Some(project_routing_notice) = format_project_routing_notice_from_value(
-            &result,
-            concise_text,
-            init_scope_authoritative,
-        ) {
+        let project_routing_notice = if unreadable_folder_notice {
+            None
+        } else {
+            format_project_routing_notice_from_value(
+                &result,
+                concise_text,
+                init_scope_authoritative,
+            )
+        };
+        if let Some(project_routing_notice) = project_routing_notice {
             let scope_key = routing_scope_key(
                 resolved_workspace_id,
                 resolved_project_id,
@@ -3749,12 +3872,12 @@ impl ToolHandler for InitTool {
             )
             .string(
                 "folder_path",
-                "Absolute path to the project folder for auto-detection.",
+                "Absolute path to the project folder for auto-detection. A server that cannot read the folder (hosted or remote) knows only its name: also pass repository_url or project_id.",
                 false,
             )
             .string(
                 "repository_url",
-                "Optional Git remote for hosted gateways that cannot inspect folder_path. SSH/HTTPS credentials are stripped before the canonical repository identity is sent.",
+                "Git remote of the checkout: the output of `git remote get-url origin`. Pass it whenever folder_path is a Git checkout and you have no project_id; on a hosted or remote server, which cannot read folder_path, it is what finds the project. A fresh clone, a worktree and a folder a cloud runner renamed all resolve to the same project by it. Credentials are stripped before it is sent.",
                 false,
             )
             .string(
@@ -3784,7 +3907,7 @@ impl ToolHandler for InitTool {
             )
             .boolean(
                 "skip_project_creation",
-                "Skip automatic project creation/matching",
+                "true: never create a project for an unmatched folder. false: create one even when this server cannot read folder_path (only for a folder that really is a new project). Omitted: a readable unmatched folder becomes a project, an unreadable one does not.",
                 false,
             )
             .string(

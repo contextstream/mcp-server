@@ -282,7 +282,7 @@ fn canonical_steps(harness_id: Option<HarnessId>) -> Vec<HarnessTeachingStep> {
         HarnessTeachingStep {
             id: HarnessTeachingStepId::InitializeOnce,
             title: "Initialize once".to_string(),
-            requirement: "Initialize before other calls; reuse its scope/session id. workspace_id is mandatory for workspace-scoped calls: use IDs from managed rules or init/context and pass it explicitly to memory, session, entity, and task calls. Never rely on implicit session scope. Never send a placeholder id; with none, call init(folder_path) alone.".to_string(),
+            requirement: "Initialize before other calls; reuse its scope/session id. workspace_id is mandatory for workspace-scoped calls: use IDs from managed rules or init/context and pass it explicitly to memory, session, entity, and task calls. Never rely on implicit session scope. No placeholder ids; no project_id? Pass init repository_url (git remote).".to_string(),
             canonical_calls: vec![init],
         },
         HarnessTeachingStep {
@@ -477,6 +477,9 @@ mod tests {
 
         assert!(initialize.requirement.contains("managed rules"));
         assert!(initialize.requirement.contains("workspace_id is mandatory"));
+        // A fresh clone has no project id in its rules, and a remote server
+        // cannot read the folder: the Git remote is what finds the project.
+        assert!(initialize.requirement.contains("repository_url"));
         assert!(initialize
             .requirement
             .contains("Never rely on implicit session scope"));

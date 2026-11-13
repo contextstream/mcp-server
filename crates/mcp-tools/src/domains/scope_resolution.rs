@@ -343,6 +343,174 @@ impl UnmatchedFolderScope<'_> {
     }
 }
 
+/// Lowercase, with every run of `-`, `_` and `.` read as one `-`, so
+/// `Owner__Repo.Name` and `owner-repo-name` compare equal.
+fn folder_name_match_key(value: &str) -> String {
+    let mut key = String::with_capacity(value.len());
+    for ch in value.trim().chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !key.ends_with('-') {
+                key.push('-');
+            }
+        } else {
+            key.extend(ch.to_lowercase());
+        }
+    }
+    key.trim_matches('-').to_string()
+}
+
+/// `owner-repo` for a project's repository, in [`folder_name_match_key`] form:
+/// the whole namespace of its remote, flattened. `None` for a project with no
+/// usable remote, or a remote with no owner.
+fn repository_folder_name_key(repository_url: Option<&str>) -> Option<String> {
+    let identity =
+        mcp_session::RepositoryRemoteIdentity::from_remote_url(repository_url?.trim()).ok()?;
+    let canonical = identity.canonical_https_url();
+    let (_, namespace) = canonical
+        .strip_prefix("https://")?
+        .trim_end_matches(".git")
+        .split_once('/')?;
+    let segments: Vec<String> = namespace
+        .split('/')
+        .map(folder_name_match_key)
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    (segments.len() >= 2).then(|| segments.join("-"))
+}
+
+/// The projects whose repository `folder_name` is named after.
+///
+/// Cloud runners and agent harnesses clone a repository into `<owner>-<repo>`
+/// (`contextstream-mcp-server`), which is no project's name. A hosted gateway
+/// cannot read the checkout's remote either, so without this the folder
+/// matched nothing and the API created an empty project named after it.
+pub(crate) fn projects_named_after_folder_repository<'a>(
+    folder_name: &str,
+    projects: &'a [Project],
+) -> Vec<&'a Project> {
+    let folder_key = folder_name_match_key(folder_name);
+    if folder_key.is_empty() {
+        return Vec::new();
+    }
+    projects
+        .iter()
+        .filter(|project| {
+            repository_folder_name_key(project.repository_url.as_deref()).as_deref()
+                == Some(folder_key.as_str())
+        })
+        .collect()
+}
+
+/// An init whose folder this server could not read, that named no project and
+/// no repository, and that matched no project: nothing was created for it.
+///
+/// A folder's name is not evidence of a new project when the folder itself
+/// cannot be inspected. Creating one from it gave every fresh cloud clone its
+/// own empty project, with none of the real project's index, decisions or
+/// lessons, and sent what the agent then saved to the wrong place.
+pub(crate) struct UnreadableFolderScope<'a> {
+    pub folder_path: &'a str,
+    pub workspace_id: Option<Uuid>,
+    pub workspace_name: Option<&'a str>,
+    pub candidates: &'a [ProjectCandidate],
+}
+
+impl UnreadableFolderScope<'_> {
+    pub(crate) const STATUS: &'static str = "project_unresolved_folder_not_readable";
+
+    fn init_call(&self, extra: &str) -> String {
+        match self.workspace_id {
+            Some(workspace_id) => format!(
+                "init(folder_path=\"{}\", workspace_id=\"{}\", {extra})",
+                self.folder_path, workspace_id
+            ),
+            None => format!("init(folder_path=\"{}\", {extra})", self.folder_path),
+        }
+    }
+
+    fn repository_call(&self) -> String {
+        self.init_call("repository_url=\"<output of the git command>\"")
+    }
+
+    fn git_command(&self) -> String {
+        format!("git -C \"{}\" remote get-url origin", self.folder_path)
+    }
+
+    fn create_call(&self) -> String {
+        self.init_call("skip_project_creation=false")
+    }
+
+    /// One line for `project_routing.suggested_action`.
+    pub(crate) fn suggested_action(&self) -> String {
+        format!(
+            "No project was created. Run `{}` and call {}, or pass project_id.",
+            self.git_command(),
+            self.repository_call()
+        )
+    }
+
+    /// Structured form, for clients that show only `structuredContent`.
+    pub(crate) fn to_value(&self) -> Value {
+        json!({
+            "status": Self::STATUS,
+            "folder_path": self.folder_path,
+            "project_created": false,
+            "note": self.notice(true),
+            "candidates": self.candidates.iter().map(|candidate| json!({
+                "project_id": candidate.id.to_string(),
+                "name": candidate.name,
+            })).collect::<Vec<_>>(),
+            "next_steps": {
+                "repository": {
+                    "run": self.git_command(),
+                    "then": self.repository_call(),
+                },
+                "pick": self.init_call("project_id=\"<candidate project_id>\""),
+                "create": self.create_call(),
+            },
+        })
+    }
+
+    /// Text form for the init response. `compact` keeps it to the decision.
+    pub(crate) fn notice(&self, compact: bool) -> String {
+        let folder_name = folder_display_name(self.folder_path);
+        let workspace = match (self.workspace_name, self.workspace_id) {
+            (Some(name), Some(id)) => format!(" in workspace {name} ({id})"),
+            (None, Some(id)) => format!(" in workspace {id}"),
+            _ => String::new(),
+        };
+        let mut text = format!(
+            "[SCOPE_RESOLUTION] No project is set for folder `{folder_name}`, and none was created: this server cannot read that folder, and its name matches no project{workspace}. Project-scoped search and memory are off until one is set."
+        );
+        text.push_str(&format!(
+            "\nIf it is a Git checkout, run `{}` and call {}",
+            self.git_command(),
+            self.repository_call()
+        ));
+        if !self.candidates.is_empty() {
+            text.push_str(if compact {
+                "\nOr pass project_id:"
+            } else {
+                "\nOr, if it belongs to one of these projects, pass its project_id:"
+            });
+        }
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            text.push_str(&format!(
+                "\n  {}. {} ({}) -> {}",
+                index + 1,
+                candidate.name,
+                candidate.id,
+                self.init_call(&format!("project_id=\"{}\"", candidate.id))
+            ));
+        }
+        text.push_str(&format!(
+            "\nOnly if this folder is a new project: {}",
+            self.create_call()
+        ));
+        text
+    }
+}
+
 /// An id the caller sent that init set aside, and why. One source for the text
 /// note and the structured block so the two cannot disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,6 +626,77 @@ pub(crate) fn with_scope_repair(mut result: ToolResult, repair: &ScopeRepair) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_is_named_after_a_repository_by_its_whole_namespace() {
+        let mut holder = project("mcp");
+        holder.repository_url = Some("git@github.com:ContextStream/MCP-Server.git".to_string());
+        let mut subgroup = project("ledger");
+        subgroup.repository_url = Some("https://gitlab.com/acme/payments/ledger".to_string());
+        let mut other = project("contextstream");
+        other.repository_url = Some("https://github.com/contextstream/contextstream".to_string());
+        let projects = vec![holder, subgroup, other, project("contextstream-mcp-server")];
+
+        let named = |folder: &str| -> Vec<String> {
+            projects_named_after_folder_repository(folder, &projects)
+                .into_iter()
+                .map(|project| project.name.clone())
+                .collect()
+        };
+        assert_eq!(named("contextstream-mcp-server"), ["mcp"]);
+        assert_eq!(named("ContextStream__mcp_server"), ["mcp"]);
+        assert_eq!(named("acme-payments-ledger"), ["ledger"]);
+        // The bare repository name and an unrelated folder identify nothing.
+        assert!(named("mcp-server").is_empty());
+        assert!(named("acme-billing").is_empty());
+        assert!(named("").is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_folder_notice_gives_the_calls_that_settle_it() {
+        let workspace_id = Uuid::new_v4();
+        let candidate = ProjectCandidate {
+            id: Uuid::new_v4(),
+            name: "contextcode".to_string(),
+            score: 0.5,
+        };
+        let scope = UnreadableFolderScope {
+            folder_path: "/runner/contextstream-contextcode",
+            workspace_id: Some(workspace_id),
+            workspace_name: Some("Engineering"),
+            candidates: std::slice::from_ref(&candidate),
+        };
+
+        let notice = scope.notice(false);
+        assert!(
+            notice.starts_with("[SCOPE_RESOLUTION] No project is set"),
+            "{notice}"
+        );
+        assert!(notice.contains("none was created"), "{notice}");
+        assert!(
+            notice.contains("git -C \"/runner/contextstream-contextcode\" remote get-url origin"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains(&format!(
+                "init(folder_path=\"/runner/contextstream-contextcode\", workspace_id=\"{workspace_id}\", project_id=\"{}\")",
+                candidate.id
+            )),
+            "{notice}"
+        );
+        let value = scope.to_value();
+        assert_eq!(value["status"], UnreadableFolderScope::STATUS);
+        assert_eq!(value["candidates"][0]["name"], "contextcode");
+
+        // With no workspace resolved the calls name none.
+        let unscoped = UnreadableFolderScope {
+            folder_path: "/runner/x",
+            workspace_id: None,
+            workspace_name: None,
+            candidates: &[],
+        };
+        assert!(!unscoped.notice(true).contains("workspace_id"));
+    }
 
     fn project(name: &str) -> Project {
         Project {

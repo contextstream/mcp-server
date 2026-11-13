@@ -203,6 +203,86 @@ mod repository_project_resolution_tests {
         assert_eq!(resolved.map(|(id, _)| id), Some(expected));
     }
 
+    fn project_with_repository(id: Uuid, name: &str, repository_url: &str) -> Project {
+        let mut project = project(id, name);
+        project.repository_url = Some(repository_url.to_string());
+        project
+    }
+
+    #[test]
+    fn a_folder_named_owner_repo_resolves_to_the_project_holding_that_repository() {
+        let contextcode = Uuid::new_v4();
+        let projects = vec![
+            // Same name as the folder, no repository: an earlier empty duplicate.
+            project(Uuid::new_v4(), "contextstream-contextcode"),
+            project_with_repository(
+                contextcode,
+                "contextcode",
+                "git@github.com:ContextStream/ContextCode.git",
+            ),
+            project_with_repository(
+                Uuid::new_v4(),
+                "contextstream",
+                "https://github.com/contextstream/contextstream",
+            ),
+        ];
+
+        let resolved = resolve_project_from_catalog(
+            &projects,
+            "/home/claude-runner/workspace/_sessions/cse_x/contextstream-contextcode",
+        )
+        .expect("resolve");
+
+        assert_eq!(resolved, Some((contextcode, "contextcode".to_string())));
+    }
+
+    #[test]
+    fn a_folder_named_owner_repo_fails_closed_against_a_same_named_project_with_its_own_repository()
+    {
+        let projects = vec![
+            project_with_repository(
+                Uuid::new_v4(),
+                "contextstream-contextcode",
+                "https://github.com/someone/contextstream-contextcode",
+            ),
+            project_with_repository(
+                Uuid::new_v4(),
+                "contextcode",
+                "https://github.com/contextstream/contextcode",
+            ),
+        ];
+
+        let error = resolve_project_from_catalog(&projects, "/work/contextstream-contextcode")
+            .expect_err("two projects with repositories claim the folder");
+
+        assert!(error.to_string().contains("repository_url"), "{error}");
+    }
+
+    #[test]
+    fn a_folder_named_after_a_repository_two_projects_hold_is_left_to_the_api() {
+        let projects = vec![
+            project(Uuid::new_v4(), "contextstream-contextcode"),
+            project_with_repository(
+                Uuid::new_v4(),
+                "contextcode",
+                "https://github.com/contextstream/contextcode",
+            ),
+            project_with_repository(
+                Uuid::new_v4(),
+                "contextcode-old",
+                "https://github.com/contextstream/contextcode.git",
+            ),
+        ];
+
+        let resolved = resolve_project_from_catalog(&projects, "/work/contextstream-contextcode")
+            .expect("no error");
+
+        assert_eq!(
+            resolved, None,
+            "neither duplicate, and not the same-named project either"
+        );
+    }
+
     #[test]
     fn duplicate_normalized_folder_matches_fail_closed() {
         let projects = vec![
@@ -7560,6 +7640,16 @@ mod init_scope_resolution_tests {
             (client, session)
         }
 
+        /// As the hosted gateway runs: it cannot read the caller's folders.
+        fn hosted_client_and_session(&self) -> (ContextStreamClient, Arc<SessionManager>) {
+            let mut config = TestFixtures::test_config();
+            config.api_url = format!("http://{}", self.address);
+            config.is_http_transport = true;
+            let client = ContextStreamClient::new(config.clone());
+            let session = Arc::new(SessionManager::new(client.clone(), config));
+            (client, session)
+        }
+
         fn calls(&self) -> Vec<String> {
             self.requests
                 .lock()
@@ -7912,6 +8002,403 @@ mod init_scope_resolution_tests {
             .unwrap()
             .get("scope_resolution")
             .is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // A fresh cloud clone: the runner names it `<owner>-<repo>`, and the
+    // hosted gateway cannot read it (ticket e1412791).
+    // ------------------------------------------------------------------
+
+    // (Not the runner's real root: these tests may run on such a runner,
+    // where that folder exists and can be read.)
+    const RUNNER_CLONE: &str =
+        "/no-such-runner/workspace/_sessions/cse_01FSKhRQdnhh3Acmp8gePpQm/contextstream-contextcode";
+
+    fn project_with_repository(
+        id: Uuid,
+        workspace_id: Uuid,
+        name: &str,
+        repository_url: &str,
+    ) -> Value {
+        json!({"id": id, "name": name, "workspace_id": workspace_id, "repository_url": repository_url})
+    }
+
+    fn project_page(items: Vec<Value>) -> Value {
+        let total = items.len();
+        json!({
+            "items": items,
+            "total": total, "page": 1, "page_size": 200,
+            "total_pages": 1, "has_next": false,
+        })
+    }
+
+    /// What the API answers when the folder matched nothing and it was told
+    /// not to create a project.
+    fn unresolved_init_answer(workspace_id: Uuid, folder: &str) -> Value {
+        json!({
+            "workspace_id": workspace_id,
+            "session_id": "api-session",
+            "workspace": {"id": workspace_id, "name": "Engineering"},
+            "project_routing": {
+                "status": "needs_project_setup",
+                "reason": "folder_path_has_no_matching_project",
+                "current_workspace_id": workspace_id,
+                "folder_path": folder,
+                "project_switch_signal": false,
+                "suggested_action": "Create or link a ContextStream project for this folder before project-scoped work.",
+            },
+        })
+    }
+
+    /// A mock workspace holding `projects`, whose session init echoes the
+    /// project it was sent, or answers unresolved when it was sent none.
+    async fn workspace_mock(workspace_id: Uuid, projects: Vec<Value>) -> ScopeMock {
+        ScopeMock::spawn(move |line, body| {
+            if line.starts_with("POST /api/v1/session/init") {
+                let folder = body["folder_path"].as_str().unwrap_or_default();
+                let sent_project = body["project_id"]
+                    .as_str()
+                    .and_then(|id| Uuid::parse_str(id).ok());
+                match sent_project {
+                    Some(project_id) => {
+                        let name = projects
+                            .iter()
+                            .find(|project| project["id"] == json!(project_id))
+                            .and_then(|project| project["name"].as_str())
+                            .unwrap_or("unknown");
+                        (200, init_answer(workspace_id, project_id, name))
+                    }
+                    None => (200, unresolved_init_answer(workspace_id, folder)),
+                }
+            } else if line.starts_with(&format!("GET /api/v1/workspaces/{workspace_id}")) {
+                (200, workspace_json(workspace_id, "Engineering"))
+            } else if line.starts_with("GET /api/v1/projects?") {
+                (200, project_page(projects.clone()))
+            } else if let Some(project) = projects.iter().find(|project| {
+                line.starts_with(&format!(
+                    "GET /api/v1/projects/{}",
+                    project["id"].as_str().unwrap_or_default()
+                ))
+            }) {
+                (200, project.clone())
+            } else {
+                (404, json!({"error": "not found"}))
+            }
+        })
+        .await
+    }
+
+    fn hosted_init_input(workspace_id: Uuid) -> Value {
+        json!({
+            "folder_path": RUNNER_CLONE,
+            "workspace_id": workspace_id,
+            "client_name": "claude",
+            "auto_update": false,
+            "auto_index": false,
+            "include_recent_memory": false,
+            "include_decisions": false,
+        })
+    }
+
+    #[tokio::test]
+    async fn hosted_init_on_a_runner_clone_lands_on_the_repositorys_project() {
+        let workspace_id = Uuid::new_v4();
+        let contextcode = Uuid::new_v4();
+        // The duplicate an earlier folder-only init left: the folder's name, no repository.
+        let stray = Uuid::new_v4();
+        let mock = workspace_mock(
+            workspace_id,
+            vec![
+                project_json(stray, workspace_id, "contextstream-contextcode"),
+                project_with_repository(
+                    contextcode,
+                    workspace_id,
+                    "contextcode",
+                    "https://github.com/contextstream/contextcode.git",
+                ),
+                project_with_repository(
+                    Uuid::new_v4(),
+                    workspace_id,
+                    "contextstream",
+                    "git@github.com:contextstream/contextstream.git",
+                ),
+            ],
+        )
+        .await;
+        let (client, session) = mock.hosted_client_and_session();
+
+        let result = InitTool::new(client, session.clone())
+            .execute(hosted_init_input(workspace_id))
+            .await
+            .expect("init");
+
+        let bodies = mock.init_bodies();
+        assert_eq!(bodies.len(), 1, "{:?}", mock.calls());
+        assert_eq!(
+            bodies[0]["project_id"],
+            contextcode.to_string(),
+            "the project that holds contextstream/contextcode, not the same-named stray"
+        );
+        assert_eq!(session.state().await.project_id, Some(contextcode));
+        let text = text_of(&result);
+        assert!(text.contains("project: contextcode"), "{text}");
+        assert!(!text.contains("[SCOPE_RESOLUTION]"), "{text}");
+        assert!(
+            !mock
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("POST /api/v1/projects")),
+            "nothing is created: {:?}",
+            mock.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_init_on_an_unmatched_folder_creates_nothing_and_says_what_to_pass() {
+        let workspace_id = Uuid::new_v4();
+        let contextcode = Uuid::new_v4();
+        let mock = workspace_mock(
+            workspace_id,
+            vec![
+                // No repository on record, so the folder's name cannot find it.
+                project_json(contextcode, workspace_id, "contextcode"),
+                project_json(Uuid::new_v4(), workspace_id, "billing"),
+            ],
+        )
+        .await;
+        let (client, session) = mock.hosted_client_and_session();
+
+        let result = InitTool::new(client, session.clone())
+            .execute(hosted_init_input(workspace_id))
+            .await
+            .expect("init");
+
+        let bodies = mock.init_bodies();
+        assert_eq!(bodies.len(), 1, "{:?}", mock.calls());
+        assert_eq!(
+            bodies[0]["skip_project_creation"], true,
+            "the API must be told not to create a project: {}",
+            bodies[0]
+        );
+        assert!(bodies[0].get("project_id").is_none(), "{}", bodies[0]);
+        assert_eq!(session.state().await.project_id, None);
+
+        let text = text_of(&result);
+        assert!(text.contains("[SCOPE_RESOLUTION]"), "{text}");
+        assert!(text.contains("none was created"), "{text}");
+        assert!(
+            text.contains(&format!("git -C \"{RUNNER_CLONE}\" remote get-url origin")),
+            "{text}"
+        );
+        assert!(text.contains("repository_url=\""), "{text}");
+        assert!(
+            text.contains(&format!("contextcode ({contextcode})")),
+            "the near-name project is offered: {text}"
+        );
+        assert!(!text.contains("billing"), "{text}");
+        assert!(text.contains("skip_project_creation=false"), "{text}");
+        assert!(
+            !text.contains("Create or link a ContextStream project"),
+            "the API's create-a-project line is replaced: {text}"
+        );
+
+        let structured = result.structured_content.as_ref().unwrap();
+        let resolution = &structured["scope_resolution"];
+        assert_eq!(
+            resolution["status"],
+            "project_unresolved_folder_not_readable"
+        );
+        assert_eq!(resolution["project_created"], false);
+        assert_eq!(
+            resolution["candidates"][0]["project_id"],
+            contextcode.to_string()
+        );
+        assert!(resolution["next_steps"]["repository"]["then"]
+            .as_str()
+            .unwrap()
+            .contains("repository_url="));
+        assert!(structured["project_routing"]["suggested_action"]
+            .as_str()
+            .unwrap()
+            .contains("remote get-url origin"));
+    }
+
+    #[tokio::test]
+    async fn hosted_init_leaves_the_question_to_the_api_when_it_names_candidates() {
+        let workspace_id = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        // Two projects hold the repository the folder is named after. The
+        // gateway picks neither; the API answers with both.
+        let projects = vec![
+            project_with_repository(
+                first,
+                workspace_id,
+                "contextcode",
+                "https://github.com/contextstream/contextcode",
+            ),
+            project_with_repository(
+                second,
+                workspace_id,
+                "contextcode-old",
+                "git@github.com:contextstream/contextcode.git",
+            ),
+        ];
+        let listed = projects.clone();
+        let mock = ScopeMock::spawn(move |line, _| {
+            if line.starts_with("POST /api/v1/session/init") {
+                let mut answer = unresolved_init_answer(workspace_id, RUNNER_CLONE);
+                answer["project_routing"] = json!({
+                    "status": "needs_project_selection",
+                    "reason": "no_active_project_with_matching_candidate",
+                    "current_workspace_id": workspace_id,
+                    "folder_path": RUNNER_CLONE,
+                    "project_switch_signal": false,
+                    "suggested_action": format!("Use project_id={first} for contextcode or confirm a different project."),
+                    "candidates": [
+                        {"project_id": first, "project_name": "contextcode", "score": 0.9, "match_reasons": ["folder_name_matches_repository_owner_repo"]},
+                        {"project_id": second, "project_name": "contextcode-old", "score": 0.9, "match_reasons": ["folder_name_matches_repository_owner_repo"]},
+                    ],
+                });
+                (200, answer)
+            } else if line.starts_with(&format!("GET /api/v1/workspaces/{workspace_id}")) {
+                (200, workspace_json(workspace_id, "Engineering"))
+            } else if line.starts_with("GET /api/v1/projects?") {
+                (200, project_page(listed.clone()))
+            } else {
+                (404, json!({"error": "not found"}))
+            }
+        })
+        .await;
+        let (client, session) = mock.hosted_client_and_session();
+
+        let result = InitTool::new(client, session)
+            .execute(hosted_init_input(workspace_id))
+            .await
+            .expect("init");
+
+        let bodies = mock.init_bodies();
+        assert!(bodies[0].get("project_id").is_none(), "{}", bodies[0]);
+        assert_eq!(bodies[0]["skip_project_creation"], true);
+        let text = text_of(&result);
+        assert!(text.contains("[PROJECT_ROUTING]"), "{text}");
+        assert!(text.contains(&first.to_string()), "{text}");
+        assert!(
+            !text.contains("[SCOPE_RESOLUTION]"),
+            "the API's candidates are the question to answer: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_init_with_a_repository_url_leaves_resolution_to_the_api() {
+        let workspace_id = Uuid::new_v4();
+        let mock = workspace_mock(workspace_id, Vec::new()).await;
+        let (client, session) = mock.hosted_client_and_session();
+
+        let mut input = hosted_init_input(workspace_id);
+        input["repository_url"] = json!("git@github.com:contextstream/contextcode.git");
+        InitTool::new(client, session)
+            .execute(input)
+            .await
+            .expect("init");
+
+        let bodies = mock.init_bodies();
+        assert_eq!(
+            bodies[0]["repository_url"],
+            "https://github.com/contextstream/contextcode.git"
+        );
+        assert!(
+            bodies[0].get("skip_project_creation").is_none(),
+            "a repository identity is enough for the API to adopt or register: {}",
+            bodies[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_init_with_a_project_id_is_sent_as_given() {
+        let workspace_id = Uuid::new_v4();
+        let contextcode = Uuid::new_v4();
+        let mock = workspace_mock(
+            workspace_id,
+            vec![project_json(contextcode, workspace_id, "contextcode")],
+        )
+        .await;
+        let (client, session) = mock.hosted_client_and_session();
+
+        let mut input = hosted_init_input(workspace_id);
+        input["project_id"] = json!(contextcode);
+        let result = InitTool::new(client, session)
+            .execute(input)
+            .await
+            .expect("init");
+
+        let bodies = mock.init_bodies();
+        assert_eq!(bodies[0]["project_id"], contextcode.to_string());
+        assert!(
+            bodies[0].get("skip_project_creation").is_none(),
+            "{}",
+            bodies[0]
+        );
+        assert!(!text_of(&result).contains("[SCOPE_RESOLUTION]"));
+    }
+
+    #[tokio::test]
+    async fn hosted_init_creates_for_an_unreadable_folder_only_when_asked_to() {
+        let workspace_id = Uuid::new_v4();
+        let mock = workspace_mock(workspace_id, Vec::new()).await;
+        let (client, session) = mock.hosted_client_and_session();
+
+        let mut input = hosted_init_input(workspace_id);
+        input["skip_project_creation"] = json!(false);
+        let result = InitTool::new(client, session)
+            .execute(input)
+            .await
+            .expect("init");
+
+        assert_eq!(mock.init_bodies()[0]["skip_project_creation"], false);
+        assert!(
+            !text_of(&result).contains("[SCOPE_RESOLUTION]"),
+            "the caller decided; no notice about withheld creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_init_on_a_readable_new_folder_may_still_become_a_project() {
+        let workspace_id = Uuid::new_v4();
+        let mock = workspace_mock(workspace_id, Vec::new()).await;
+        let (client, session) = mock.client_and_session();
+        let parent = tempfile::tempdir().expect("tempdir");
+        let folder = parent.path().join("acme-billing");
+        std::fs::create_dir_all(&folder).expect("folder");
+
+        let mut input = hosted_init_input(workspace_id);
+        input["folder_path"] = json!(folder.to_string_lossy());
+        let result = InitTool::new(client, session)
+            .execute(input)
+            .await
+            .expect("init");
+
+        assert!(
+            mock.init_bodies()[0].get("skip_project_creation").is_none(),
+            "zero-touch first open is unchanged for a folder this server can read: {}",
+            mock.init_bodies()[0]
+        );
+        assert!(!text_of(&result).contains("[SCOPE_RESOLUTION]"));
+    }
+
+    #[tokio::test]
+    async fn local_init_on_a_folder_that_is_not_on_this_machine_creates_nothing() {
+        let workspace_id = Uuid::new_v4();
+        let mock = workspace_mock(workspace_id, Vec::new()).await;
+        let (client, session) = mock.client_and_session();
+
+        let result = InitTool::new(client, session)
+            .execute(hosted_init_input(workspace_id))
+            .await
+            .expect("init");
+
+        assert_eq!(mock.init_bodies()[0]["skip_project_creation"], true);
+        assert!(text_of(&result).contains("[SCOPE_RESOLUTION]"));
     }
 }
 

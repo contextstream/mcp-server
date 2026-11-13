@@ -894,3 +894,108 @@ fn classify_reads_the_listed_tools_and_no_other() {
     ));
     assert_eq!(ANSWERS_READ, &["init", "progress", "entity"]);
 }
+
+/// What the hosted gateway answers when it sent a report that named no run on
+/// to the session's one open run: by the run's id, so without a key.
+fn sent_on_by_id(state: &str, liveness: &str) -> Value {
+    let mut answer = answer(&ticket_key(), state);
+    answer.as_object_mut().unwrap().remove("run_key");
+    answer["run"]["liveness"] = json!(liveness);
+    answer
+}
+
+#[test]
+fn a_report_the_gateway_sent_on_lands_on_the_run_the_hooks_started_and_its_end_stands() {
+    let mut file = known();
+    file.ticket_changed(
+        &main_agent(),
+        &ticket("in_progress"),
+        &Scope::default(),
+        1_000,
+    );
+    take(&mut file);
+    // The model asks a person, naming no run: no second run is kept.
+    file.model_reported(
+        &json!({"waiting": {"on": "person", "question": "Close it?"}}),
+        &sent_on_by_id("waiting_input", "waiting"),
+        &Scope::default(),
+        2_000,
+    );
+    assert_eq!(file.runs.len(), 1);
+    assert_eq!(file.runs[0].run_id.as_deref(), Some(RUN));
+    assert_eq!(file.runs[0].key, Some(ticket_key()));
+    // The model said what the run waits on: the turn's end adds nothing.
+    file.turn_ended(3_000);
+    assert!(take(&mut file).is_empty());
+    // The model's own last word ends the run: moving the ticket on, a new
+    // prompt and the turn's end send nothing over it.
+    file.model_reported(
+        &json!({"status": "completed", "summary": "Done."}),
+        &sent_on_by_id("finished", "ended"),
+        &Scope::default(),
+        4_000,
+    );
+    assert!(file.runs.is_empty());
+    file.ticket_changed(&main_agent(), &ticket("closed"), &Scope::default(), 5_000);
+    file.prompt_submitted(6_000);
+    file.turn_ended(7_000);
+    assert!(take(&mut file).is_empty());
+}
+
+#[test]
+fn a_report_that_named_no_run_is_never_guessed_onto_another_run() {
+    let other_ticket = "55555555-5555-4555-8555-555555555555";
+    // The run the answer names is on another ticket.
+    let mut file = known();
+    file.ticket_changed(
+        &main_agent(),
+        &ticket("in_progress"),
+        &Scope::default(),
+        1_000,
+    );
+    let mut elsewhere = sent_on_by_id("working", "live");
+    elsewhere["run"]["scope"]["ticket_id"] = json!(other_ticket);
+    file.model_reported(
+        &json!({"step": "Reading"}),
+        &elsewhere,
+        &Scope::default(),
+        2_000,
+    );
+    assert_eq!(file.runs.len(), 2);
+    assert!(file.runs[0].run_id.is_none());
+    // The report named its run: it is matched by that, never by this rule.
+    let mut file = known();
+    file.ticket_changed(
+        &main_agent(),
+        &ticket("in_progress"),
+        &Scope::default(),
+        1_000,
+    );
+    file.model_reported(
+        &json!({"step": "Reading", "run_key": "my-own-run"}),
+        &sent_on_by_id("working", "live"),
+        &Scope::default(),
+        2_000,
+    );
+    assert_eq!(file.runs.len(), 2);
+    assert!(file.runs[0].run_id.is_none());
+    // Two runs of the session's own: which one is not guessed.
+    let mut file = known();
+    file.ticket_changed(
+        &main_agent(),
+        &ticket("in_progress"),
+        &Scope::default(),
+        1_000,
+    );
+    let mut second = ticket("in_progress");
+    second["id"] = json!(other_ticket);
+    file.ticket_changed(&main_agent(), &second, &Scope::default(), 1_500);
+    file.model_reported(
+        &json!({"step": "Reading"}),
+        &sent_on_by_id("working", "live"),
+        &Scope::default(),
+        2_000,
+    );
+    assert_eq!(file.runs.len(), 3);
+    assert!(file.runs[..2].iter().all(|run| run.run_id.is_none()));
+}

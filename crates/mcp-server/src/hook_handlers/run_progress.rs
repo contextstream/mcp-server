@@ -563,9 +563,13 @@ impl SessionFile {
         );
         let run_id = uuid_text(view, "run_id");
         let key = text(answer, "run_key");
-        let found = self.runs.iter().position(|run| {
-            (key.is_some() && run.key == key) || (run_id.is_some() && run.run_id == run_id)
-        });
+        let found = self
+            .runs
+            .iter()
+            .position(|run| {
+                (key.is_some() && run.key == key) || (run_id.is_some() && run.run_id == run_id)
+            })
+            .or_else(|| self.sole_own_run(input, view, run_id.as_deref()));
         let found_by_key = found.is_some_and(|index| key.is_some() && self.runs[index].key == key);
         let status = text(input, "status").unwrap_or_default();
         let ended = TERMINAL.contains(&status.as_str())
@@ -633,6 +637,39 @@ impl SessionFile {
         }
         // The model's word is the run's state now.
         run.hook_waiting = false;
+    }
+
+    /// A report that named no run went to the session's one open run. The
+    /// hosted gateway sends it there by the run's id and cannot know the key
+    /// the hooks opened it under (a ticket's take-up), so its answer names no
+    /// key: when the hooks keep exactly one run of the session's own, on the
+    /// same ticket and with no other id, that is the run.
+    fn sole_own_run(&self, input: &Value, view: &Value, run_id: Option<&str>) -> Option<usize> {
+        let named = ["run_key", "ticket_id", "run_id"].iter().any(|field| {
+            input
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+        if named {
+            return None;
+        }
+        let ticket = view
+            .get("scope")
+            .and_then(|scope| uuid_text(scope, "ticket_id"));
+        let mut own = self
+            .runs
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| run.owner.is_none());
+        let (index, run) = own.next()?;
+        if own.next().is_some() || run.ticket_id != ticket {
+            return None;
+        }
+        if run.run_id.is_some() && run.run_id.as_deref() != run_id {
+            return None;
+        }
+        Some(index)
     }
 
     /// The model called `progress` and the answer came in words (a local

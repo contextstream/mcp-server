@@ -1674,6 +1674,7 @@ async fn on_the_hosted_gateway_a_report_that_names_no_run_goes_to_the_sessions_o
     assert!(report.get("source_run_id").is_none(), "{report}");
     assert_eq!(report["status"], "waiting_input");
     assert!(text.contains(SENT_ON), "{text}");
+    assert_eq!(answer["notes"], json!([SENT_ON]), "{answer}");
     assert!(answer.get("run_key").is_none(), "{answer}");
     assert!(answer["session"].as_str().unwrap().starts_with("s-"));
 }
@@ -1688,6 +1689,7 @@ async fn on_the_hosted_gateway_none_or_several_open_runs_mean_the_default_run() 
         assert!(report.get("run_id").is_none(), "{report}");
         assert!(!text.contains(SENT_ON), "{text}");
     };
+    let no_notes = |answer: &Value| assert!(answer.get("notes").is_none(), "{answer}");
     // None of this session's.
     let nobody = |_: &str| vec!["claude-code:0badc0de".to_string()];
     let HostedReport {
@@ -1697,6 +1699,7 @@ async fn on_the_hosted_gateway_none_or_several_open_runs_mean_the_default_run() 
         ..
     } = hosted_report(&fixture, Some(TOKEN_A), Some(&nobody), step()).await;
     default_run(&report, &text);
+    no_notes(&answer);
     assert_eq!(answer["run_key"], report["source_run_id"]);
     // Two of this session's.
     let two = |me: &str| vec![me.to_string(), me.to_string()];

@@ -326,6 +326,11 @@ impl ProgressTool {
                     if !report.by_run_id {
                         fields.insert("run_key".into(), json!(report.run_key));
                     }
+                    // A client that shows the structured answer (the hosted
+                    // gateway's) says what the text says.
+                    if !report.notes.is_empty() {
+                        fields.insert("notes".into(), json!(report.notes));
+                    }
                 }
                 let run_id = answer
                     .pointer("/run/run_id")

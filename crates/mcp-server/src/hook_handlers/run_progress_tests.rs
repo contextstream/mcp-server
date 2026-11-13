@@ -857,7 +857,7 @@ fn a_local_server_answers_in_words_and_the_hooks_still_follow() {
 /// editor (1.0.77: `progress` and `entity`).
 #[test]
 fn classify_reads_the_listed_tools_and_no_other() {
-    let report = json!({"run": {"run_id": "0b0e4f8e-9c55-4f0e-8a51-5a3f0f1d2c3b"}});
+    let report = json!({"run": {"run_id": "11111111-1111-4111-8111-111111111111"}});
     let answer = Answer {
         succeeded: true,
         json: Some(&report),
@@ -881,7 +881,7 @@ fn classify_reads_the_listed_tools_and_no_other() {
         classify("init", &json!({}), &answer),
         Some(Finding::Identity { .. })
     ));
-    let ticket = json!({"id": "0b0e4f8e-9c55-4f0e-8a51-5a3f0f1d2c3b", "status": "in_progress"});
+    let ticket = json!({"id": "11111111-1111-4111-8111-111111111111", "status": "in_progress"});
     let answer = Answer {
         succeeded: true,
         json: Some(&ticket),

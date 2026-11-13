@@ -998,4 +998,16 @@ fn a_report_that_named_no_run_is_never_guessed_onto_another_run() {
     );
     assert_eq!(file.runs.len(), 3);
     assert!(file.runs[..2].iter().all(|run| run.run_id.is_none()));
+    // No run of its own: the hooks follow the run the server named, by its
+    // id, as for any report of the model's, and claim no key for it.
+    let mut file = known();
+    file.model_reported(
+        &json!({"step": "Reading"}),
+        &sent_on_by_id("working", "live"),
+        &Scope::default(),
+        2_000,
+    );
+    assert_eq!(file.runs.len(), 1);
+    assert_eq!(file.runs[0].run_id.as_deref(), Some(RUN));
+    assert!(file.runs[0].key.is_none());
 }

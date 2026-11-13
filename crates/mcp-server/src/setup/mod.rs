@@ -1388,6 +1388,7 @@ pub async fn update_hooks_scoped(
         // Each installer removes only exact managed entries in memory and
         // commits once. Avoiding an uninstall/install pair preserves the
         // original recovery backup and makes refreshes true no-ops.
+        let registered_before = hooks::registered_hooks_text(editor);
         match hooks::install_hooks_with_note(editor, None) {
             Ok(note) => {
                 let name = editor.display_name();
@@ -1398,6 +1399,20 @@ pub async fn update_hooks_scoped(
                         format!("Hooks would be updated for {name}"),
                     )
                 );
+                // A refresh that rewrote what the editor reads says so: an
+                // install from an earlier version gets registrations it
+                // lacked (1.0.77 left live progress's tools out of one).
+                if registered_before.is_some()
+                    && hooks::registered_hooks_text(editor) != registered_before
+                {
+                    refresh_note!(
+                        "{}    {}",
+                        ui::GUTTER,
+                        ui::ui().faint(
+                            "Hook registrations changed: sessions started from now on use them."
+                        )
+                    );
+                }
                 if let Some(guidance) = note {
                     refresh_note!("{}    {}", ui::GUTTER, ui::ui().faint(&guidance));
                 }

@@ -1464,6 +1464,16 @@ fn validate_antigravity_hooks(value: &Value) -> std::result::Result<usize, Strin
     Ok(ANTIGRAVITY_HOOK_SPECS.len())
 }
 
+/// The text of the file an editor reads its hook registrations from, for a
+/// caller that says whether a refresh changed it (Claude Code's
+/// `settings.json`; `None` for the other editors and when there is no file).
+pub(super) fn registered_hooks_text(editor: &Editor) -> Option<String> {
+    match editor {
+        Editor::ClaudeCode => std::fs::read_to_string(claude_code_settings_path()?).ok(),
+        _ => None,
+    }
+}
+
 /// Get Claude Code settings.json path.
 fn claude_code_settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
@@ -1724,6 +1734,27 @@ struct ClaudeHookSpec {
     timeout: u64,
 }
 
+impl ClaudeHookSpec {
+    /// The matcher setup writes for this hook. For the PostToolUse hook that is
+    /// `matcher` plus every ContextStream tool whose answer the hooks read
+    /// (`run_progress::ANSWERS_READ`), from that one list: a tool the hook
+    /// code handles cannot be missing from what setup writes.
+    fn full_matcher(&self) -> Option<String> {
+        let base = self.matcher?;
+        if self.event != ClaudeHookEvent::PostToolUse || self.hook_name != "post-tool-use" {
+            return Some(base.to_string());
+        }
+        let mut names: Vec<String> = base.split('|').map(str::to_string).collect();
+        for tool in crate::hook_handlers::run_progress::ANSWERS_READ {
+            let name = crate::hook_handlers::run_progress::claude_tool_name(tool);
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        Some(names.join("|"))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct JsonHookSpec {
     event: &'static str,
@@ -1742,11 +1773,13 @@ const CLAUDE_HOOK_SPECS: &[ClaudeHookSpec] = &[
     },
     ClaudeHookSpec {
         event: ClaudeHookEvent::PostToolUse,
-        // Observe successful quick-start context and session ground calls as
-        // well as init so hosted transports can persist local session state.
-        // ExitPlanMode saves the approved plan-mode plan to ContextStream.
+        // Observe successful quick-start context and session ground calls so
+        // hosted transports can persist local session state. ExitPlanMode
+        // saves the approved plan-mode plan to ContextStream. The tools whose
+        // answers live progress reads (init among them) are not written here:
+        // `ClaudeHookSpec::full_matcher` adds them from the hooks' own list.
         matcher: Some(
-            "Edit|Write|NotebookEdit|ExitPlanMode|mcp__contextstream__init|mcp__contextstream__context|mcp__contextstream__session|mcp__contextstream__project",
+            "Edit|Write|NotebookEdit|ExitPlanMode|mcp__contextstream__context|mcp__contextstream__session|mcp__contextstream__project",
         ),
         hook_name: "post-tool-use",
         timeout: 10,
@@ -2229,7 +2262,7 @@ fn push_claude_hook(
     windows: bool,
 ) {
     let entry = HookEntry {
-        matcher: spec.matcher.map(str::to_string),
+        matcher: spec.full_matcher(),
         hooks: vec![claude_hook_handler_for_platform(
             binary,
             spec.hook_name,
@@ -2841,7 +2874,8 @@ fn validate_claude_hook_specs_for_platform(
                 entries
                     .iter()
                     .filter(|entry| {
-                        entry.get("matcher").and_then(Value::as_str) == spec.matcher
+                        entry.get("matcher").and_then(Value::as_str)
+                            == spec.full_matcher().as_deref()
                             && entry.get("hooks").and_then(Value::as_array).is_some_and(
                                 |commands| {
                                     commands.iter().any(|command| {
@@ -3940,6 +3974,81 @@ mod tests {
         ("Elicitation", "elicitation", Some(".*")),
         ("ElicitationResult", "elicitation-result", Some(".*")),
     ];
+
+    /// 1.0.77 wrote a PostToolUse matcher without `progress` and `entity`: in a
+    /// real Claude Code session their answers never reached the hook, and with
+    /// live progress switched on the hooks learned no run. The matcher is now
+    /// built from the hooks' own list, so this fails when a tool the hooks
+    /// read is missing from what setup writes.
+    #[test]
+    fn the_post_tool_use_matcher_setup_writes_names_every_tool_whose_answer_the_hooks_read() {
+        use crate::hook_handlers::durable_paths::post_tool_use_hook_matches;
+        use crate::hook_handlers::run_progress::{claude_tool_name, ANSWERS_READ};
+
+        let settings = json!({
+            "hooks": serde_json::to_value(generate_contextstream_hooks(None)).unwrap()
+        });
+        for tool in ANSWERS_READ {
+            assert!(
+                post_tool_use_hook_matches(&settings, &claude_tool_name(tool)),
+                "the hooks read the answer of {tool}, and setup's PostToolUse matcher does not name it"
+            );
+        }
+        for tool in ["init", "progress", "entity"] {
+            assert!(
+                ANSWERS_READ.contains(&tool),
+                "live progress reads the answer of {tool}"
+            );
+        }
+        // What the hook was registered for before stays registered.
+        for name in [
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "ExitPlanMode",
+            "mcp__contextstream__context",
+            "mcp__contextstream__session",
+            "mcp__contextstream__project",
+        ] {
+            assert!(post_tool_use_hook_matches(&settings, name), "{name}");
+        }
+        // And it is not registered for every tool of the server.
+        assert!(!post_tool_use_hook_matches(
+            &settings,
+            "mcp__contextstream__search"
+        ));
+    }
+
+    /// `update-hooks` rewrites a registration that is not the current one: an
+    /// install carrying 1.0.77's matcher must read as stale.
+    #[test]
+    fn an_install_with_the_1_0_77_post_tool_use_matcher_reads_as_stale() {
+        let current = json!({
+            "hooks": serde_json::to_value(generate_contextstream_hooks(None)).unwrap()
+        });
+        assert!(
+            validate_managed_hook_config(&Editor::ClaudeCode, &current).is_ok(),
+            "what setup writes now is current"
+        );
+        let mut old = current.clone();
+        let mut swapped = 0;
+        for entry in old["hooks"]["PostToolUse"].as_array_mut().unwrap() {
+            if entry["matcher"]
+                .as_str()
+                .is_some_and(|matcher| matcher.contains("mcp__contextstream__progress"))
+            {
+                entry["matcher"] = json!(
+                    "Edit|Write|NotebookEdit|ExitPlanMode|mcp__contextstream__init|mcp__contextstream__context|mcp__contextstream__session|mcp__contextstream__project"
+                );
+                swapped += 1;
+            }
+        }
+        assert_eq!(swapped, 1, "one PostToolUse entry carries the tools");
+        assert!(
+            validate_managed_hook_config(&Editor::ClaudeCode, &old).is_err(),
+            "1.0.77's matcher must read as stale, so update-hooks rewrites it"
+        );
+    }
 
     #[test]
     fn update_hooks_removes_previously_installed_no_op_entries_but_keeps_user_hooks() {

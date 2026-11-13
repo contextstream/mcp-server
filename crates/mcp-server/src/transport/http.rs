@@ -3764,6 +3764,10 @@ pub async fn auth_middleware(
         jwt_subject.as_deref(),
         auth.as_ref().and_then(|a| a.api_key.as_deref()),
     );
+    // A client on the stateless contract can name its connection (see
+    // `mcp_client::client_session`). Untrusted input: a value of any other
+    // shape is ignored, and no tool uses it without the caller's identity.
+    let client_session = client_session_from_headers(&headers);
 
     // Wrap handler execution with per-request auth, config, and session-
     // identity context. SessionManager reads the session key via
@@ -3817,15 +3821,21 @@ pub async fn auth_middleware(
             None => exec_with_caller_cache().await,
         }
     };
+    let exec_with_client_session = || async move {
+        match client_session {
+            Some(token) => mcp_client::client_session::run_with(token, exec_with_session).await,
+            None => exec_with_session().await,
+        }
+    };
     // The edge's view of the caller's location rides every API call made for
     // this request, and the tenant home the API names on those calls comes
     // back on this response so the Cloudflare MCP gateway can remember it.
     let (mut response, tenant_home) = mcp_client::run_capturing_tenant_home(|| async move {
         match edge_geography {
             Some(geography) => {
-                mcp_client::run_with_edge_geography(geography, exec_with_session).await
+                mcp_client::run_with_edge_geography(geography, exec_with_client_session).await
             }
-            None => exec_with_session().await,
+            None => exec_with_client_session().await,
         }
     })
     .await;
@@ -3834,6 +3844,70 @@ pub async fn auth_middleware(
         state.session.discard_transient_state(&key);
     }
     Ok(response)
+}
+
+/// The token a client sent to name its connection, when it has the one shape
+/// the gateway accepts (`mcp_client::client_session::accepted`).
+fn client_session_from_headers(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(mcp_client::client_session::HEADER_LOWERCASE)?
+        .to_str()
+        .ok()?;
+    mcp_client::client_session::accepted(raw).map(str::to_string)
+}
+
+#[cfg(test)]
+mod client_session_header_tests {
+    use super::{client_session_from_headers, HeaderMap};
+    use mcp_client::client_session::{HEADER, HEADER_LOWERCASE};
+
+    fn sent(value: &[u8]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_LOWERCASE,
+            axum::http::HeaderValue::from_bytes(value).expect("a header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn a_well_formed_token_is_read_whatever_the_case_of_the_header_name() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            client_session_from_headers(&sent(token.as_bytes())).as_deref(),
+            Some(token)
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_bytes(HEADER.as_bytes()).expect("a header name"),
+            token.parse().expect("a header value"),
+        );
+        assert_eq!(
+            client_session_from_headers(&headers).as_deref(),
+            Some(token)
+        );
+    }
+
+    #[test]
+    fn anything_else_is_ignored_as_if_no_header_had_been_sent() {
+        assert_eq!(client_session_from_headers(&HeaderMap::new()), None);
+        for refused in [
+            &b""[..],
+            b"0123456789abcdef0123456789abcde",
+            b"0123456789abcdef0123456789abcdef0",
+            b"0123456789ABCDEF0123456789ABCDEF",
+            b"0123456789abcdef0123456789abcdeg",
+            b"0123456789abcdef 123456789abcdef",
+            b"0123456789abcdef0123456789abcd\xff\xfe",
+            b"c-0123456789abcdef0123456789abcd",
+        ] {
+            assert_eq!(
+                client_session_from_headers(&sent(refused)),
+                None,
+                "{refused:?}"
+            );
+        }
+    }
 }
 
 /// Name of the response header the API sets once a request identified its

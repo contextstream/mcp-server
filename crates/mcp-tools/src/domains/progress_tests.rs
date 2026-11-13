@@ -1011,8 +1011,15 @@ async fn the_hosted_gateway_runs_no_timer_and_tells_the_api_to_expect_a_longer_s
     .expect("report");
     assert!(text_of(&result).starts_with("[PROGRESS] Recorded: step."));
     tokio::time::sleep(Duration::from_millis(120)).await;
-    let requests = api.requests();
-    assert_eq!(requests.len(), 1, "no background request: {requests:?}");
+    // The call named no run, so the session's open runs were read first (the
+    // mock has none to show); then the report, and nothing after it.
+    let all = api.requests();
+    assert_eq!(all.len(), 2, "no background request: {all:?}");
+    assert!(
+        all[0].target.starts_with("/api/v1/run-progress/runs?"),
+        "{all:?}"
+    );
+    let requests = &all[1..];
     assert_eq!(requests[0].body["heartbeat_s"], 120);
     let run_key = requests[0].body["source_run_id"].as_str().expect("run key");
     assert!(run_key.starts_with("s-"), "{run_key}");
@@ -1029,7 +1036,7 @@ async fn the_hosted_gateway_runs_no_timer_and_tells_the_api_to_expect_a_longer_s
         "{}",
         text_of(&read)
     );
-    assert_eq!(api.requests().len(), 1, "{:?}", api.requests());
+    assert_eq!(api.requests().len(), 2, "{:?}", api.requests());
 }
 
 // ============================================================================
@@ -1353,4 +1360,432 @@ fn a_report_is_labelled_for_the_write_latency_histogram_and_a_read_is_not() {
             "{arguments}"
         );
     }
+}
+
+// ============================================================================
+// One session, one agent; a report that names no run
+// ============================================================================
+
+const TOKEN_A: &str = "0123456789abcdef0123456789abcdef";
+const TOKEN_B: &str = "fedcba9876543210fedcba9876543210";
+
+/// Run `work` as the hosted gateway runs a request of `caller` that carried
+/// `token` in the header that names a connection.
+async fn hosted<T, F, Fut>(caller: Option<&str>, token: Option<&str>, work: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let caller = caller.map(str::to_string);
+    let as_caller = || async move {
+        match caller {
+            Some(caller) => mcp_client::run_with_caller_cache_identity(caller, work).await,
+            None => work().await,
+        }
+    };
+    match token {
+        Some(token) => mcp_client::client_session::run_with(token.to_string(), as_caller).await,
+        None => as_caller().await,
+    }
+}
+
+async fn hosted_part(caller: Option<&str>, token: Option<&str>) -> String {
+    hosted(caller, token, || async { session_part(true) }).await
+}
+
+#[tokio::test]
+async fn a_stateless_client_that_names_its_connection_is_one_session_per_connection() {
+    let one = hosted_part(Some("key-1"), Some(TOKEN_A)).await;
+    assert!(one.starts_with("s-"), "{one}");
+    assert_eq!(one.len(), 18);
+    assert!(!one.contains(&TOKEN_A[..8]), "{one}");
+    // The same connection is the same session on every request.
+    assert_eq!(one, hosted_part(Some("key-1"), Some(TOKEN_A)).await);
+    // Two connections of one key are two sessions, and two agents.
+    let two = hosted_part(Some("key-1"), Some(TOKEN_B)).await;
+    assert_ne!(one, two);
+    let agent = |part: &str| agent_identity(None, Some("claude-code".to_string()), part);
+    assert_ne!(agent(&one)["id"], agent(&two)["id"]);
+    assert_ne!(agent(&one)["name"], agent(&two)["name"]);
+    // The token alone names nothing: under another key it is another session,
+    // so no key can reach a session of another by choosing its token.
+    assert_ne!(one, hosted_part(Some("key-2"), Some(TOKEN_A)).await);
+    // Without a caller the token is not used at all.
+    assert_eq!(hosted_part(None, Some(TOKEN_A)).await, "mcp");
+    // A request without the header is named exactly as before.
+    let by_key = hosted_part(Some("key-1"), None).await;
+    assert!(by_key.starts_with("c-"), "{by_key}");
+    assert_eq!(
+        by_key,
+        mcp_client::run_with_caller_cache_identity("key-1".to_string(), || async {
+            session_part(true)
+        })
+        .await
+    );
+    assert_ne!(by_key[2..], one[2..]);
+    // A transport that has a session id of its own is named by that, as before.
+    let by_transport = mcp_client::run_with_mcp_session_id("mcp-session-1".to_string(), || {
+        hosted_part(Some("key-1"), Some(TOKEN_A))
+    })
+    .await;
+    let transport_alone =
+        mcp_client::run_with_mcp_session_id("mcp-session-1".to_string(), || async {
+            session_part(true)
+        })
+        .await;
+    assert_eq!(by_transport, transport_alone);
+}
+
+#[test]
+fn only_a_session_part_that_is_one_session_has_one_open_run() {
+    assert!(is_one_session("3f2b0c9a4d5e4f6a8b7c6d5e4f3a2b1c", false));
+    assert!(is_one_session("s-0123456789abcdef", true));
+    assert!(!is_one_session("c-0123456789abcdef", true));
+    assert!(!is_one_session("mcp", true));
+}
+
+#[test]
+fn a_report_names_a_run_by_its_ticket_or_its_key() {
+    assert!(names_no_run(&input(json!({"step": "Reading"}))));
+    assert!(names_no_run(&input(
+        json!({"step": "Reading", "run_key": "  ", "ticket_id": ""})
+    )));
+    assert!(!names_no_run(&input(json!({"run_key": "reviewer-2"}))));
+    assert!(!names_no_run(&input(json!({"ticket_id": Uuid::new_v4()}))));
+}
+
+#[tokio::test]
+async fn on_a_local_server_a_report_that_names_no_run_goes_to_the_one_open_run() {
+    let fixture = Fixture::new();
+    let api = Api::start(vec![(
+        "POST /api/v1/run-progress/report",
+        200,
+        fixture.answer("working", &[]),
+    )])
+    .await;
+    let tool = fixture.tool(&api.base_url).with_heartbeat(Heartbeat::None);
+    let sent = |index: usize| api.requests()[index].body.clone();
+
+    // The session takes up a ticket: one run is open.
+    tool.execute(json!({"step": "Reading the parser", "ticket_id": fixture.ticket}))
+        .await
+        .expect("report");
+    let on_ticket = sent(0)["source_run_id"]
+        .as_str()
+        .expect("a key")
+        .to_string();
+    assert!(
+        on_ticket.ends_with(&format!(":{}", fixture.ticket)),
+        "{on_ticket}"
+    );
+
+    // Its question names no run: it is that run's question, and the answer
+    // says where it went.
+    let result = tool
+        .execute(json!({"waiting": {"on": "person", "question": "Go ahead?"}}))
+        .await
+        .expect("report");
+    assert_eq!(sent(1)["source_run_id"], json!(on_ticket));
+    assert!(sent(1).get("run_id").is_none(), "{}", sent(1));
+    assert_eq!(sent(1)["status"], "waiting_input");
+    assert!(text_of(&result).contains(SENT_ON), "{}", text_of(&result));
+    assert_eq!(
+        result.structured_content.expect("structured")["run_key"],
+        json!(on_ticket)
+    );
+
+    // A report that names a run goes where it says, open run or not.
+    let other = Uuid::new_v4();
+    let result = tool
+        .execute(json!({"step": "Another ticket", "ticket_id": other}))
+        .await
+        .expect("report");
+    assert!(sent(2)["source_run_id"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!(":{other}")));
+    assert!(!text_of(&result).contains(SENT_ON));
+
+    // Two runs are open now: a report that names none goes to the session's
+    // default run, as it always did.
+    let result = tool
+        .execute(json!({"step": "Which one?"}))
+        .await
+        .expect("report");
+    assert!(sent(3)["source_run_id"]
+        .as_str()
+        .unwrap()
+        .ends_with(":session"));
+    assert!(!text_of(&result).contains(SENT_ON));
+}
+
+#[tokio::test]
+async fn on_a_local_server_no_open_run_means_the_default_run() {
+    let fixture = Fixture::new();
+    let api = Api::start(vec![(
+        "POST /api/v1/run-progress/report",
+        200,
+        fixture.answer("working", &[]),
+    )])
+    .await;
+    let tool = fixture.tool(&api.base_url).with_heartbeat(Heartbeat::None);
+    let key = |index: usize| {
+        api.requests()[index].body["source_run_id"]
+            .as_str()
+            .expect("a key")
+            .to_string()
+    };
+    // Nothing reported yet.
+    tool.execute(json!({"step": "Looking around"}))
+        .await
+        .expect("report");
+    assert!(key(0).ends_with(":session"), "{}", key(0));
+    // The default run is the one open run: the next goes there too, unsaid.
+    let result = tool
+        .execute(json!({"step": "Still looking"}))
+        .await
+        .expect("report");
+    assert_eq!(key(1), key(0));
+    assert!(!text_of(&result).contains(SENT_ON));
+    tool.execute(json!({"status": "completed", "summary": "Looked."}))
+        .await
+        .expect("finish");
+    assert_eq!(key(2), key(0));
+
+    // A ticket's run, opened and finished: nothing is open afterwards.
+    tool.execute(json!({"step": "Fixing", "ticket_id": fixture.ticket}))
+        .await
+        .expect("report");
+    tool.execute(json!({"status": "completed", "summary": "Fixed.", "ticket_id": fixture.ticket}))
+        .await
+        .expect("finish");
+    tool.execute(json!({"step": "Afterwards"}))
+        .await
+        .expect("report");
+    assert!(key(5).ends_with(":session"), "{}", key(5));
+}
+
+/// The open runs a mock API lists, each under `agent_id`, the first on a ticket.
+fn open_runs(fixture: &Fixture, agent_ids: &[&str]) -> Value {
+    let runs: Vec<Value> = agent_ids
+        .iter()
+        .enumerate()
+        .map(|(index, agent_id)| {
+            let mut view = fixture.view("working");
+            view["run_id"] = json!(Uuid::from_u128(index as u128 + 1));
+            view["agent"] = json!({"id": agent_id, "name": "Claude Code", "runtime": "mcp"});
+            view["scope"]["ticket_id"] = if index == 0 {
+                json!(fixture.ticket)
+            } else {
+                Value::Null
+            };
+            view
+        })
+        .collect();
+    json!({"success": true, "data": {"runs": runs}})
+}
+
+/// The agent ids of the workspace's open runs, given this session's own.
+type Listed<'a> = &'a dyn Fn(&str) -> Vec<String>;
+
+/// One report through the hosted gateway: the targets of the requests it
+/// made, the report's body, the answer's text and its structured part.
+struct HostedReport {
+    targets: Vec<String>,
+    report: Value,
+    text: String,
+    answer: Value,
+}
+
+/// What the hosted gateway sent for one report, when the API lists `listed`
+/// as the workspace's open runs (`None`: it cannot say).
+async fn hosted_report(
+    fixture: &Fixture,
+    token: Option<&str>,
+    listed: Option<Listed<'_>>,
+    arguments: Value,
+) -> HostedReport {
+    let me = hosted(Some("key-1"), token, || async {
+        agent_identity(
+            None,
+            crate::client_identity::current_client_name(),
+            &session_part(true),
+        )
+    })
+    .await;
+    let my_id = me["id"].as_str().expect("an agent id").to_string();
+    let mut routes = vec![(
+        "POST /api/v1/run-progress/report",
+        200,
+        fixture.answer("working", &["run.step"]),
+    )];
+    if let Some(listed) = listed {
+        let ids = listed(&my_id);
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        routes.push((
+            "GET /api/v1/run-progress/runs?",
+            200,
+            open_runs(fixture, &ids),
+        ));
+    }
+    let api = Api::start(routes).await;
+    let tool = fixture.hosted_tool(&api.base_url);
+    let result = hosted(Some("key-1"), token, || async {
+        tool.execute(arguments).await
+    })
+    .await
+    .expect("report");
+    let requests = api.requests();
+    let targets = requests.iter().map(|seen| seen.target.clone()).collect();
+    let report = requests.last().expect("the report").body.clone();
+    HostedReport {
+        targets,
+        report,
+        text: text_of(&result),
+        answer: result.structured_content.unwrap_or(Value::Null),
+    }
+}
+
+#[tokio::test]
+async fn on_the_hosted_gateway_a_report_that_names_no_run_goes_to_the_sessions_one_open_run() {
+    let fixture = Fixture::new();
+    // One open run of this session, and one of somebody else.
+    let listed = |me: &str| vec![me.to_string(), "claude-code:0badc0de".to_string()];
+    let HostedReport {
+        targets,
+        report,
+        text,
+        answer,
+    } = hosted_report(
+        &fixture,
+        Some(TOKEN_A),
+        Some(&listed),
+        json!({"waiting": {"on": "person", "question": "Go ahead?"}}),
+    )
+    .await;
+    assert_eq!(targets.len(), 2, "{targets:?}");
+    assert!(targets[0].contains("active=true"), "{targets:?}");
+    assert!(
+        targets[0].contains(&format!("workspace_id={}", fixture.workspace)),
+        "{targets:?}"
+    );
+    // Sent by the run's id: the gateway cannot know the key it was opened under.
+    assert_eq!(report["run_id"], json!(Uuid::from_u128(1)));
+    assert!(report.get("source_run_id").is_none(), "{report}");
+    assert_eq!(report["status"], "waiting_input");
+    assert!(text.contains(SENT_ON), "{text}");
+    assert!(answer.get("run_key").is_none(), "{answer}");
+    assert!(answer["session"].as_str().unwrap().starts_with("s-"));
+}
+
+#[tokio::test]
+async fn on_the_hosted_gateway_none_or_several_open_runs_mean_the_default_run() {
+    let fixture = Fixture::new();
+    let step = || json!({"step": "Running the tests"});
+    let default_run = |report: &Value, text: &str| {
+        let key = report["source_run_id"].as_str().expect("a key");
+        assert!(key.starts_with("s-") && key.ends_with(":session"), "{key}");
+        assert!(report.get("run_id").is_none(), "{report}");
+        assert!(!text.contains(SENT_ON), "{text}");
+    };
+    // None of this session's.
+    let nobody = |_: &str| vec!["claude-code:0badc0de".to_string()];
+    let HostedReport {
+        report,
+        text,
+        answer,
+        ..
+    } = hosted_report(&fixture, Some(TOKEN_A), Some(&nobody), step()).await;
+    default_run(&report, &text);
+    assert_eq!(answer["run_key"], report["source_run_id"]);
+    // Two of this session's.
+    let two = |me: &str| vec![me.to_string(), me.to_string()];
+    let HostedReport { report, text, .. } =
+        hosted_report(&fixture, Some(TOKEN_A), Some(&two), step()).await;
+    default_run(&report, &text);
+    // The API cannot say (an older API, or it is away): as before.
+    let HostedReport {
+        targets,
+        report,
+        text,
+        ..
+    } = hosted_report(&fixture, Some(TOKEN_A), None, step()).await;
+    assert_eq!(targets.len(), 2, "{targets:?}");
+    default_run(&report, &text);
+}
+
+#[tokio::test]
+async fn the_hosted_gateway_asks_for_open_runs_only_when_it_could_use_the_answer() {
+    let fixture = Fixture::new();
+    let mine = |me: &str| vec![me.to_string()];
+    // A client that names no connection is every session of its key: its
+    // one open run may be another session's. Nothing is read, nothing moves.
+    let HostedReport {
+        targets,
+        report,
+        text,
+        ..
+    } = hosted_report(
+        &fixture,
+        None,
+        Some(&mine),
+        json!({"step": "Running the tests"}),
+    )
+    .await;
+    assert_eq!(targets, ["/api/v1/run-progress/report"]);
+    let key = report["source_run_id"].as_str().expect("a key");
+    assert!(key.starts_with("c-") && key.ends_with(":session"), "{key}");
+    assert!(!text.contains(SENT_ON));
+    // A report that names its run is sent there, unread.
+    let HostedReport {
+        targets, report, ..
+    } = hosted_report(
+        &fixture,
+        Some(TOKEN_A),
+        Some(&mine),
+        json!({"step": "Running the tests", "ticket_id": fixture.ticket}),
+    )
+    .await;
+    assert_eq!(targets, ["/api/v1/run-progress/report"]);
+    assert!(report["source_run_id"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!(":{}", fixture.ticket)));
+    let HostedReport {
+        targets, report, ..
+    } = hosted_report(
+        &fixture,
+        Some(TOKEN_A),
+        Some(&mine),
+        json!({"step": "Running the tests", "run_key": "reviewer-2"}),
+    )
+    .await;
+    assert_eq!(targets, ["/api/v1/run-progress/report"]);
+    assert_eq!(report["source_run_id"], "reviewer-2");
+}
+
+#[test]
+fn a_report_sent_on_says_so_only_when_it_went_somewhere_else() {
+    let fixture = Fixture::new();
+    let mut report = report_of(&fixture, json!({"step": "Reading"}));
+    let default_key = report.run_key.clone();
+    report.address(RunTarget::Key(default_key.clone()));
+    assert_eq!(report.run_key, default_key);
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    assert!(!report.by_run_id);
+
+    report.address(RunTarget::Key("sess:another".to_string()));
+    assert_eq!(report.run_key, "sess:another");
+    assert_eq!(report.body["source_run_id"], "sess:another");
+    assert_eq!(report.notes, [SENT_ON]);
+
+    let mut report = report_of(&fixture, json!({"step": "Reading"}));
+    report.address(RunTarget::Id {
+        run_id: fixture.run.to_string(),
+        on_a_ticket: false,
+    });
+    assert!(report.by_run_id);
+    assert_eq!(report.body["run_id"], json!(fixture.run));
+    assert!(report.body.get("source_run_id").is_none());
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
 }

@@ -1158,6 +1158,96 @@ fn apply_managed_config_metadata(
                 .or_insert_with(|| json!(profile));
         }
     }
+
+    apply_session_headers_helper(editor, server);
+}
+
+/// The entry field Claude Code reads a command from when it connects to a
+/// remote server; it adds the headers the command prints to the entry's own.
+const HEADERS_HELPER_FIELD: &str = "headersHelper";
+
+/// Claude Code's hosted entry runs `contextstream-mcp hook mcp-headers` when
+/// it connects: the command prints one header with a random id, so the
+/// hosted server can tell one session of a person from another (Claude Code
+/// speaks the stateless MCP contract and says nothing else about a session).
+/// If the command is missing or fails, Claude Code connects with the entry's
+/// own headers, as it did before this field existed.
+///
+/// Only ContextStream's own line is written or replaced. A helper a person
+/// put there is theirs and stays, and an entry that is not hosted loses
+/// ours. No other editor gets the field.
+fn apply_session_headers_helper(editor: &Editor, server: &mut Value) {
+    if !matches!(editor, Editor::ClaudeCode) {
+        return;
+    }
+    let Some(entry) = server.as_object_mut() else {
+        return;
+    };
+    let present = entry.contains_key(HEADERS_HELPER_FIELD);
+    let ours = entry
+        .get(HEADERS_HELPER_FIELD)
+        .and_then(Value::as_str)
+        .is_some_and(is_managed_headers_helper);
+    let hosted =
+        entry.get("type").and_then(Value::as_str) == Some("http") && entry.contains_key("url");
+    if !hosted {
+        if ours {
+            entry.remove(HEADERS_HELPER_FIELD);
+        }
+        return;
+    }
+    if present && !ours {
+        return;
+    }
+    entry.insert(
+        HEADERS_HELPER_FIELD.to_string(),
+        json!(headers_helper_line(
+            &super::hooks::managed_binary_path().to_string_lossy(),
+            cfg!(windows),
+        )),
+    );
+}
+
+/// The line setup writes: `<program> hook mcp-headers`, with nothing in it
+/// that any shell would need quoted, because Claude Code hands the line to a
+/// shell and which shell differs by system (sh; on Windows Git Bash or
+/// PowerShell). The program is the managed binary's full path when every
+/// character of it is plain (letters, digits, `/`, `.`, `_`, `-`; on Windows
+/// also the drive's colon, with `\` written as `/`, which both shells there
+/// read). A path with a space or anything else in it is not written:
+/// the bare command name is, and the shell finds it on PATH.
+fn headers_helper_line(binary: &str, windows: bool) -> String {
+    let path = if windows {
+        binary.replace('\\', "/")
+    } else {
+        binary.to_string()
+    };
+    let plain = !path.is_empty()
+        && path.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-') || (windows && c == ':')
+        });
+    let program = if plain {
+        path.as_str()
+    } else {
+        "contextstream-mcp"
+    };
+    format!("{program} hook {}", crate::hook_handlers::mcp_headers::HOOK)
+}
+
+/// Whether a `headersHelper` line is the one setup writes, in either form.
+fn is_managed_headers_helper(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let (Some(program), Some("hook"), Some(name), None) =
+        (words.next(), words.next(), words.next(), words.next())
+    else {
+        return false;
+    };
+    let file = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    name == crate::hook_handlers::mcp_headers::HOOK
+        && matches!(
+            file.to_ascii_lowercase().as_str(),
+            "contextstream-mcp" | "contextstream-mcp.exe"
+        )
 }
 
 fn resolved_command_and_args() -> (String, Vec<String>) {
@@ -1752,7 +1842,13 @@ pub(crate) fn catalog_remote_entry(editor: &Editor) -> Option<Value> {
         None,
         &ManagedConfigIdentity::default(),
     );
-    generated.get("server_config").cloned()
+    let mut entry = generated.get("server_config").cloned()?;
+    // The catalog is read on other machines: it names the command, not where
+    // this machine keeps it.
+    if let Some(line) = entry.get_mut(HEADERS_HELPER_FIELD) {
+        *line = json!(headers_helper_line("", false));
+    }
+    Some(entry)
 }
 
 /// Generate configs for all specified editors as a single JSON payload.
@@ -9977,6 +10073,209 @@ CONTEXTSTREAM_API_KEY = "test-key"
             !home.join(".cursor").join("mcp.json").exists(),
             "must never create unconfigured editor files"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_headers_helper_tests {
+    use super::*;
+
+    const LINE_END: &str = " hook mcp-headers";
+
+    fn entry(editor: &Editor, existing: Option<&Value>, mode: TransportMode) -> Value {
+        build_json_like_server_for_editor(
+            editor,
+            existing,
+            Some("key"),
+            None,
+            None,
+            None,
+            None,
+            mode,
+            Some("key"),
+        )
+        .expect("an entry")
+    }
+
+    #[test]
+    fn claude_codes_hosted_entry_runs_the_command_that_names_the_connection() {
+        let hosted = entry(&Editor::ClaudeCode, None, TransportMode::ForceRemote);
+        let line = hosted[HEADERS_HELPER_FIELD].as_str().expect("the line");
+        assert!(line.ends_with(LINE_END), "{line}");
+        assert!(is_managed_headers_helper(line), "{line}");
+        // The static headers are still there: the helper only adds to them.
+        assert_eq!(hosted["type"], "http");
+        assert_eq!(hosted["headers"][HEADER_API_KEY], "key");
+        // Written again, nothing changes.
+        let again = entry(
+            &Editor::ClaudeCode,
+            Some(&hosted),
+            TransportMode::PreserveExisting,
+        );
+        assert_eq!(again, hosted);
+    }
+
+    #[test]
+    fn an_entry_written_by_an_earlier_version_gains_the_line_and_keeps_the_rest() {
+        let mut earlier = entry(&Editor::ClaudeCode, None, TransportMode::ForceRemote);
+        earlier
+            .as_object_mut()
+            .expect("an entry")
+            .remove(HEADERS_HELPER_FIELD);
+        earlier["headers"]["X-Mine"] = json!("kept");
+        let updated = entry(
+            &Editor::ClaudeCode,
+            Some(&earlier),
+            TransportMode::PreserveExisting,
+        );
+        assert!(is_managed_headers_helper(
+            updated[HEADERS_HELPER_FIELD].as_str().expect("the line")
+        ));
+        assert_eq!(updated["headers"]["X-Mine"], "kept");
+        assert_eq!(updated["url"], earlier["url"]);
+    }
+
+    #[test]
+    fn a_persons_own_helper_is_left_alone() {
+        let mut theirs = entry(&Editor::ClaudeCode, None, TransportMode::ForceRemote);
+        theirs[HEADERS_HELPER_FIELD] = json!("/usr/local/bin/my-headers --team blue");
+        let updated = entry(
+            &Editor::ClaudeCode,
+            Some(&theirs),
+            TransportMode::PreserveExisting,
+        );
+        assert_eq!(
+            updated[HEADERS_HELPER_FIELD],
+            "/usr/local/bin/my-headers --team blue"
+        );
+        // Also when it is not a string at all: it is not ours to repair.
+        theirs[HEADERS_HELPER_FIELD] = json!(["my-headers"]);
+        let updated = entry(
+            &Editor::ClaudeCode,
+            Some(&theirs),
+            TransportMode::PreserveExisting,
+        );
+        assert_eq!(updated[HEADERS_HELPER_FIELD], json!(["my-headers"]));
+    }
+
+    #[test]
+    fn a_local_entry_carries_no_line_and_loses_ours() {
+        let local = entry(&Editor::ClaudeCode, None, TransportMode::ForceLocal);
+        assert!(local.get(HEADERS_HELPER_FIELD).is_none(), "{local}");
+        let hosted = entry(&Editor::ClaudeCode, None, TransportMode::ForceRemote);
+        let turned_local = entry(
+            &Editor::ClaudeCode,
+            Some(&hosted),
+            TransportMode::ForceLocal,
+        );
+        assert!(
+            turned_local.get(HEADERS_HELPER_FIELD).is_none(),
+            "{turned_local}"
+        );
+    }
+
+    #[test]
+    fn no_other_editor_gets_the_field() {
+        for editor in [
+            Editor::Cursor,
+            Editor::Windsurf,
+            Editor::Copilot,
+            Editor::Cline,
+            Editor::RooCode,
+            Editor::Antigravity,
+        ] {
+            if !editor_supports_hosted_remote(&editor) {
+                continue;
+            }
+            let hosted = entry(&editor, None, TransportMode::ForceRemote);
+            assert!(
+                hosted.get(HEADERS_HELPER_FIELD).is_none(),
+                "{}: {hosted}",
+                editor.display_name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_line_holds_nothing_a_shell_would_need_quoted() {
+        let cases = [
+            (
+                "/home/dev/.contextstream/bin/contextstream-mcp",
+                false,
+                "/home/dev/.contextstream/bin/contextstream-mcp hook mcp-headers",
+            ),
+            (
+                "/Users/Jane Doe/.contextstream/bin/contextstream-mcp",
+                false,
+                "contextstream-mcp hook mcp-headers",
+            ),
+            (
+                "/home/o'neil/.contextstream/bin/contextstream-mcp",
+                false,
+                "contextstream-mcp hook mcp-headers",
+            ),
+            (
+                "/home/$USER/.contextstream/bin/contextstream-mcp",
+                false,
+                "contextstream-mcp hook mcp-headers",
+            ),
+            (
+                r"C:\Users\jane\.contextstream\bin\contextstream-mcp.exe",
+                true,
+                "C:/Users/jane/.contextstream/bin/contextstream-mcp.exe hook mcp-headers",
+            ),
+            (
+                r"C:\Users\Jane Doe\.contextstream\bin\contextstream-mcp.exe",
+                true,
+                "contextstream-mcp hook mcp-headers",
+            ),
+            (
+                r"C:\Users\R&D (lab)\.contextstream\bin\contextstream-mcp.exe",
+                true,
+                "contextstream-mcp hook mcp-headers",
+            ),
+            // A colon is plain only where it is the drive's.
+            (
+                "/home/a:b/.contextstream/bin/contextstream-mcp",
+                false,
+                "contextstream-mcp hook mcp-headers",
+            ),
+            ("", false, "contextstream-mcp hook mcp-headers"),
+        ];
+        for (binary, windows, expected) in cases {
+            let line = headers_helper_line(binary, windows);
+            assert_eq!(line, expected, "{binary:?}");
+            assert!(is_managed_headers_helper(&line), "{line}");
+            assert!(
+                line.chars()
+                    .all(|c| c.is_ascii_alphanumeric()
+                        || matches!(c, '/' | '.' | '_' | '-' | ':' | ' ')),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_setups_own_line_is_taken_for_setups() {
+        for ours in [
+            "contextstream-mcp hook mcp-headers",
+            "contextstream-mcp.exe hook mcp-headers",
+            "/opt/x/contextstream-mcp   hook   mcp-headers",
+            r"C:\Users\jane\.contextstream\bin\ContextStream-MCP.exe hook mcp-headers",
+        ] {
+            assert!(is_managed_headers_helper(ours), "{ours}");
+        }
+        for theirs in [
+            "",
+            "my-headers",
+            "contextstream-mcp hook stop",
+            "contextstream-mcp hook mcp-headers --extra",
+            "echo contextstream-mcp hook mcp-headers",
+            "contextstream-mcp-wrapper hook mcp-headers",
+            "contextstream-mcp mcp-headers",
+        ] {
+            assert!(!is_managed_headers_helper(theirs), "{theirs}");
+        }
     }
 }
 

@@ -75,6 +75,10 @@ const MAX_HEARTBEAT_RUNS: usize = 8;
 /// Most runs one process remembers the id of.
 const MAX_REMEMBERED_RUNS: usize = 64;
 
+/// How many of a workspace's open runs the hosted gateway reads to find the
+/// session's own (see `ProgressTool::sole_open_run`).
+const OPEN_RUNS_READ: i64 = 100;
+
 /// The agent's name when neither an agent name nor a client name is known.
 const DEFAULT_AGENT_NAME: &str = "MCP agent";
 
@@ -172,6 +176,8 @@ struct RunMemo {
     run_id: Option<String>,
     /// The heartbeat task keeping the run alive, by its generation.
     beat: Option<u64>,
+    /// The run was reported and has not been finished since.
+    open: bool,
     /// When the agent last reported on the run.
     reported_at: Instant,
     /// Held while a report or a heartbeat for the run is on its way, so the
@@ -185,6 +191,7 @@ impl RunMemo {
         Self {
             run_id: None,
             beat: None,
+            open: false,
             reported_at: Instant::now(),
             sending: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -294,7 +301,12 @@ impl ProgressTool {
             agent: self.agent(is_http).await,
             heartbeat_s: heartbeat.seconds(),
         };
-        let report = build_report(&input, &context)?;
+        let mut report = build_report(&input, &context)?;
+        if names_no_run(&input) {
+            if let Some(target) = self.sole_open_run(workspace_id, is_http, &context).await {
+                report.address(target);
+            }
+        }
         let key = run_memo_key(workspace_id, &report.run_key);
         // A local server sends one thing at a time for a run (see `RunMemo`).
         let sending = (!is_http).then(|| self.sending_gate(&key));
@@ -311,7 +323,9 @@ impl ProgressTool {
                 // signals they send land on the same run under the same agent.
                 if let Some(fields) = answer.as_object_mut() {
                     fields.insert("session".into(), json!(context.session));
-                    fields.insert("run_key".into(), json!(report.run_key));
+                    if !report.by_run_id {
+                        fields.insert("run_key".into(), json!(report.run_key));
+                    }
                 }
                 let run_id = answer
                     .pointer("/run/run_id")
@@ -339,6 +353,71 @@ impl ProgressTool {
         }
     }
 
+    /// The session's one open run, for a report that names none (no
+    /// `ticket_id`, no `run_key`). A model that took up a ticket and then
+    /// reports a question without naming the ticket means that run, not a
+    /// second one. `None` when the session has no open run or more than one,
+    /// and when the session part is not one session (a stateless client that
+    /// names no connection shares it with every session of its key): the
+    /// report then goes to the session's default run, as it always did.
+    async fn sole_open_run(
+        &self,
+        workspace_id: Uuid,
+        is_http: bool,
+        context: &ReportContext,
+    ) -> Option<RunTarget> {
+        if !is_one_session(&context.session, is_http) {
+            return None;
+        }
+        if !is_http {
+            return self.sole_remembered_run(workspace_id).map(RunTarget::Key);
+        }
+        // The gateway keeps nothing between requests; the API knows the
+        // runs, and names each by its agent: this session's is its own.
+        let agent_id = context.agent.get("id").and_then(Value::as_str)?;
+        let filter = RunFilter {
+            workspace_id: Some(workspace_id),
+            active: Some(true),
+            limit: Some(OPEN_RUNS_READ),
+            ..RunFilter::default()
+        };
+        let result = self.client.list_run_progress(&filter).await.ok()?;
+        let listed = runs_of(&result);
+        if listed.len() as i64 >= OPEN_RUNS_READ {
+            // A full page may hide another run of this session.
+            return None;
+        }
+        let mut mine = listed
+            .iter()
+            .filter(|view| view.pointer("/agent/id").and_then(Value::as_str) == Some(agent_id));
+        let view = mine.next()?;
+        if mine.next().is_some() {
+            return None;
+        }
+        let run_id = str_field(view, "run_id").filter(|id| Uuid::parse_str(id).is_ok())?;
+        Some(RunTarget::Id {
+            run_id: run_id.to_string(),
+            on_a_ticket: view
+                .pointer("/scope/ticket_id")
+                .is_some_and(|id| !id.is_null()),
+        })
+    }
+
+    /// The key of the one run this process reported in the workspace and
+    /// has not finished, when there is exactly one.
+    fn sole_remembered_run(&self, workspace_id: Uuid) -> Option<String> {
+        let prefix = format!("{workspace_id}:");
+        let runs = lock(&self.runs);
+        let mut open = runs
+            .iter()
+            .filter(|(key, memo)| memo.open && key.starts_with(&prefix));
+        let (key, _) = open.next()?;
+        if open.next().is_some() {
+            return None;
+        }
+        Some(key[prefix.len()..].to_string())
+    }
+
     /// Remember a finished run's id and stop its heartbeat.
     fn finish(&self, key: &str, run_id: Option<String>, is_http: bool) {
         if is_http {
@@ -347,6 +426,7 @@ impl ProgressTool {
         let mut runs = lock(&self.runs);
         let memo = runs.entry(key.to_string()).or_insert_with(RunMemo::new);
         memo.beat = None;
+        memo.open = false;
         memo.reported_at = Instant::now();
         if run_id.is_some() {
             memo.run_id = run_id;
@@ -389,6 +469,7 @@ impl ProgressTool {
                 memo.run_id = run_id;
             }
             memo.beat = generation;
+            memo.open = true;
             memo.reported_at = Instant::now();
             let sending = memo.sending.clone();
             // The runs reported longest ago lose their heartbeat first.
@@ -790,9 +871,54 @@ pub(crate) struct Report {
     pub gave: Vec<&'static str>,
     /// Things the agent should know that did not stop the report.
     pub notes: Vec<String>,
+    /// The report is sent by the run's id (`run_id`), not by a key: the
+    /// hosted gateway sent it on to the session's open run (see
+    /// [`RunTarget`]), whose key it cannot know.
+    pub by_run_id: bool,
 }
 
+/// The run a report that named none is sent on to: the session's one open run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RunTarget {
+    /// By the key it was reported under (a local server remembers it).
+    Key(String),
+    /// By its id, which is all the hosted gateway can learn from the API.
+    Id { run_id: String, on_a_ticket: bool },
+}
+
+/// What a report says when it was sent on to another run than its default.
+const SENT_ON: &str = "No run was named, so this went to the one run this session has open. Pass ticket_id or run_key to report on another.";
+
 impl Report {
+    /// Send the report to `target` instead of the session's default run.
+    pub(crate) fn address(&mut self, target: RunTarget) {
+        let Some(body) = self.body.as_object_mut() else {
+            return;
+        };
+        match target {
+            RunTarget::Key(key) => {
+                if key == self.run_key {
+                    return;
+                }
+                body.insert("source_run_id".into(), json!(key));
+                self.run_key = key;
+                self.notes.push(SENT_ON.to_string());
+            }
+            RunTarget::Id {
+                run_id,
+                on_a_ticket,
+            } => {
+                body.remove("source_run_id");
+                body.insert("run_id".into(), json!(run_id));
+                self.by_run_id = true;
+                // A run without a ticket is as a rule the default run itself.
+                if on_a_ticket {
+                    self.notes.push(SENT_ON.to_string());
+                }
+            }
+        }
+    }
+
     /// Whether the report ends the run.
     pub fn is_terminal(&self) -> bool {
         self.status
@@ -947,6 +1073,7 @@ pub(crate) fn build_report(input: &ProgressInput, context: &ReportContext) -> Re
         status,
         gave,
         notes,
+        by_run_id: false,
     })
 }
 
@@ -981,9 +1108,13 @@ pub(crate) fn run_key_of(given: Option<&str>, session: &str, ticket_id: Option<U
 }
 
 /// What stands for "this MCP session" in a default run key. A local server
-/// process serves one client session, so it is the process; the hosted
-/// gateway uses the transport's session id, else the caller (a digest of
-/// either: neither is sent as it is).
+/// process serves one client session, so it is the process. The hosted
+/// gateway uses the transport's session id; for a client on the stateless
+/// contract, which has none, the token the client sent to name its
+/// connection, together with the caller (`mcp_client::client_session`: the
+/// token alone is never used, so a token chosen under one key cannot name a
+/// session of another); else the caller alone, which is every session of
+/// that key. Each is a digest: none is sent as it is.
 pub(crate) fn session_part(is_http: bool) -> String {
     if !is_http {
         static PROCESS: OnceLock<String> = OnceLock::new();
@@ -994,10 +1125,31 @@ pub(crate) fn session_part(is_http: bool) -> String {
     if let Some(id) = mcp_client::get_task_mcp_session_id().filter(|id| !id.trim().is_empty()) {
         return format!("s-{}", short_digest(&id));
     }
-    match mcp_client::get_task_caller_cache_identity() {
+    let caller = mcp_client::get_task_caller_cache_identity();
+    if let (Some(caller), Some(token)) = (caller.as_deref(), mcp_client::client_session::current())
+    {
+        return format!(
+            "s-{}",
+            short_digest(&format!("client-session\n{caller}\n{token}"))
+        );
+    }
+    match caller {
         Some(caller) => format!("c-{}", short_digest(&caller)),
         None => "mcp".to_string(),
     }
+}
+
+/// Whether a session part stands for one session of a client (see
+/// [`session_part`]): a local server's process or a hosted `s-` part. A `c-`
+/// part is every session of a key, and `mcp` is everyone.
+fn is_one_session(session: &str, is_http: bool) -> bool {
+    !is_http || session.starts_with("s-")
+}
+
+/// Whether a report names no run: no `run_key` and no `ticket_id`.
+fn names_no_run(input: &ProgressInput) -> bool {
+    text_argument(input.run_key.as_deref(), MAX_RUN_KEY).is_none()
+        && text_argument(input.ticket_id.as_deref(), MAX_RUN_KEY).is_none()
 }
 
 fn short_digest(text: &str) -> String {

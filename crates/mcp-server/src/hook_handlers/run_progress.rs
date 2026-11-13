@@ -566,6 +566,7 @@ impl SessionFile {
         let found = self.runs.iter().position(|run| {
             (key.is_some() && run.key == key) || (run_id.is_some() && run.run_id == run_id)
         });
+        let found_by_key = found.is_some_and(|index| key.is_some() && self.runs[index].key == key);
         let status = text(input, "status").unwrap_or_default();
         let ended = TERMINAL.contains(&status.as_str())
             || matches!(
@@ -603,7 +604,10 @@ impl SessionFile {
         if run_id.is_some() {
             run.run_id = run_id;
         }
-        if key.is_some() {
+        // A run found by its id keeps the key it is known by: a report that
+        // named no run is sent on to the session's one open run, and a local
+        // server's words do not say under which key.
+        if key.is_some() && (run.key.is_none() || found_by_key) {
             run.key = key;
         }
         let ticket = view

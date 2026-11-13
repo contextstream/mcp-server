@@ -21,6 +21,7 @@ pub mod git_post_commit;
 pub mod git_post_merge;
 pub mod git_pre_push;
 pub mod instructions_loaded;
+pub(crate) mod mcp_headers;
 pub mod mid_run_notices;
 pub mod notification;
 pub mod on_save_intent;
@@ -594,6 +595,11 @@ pub fn editor_hooks_disabled() -> bool {
 
 /// Dispatch a hook by name.
 pub async fn dispatch_hook(name: &str) -> Result<()> {
+    // Not an editor hook: Claude Code runs it when it connects to the hosted
+    // server (`headersHelper`), whatever the hooks' own switch says.
+    if name == mcp_headers::HOOK {
+        return mcp_headers::handle();
+    }
     if editor_hooks_disabled() {
         match name {
             // Managed local Git hooks have their own dedicated kill-switch

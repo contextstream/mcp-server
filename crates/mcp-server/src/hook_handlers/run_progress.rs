@@ -1198,8 +1198,23 @@ fn word_after(text: &str, mark: &str) -> Option<String> {
     (!word.is_empty()).then_some(word)
 }
 
+/// ContextStream's own tools whose ANSWERS the hooks read after the call
+/// (PostToolUse): who the server says the session is (`init`), a run the
+/// model reported (`progress`), a ticket taken up or moved on (`entity`).
+/// [`classify`] reads no other tool, and setup builds the PostToolUse matcher
+/// it writes for Claude Code from this list (`setup::hooks`), so a tool named
+/// here reaches the hook in a real session. 1.0.77 named only `init` in that
+/// matcher: the answers of `progress` and `entity` never reached the hook,
+/// and with the switch on the hooks learned no run.
+pub(crate) const ANSWERS_READ: &[&str] = &["init", "progress", "entity"];
+
+/// The name Claude Code gives a tool of ContextStream's server in a matcher.
+pub(crate) fn claude_tool_name(tool: &str) -> String {
+    format!("mcp__contextstream__{tool}")
+}
+
 fn classify(tool: &str, tool_input: &Value, answer: &Answer) -> Option<Finding> {
-    if !answer.succeeded {
+    if !answer.succeeded || !ANSWERS_READ.contains(&tool) {
         return None;
     }
     let action = text(tool_input, "action").unwrap_or_default();

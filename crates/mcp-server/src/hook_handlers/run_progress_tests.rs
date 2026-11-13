@@ -850,3 +850,47 @@ fn a_local_server_answers_in_words_and_the_hooks_still_follow() {
     );
     assert!(unknown.runs.is_empty());
 }
+
+/// `classify` reads the answers of the tools in `ANSWERS_READ` and of no
+/// other: that list is what setup's PostToolUse matcher is built from, so a
+/// tool handled here and missing there would never reach this code in an
+/// editor (1.0.77: `progress` and `entity`).
+#[test]
+fn classify_reads_the_listed_tools_and_no_other() {
+    let report = json!({"run": {"run_id": "0b0e4f8e-9c55-4f0e-8a51-5a3f0f1d2c3b"}});
+    let answer = Answer {
+        succeeded: true,
+        json: Some(&report),
+        text: None,
+    };
+    assert!(matches!(
+        classify("progress", &json!({}), &answer),
+        Some(Finding::Report(_))
+    ));
+    assert!(
+        classify("progress_elsewhere", &json!({}), &answer).is_none(),
+        "a tool outside the list is not read, whatever it answers"
+    );
+    let identity = json!({"run_progress": {"session": "s-1", "agent": {"id": "claude-code:1"}}});
+    let answer = Answer {
+        succeeded: true,
+        json: Some(&identity),
+        text: None,
+    };
+    assert!(matches!(
+        classify("init", &json!({}), &answer),
+        Some(Finding::Identity { .. })
+    ));
+    let ticket = json!({"id": "0b0e4f8e-9c55-4f0e-8a51-5a3f0f1d2c3b", "status": "in_progress"});
+    let answer = Answer {
+        succeeded: true,
+        json: Some(&ticket),
+        text: None,
+    };
+    let call = json!({"kind": "ticket", "action": "update", "body": {"status": "in_progress"}});
+    assert!(matches!(
+        classify("entity", &call, &answer),
+        Some(Finding::Ticket(_))
+    ));
+    assert_eq!(ANSWERS_READ, &["init", "progress", "entity"]);
+}

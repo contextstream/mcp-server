@@ -1,13 +1,15 @@
 # Release process
 
-Releases run end to end from the maintainers' own release tooling, with no person in the loop. The logic in this repository lives in:
+Releases go only through the maintainers' release controller: their own release tooling, outside this repository. A
+run goes end to end with no person in the loop. The logic in this repository lives in:
 
 - `scripts/release/mcp_release.py`: plan, assemble, publish, verify, the hosted wait and the R2 probe;
 - `scripts/release/gate.sh`: the gate;
 - `scripts/release/build.sh`: the builds.
 
 GitHub Actions does not run releases. The old `.github/workflows/release.yml` is kept only for its tests. A pushed
-`v*` tag still starts an Actions run that never gets a runner; ignore it.
+`v*` tag still starts an Actions run of it, which fails in its first job within seconds and publishes nothing; ignore
+it.
 
 ## Cutting a release
 
@@ -77,6 +79,8 @@ flowchart TD
 4. **publish** (4 CPUs) assembles the bundle, then does the following in this order:
    1. Assembles the bundle with syft and the release contract: `sbom.spdx.json` (the crates in `Cargo.lock`, under `contextstream-mcp` and the release version), `version.json` and `checksums.txt`.
       Or, on a resume, fetches the bundle from R2.
+      Either way it first prints one digest over the six binaries, and a run that was told which digest to expect
+      stops here when it finds another ("A release reuses its dry run's build", below).
    2. Pushes the annotated tag `vX.Y.Z`.
    3. Writes R2 `mcp/vX.Y.Z/`, with `version.json` last, then `mcp/latest/`. Every object is read back.
    4. Creates a GitHub draft with the nine assets and checks their sha256 digests.
@@ -121,6 +125,46 @@ nothing. Dispatched on `main`, it also proves the R2 key: it puts, lists, reads 
 `mcp/.release-probe/` (`mcp_release.py r2-probe`). Any run that is not a clean checkout of `main` is a dry run,
 whatever mode it asks for: a branch, or a local run with a patch.
 
+## A release reuses its dry run's build
+
+The six binaries build from the checkout without `.git` (`gate.Dockerfile`, stages `tree` and `build`). Two checkouts
+of one commit are the same files outside `.git`, so on the release builder the build step of a commit that was just
+built comes from the builder's cache: a release started after a dry run of the same commit exports the binaries the
+dry run built and checked, byte for byte, instead of compiling them again. The step is reused only while everything
+it is built from is the same: the tree, `gate.Dockerfile`, the Rust toolchain, and the stage's three arguments
+(`ARTIFACT`, `VERSION`, `SOURCE_DATE_EPOCH`, which is the commit's time). `scripts/release/test_gate_dockerfile.py`
+pins the two stages as text, because one more argument or one more flag on a copy would end the reuse without any
+failure.
+
+Reuse is the builder's choice, not a promise. A build that missed the cache makes other bytes: the darwin and Windows
+binaries do not build reproducibly. So a release can be held to its dry run's binaries:
+
+1. A maintainer starts the dry run and lets it pass.
+2. Its assemble step prints one sha256 over the six binaries, as
+   `{"at": ..., "binaries": "<64 hex digits>", "stage": "assemble"}`. In a directory that holds the six,
+   `sha256sum contextstream-mcp-* | LC_ALL=C sort | sha256sum` prints the same.
+3. The maintainer starts the release with that digest as the expectation (`mcp_release.py assemble --expect-binaries
+   <digest>`; the release tooling passes it through). The assemble line of that run then carries `"expected"` too:
+   that field is the proof that the expectation arrived.
+
+With an expectation, `assemble` refuses any other six binaries before it writes a file, and long before the tag, R2,
+GitHub, npm or the registry are touched: the run publishes nothing. A resume, which takes its bundle from R2
+(`fetch-bundle`), compares the six binaries R2 serves in the same way.
+
+- **The expectation is exactly 64 lowercase hex digits.** Anything else that is passed (a blank value, a space or a
+  line end around the digest, upper case, 63 or 65 digits, a prefix) is refused. It is never read as "no check".
+- **Without an expectation** nothing is compared: the release ships what it built, as every release did until 1.0.77.
+- **After a refusal** the message says how to go on. A run started again with the same expectation is refused again
+  when the cause was a build that missed the cache, because the builder now holds the refused run's build. Either
+  start the release without an expectation (it ships what it builds, checked as every release is), or start a new dry
+  run and give the release the digest that dry run prints.
+- **A fallback build can never meet an expectation.** When the release builder cannot be reached and a binary is
+  built elsewhere, that build has no cache to come from. Do not give an expectation to such a run.
+
+Every JSON line the script prints carries `"at"`, the UTC time of day it was written (no date), and so does each
+`ok`/`FAIL` line of the outside verification, so a run's log tells how long each step took. An `::error` annotation
+and the output of the programs the script runs (cargo, npm, syft) carry no time.
+
 ## Re-running after a failure
 
 Fix the cause on `main`, then have the release run started again from the release tooling with mode `release`. Nothing
@@ -134,6 +178,7 @@ Every step skips what is already done with the same bytes, and stops at differen
   - Before `version.json` is written, a re-run may replace a partial upload. Once npm has the version it may not.
 - **npm, the registry entry, GitHub assets and R2 objects** that already exist must match, or the run stops.
 - **`mcp/latest/`** never moves to an older version.
+- **An expectation that was not met** published nothing, so nothing is half done: see "After a refusal" above.
 
 A bad artifact that is already public is never replaced: fix forward with the next patch version.
 

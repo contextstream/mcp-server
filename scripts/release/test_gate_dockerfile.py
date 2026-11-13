@@ -44,6 +44,27 @@ def copies(block):
     return found
 
 
+def instructions(block):
+    """The instructions of `block`, one string each: comments dropped, a line ending in a backslash joined to the next
+    with one space."""
+    found, pending = [], ""
+    for line in block.splitlines():
+        if not pending and (not line.strip() or line.lstrip().startswith("#")):
+            continue
+        pending += line.strip()
+        if pending.endswith("\\"):
+            pending = pending[:-1].rstrip() + " "
+            continue
+        found.append(pending)
+        pending = ""
+    return found
+
+
+def arguments(block):
+    """The names a stage declares with ARG, in order (a default after `=` is not part of the name)."""
+    return [line.split(None, 1)[1].split("=", 1)[0] for line in instructions(block) if line.startswith("ARG ")]
+
+
 def locked_mounts(block):
     """{id: options} of the cache mounts in `block` that take a lock."""
     found = {}
@@ -93,6 +114,51 @@ class GateDockerfileTest(unittest.TestCase):
         # target/ is the cache mount whose times cargo compares the sources with: the stamp must leave it alone.
         self.assertIn("target=/home/runner/src/target", step)
         self.assertEqual(build.count("RUN "), 1)
+
+    # What a run's build step is keyed by, pinned as text. A release reuses its dry run's build only while every input of
+    # the step is the same in both runs: an argument that differs per run (a run id, a mode, a time), or a flag on a COPY
+    # that makes the copy depend on the run, turns every release into a full build again, silently. Whoever changes one
+    # of these on purpose changes the test with it, and says in the change why the reuse survives.
+    TREE = ["COPY --chown=1001:1001 . /home/runner/tree", "RUN rm -rf /home/runner/tree/.git"]
+    BUILD = [
+        "ENV CARGO_HOME=/home/runner/.cargo CI=true",
+        "WORKDIR /home/runner/src",
+        "COPY --from=tree --chown=1001:1001 /home/runner/tree/ .",
+        "ARG ARTIFACT",
+        "ARG VERSION",
+        "ARG SOURCE_DATE_EPOCH",
+    ]
+    BUILD_RUN = ("RUN --mount=type=cache,id=mcp-cargo-home,target=/home/runner/.cargo,uid=1001,gid=1001 "
+                 "--mount=type=cache,id=mcp-build-target-${ARTIFACT},target=/home/runner/src/target,uid=1001,gid=1001,sharing=locked "
+                 "--mount=type=cache,id=mcp-build-xwin-${ARTIFACT},target=/home/runner/.cache/cargo-xwin,uid=1001,gid=1001,sharing=locked "
+                 "find . -path ./target -prune -o -type f -exec touch {} + "
+                 "&& git config --global --add safe.directory '*' && bash scripts/release/build.sh \"$ARTIFACT\" \"$VERSION\"")
+
+    def test_the_tree_stage_is_exactly_the_checkout_without_git(self):
+        self.assertEqual(instructions(stage(DOCKERFILE.read_text(), "tree")), self.TREE)
+
+    def test_the_build_stage_takes_exactly_its_three_arguments(self):
+        text = DOCKERFILE.read_text()
+        build = stage(text, "build")
+        self.assertEqual(arguments(build), ["ARTIFACT", "VERSION", "SOURCE_DATE_EPOCH"])
+        self.assertEqual(instructions(build), self.BUILD + [self.BUILD_RUN])
+        # The stages the build stands on declare no argument but the image's own: none of them is per run.
+        self.assertEqual({name: arguments(stage(text, name)) for name in ("env", "build-env", "tree", "binary")},
+                         {"env": ["NODE_VERSION", "RUST_CHANNEL"], "build-env": [], "tree": [], "binary": []})
+        self.assertEqual(re.findall(r"^ARG (\w+)", text.split("\nFROM ", 1)[0], re.M), ["UBUNTU"])
+        # The per-run arguments (PART, RUN_ID) belong to the gate, whose step must run every time.
+        self.assertEqual(arguments(stage(text, "gate")), ["PART", "RUN_ID"])
+        self.assertEqual(arguments(stage(text, "src")), [])
+
+    def test_the_binary_stage_exports_exactly_the_build_output(self):
+        self.assertEqual(instructions(stage(DOCKERFILE.read_text(), "binary")), ["COPY --from=build /home/runner/src/out/ /"])
+
+    def test_the_check_sees_an_added_argument_and_an_added_flag(self):
+        self.assertEqual(arguments("WORKDIR /w\nARG ARTIFACT\nARG RUN_ID\nARG NODE=22\nRUN true\n"), ["ARTIFACT", "RUN_ID", "NODE"])
+        self.assertEqual(instructions("# a comment\nCOPY --chown=1001:1001 --link . /t\n\nRUN a \\\n && b\n"),
+                         ["COPY --chown=1001:1001 --link . /t", "RUN a && b"])
+        self.assertNotEqual(instructions("COPY --chown=1001:1001 --link . /home/runner/tree\nRUN rm -rf /home/runner/tree/.git\n"),
+                            self.TREE)
 
     def test_the_check_sees_a_copy_of_the_build_context(self):
         block = "WORKDIR /w\nCOPY --chown=1001:1001 . .\nCOPY --from=tree --chown=1001:1001 /home/runner/tree/ .\nCOPY a b\n"

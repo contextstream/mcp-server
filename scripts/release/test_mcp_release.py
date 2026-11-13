@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mcp_release as release  # noqa: E402
@@ -213,6 +214,16 @@ class Lines(unittest.TestCase):
         self.assertRegex(lines[0].pop("at"), r"^([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$")
         self.assertEqual(lines, [{"stage": "npm", "result": "published", "version": "1.0.30"}])
 
+    def test_a_check_line_of_verify_says_when_too(self):
+        self.assertRegex(release.check_line(True, "npm latest is 1.0.30"),
+                         r"^ok   ([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z npm latest is 1\.0\.30$")
+        self.assertRegex(release.check_line(False, "GitHub Latest is v1.0.30"),
+                         r"^FAIL ([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z GitHub Latest is v1\.0\.30$")
+        import inspect
+        source = inspect.getsource(release.cmd_verify)
+        self.assertIn("print(check_line(ok, what), flush=True)", source)
+        self.assertNotIn('"ok   "', source)
+
     def test_a_refusal_is_a_line_too(self):
         with tempfile.TemporaryDirectory() as empty:
             code, lines = printed(release.main, ["assemble", "--dist", empty, "--version", "1.0.30", "--commit", HEAD])
@@ -266,9 +277,34 @@ class Binaries(unittest.TestCase):
 
     def test_the_expected_binaries_pass(self):
         digest = release.binaries_digest(self.dist)
-        for given in (digest, " " + digest.upper() + "\n"):
-            found, lines = printed(release.check_binaries, "assemble", self.dist, given)
-            self.assertEqual((found, lines[0]["binaries"], lines[0]["expected"]), (digest, digest, digest))
+        for stage in ("assemble", "fetch-bundle"):
+            found, lines = printed(release.check_binaries, stage, self.dist, digest)
+            self.assertEqual((found, lines[0]["binaries"], lines[0]["expected"], lines[0]["stage"]), (digest, digest, digest, stage))
+
+    def test_a_run_told_nothing_checks_nothing_and_says_so_by_printing_no_expectation(self):
+        for given in ((), (None,)):
+            found, lines = printed(release.check_binaries, "assemble", self.dist, *given)
+            self.assertEqual(found, release.binaries_digest(self.dist))
+            self.assertEqual([sorted(line) for line in lines], [["at", "binaries", "stage"]])
+
+    def test_the_whole_digest_is_compared(self):
+        # An expectation that agrees with the binaries in its first 8 digits, in all but its last digit, or in all but one
+        # digit in the middle is another digest.
+        found = release.binaries_digest(self.dist)
+        other = lambda digit: "0" if digit != "0" else "1"                                     # noqa: E731
+        near = {
+            "the first 8 digits agree": found[:8] + "".join(other(digit) for digit in found[8:]),
+            "all but the last digit agree": found[:-1] + other(found[-1]),
+            "all but digit 9 agree": found[:8] + other(found[8]) + found[9:],
+            "all but the first digit agree": other(found[0]) + found[1:],
+        }
+        for label, expected in near.items():
+            with self.subTest(label):
+                self.assertEqual(len(expected), 64)
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(release.Refused) as refused:
+                    release.check_binaries("assemble", self.dist, expected)
+                self.assertIn(found, str(refused.exception))
+                self.assertIn(expected, str(refused.exception))
 
     def test_other_binaries_are_refused_and_the_reason_names_both_digests(self):
         expected = release.binaries_digest(self.dist)
@@ -280,10 +316,74 @@ class Binaries(unittest.TestCase):
         self.assertIn(found, str(refused.exception))
         self.assertIn(expected, str(refused.exception))
 
+    def test_a_refusal_says_how_to_go_on(self):
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(release.Refused) as refused:
+            release.check_binaries("assemble", self.dist, "0" * 64)
+        reason = str(refused.exception)
+        self.assertIn("this run publishes nothing", reason)
+        self.assertIn("a run started again with the same expectation is refused again", reason)
+        self.assertIn("start the release without an expectation", reason)
+        self.assertIn("start a new dry run and give the release the digest that dry run prints", reason)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(release.Refused) as refused:
+            release.check_binaries("fetch-bundle", self.dist, "0" * 64)
+        reason = str(refused.exception)
+        self.assertIn("a run started again with the same expectation is refused again", reason)
+        self.assertIn("To publish the bundle R2 holds, start the release without an expectation", reason)
+        self.assertNotIn("new dry run", reason, "a dry run cannot change the bundle R2 holds")
+
+    def bad_expectations(self):
+        """Values an operator can pass that are not the digest a run printed. None of them may switch the check off."""
+        digest = release.binaries_digest(self.dist)
+        return {
+            "one space": " ", "a tab": "\t", "a newline": "\n", "63 digits": digest[:63], "65 digits": digest + "0",
+            "upper case": digest.upper(),
+            "empty": "", "spaces and a newline": "  \n", "the digest after a space": " " + digest,
+            "the digest and a newline": digest + "\n", "a word": "yes", "64 letters that are no hex": "g" * 64,
+            "a 0x prefix": "0x" + digest[2:], "a sha256: prefix": "sha256:" + digest, "quoted": '"%s"' % digest,
+            "full-width digits": "\uff10" * 64, "one upper-case digit": digest[:10] + "A" + digest[11:],
+        }
+
     def test_an_expectation_that_is_no_digest_is_refused(self):
-        for given in ("yes", "0" * 63, "g" * 64):
-            with self.subTest(given=given), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(release.Refused):
-                release.check_binaries("assemble", self.dist, given)
+        # The digest of these binaries is right there in six of the values: the refusal is about the form, and no form but
+        # the exact one is accepted, so a blank value never reads as "no check".
+        for label, given in self.bad_expectations().items():
+            with self.subTest(label, given=given):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), self.assertRaises(release.Refused) as refused:
+                    release.check_binaries("assemble", self.dist, given)
+                self.assertIn("exactly the 64 lowercase hex digits", str(refused.exception))
+                self.assertIn("this run publishes nothing", str(refused.exception))
+                self.assertNotIn("expected", json.loads(out.getvalue().splitlines()[0]))
+
+    def test_assemble_and_fetch_bundle_refuse_a_bad_expectation_given_on_the_command_line(self):
+        # The path a run takes: the option's value arrives through argparse. fetch-bundle's R2 and the release contract
+        # are stand-ins; neither command may get past the check.
+        for command in ("assemble", "fetch-bundle"):
+            for label, given in self.bad_expectations().items():
+                with self.subTest(command=command, label=label), \
+                        mock.patch.object(release, "r2_public", lambda key: (self.dist / key.rsplit("/", 1)[1]).read_bytes()
+                                          if key.rsplit("/", 1)[1] in release.BINARIES else b"{}"), \
+                        mock.patch.object(release.contract, "verify_release_files") as verified, \
+                        mock.patch.object(release, "check_darwin") as darwin, \
+                        tempfile.TemporaryDirectory() as fetched:
+                    dist = self.dist if command == "assemble" else Path(fetched)
+                    code, lines = printed(release.main, [command, "--dist", str(dist), "--version", "1.0.30", "--commit", HEAD,
+                                                         "--expect-binaries=" + given])
+                    self.assertEqual(code, 1)
+                    self.assertEqual([sorted(line) for line in lines], [["at", "binaries", "stage"], ["at", "error", "stage"]])
+                    self.assertIn("exactly the 64 lowercase hex digits", lines[1]["error"])
+                    verified.assert_not_called()
+                    darwin.assert_not_called()
+        self.assertEqual(sorted(path.name for path in self.dist.iterdir()), sorted(release.BINARIES))
+
+    def test_the_option_left_out_is_none_never_a_blank_string(self):
+        seen = {}
+        for command in ("assemble", "fetch-bundle"):
+            with mock.patch.object(release, "cmd_" + command.replace("-", "_"), lambda args, command=command: seen.update({command: args.expect_binaries})):
+                self.assertEqual(release.main([command, "--dist", str(self.dist), "--version", "1.0.30", "--commit", HEAD]), 0)
+        self.assertEqual(seen, {"assemble": None, "fetch-bundle": None})
+        import inspect
+        self.assertIn("expected=None", str(inspect.signature(release.check_binaries)))
 
     def test_assemble_refuses_other_binaries_before_it_assembles_anything(self):
         # The refusal comes before the darwin check, the SBOM tool's download and every file assemble writes; publish, which
@@ -306,6 +406,115 @@ class Binaries(unittest.TestCase):
         for command in ("assemble", "fetch-bundle"):
             with self.subTest(command=command), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 release.main([command, "--dist", str(self.dist), "--version", "1.0.30", "--commit", HEAD, "--expect-binaries"])
+
+
+class FetchBundle(unittest.TestCase):
+    """A run that takes its bundle from R2 (a resume) checks the six binaries R2 serves against the expectation, before
+    the bundle is verified and long before publish."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dist = Path(self._tmp.name) / "dist"
+        self.r2 = {"v1.0.30/" + name: b"R2's " + name.encode() for name in release.PAYLOAD}
+        self.asked, self.verified = [], []
+        for name, stand_in in (("r2_public", lambda key: (self.asked.append(key), self.r2.get(key))[1]),):
+            patch = mock.patch.object(release, name, stand_in)
+            patch.start()
+            self.addCleanup(patch.stop)
+        patch = mock.patch.object(release.contract, "verify_release_files", lambda *args: self.verified.append(args))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def digest(self):
+        lines = sorted("%s  %s\n" % (hashlib.sha256(self.r2["v1.0.30/" + name]).hexdigest(), name) for name in release.BINARIES)
+        return hashlib.sha256("".join(lines).encode()).hexdigest()
+
+    def run_it(self, *more):
+        return printed(release.main, ["fetch-bundle", "--dist", str(self.dist), "--version", "1.0.30", "--commit", HEAD, *more])
+
+    def test_it_downloads_the_nine_files_prints_the_digest_and_verifies_the_bundle(self):
+        code, lines = self.run_it()
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(self.asked), sorted(self.r2))
+        self.assertEqual({path.name: path.read_bytes() for path in self.dist.iterdir()},
+                         {name: self.r2["v1.0.30/" + name] for name in release.PAYLOAD})
+        self.assertEqual([{key: value for key, value in line.items() if key != "at"} for line in lines],
+                         [{"stage": "fetch-bundle", "binaries": self.digest()},
+                          {"stage": "fetch-bundle", "version": "1.0.30", "commit": HEAD, "source": "R2 mcp/v1.0.30"}])
+        self.assertEqual(self.verified, [(self.dist, "1.0.30", HEAD)])
+
+    def test_the_expected_bundle_goes_on(self):
+        code, lines = self.run_it("--expect-binaries", self.digest())
+        self.assertEqual(code, 0)
+        self.assertEqual((lines[0]["binaries"], lines[0]["expected"]), (self.digest(), self.digest()))
+        self.assertEqual(len(self.verified), 1)
+
+    def test_another_bundle_is_refused_before_it_is_verified(self):
+        code, lines = self.run_it("--expect-binaries", "0" * 64)
+        self.assertEqual(code, 1)
+        self.assertEqual((lines[0]["binaries"], lines[0]["expected"]), (self.digest(), "0" * 64))
+        self.assertEqual([line["stage"] for line in lines], ["fetch-bundle", "fetch-bundle"])
+        self.assertIn(self.digest(), lines[1]["error"])
+        self.assertIn("To publish the bundle R2 holds, start the release without an expectation", lines[1]["error"])
+        self.assertEqual(self.verified, [], "the refusal comes before the bundle is verified")
+
+    def test_one_changed_binary_on_r2_is_another_bundle(self):
+        expected = self.digest()
+        self.r2["v1.0.30/" + release.BINARIES[-1]] += b"\0"
+        code, lines = self.run_it("--expect-binaries", expected)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.verified, [])
+
+    def test_a_file_r2_lacks_is_refused(self):
+        del self.r2["v1.0.30/version.json"]
+        code, lines = self.run_it("--expect-binaries", self.digest())
+        self.assertEqual(code, 1)
+        self.assertIn("R2 has no v1.0.30/version.json", lines[-1]["error"])
+
+
+class AssembleGoesOn(unittest.TestCase):
+    """assemble with the expected six: the digest line comes first, with the expectation, and the bundle is made. The
+    darwin check, the SBOM tool and the release contract are stand-ins (they need real binaries and a download)."""
+
+    def test_the_expected_six_are_assembled_and_others_are_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp)
+            for name in release.BINARIES:
+                (dist / name).write_bytes(b"binary " + name.encode())
+            digest = release.binaries_digest(dist)
+            calls = []
+
+            def generate(folder, version, commit):
+                calls.append("generate")
+                for name in release.PAYLOAD:
+                    if name not in release.BINARIES and name != "sbom.spdx.json":
+                        (Path(folder) / name).write_text("{}")
+
+            def syft(argv, **kwargs):
+                calls.append("sbom")
+                (dist / "sbom.spdx.json").write_text("{}")
+
+            with mock.patch.object(release, "check_darwin", lambda path, version: calls.append("darwin")), \
+                    mock.patch.object(release, "fetch_tool", lambda *args: Path("syft")), \
+                    mock.patch.object(release.subprocess, "run", syft), \
+                    mock.patch.object(release.contract, "generate_release_files", generate), \
+                    mock.patch.object(release.contract, "verify_release_files", lambda *args: calls.append("verify")):
+                argv = ["assemble", "--dist", str(dist), "--version", "1.0.30", "--commit", HEAD]
+                code, lines = printed(release.main, argv + ["--expect-binaries", digest])
+                self.assertEqual(code, 0)
+                self.assertEqual(calls, ["darwin", "darwin", "sbom", "generate", "verify"])
+                self.assertEqual({key: value for key, value in lines[0].items() if key != "at"},
+                                 {"stage": "assemble", "binaries": digest, "expected": digest})
+                self.assertEqual((lines[1]["stage"], sorted(lines[1]["files"])), ("assemble", sorted(release.PAYLOAD)))
+                for name in release.PAYLOAD:
+                    if name not in release.BINARIES:
+                        (dist / name).unlink()
+                del calls[:]
+                code, lines = printed(release.main, argv + ["--expect-binaries", digest[:-1] + ("0" if digest[-1] != "0" else "1")])
+                self.assertEqual(code, 1)
+                self.assertEqual(calls, [], "nothing runs after the refusal")
+                self.assertEqual(sorted(path.name for path in dist.iterdir()), sorted(release.BINARIES))
 
 
 class Darwin(unittest.TestCase):

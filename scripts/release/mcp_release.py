@@ -8,7 +8,8 @@
   macho-check   Check a darwin binary built on Linux: architecture, linked libraries, minimum macOS, signature.
   assemble      SBOM, version.json and checksums.txt for the six binaries (release_contract.py rules). It prints one
                 digest over the six; with --expect-binaries <digest> (the one a dry run of the commit printed) it
-                refuses any other six, before anything is published.
+                refuses any other six, before anything is published. The digest is exactly 64 lowercase hex digits:
+                any other value, a blank one included, is refused and never read as "no check".
   fetch-bundle  Download the bundle a previous run put on R2 and verify it against the tag. --expect-binaries as above.
   publish       In this order, each step a no-op when already done with the same bytes: the annotated tag, R2
                 mcp/vX.Y.Z then mcp/latest, a GitHub draft with the nine assets, npm, the MCP Registry, and the
@@ -102,9 +103,21 @@ def require(condition, message):
         raise Refused(message)
 
 
+def clock():
+    """The time of day now, UTC, as HH:MM:SSZ. It carries no date: a run that crosses midnight starts again at 00."""
+    return time.strftime("%H:%M:%SZ", time.gmtime())
+
+
 def say(**fields):
-    # "at" is when the line was written (UTC), so a run's log tells how long each step took.
-    print(json.dumps({"at": time.strftime("%H:%M:%SZ", time.gmtime()), **fields}, sort_keys=True), flush=True)
+    # "at" is when the line was written (UTC), so a run's log tells how long each step took. The lines that carry a time
+    # are these JSON lines and verify's check lines (check_line); an "::error" annotation and what a child program prints
+    # (cargo, npm, syft) carry none.
+    print(json.dumps({"at": clock(), **fields}, sort_keys=True), flush=True)
+
+
+def check_line(ok, what):
+    """One line of verify's outside checks: the verdict, when it was reached (UTC), and what was checked."""
+    return "%s %s %s" % ("ok  " if ok else "FAIL", clock(), what)
 
 
 def secret(name):
@@ -379,19 +392,42 @@ def binaries_digest(dist):
     return sha256_bytes("".join(lines).encode())
 
 
-def check_binaries(stage, dist, expected=""):
+GO_ON = {
+    # How to go on after a refusal, by the command that refused.
+    "assemble": "After a build that missed the builder's cache, a run started again with the same expectation is refused "
+                "again: the builder now holds this run's build, not the expected one. To go on, either start the release "
+                "without an expectation (it then ships what it builds, checked as every release is), or start a new dry "
+                "run and give the release the digest that dry run prints.",
+    "fetch-bundle": "R2 holds the complete bundle of this version and it stays what it is, so a run started again with "
+                    "the same expectation is refused again. To publish the bundle R2 holds, start the release without an "
+                    "expectation.",
+}
+
+
+def check_binaries(stage, dist, expected=None):
     """Print the digest of the six binaries; when the run was told which six to expect, refuse any other.
 
     A release whose dry run just built the commit exports the same binaries from the builder's cache (gate.Dockerfile,
     stage build). A build that missed the cache makes other bytes for the binaries that do not build reproducibly, and
-    this is where a run told to ship the dry run's binaries stops."""
-    expected = (expected or "").strip().lower()
+    this is where a run told to ship the dry run's binaries stops.
+
+    `expected` is None when the run was told nothing (--expect-binaries not given). A value that was given is the digest
+    exactly as a run printed it, 64 lowercase hex digits: a blank one, one with a space or a line end around it, upper
+    case, 63 or 65 digits are all refused. None of them is ever read as "no check", which is what an operator who
+    passed the option does not mean."""
     found = binaries_digest(dist)
-    say(stage=stage, binaries=found, **({"expected": expected} if expected else {}))
-    if expected:
-        require(SHA256.fullmatch(expected), "--expect-binaries takes the 64 hex digits a run printed as \"binaries\", not %r" % expected)
-        require(found == expected, "the six binaries are not the expected ones: their digest is %s, and the run was told to "
-                                   "expect %s (--expect-binaries); this run publishes nothing" % (found, expected))
+    if expected is None:
+        say(stage=stage, binaries=found)
+        return found
+    if not (isinstance(expected, str) and SHA256.fullmatch(expected)):
+        say(stage=stage, binaries=found)
+        raise Refused("--expect-binaries takes exactly the 64 lowercase hex digits a dry run printed as \"binaries\", not %r; "
+                      "this run publishes nothing. Start it again with that digest, or without an expectation (the release "
+                      "then ships what it builds, with no comparison)." % (expected,))
+    say(stage=stage, binaries=found, expected=expected)
+    require(found == expected, "the six binaries are not the expected ones: their digest is %s, and the run was told to "
+                               "expect %s (--expect-binaries); this run publishes nothing. %s"
+                               % (found, expected, GO_ON.get(stage, GO_ON["assemble"])))
     return found
 
 
@@ -793,7 +829,7 @@ def cmd_verify(args):
     failures = []
 
     def check(ok, what):
-        print(("ok   " if ok else "FAIL ") + what, flush=True)
+        print(check_line(ok, what), flush=True)
         if not ok:
             failures.append(what)
 
@@ -870,8 +906,9 @@ def main(argv=None):
         if name == "publish":
             sub.add_argument("--mode", choices=("release", "dry-run"), required=True)
         else:
-            sub.add_argument("--expect-binaries", default="", metavar="DIGEST",
-                             help="refuse the six binaries unless their digest (printed as \"binaries\") is this one")
+            sub.add_argument("--expect-binaries", default=None, metavar="DIGEST",
+                             help="refuse the six binaries unless their digest (printed as \"binaries\") is this one: "
+                                  "exactly 64 lowercase hex digits, anything else is refused")
     verify = commands.add_parser("verify")
     verify.add_argument("--dist", required=True)
     verify.add_argument("--version", required=True)

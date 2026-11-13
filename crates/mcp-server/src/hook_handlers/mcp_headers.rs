@@ -261,9 +261,12 @@ mod tests {
         std::fs::write(&socket, b"").expect("a file standing in for the socket");
         let first = process_anchor(&socket).expect("an anchor");
         assert_eq!(process_anchor(&socket).as_deref(), Some(first.as_str()));
-        // A later process given the same path makes a new file.
+        // A later process given the same path makes a new file. A second
+        // link keeps the first file's inode in use, so the new file cannot
+        // be given it back (a file system may reuse a freed inode at once,
+        // and its change time may not move within one clock tick).
+        std::fs::hard_link(&socket, dir.path().join("keeps-the-inode-busy")).expect("link");
         std::fs::remove_file(&socket).expect("remove");
-        std::fs::write(dir.path().join("keeps-the-inode-busy"), b"").expect("write");
         std::fs::write(&socket, b"").expect("a new file");
         assert_ne!(process_anchor(&socket).expect("an anchor"), first);
     }

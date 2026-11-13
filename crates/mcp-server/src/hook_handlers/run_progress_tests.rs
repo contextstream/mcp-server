@@ -674,6 +674,13 @@ fn one_keep_alive_a_session_and_never_one_for_two() {
     let other = BeaterLock::take(&second).expect("another session has its own keep-alive");
     assert_ne!(beater_lock_path(&first), beater_lock_path(&second));
     drop(held);
+    // The lock is a flock on the open file. A child process that another
+    // test starts at this moment holds a copy of the descriptor from its
+    // fork until its exec, so the lock can outlive the drop by that much.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while beater_running(&first) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(!beater_running(&first));
     assert!(beater_running(&second));
     drop(other);

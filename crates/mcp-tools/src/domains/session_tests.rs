@@ -222,8 +222,8 @@ mod repository_project_resolution_tests {
             ),
             project_with_repository(
                 Uuid::new_v4(),
-                "contextstream",
-                "https://github.com/contextstream/contextstream",
+                "example-app",
+                "https://github.com/contextstream/example-app",
             ),
         ];
 

@@ -667,8 +667,8 @@ mod tests {
         holder.repository_url = Some("git@github.com:ContextStream/MCP-Server.git".to_string());
         let mut subgroup = project("ledger");
         subgroup.repository_url = Some("https://gitlab.com/acme/payments/ledger".to_string());
-        let mut other = project("contextstream");
-        other.repository_url = Some("https://github.com/contextstream/contextstream".to_string());
+        let mut other = project("example-app");
+        other.repository_url = Some("https://github.com/contextstream/example-app".to_string());
         let projects = vec![holder, subgroup, other, project("contextstream-mcp-server")];
 
         let named = |folder: &str| -> Vec<String> {

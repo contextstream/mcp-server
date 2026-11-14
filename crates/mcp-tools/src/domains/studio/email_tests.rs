@@ -1946,3 +1946,401 @@ fn addresses_contacts_and_operations_read_plainly() {
         "added through the API on 2026-10-20 08:00 UTC"
     );
 }
+
+// ============================================================================
+// email_sequences: the read-only view of the API's email sequences
+// ============================================================================
+
+use super::email_sequences::{
+    changes_words, rule_words, state_words, step_line, step_number, summary_line, window_days,
+    SEQUENCES_ACTION, SEQUENCES_NOT_OFFERED,
+};
+
+const SEQUENCE: &str = "33333333-3333-4333-8333-333333333333";
+const STEP_ONE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const STEP_TWO: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+/// The API's own shape for these routes: bare JSON, no `{success, data}` envelope.
+fn bare(status: u16, body: Value) -> Answer {
+    Answer { status, body }
+}
+
+fn sequence_summary() -> Value {
+    json!({
+        "id": SEQUENCE,
+        "name": "Getting Started",
+        "status": "sending",
+        "state": "running",
+        "exit_applies": true,
+        "edits_live_on_save": true,
+        "paused": false,
+        "automation": {
+            "enabled": true,
+            "trigger": "starter_signup",
+            "exit_condition": "paid_subscription",
+            "started_at": "2026-01-05T09:00:00Z",
+            "published_steps": 10
+        },
+        "from_address": "hello",
+        "from_name": "Example Co",
+        "steps": 10,
+        "totals": {"sent": 1500, "delivered": 1450, "opened": 400, "clicked": 50, "bounced": 20, "complained": 0, "unsubscribed": 6},
+        "people": 140,
+        "people_mid_sequence": 12,
+        "last_sent_at": "2026-11-14T23:08:07.147562Z",
+        "updated_at": "2026-11-14T23:08:09Z",
+        "admin_url": format!("https://admin.example.com/email/campaigns/{SEQUENCE}")
+    })
+}
+
+fn sequence_detail() -> Value {
+    json!({
+        "sequence": sequence_summary(),
+        "window_days": 7,
+        "people": {
+            "all_time": 140, "enrolled_in_window": 30, "mid_sequence": 12, "exited_paid": 2,
+            "unsubscribed": 6, "bounced": 3, "complained": 0,
+            "first_enrolled_at": "2026-01-05T09:10:00Z", "newest_enrolled_at": "2026-11-14T23:08:06Z"
+        },
+        "steps": [
+            {
+                "id": STEP_ONE, "number": 1, "name": "Step 1", "subject": "Your first step",
+                "published": true, "delay_days": 0, "delay_hours": 0, "day": 0.0,
+                "totals": {"sent": 150, "delivered": 0, "opened": 60, "clicked": 9, "bounced": 0, "complained": 0, "unsubscribed": 0},
+                "window": {"sent": 28, "delivered": 28, "opened": 10, "clicked": 3, "bounced": 0, "complained": 0, "unsubscribed": 0},
+                "waiting": 0, "next_due_at": null, "last_sent_at": "2026-11-14T23:08:07Z"
+            },
+            {
+                "id": STEP_TWO, "number": 2, "name": "Step 2", "subject": "Pick your path",
+                "published": true, "delay_days": 2, "delay_hours": 0, "day": 2.0,
+                "totals": {"sent": 145, "delivered": 0, "opened": 50, "clicked": 7, "bounced": 0, "complained": 0, "unsubscribed": 0},
+                "window": {"sent": 28, "delivered": 28, "opened": 11, "clicked": 2, "bounced": 0, "complained": 0, "unsubscribed": 0},
+                "waiting": 1, "next_due_at": "2026-11-16T23:07:00Z", "last_sent_at": "2026-11-14T12:24:03Z"
+            }
+        ],
+        "skipped": [
+            {"status": "skipped", "reason": "Recipient is an invalid or test address", "count": 23},
+            {"status": "skipped", "reason": "Recipient has unsubscribed", "count": 12}
+        ],
+        "window_totals": {"sent": 56, "delivered": 56, "opened": 21, "clicked": 5, "bounced": 0, "complained": 0, "unsubscribed": 0},
+        "as_of": "2026-11-14T23:17:00Z"
+    })
+}
+
+fn sequences_api() -> Responder {
+    Arc::new(|request: &Recorded| {
+        let detail = format!("/admin/email/sequences/{SEQUENCE}");
+        let step = format!("/admin/email/sequences/{SEQUENCE}/steps/{STEP_TWO}");
+        match request.path.as_str() {
+            "/admin/email/sequences" => bare(
+                200,
+                json!({"sequences": [sequence_summary()], "as_of": "2026-11-14T23:17:00Z"}),
+            ),
+            path if path == detail => bare(200, sequence_detail()),
+            path if path == step => bare(
+                200,
+                json!({
+                    "sequence_id": SEQUENCE, "id": STEP_TWO, "number": 2, "name": "Step 2",
+                    "published": true, "subject": "Pick your path", "headline": "Three ways in",
+                    "message": "<p>There are three ways to begin:</p>",
+                    "editor_mode": "richtext", "cta_text": "Choose one", "cta_url": "https://example.com/start",
+                    "signature_type": "founder", "delay_days": 2, "delay_hours": 0,
+                    "admin_url": format!("https://admin.example.com/email/campaigns/{SEQUENCE}")
+                }),
+            ),
+            _ => Answer::error(
+                404,
+                "NOT_FOUND",
+                "Not found: No email sequence with that id",
+            ),
+        }
+    })
+}
+
+#[test]
+fn the_sequences_action_is_listed_described_and_in_the_schema() {
+    assert!(VALID_ACTIONS.contains(&SEQUENCES_ACTION));
+    assert!(TOOL_REFERENCE.contains(&format!("- {SEQUENCES_ACTION}:")));
+    // Not one of Create's email actions: the API decides who it is offered to, not the catalog.
+    assert!(!EMAIL_ACTIONS.contains(&SEQUENCES_ACTION));
+    assert!(DESCRIPTION.chars().count() <= 1024);
+    let schema = input_schema();
+    let properties = schema["properties"].as_object().unwrap();
+    for field in ["sequence_id", "step", "days"] {
+        assert!(properties.contains_key(field), "{field}");
+    }
+}
+
+#[tokio::test]
+async fn sequences_are_listed_with_where_each_stands_and_only_read() {
+    let stub = Stub::start(sequences_api()).await;
+    let result = stub
+        .tool()
+        .execute(json!({"action": "email_sequences"}))
+        .await
+        .unwrap();
+    assert!(!result.is_error);
+    let said = text_of(&result);
+    assert!(said.starts_with("1 email sequence:"), "{said}");
+    assert!(said.contains("- Getting Started: running. 10 emails; a new Starter sign-up starts it; paying ends it."), "{said}");
+    assert!(
+        said.contains("140 people so far, 12 part-way through."),
+        "{said}"
+    );
+    assert!(said.contains("All time: sent 1,500, delivered 1,450, opened 400, clicked 50, bounced 20, unsubscribed 6, no complaints."), "{said}");
+    assert!(said.contains("Last send 2026-11-14 23:08 UTC."), "{said}");
+    assert!(
+        said.contains(&format!("(sequence_id {SEQUENCE})")),
+        "{said}"
+    );
+    assert_eq!(structured(&result)["sequences"][0]["people"], 140);
+    // The API decides the offer: Create's catalog is not asked, and nothing but a GET is sent.
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        (requests[0].method.as_str(), requests[0].path.as_str()),
+        ("GET", "/admin/email/sequences")
+    );
+    assert!(stub.calls_to("GET", "/create/catalog").is_empty());
+    assert!(stub.email_calls().is_empty());
+}
+
+#[tokio::test]
+async fn one_sequence_shows_its_people_its_emails_and_their_numbers() {
+    let stub = Stub::start(sequences_api()).await;
+    let result = stub
+        .tool()
+        .execute(json!({"action": "email_sequences", "sequence_id": SEQUENCE, "days": 7}))
+        .await
+        .unwrap();
+    assert!(!result.is_error);
+    let said = text_of(&result);
+    assert!(
+        said.contains(
+            "Getting Started: running. 10 emails; a new Starter sign-up starts it; paying ends it."
+        ),
+        "{said}"
+    );
+    assert!(said.contains("People: 140 so far, 30 in the last 7 days, 12 part-way through, 2 left on paying, 6 unsubscribed, 3 bounced, no complaints."), "{said}");
+    assert!(said.contains("In the last 7 days: sent 56, delivered 56, opened 21, clicked 5, bounced 0, unsubscribed 0, no complaints."), "{said}");
+    assert!(
+        said.contains("1. Your first step: day 0; 28/10/3; 150/60/9"),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "2. Pick your path: day 2; 28/11/2; 145/50/7; 1 waiting, next 2026-11-16 23:07 UTC"
+        ),
+        "{said}"
+    );
+    assert!(said.contains("Not sent in the last 7 days: 23 skipped (Recipient is an invalid or test address); 12 skipped (Recipient has unsubscribed)."), "{said}");
+    assert!(said.contains(&format!("A change is made at https://admin.example.com/email/campaigns/{SEQUENCE}, and a save there is live at once: there is no draft.")), "{said}");
+    assert_eq!(structured(&result)["steps"][1]["window"]["opened"], 11);
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].query, "days=7");
+    // Out of range is brought into range, never refused.
+    assert_eq!(window_days(None), 30);
+    assert_eq!(window_days(Some(0)), 1);
+    assert_eq!(window_days(Some(9_999)), 365);
+}
+
+#[tokio::test]
+async fn an_emails_text_is_read_by_its_number() {
+    let stub = Stub::start(sequences_api()).await;
+    let tool = stub.tool();
+    let result = tool
+        .execute(json!({"action": "email_sequences", "sequence_id": SEQUENCE, "step": 2}))
+        .await
+        .unwrap();
+    assert!(!result.is_error, "{}", text_of(&result));
+    let said = text_of(&result);
+    assert!(
+        said.starts_with("Email 2 of “Getting Started” (published; day 2):"),
+        "{said}"
+    );
+    assert!(said.contains("Subject: Pick your path"), "{said}");
+    assert!(said.contains("Headline: Three ways in"), "{said}");
+    assert!(
+        said.contains("Button: Choose one -> https://example.com/start"),
+        "{said}"
+    );
+    assert!(said.contains("Body, as stored (richtext):"), "{said}");
+    assert!(
+        said.contains(
+            "This is the text being sent now. Nothing here changes it. A change is made at"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("<p>There are three ways to begin:</p>"),
+        "{said}"
+    );
+    assert_eq!(structured(&result)["subject"], "Pick your path");
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|r| r.method == "GET"));
+    assert_eq!(
+        requests[1].path,
+        format!("/admin/email/sequences/{SEQUENCE}/steps/{STEP_TWO}")
+    );
+
+    // An email the sequence does not have is said plainly, and its text is not asked for.
+    let missing = tool
+        .execute(json!({"action": "email_sequences", "sequence_id": SEQUENCE, "step": 11}))
+        .await
+        .unwrap();
+    assert!(missing.is_error);
+    assert_eq!(
+        text_of(&missing),
+        "“Getting Started” has 2 emails: there is no email 11."
+    );
+    assert_eq!(stub.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn an_account_sequences_arent_offered_to_gets_one_plain_refusal() {
+    let closed = Stub::start(Arc::new(|_: &Recorded| {
+        Answer::error(
+            403,
+            "FORBIDDEN",
+            "Forbidden: Email sequences aren't offered to this account",
+        )
+    }))
+    .await;
+    let tool = closed.tool();
+    for call in [
+        json!({"action": "email_sequences"}),
+        json!({"action": "email_sequences", "sequence_id": SEQUENCE}),
+        json!({"action": "email_sequences", "sequence_id": SEQUENCE, "step": 1}),
+    ] {
+        let result = tool.execute(call.clone()).await.unwrap();
+        assert!(result.is_error, "{call}");
+        assert_eq!(text_of(&result), SEQUENCES_NOT_OFFERED, "{call}");
+    }
+    assert!(closed.requests().iter().all(|r| r.method == "GET"));
+
+    let signed_out = Stub::start(Arc::new(|_: &Recorded| {
+        Answer::error(401, "UNAUTHORIZED", "Unauthorized")
+    }))
+    .await;
+    let result = signed_out
+        .tool()
+        .execute(json!({"action": "email_sequences"}))
+        .await
+        .unwrap();
+    assert_eq!(text_of(&result), SIGN_IN);
+
+    let stub = Stub::start(sequences_api()).await;
+    let unknown = stub
+        .tool()
+        .execute(json!({"action": "email_sequences", "sequence_id": CAMPAIGN}))
+        .await
+        .unwrap();
+    assert!(unknown.is_error);
+    assert!(text_of(&unknown).starts_with("No email sequence has that sequence_id"));
+
+    let down = Stub::start(Arc::new(|_: &Recorded| {
+        Answer::error(503, "UNAVAILABLE", "Service unavailable: x")
+    }))
+    .await;
+    let error = down
+        .tool()
+        .execute(json!({"action": "email_sequences"}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("try again in a few minutes"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_call_is_refused_before_anything_is_asked() {
+    let stub = Stub::start(sequences_api()).await;
+    let tool = stub.tool();
+    for call in [
+        json!({"action": "email_sequences", "step": 2}),
+        json!({"action": "email_sequences", "sequence_id": SEQUENCE, "step": 0}),
+        json!({"action": "email_sequences", "sequence_id": "not-an-id"}),
+    ] {
+        assert!(tool.execute(call.clone()).await.is_err(), "{call}");
+    }
+    let keyed = tool
+        .execute(json!({"action": "email_sequences", "query": "re_Tq9Zc4Hk2vW8pL1sN6bR3xY7_Qa7x"}))
+        .await
+        .unwrap();
+    assert_eq!(text_of(&keyed), KEY_REFUSED);
+    assert!(stub.requests().is_empty(), "nothing was asked of the API");
+    assert!(step_number(None).unwrap().is_none());
+    assert_eq!(step_number(Some(3)).unwrap(), Some(3));
+    assert!(step_number(Some(-1)).is_err());
+}
+
+#[test]
+fn a_sequences_state_and_rules_are_said_from_the_apis_fields() {
+    let running = sequence_summary();
+    assert_eq!(state_words(&running), "running");
+    assert_eq!(
+        rule_words(&running),
+        "a new Starter sign-up starts it; paying ends it"
+    );
+
+    let mut paused = sequence_summary();
+    paused["state"] = json!("paused");
+    assert_eq!(state_words(&paused), "paused: nothing is being sent");
+
+    let mut drafted = sequence_summary();
+    drafted["state"] = json!("not_running");
+    drafted["status"] = json!("draft");
+    assert_eq!(state_words(&drafted), "not running (status draft)");
+
+    // The API says the automation is off and the exit with it: both are said as they are.
+    let mut enrolled_only = sequence_summary();
+    enrolled_only["state"] = json!("enrolled_only");
+    enrolled_only["exit_applies"] = json!(false);
+    assert_eq!(
+        state_words(&enrolled_only),
+        "sending only to the people already in it: nobody new is enrolled"
+    );
+    assert_eq!(
+        rule_words(&enrolled_only),
+        "a new Starter sign-up starts it; paying no longer ends it"
+    );
+
+    // A value this build does not know is shown, not guessed at.
+    let mut other = sequence_summary();
+    other["state"] = json!("draining");
+    other["automation"]["trigger"] = json!("joined_audience");
+    other["automation"]["exit_condition"] = Value::Null;
+    assert_eq!(state_words(&other), "state draining");
+    assert_eq!(
+        rule_words(&other),
+        "its trigger is joined_audience; it has no exit"
+    );
+    let mut older = sequence_summary();
+    older.as_object_mut().unwrap().remove("state");
+    assert_eq!(state_words(&older), "status sending");
+
+    // Where a change is made, and whether a save is live, are the API's to say.
+    assert!(changes_words(&running).ends_with("a save there is live at once: there is no draft."));
+    let mut drafts = sequence_summary();
+    drafts["edits_live_on_save"] = json!(false);
+    assert_eq!(
+        changes_words(&drafts),
+        format!(" A change is made at https://admin.example.com/email/campaigns/{SEQUENCE}.")
+    );
+    assert_eq!(changes_words(&json!({})), "");
+
+    // Fewer published than written: both are said, and an unpublished email says so.
+    let mut partly = sequence_summary();
+    partly["automation"]["published_steps"] = json!(8);
+    assert!(summary_line(&partly).contains("10 emails, 8 published"));
+    let unpublished = json!({"number": 9, "subject": "Later", "day": 16.5, "published": false,
+        "totals": {"sent": 0, "opened": 0, "clicked": 0}, "window": {"sent": 0, "opened": 0, "clicked": 0}, "waiting": 0});
+    assert_eq!(
+        step_line(&unpublished),
+        "9. Later: day 16.5; 0/0/0; 0/0/0; not published, so it is not sent"
+    );
+}

@@ -1423,17 +1423,24 @@ async fn a_stateless_client_that_names_its_connection_is_one_session_per_connect
         .await
     );
     assert_ne!(by_key[2..], one[2..]);
-    // A transport that has a session id of its own is named by that, as before.
+    // A transport that has a session id of its own is named by that id,
+    // bound to the caller as the token is; the token is not used then.
     let by_transport = mcp_client::run_with_mcp_session_id("mcp-session-1".to_string(), || {
         hosted_part(Some("key-1"), Some(TOKEN_A))
     })
     .await;
-    let transport_alone =
-        mcp_client::run_with_mcp_session_id("mcp-session-1".to_string(), || async {
-            session_part(true)
+    let transport_without_token =
+        mcp_client::run_with_mcp_session_id("mcp-session-1".to_string(), || {
+            hosted_part(Some("key-1"), None)
         })
         .await;
-    assert_eq!(by_transport, transport_alone);
+    assert_eq!(by_transport, transport_without_token);
+    assert_ne!(by_transport, one);
+    let other_key = mcp_client::run_with_mcp_session_id("mcp-session-1".to_string(), || {
+        hosted_part(Some("key-2"), None)
+    })
+    .await;
+    assert_ne!(by_transport, other_key);
 }
 
 #[test]
@@ -1980,19 +1987,7 @@ async fn sign_for(
     tool: &str,
     listed: Vec<Value>,
 ) -> (bool, Vec<(String, Value)>) {
-    let api = Api::start(vec![
-        (
-            "GET /api/v1/run-progress/runs?",
-            200,
-            json!({"success": true, "data": {"runs": listed}}),
-        ),
-        (
-            "POST /api/v1/run-progress/report",
-            200,
-            fixture.answer("working", &[]),
-        ),
-    ])
-    .await;
+    let api = Api::start(routes_knowing(fixture, &listed)).await;
     let (client, session) = hosted_client(fixture, &api.base_url);
     let params = json!({"name": tool, "arguments": {"query": "anything"}});
     let sent = as_caller(caller, || async {
@@ -2012,53 +2007,70 @@ async fn sign_for(
 }
 
 #[tokio::test]
-async fn a_tool_call_keeps_the_sessions_open_runs_alive_where_the_gateway_is_told_to() {
-    let fixture = Fixture::new();
-    let me = agent_id_of(SESSION_A).await;
-    let listed = vec![
-        listed_run(&fixture, 1, &me, "live", 5),
-        listed_run(&fixture, 2, &me, "waiting", 5),
-        listed_run(&fixture, 3, "claude-code:0badc0de", "live", 5),
-        listed_run(&fixture, 4, &me, "stalled", 20),
-        listed_run(&fixture, 5, &me, "quiet", 4 * 60 + 5),
+async fn a_tool_call_keeps_the_sessions_own_run_alive_where_the_gateway_is_told_to() {
+    // The session's own run (its reports that name none), by how the API
+    // answers it, and whether a tool call of the session signals it.
+    let cases = [
+        ("live", 5, true),
+        ("stalled", 20, true),
+        ("quiet", 4 * 60 - 5, true),
+        ("waiting", 5, false),
+        ("ended", 5, false),
+        ("quiet", 4 * 60 + 5, false),
     ];
-    let (went, requests) = sign_for(
-        &fixture,
-        SESSION_A,
-        &[fixture.workspace],
-        "search",
-        listed.clone(),
-    )
-    .await;
-    assert!(went);
-    let targets: Vec<&str> = requests.iter().map(|(target, _)| target.as_str()).collect();
-    assert_eq!(targets.len(), 3, "{targets:?}");
-    assert!(
-        targets[0].starts_with("/api/v1/run-progress/runs?")
-            && targets[0].contains("active=true")
-            && targets[0].contains(&format!("workspace_id={}", fixture.workspace)),
-        "{targets:?}"
-    );
-    // Its working run and its stalled one. Not the run that waits, not
-    // another agent's, not one its agent last reported on hours ago.
-    for ((target, body), index) in requests[1..].iter().zip([1_u128, 4]) {
-        assert_eq!(target, "/api/v1/run-progress/report");
-        // Who and which run and nothing about the work, under the run's own
-        // agent, so nothing is renamed.
+    for (liveness, minutes_ago, signalled) in cases {
+        let fixture = Fixture::new();
+        let mut own = reported_run(&fixture, SESSION_A, minutes_ago).await;
+        own["liveness"] = json!(liveness);
+        if liveness == "waiting" {
+            own["waiting"] = json!({"on": "person"});
+        }
+        let others = listed_run(&fixture, 3, "claude-code:0badc0de", "live", 5);
+        let (went, requests) = sign_for(
+            &fixture,
+            SESSION_A,
+            &[fixture.workspace],
+            "search",
+            vec![own.clone(), others],
+        )
+        .await;
+        assert!(went, "{liveness} {minutes_ago}");
+        // One read: that run, by its id, in the call's workspace. Nothing
+        // is listed, and no other run is read.
         assert_eq!(
-            body,
-            &json!({
-                "workspace_id": fixture.workspace,
-                "run_id": Uuid::from_u128(index),
-                "agent": listed[0]["agent"],
-            })
+            requests[0].0,
+            format!(
+                "/api/v1/run-progress/runs/{}?workspace_id={}",
+                own["run_id"].as_str().expect("a run id"),
+                fixture.workspace
+            )
         );
+        if signalled {
+            // Who and which run and nothing about the work, under the run's
+            // own agent, so nothing is renamed.
+            assert_eq!(requests.len(), 2, "{liveness} {minutes_ago}: {requests:?}");
+            assert_eq!(
+                reports_in(&requests),
+                vec![&json!({
+                    "workspace_id": fixture.workspace,
+                    "run_id": own["run_id"],
+                    "agent": own["agent"],
+                })]
+            );
+        } else {
+            assert_eq!(requests.len(), 1, "{liveness} {minutes_ago}: {requests:?}");
+        }
+        // At most once a minute for one session: the next call sends nothing.
+        let (went, requests) = sign_for(
+            &fixture,
+            SESSION_A,
+            &[fixture.workspace],
+            "memory",
+            vec![own],
+        )
+        .await;
+        assert!(!went && requests.is_empty(), "{requests:?}");
     }
-    // At most once a minute for one session: the next call sends nothing.
-    let (went, requests) =
-        sign_for(&fixture, SESSION_A, &[fixture.workspace], "memory", listed).await;
-    assert!(!went);
-    assert!(requests.is_empty(), "{requests:?}");
 }
 
 #[tokio::test]
@@ -2131,7 +2143,8 @@ async fn a_session_the_gateway_cannot_tell_apart_gives_no_sign_of_life() {
     // A report is a signal of its own.
     let (went, requests) = sign_for(&fixture, SESSION_A, &here, "progress", vec![]).await;
     assert!(!went && requests.is_empty(), "{requests:?}");
-    // An agent its client named is that agent, on whatever connection.
+    // A name its client sent says nothing of the session: any session of
+    // any key may send it.
     let named = Caller {
         key: Some("key-1"),
         token: None,
@@ -2148,12 +2161,465 @@ async fn a_session_the_gateway_cannot_tell_apart_gives_no_sign_of_life() {
         ],
     )
     .await;
-    assert!(went);
-    let reports: Vec<&Value> = requests
+    assert!(!went && requests.is_empty(), "{requests:?}");
+}
+
+// ============================================================================
+// A sign only for this session's own run (review of 89c632e: MUST 1, SHOULD 2
+// and 3; the reviewer's two failing tests are the first two)
+// ============================================================================
+
+/// A hosted report of `caller` that names no run: the body the API received.
+async fn review_report_body(fixture: &Fixture, caller: Caller<'_>) -> Value {
+    let api = Api::start(vec![
+        (
+            "GET /api/v1/run-progress/runs?",
+            200,
+            json!({"success": true, "data": {"runs": []}}),
+        ),
+        (
+            "POST /api/v1/run-progress/report",
+            200,
+            fixture.answer("working", &["run.step"]),
+        ),
+    ])
+    .await;
+    let tool = fixture.hosted_tool(&api.base_url);
+    as_caller(caller, || async {
+        tool.execute(json!({"step": "Running the tests"})).await
+    })
+    .await
+    .expect("report");
+    api.requests()
+        .into_iter()
+        .find(|seen| seen.target.ends_with("/run-progress/report"))
+        .expect("a report")
+        .body
+}
+
+/// The run a report of `caller` that names no run made, as the API keeps it:
+/// the id the API gives it (`uuid5(workspace, "mcp:" + source_run_id)`,
+/// contextstream `progress/report.rs`) and the agent as sent (an agent with
+/// no id is listed under its name).
+async fn reported_run(fixture: &Fixture, caller: Caller<'_>, minutes_ago: i64) -> Value {
+    let report = review_report_body(fixture, caller).await;
+    let mut agent = report["agent"].clone();
+    if agent.get("id").is_none() {
+        agent["id"] = agent["name"].clone();
+    }
+    let id = agent["id"].as_str().expect("an agent id").to_string();
+    let mut run = listed_run(fixture, 0, &id, "live", minutes_ago);
+    let key = report["source_run_id"].as_str().expect("a run key");
+    run["run_id"] = json!(run_id_of_key(fixture.workspace, key));
+    run["agent"] = agent;
+    run
+}
+
+fn reports_in(requests: &[(String, Value)]) -> Vec<&Value> {
+    requests
         .iter()
         .filter(|(target, _)| target.ends_with("/run-progress/report"))
         .map(|(_, body)| body)
+        .collect()
+}
+
+/// The routes of a mock API that knows the runs `known`: each by its id,
+/// all of them in a list, and a report route.
+fn routes_knowing(fixture: &Fixture, known: &[Value]) -> Vec<(&'static str, u16, Value)> {
+    let mut routes = vec![
+        (
+            "GET /api/v1/run-progress/runs?",
+            200,
+            json!({"success": true, "data": {"runs": known}}),
+        ),
+        (
+            "POST /api/v1/run-progress/report",
+            200,
+            fixture.answer("working", &[]),
+        ),
+    ];
+    for view in known {
+        if let Some(id) = view["run_id"].as_str() {
+            let route: &'static str =
+                Box::leak(format!("GET /api/v1/run-progress/runs/{id}").into_boxed_str());
+            routes.push((route, 200, json!({"success": true, "data": view})));
+        }
+    }
+    routes
+}
+
+/// One tool call each of `callers`, in turn, through one hosted gateway
+/// client against one mock API that knows the runs `known`: how many signs
+/// went out, and every request they made (target, body).
+async fn signs_for_calls(
+    fixture: &Fixture,
+    callers: &[Caller<'_>],
+    known: Vec<Value>,
+) -> (usize, Vec<(String, Value)>) {
+    let api = Api::start(routes_knowing(fixture, &known)).await;
+    let (client, session) = hosted_client(fixture, &api.base_url);
+    let params = json!({"name": "search", "arguments": {"query": "anything"}});
+    let mut went = 0;
+    for caller in callers {
+        let sent = as_caller(*caller, || async {
+            sign_of_life_for(&client, &session, &params, &[fixture.workspace]).await
+        })
+        .await;
+        if let Some(task) = sent {
+            went += 1;
+            task.await.expect("the sign of life finishes");
+        }
+    }
+    let requests = api
+        .requests()
+        .into_iter()
+        .map(|seen| (seen.target, seen.body))
         .collect();
+    (went, requests)
+}
+
+/// B1/A2. A tool call is a sign of life for THAT session's run, and a dead
+/// session's run goes quiet at the old time, whatever name both sessions
+/// send.
+#[tokio::test]
+async fn review_a_dead_named_sessions_run_gets_no_sign_from_another_session_of_that_name() {
+    let fixture = Fixture::new();
+    let here = [fixture.workspace];
+    let dead = Caller {
+        key: Some("key-1"),
+        token: Some(TOKEN_A),
+        name: Some("floor-live-runs"),
+    };
+    let alive = Caller {
+        key: Some("key-1"),
+        token: Some(TOKEN_B),
+        name: Some("floor-live-runs"),
+    };
+    // The first session reported, then died five minutes ago; its run is
+    // still open.
+    let dead_run = reported_run(&fixture, dead, 5).await;
+    let (went, requests) = sign_for(&fixture, alive, &here, "search", vec![dead_run.clone()]).await;
+    let reports = reports_in(&requests);
+    assert!(
+        reports.is_empty(),
+        "went={went}: the live session's tool call kept the dead session's run alive: {reports:?}"
+    );
+    // The run is the dead session's own: its call would have signalled it.
+    let (went, requests) = sign_for(&fixture, dead, &here, "search", vec![dead_run.clone()]).await;
+    let reports = reports_in(&requests);
+    assert!(went, "{requests:?}");
     assert_eq!(reports.len(), 1, "{requests:?}");
-    assert_eq!(reports[0]["run_id"], json!(Uuid::from_u128(1)));
+    assert_eq!(reports[0]["run_id"], dead_run["run_id"]);
+}
+
+/// A2. The same across keys: another key that sends the same name.
+#[tokio::test]
+async fn review_another_keys_tool_call_gives_no_sign_for_a_named_agents_run() {
+    let fixture = Fixture::new();
+    let here = [fixture.workspace];
+    let owner = Caller {
+        key: Some("key-1"),
+        token: Some(TOKEN_A),
+        name: Some("floor-live-runs"),
+    };
+    let other_key = Caller {
+        key: Some("key-2"),
+        token: None,
+        name: Some("floor-live-runs"),
+    };
+    let owners_run = reported_run(&fixture, owner, 5).await;
+    let (went, requests) = sign_for(&fixture, other_key, &here, "search", vec![owners_run]).await;
+    let reports = reports_in(&requests);
+    assert!(
+        reports.is_empty(),
+        "went={went}: key-2 kept key-1's run alive by sending its name: {reports:?}"
+    );
+}
+
+/// A named caller the gateway cannot tell from the key's other sessions (no
+/// `s-` session part) gets no sign: a name alone is never enough.
+#[tokio::test]
+async fn a_named_caller_with_no_session_part_gets_no_sign() {
+    let fixture = Fixture::new();
+    let here = [fixture.workspace];
+    let lane = Caller {
+        key: Some("key-1"),
+        token: Some(TOKEN_A),
+        name: Some("floor-live-runs"),
+    };
+    let named_only = Caller {
+        key: Some("key-1"),
+        token: None,
+        name: Some("floor-live-runs"),
+    };
+    let known = vec![
+        reported_run(&fixture, lane, 5).await,
+        reported_run(&fixture, named_only, 5).await,
+        listed_run(&fixture, 7, "floor-live-runs", "live", 5),
+    ];
+    let (went, requests) = sign_for(&fixture, named_only, &here, "search", known).await;
+    assert!(
+        !went && requests.is_empty(),
+        "went={went}: a name alone was taken for a session: {requests:?}"
+    );
+}
+
+/// The session part a legacy (stateful) request of `key` that presents
+/// `session_id` gets.
+async fn legacy_part(key: &str, session_id: &str) -> String {
+    mcp_client::run_with_mcp_session_id(session_id.to_string(), || hosted_part(Some(key), None))
+        .await
+}
+
+/// Run `work` as a legacy request that presents the session id
+/// `mcp-session-1`.
+async fn in_session<T, F, Fut>(work: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    mcp_client::run_with_mcp_session_id("mcp-session-1".to_string(), work).await
+}
+
+/// On the legacy contract the session id is the client's to send: the part
+/// is bound to the caller, so another key that presents the same id is
+/// another session, and its tool calls give the first key's run no sign.
+#[tokio::test]
+async fn the_legacy_session_part_is_bound_to_the_caller() {
+    let one = legacy_part("key-1", "mcp-session-1").await;
+    assert!(one.starts_with("s-") && one.len() == 18, "{one}");
+    assert_eq!(one, legacy_part("key-1", "mcp-session-1").await);
+    let other = legacy_part("key-2", "mcp-session-1").await;
+    assert_ne!(
+        one, other,
+        "another key with the same session id is another session"
+    );
+
+    let fixture = Fixture::new();
+    let here = [fixture.workspace];
+    let key_1 = Caller {
+        key: Some("key-1"),
+        token: None,
+        name: None,
+    };
+    let key_2 = Caller {
+        key: Some("key-2"),
+        token: None,
+        name: None,
+    };
+    let run = in_session(|| reported_run(&fixture, key_1, 5)).await;
+    let (went, requests) =
+        in_session(|| sign_for(&fixture, key_2, &here, "search", vec![run.clone()])).await;
+    let reports = reports_in(&requests);
+    assert!(
+        reports.is_empty(),
+        "went={went}: key-2 kept key-1's run alive with key-1's session id: {reports:?}"
+    );
+    // Key-1's own call in its session signals it.
+    let (went, requests) =
+        in_session(|| sign_for(&fixture, key_1, &here, "search", vec![run.clone()])).await;
+    let reports = reports_in(&requests);
+    assert!(went, "{requests:?}");
+    assert_eq!(reports.len(), 1, "{requests:?}");
+    assert_eq!(reports[0]["run_id"], run["run_id"]);
+}
+
+/// SHOULD 2. A client that sends a new connection token on every call is a
+/// new session each time; one key's calls still make at most the allowed
+/// signs a minute, and a run is signalled at most once a minute.
+#[tokio::test]
+async fn three_hundred_calls_with_three_hundred_tokens_make_at_most_the_allowed_signs() {
+    const ALLOWED: usize = 60;
+    let fixture = Fixture::new();
+    let tokens: Vec<String> = (0..300_u32).map(|index| format!("{index:032x}")).collect();
+    let callers: Vec<Caller> = tokens
+        .iter()
+        .map(|token| Caller {
+            key: Some("key-1"),
+            token: Some(token),
+            name: None,
+        })
+        .collect();
+    let first_run = reported_run(&fixture, callers[0], 5).await;
+    let (went, requests) = signs_for_calls(&fixture, &callers, vec![first_run.clone()]).await;
+    let reads = requests.len() - reports_in(&requests).len();
+    let reports = reports_in(&requests);
+    println!(
+        "SIGNS 300 calls, 300 tokens, one key: signs {went}, reads {reads}, reports {}",
+        reports.len()
+    );
+    assert!(
+        went <= ALLOWED && reads <= ALLOWED,
+        "went={went} reads={reads}"
+    );
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0]["run_id"], first_run["run_id"]);
+
+    // One named agent, 50 tokens: the run its first session reported gets
+    // one sign.
+    let fixture = Fixture::new();
+    let named: Vec<Caller> = tokens[..50]
+        .iter()
+        .map(|token| Caller {
+            key: Some("key-1"),
+            token: Some(token),
+            name: Some("floor-live-runs"),
+        })
+        .collect();
+    let lanes_run = reported_run(&fixture, named[0], 5).await;
+    let by_name = listed_run(&fixture, 8, "floor-live-runs", "live", 5);
+    let (went, requests) = signs_for_calls(&fixture, &named, vec![lanes_run, by_name]).await;
+    let reports = reports_in(&requests);
+    println!(
+        "SIGNS 50 calls, one named agent, 50 tokens: signs {went}, requests {}, reports {}",
+        requests.len(),
+        reports.len()
+    );
+    assert!(reports.len() <= 1, "{reports:?}");
+
+    // One session, 300 calls: one sign.
+    let fixture = Fixture::new();
+    let run = reported_run(&fixture, callers[0], 5).await;
+    let (went, requests) = signs_for_calls(&fixture, &[callers[0]; 300], vec![run]).await;
+    println!(
+        "SIGNS 300 calls, one session: signs {went}, requests {}",
+        requests.len()
+    );
+    assert_eq!((went, requests.len()), (1, 2), "{requests:?}");
+}
+
+/// SHOULD 3. A sign the API refuses is one request: no session refresh, no
+/// retry, and nothing more for that session that minute.
+#[tokio::test]
+async fn a_refused_sign_is_one_request_and_never_refreshes_the_session() {
+    let fixture = Fixture::new();
+    let api = Api::start(vec![
+        (
+            "GET /api/v1/run-progress/runs",
+            403,
+            json!({"success": false, "error": {"code": "forbidden", "message": "not a member"}}),
+        ),
+        (
+            "POST /api/v1/run-progress/report",
+            403,
+            json!({"success": false, "error": {"code": "forbidden", "message": "not a member"}}),
+        ),
+    ])
+    .await;
+    let (client, session) = hosted_client(&fixture, &api.base_url);
+    let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let refreshes_for_hook = Arc::clone(&refreshes);
+    client
+        .set_session_refresh_hook(Arc::new(move || {
+            let refreshes = Arc::clone(&refreshes_for_hook);
+            Box::pin(async move {
+                refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            })
+        }))
+        .await;
+    let params = json!({"name": "search", "arguments": {}});
+    for _ in 0..3 {
+        let sent = as_caller(SESSION_A, || async {
+            sign_of_life_for(&client, &session, &params, &[fixture.workspace]).await
+        })
+        .await;
+        if let Some(task) = sent {
+            task.await.expect("the sign of life finishes");
+        }
+    }
+    let requests = api.requests();
+    let refreshed = refreshes.load(std::sync::atomic::Ordering::SeqCst);
+    println!(
+        "SIGNS refused: requests {} {:?}, session refreshes {refreshed}",
+        requests.len(),
+        requests
+            .iter()
+            .map(|seen| seen.target.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(refreshed, 0, "a sign never refreshes the session");
+    assert_eq!(requests.len(), 1, "one request, then quiet for the minute");
+}
+
+/// The run id the API gives a report's `source_run_id`, the same as
+/// Python's `uuid.uuid5(workspace, "mcp:" + key)` (here for the synthetic
+/// workspace 1111..., written without hyphens).
+#[test]
+fn the_default_run_id_is_the_apis_id_for_the_default_key() {
+    let workspace = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+    assert_eq!(
+        run_id_of_key(workspace, "s-0123456789abcdef:session")
+            .simple()
+            .to_string(),
+        "cd442ae9fd695186a39dd2da46cbc5c7"
+    );
+}
+
+/// SHOULD 4. Signs out at once are capped: above the cap a sign is dropped,
+/// not queued, and its place is free again when a sign ends.
+#[test]
+fn signs_out_at_once_are_capped_and_dropped_above_the_cap() {
+    let in_flight: &'static InFlight = Box::leak(Box::new(InFlight::new(3)));
+    let slots: Vec<SignSlot> = (0..3)
+        .map(|_| in_flight.take().expect("a free place"))
+        .collect();
+    assert!(in_flight.take().is_none(), "the fourth is dropped");
+    drop(slots);
+    assert!(in_flight.take().is_some(), "a place is free again");
+}
+
+/// SHOULD 2. What the gateway remembers of its signs: one a minute per
+/// session, at most so many a minute per key, and bounded, the oldest
+/// forgotten first.
+#[test]
+fn the_memory_of_signs_is_bounded_and_forgets_the_old_first() {
+    let workspace = Uuid::new_v4();
+    let start = Instant::now();
+    let mut due = SignsDue::default();
+    assert!(due.due("s-1", "key-1", workspace, start));
+    assert!(!due.due("s-1", "key-1", workspace, start + Duration::from_secs(59)));
+    assert!(due.due("s-1", "key-1", workspace, start + SIGN_OF_LIFE_EVERY));
+    // One key, a new session every call: at most so many signs a minute.
+    let mut due = SignsDue::default();
+    let sent = (0..300)
+        .filter(|index| due.due(&format!("s-{index}"), "key-1", workspace, start))
+        .count();
+    assert_eq!(sent, SIGNS_PER_CALLER_EVERY_MINUTE as usize);
+    assert!(
+        due.due("s-x", "key-2", workspace, start),
+        "another key has its own"
+    );
+    assert!(due.due("s-x", "key-1", workspace, start + SIGN_OF_LIFE_EVERY));
+    // Full of signs a minute old: they are forgotten for a new one.
+    let mut due = SignsDue::default();
+    for index in 0..MAX_SIGNED_SESSIONS {
+        assert!(due.due(
+            &format!("s-{index}"),
+            &format!("key-{index}"),
+            workspace,
+            start
+        ));
+    }
+    assert_eq!(due.remembered(), (MAX_SIGNED_SESSIONS, MAX_SIGNED_SESSIONS));
+    assert!(due.due("s-new", "key-new", workspace, start + SIGN_OF_LIFE_EVERY));
+    assert_eq!(due.remembered(), (1, 1));
+    // Full of signs of this minute: all are forgotten (one sign more each
+    // is harmless), never more than the bound is kept.
+    let mut due = SignsDue::default();
+    for index in 0..MAX_SIGNED_SESSIONS {
+        due.due(
+            &format!("s-{index}"),
+            &format!("key-{index}"),
+            workspace,
+            start,
+        );
+    }
+    assert!(due.due(
+        "s-new",
+        "key-new",
+        workspace,
+        start + Duration::from_secs(1)
+    ));
+    assert_eq!(due.remembered(), (1, 1));
 }

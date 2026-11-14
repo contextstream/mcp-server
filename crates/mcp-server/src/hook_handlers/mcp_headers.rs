@@ -6,11 +6,13 @@
 //! connects to a remote server and adds the headers that command prints
 //! (`headersHelper`); setup writes this command there. It prints one header,
 //! [`mcp_client::client_session::HEADER`], with a random id: nothing of the
-//! machine, the person, the folder or the key is in it. When the session
-//! names its agent the way a local server reads it (`CONTEXTSTREAM_AGENT_NAME`
-//! or `AGENT_NAME`, else an `agent-<name>` working folder), it also prints
-//! [`mcp_client::agent_handle::HEADER`] with that name, so the hosted server
-//! reports the session's runs under it; without one, nothing more is sent.
+//! machine, the person, the folder or the key is in it. Where the machine
+//! turned signs of life on (`CONTEXTSTREAM_RUN_PROGRESS_SIGNS=on`, off as
+//! shipped) and the session names its agent the way a local server reads it
+//! (`CONTEXTSTREAM_AGENT_NAME` or `AGENT_NAME`, else an `agent-<name>`
+//! working folder), it also prints [`mcp_client::agent_handle::HEADER`] with
+//! that name, so the hosted server reports the session's runs under it.
+//! Otherwise nothing more is sent, as before.
 //!
 //! Claude Code runs the command again whenever it connects again. It names
 //! the session's own process to the command by its messaging socket
@@ -74,17 +76,22 @@ pub fn handle() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What the command prints: the one header, or no header at all where live
-/// progress is turned off.
 /// The session's agent name, by the rule a local server uses: its
 /// `CONTEXTSTREAM_AGENT_NAME` (or `AGENT_NAME`), else a working folder named
 /// `agent-<name>` (`mcp_client::agent_handle::agent_handle`). Claude Code
-/// runs this command in the session's own environment.
+/// runs this command in the session's own environment. Only where signs of
+/// life are on (`CONTEXTSTREAM_RUN_PROGRESS_SIGNS=on`, off as shipped):
+/// otherwise a hosted session's runs keep the name they had.
 fn agent_name() -> Option<String> {
+    if !super::run_progress::Settings::from_env().signs {
+        return None;
+    }
     let folder = std::env::current_dir().ok();
     mcp_client::agent_handle::agent_handle(folder.as_deref().and_then(|path| path.to_str()))
 }
 
+/// What the command prints: the one header (and the agent's name, when it
+/// is given), or no header at all where live progress is turned off.
 fn headers(
     enabled: Option<&str>,
     token: impl FnOnce() -> String,

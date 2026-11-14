@@ -917,3 +917,175 @@ fn signs_of_life_follow_real_tool_calls_and_nothing_else() {
         );
     }
 }
+
+// ============================================================================
+// Review of 89c632e: the reviewer's own break attempts (not part of the branch)
+// ============================================================================
+
+fn review_signs_sandbox(api: &FakeApi) -> Sandbox {
+    Sandbox::new(
+        api,
+        &[
+            ("CONTEXTSTREAM_RUN_PROGRESS_AUTO", UNSET),
+            ("CONTEXTSTREAM_RUN_PROGRESS_SIGNS", "on"),
+        ],
+    )
+}
+
+fn review_view(run_id: &str) -> Value {
+    json!({
+        "run_id": run_id,
+        "workspace_id": WORKSPACE,
+        "project_id": PROJECT,
+        "state": "working",
+        "liveness": "live",
+        "agent": {"id": "floor-live-runs", "name": "floor-live-runs", "runtime": "mcp", "client": "claude-code"},
+        "scope": {"workspace_id": WORKSPACE},
+    })
+}
+
+fn review_work(sandbox: &Sandbox, session: &Session, seconds: u64) {
+    let pre = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "cargo build"}});
+    let post = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cargo build"},
+        "tool_response": {"stdout": "", "stderr": "", "interrupted": false},
+    });
+    for _ in 0..seconds {
+        sandbox.hook(session, "pre-tool-use", pre.clone());
+        std::thread::sleep(Duration::from_secs(1));
+        sandbox.hook(session, "post-tool-use", post.clone());
+    }
+}
+
+/// B. A subagent reported a run of its own and stopped without ending it.
+/// Its run is no longer worked on; the session's later tool calls say nothing
+/// about it.
+#[test]
+fn review_a_stopped_subagents_run_gets_no_sign_from_the_sessions_later_tool_calls() {
+    let api = FakeApi::start();
+    let sandbox = review_signs_sandbox(&api);
+    let session = Session::new("host-session-review-sub", SESSION_A);
+    sandbox.init(&session);
+    let sub_run = "66666666-6666-4666-8666-666666666666";
+    sandbox.hook(
+        &session,
+        "post-tool-use",
+        json!({
+            "hook_event_name": "PostToolUse",
+            "agent_id": "agent-1",
+            "agent_type": "Explore",
+            "tool_name": "mcp__contextstream__progress",
+            "tool_input": {"run_key": "explore-1", "step": "Reading the code"},
+            "tool_response": {
+                "isError": false,
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": {"run": review_view(sub_run), "written": ["run.step"], "session": SESSION_A, "run_key": "explore-1"},
+            },
+        }),
+    );
+    sandbox.hook(
+        &session,
+        "subagent-stop",
+        json!({"hook_event_name": "SubagentStop", "agent_id": "agent-1", "agent_type": "Explore"}),
+    );
+    // The main agent works on.
+    review_work(&sandbox, &session, 5);
+    let sign = api.wait_for(Duration::from_secs(4), |body| body["run_id"] == sub_run);
+    assert!(
+        sign.is_none(),
+        "the stopped subagent's run was signalled: {}",
+        sign.map(|report| report.body.to_string())
+            .unwrap_or_default()
+    );
+}
+
+/// B. A session that dies right after a tool call: how many signs follow.
+#[test]
+fn review_signs_after_the_sessions_last_hook_event() {
+    let api = FakeApi::start();
+    let sandbox = review_signs_sandbox(&api);
+    let session = Session::new("host-session-review-dead", SESSION_A);
+    sandbox.init(&session);
+    let run_id = "77777777-7777-4777-8777-777777777777";
+    sandbox.tool_result(
+        &session,
+        "progress",
+        json!({"run_key": "floor-live-runs", "step": "Building"}),
+        json!({"run": review_view(run_id), "written": ["run.step"], "session": SESSION_A, "run_key": "floor-live-runs"}),
+    );
+    let reported = Instant::now();
+    // One tool call starts 300 ms after the report, and then the session is gone.
+    std::thread::sleep(Duration::from_millis(300));
+    sandbox.hook(
+        &session,
+        "pre-tool-use",
+        json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "sleep 600"}}),
+    );
+    let last_event = Instant::now();
+    std::thread::sleep(Duration::from_secs(12));
+    let signs = api.reports();
+    println!(
+        "REVIEW signs after the last hook event: {} at {:?} after the report (last hook event {:?} after it)",
+        signs.len(),
+        signs
+            .iter()
+            .map(|report| report.at.duration_since(reported))
+            .collect::<Vec<_>>(),
+        last_event.duration_since(reported),
+    );
+    assert!(
+        signs.len() <= 1,
+        "more than one sign with no hook event since"
+    );
+    for report in &signs {
+        assert_eq!(report.body["run_id"], run_id);
+        assert!(report.body.get("status").is_none() && report.body.get("step").is_none());
+    }
+}
+
+/// A run reported under the session's default key belongs to that session
+/// part: once the client reconnects (the server names a new part), the old
+/// part's run gets no further sign; the new part's run does.
+#[test]
+fn a_default_run_of_a_session_part_that_ended_gets_no_further_sign() {
+    let api = FakeApi::start();
+    let sandbox = review_signs_sandbox(&api);
+    let session = Session::new("host-session-part", SESSION_A);
+    sandbox.init(&session);
+    let old_run = "88888888-8888-4888-8888-888888888888";
+    let old_key = format!("{SESSION_A}:session");
+    sandbox.tool_result(
+        &session,
+        "progress",
+        json!({"step": "Building"}),
+        json!({"run": review_view(old_run), "written": ["run.step"], "session": SESSION_A, "run_key": old_key}),
+    );
+    // The client reconnects: the server names a new session part, and the
+    // model's next report lands on a new run.
+    let new_run = "99999999-9999-4999-8999-999999999999";
+    let new_key = format!("{SESSION_B}:session");
+    sandbox.tool_result(
+        &session,
+        "progress",
+        json!({"step": "Building again"}),
+        json!({"run": review_view(new_run), "written": ["run.step"], "session": SESSION_B, "run_key": new_key}),
+    );
+    review_work(&sandbox, &session, 5);
+    assert!(
+        api.wait_for(SOON, |body| body["run_id"] == new_run)
+            .is_some(),
+        "the new part's run is signalled"
+    );
+    let old = api
+        .reports()
+        .into_iter()
+        .find(|report| report.body["run_id"] == old_run);
+    assert!(
+        old.is_none(),
+        "the ended part's run was signalled: {}",
+        old.map(|report| report.body.to_string())
+            .unwrap_or_default()
+    );
+}

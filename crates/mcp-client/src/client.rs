@@ -4219,6 +4219,18 @@ impl ContextStreamClient {
             .await
     }
 
+    /// Make a GET request with options and no session-refresh replay: a 403
+    /// is passed on as it is. For side-channel reads (a run-progress sign of
+    /// life) that must never re-initialize the session or log a refresh.
+    pub(crate) async fn get_without_session_refresh<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        options: RequestOptions,
+    ) -> Result<T> {
+        self.request_with_replay("GET", path, None::<()>, Some(options), false)
+            .await
+    }
+
     /// Make a PUT request.
     pub async fn put<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: B) -> Result<T> {
         self.request("PUT", path, Some(body), None).await

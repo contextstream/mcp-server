@@ -161,6 +161,25 @@ impl ContextStreamClient {
         )
         .await
     }
+
+    /// [`Self::get_run_progress`] for a side channel (a sign of life): one
+    /// attempt, no retry and no session refresh, so a 403 or a 404 comes
+    /// back as it is and nothing is logged above debug.
+    pub async fn get_run_progress_quietly(
+        &self,
+        workspace_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Value> {
+        self.get_without_session_refresh(
+            &format!("/run-progress/runs/{run_id}?workspace_id={workspace_id}"),
+            RequestOptions {
+                timeout: Some(READ_TIMEOUT),
+                retries: Some(0),
+                ..RequestOptions::default()
+            },
+        )
+        .await
+    }
 }
 
 #[cfg(test)]

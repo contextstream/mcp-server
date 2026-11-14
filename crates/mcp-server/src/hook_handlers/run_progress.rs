@@ -48,9 +48,11 @@
 //! or ends, a prompt arrives) is a sign the session is at work, and the
 //! detached process sends it as a bare report, at most once a minute per run
 //! ([`sign_every_ms`]), under the agent the run was reported as. Nothing for
-//! a run that waits or that its agent has not reported on for four hours;
-//! no run started on a ticket, no waiting at a turn's end, no coarse step,
-//! no end. With the automatic reports on, they do the work instead.
+//! a run that waits or that its agent has not reported on for four hours,
+//! for a run a subagent reported last once that subagent stopped, or for a
+//! default run of a session part that ended (the client reconnected); no
+//! run started on a ticket, no waiting at a turn's end, no coarse step, no
+//! end. With the automatic reports on, they do the work instead.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -257,6 +259,11 @@ pub(crate) struct Run {
     /// When the last sign of life for the run went out.
     #[serde(default)]
     pub signed_ms: u64,
+    /// The subagent (`agent_id`) whose call reported the run last; `None`
+    /// is the session's main agent. When that subagent stops, the run gets
+    /// no more signs of life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_by: Option<String>,
 }
 
 /// What the hooks keep about one host session.
@@ -527,6 +534,28 @@ impl SessionFile {
         self.closed = false;
     }
 
+    /// Signs of life only: the session part `ended` is gone (the client
+    /// reconnected under a new one), and with it the session's default runs
+    /// under it, whose keys start with it: the model's reports can no longer
+    /// land on them. They get no more signs and fall silent; nothing is sent.
+    pub(crate) fn forget_part(&mut self, ended: &str) {
+        let plain = format!("{ended}:");
+        let sub = format!("{ended}/");
+        self.runs.retain(|run| {
+            !run.key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(&plain) || key.starts_with(&sub))
+        });
+    }
+
+    /// Signs of life only: the subagent `agent_id` stopped. The runs it
+    /// reported last get no more signs and fall silent; nothing is sent.
+    pub(crate) fn forget_subagent(&mut self, agent_id: &str) {
+        self.subagents.retain(|known| known != agent_id);
+        self.runs
+            .retain(|run| run.reported_by.as_deref() != Some(agent_id));
+    }
+
     /// The signs of life due at `now` (signs only), as (run, body): one for
     /// each run this session reported that has an id and does not wait, when
     /// a hook event came after both its last report and its last sign, at
@@ -647,7 +676,7 @@ impl SessionFile {
         answer: &Value,
         scope: &Scope,
         now: u64,
-    ) {
+    ) -> Option<usize> {
         self.last_hook_ms = now;
         self.closed = false;
         if answer.get("recorded").and_then(Value::as_bool) == Some(false) {
@@ -655,11 +684,9 @@ impl SessionFile {
             if matches!(reason.as_str(), "off" | "not_available" | "not_allowed") {
                 self.refuse();
             }
-            return;
+            return None;
         }
-        let Some(view) = answer.get("run").filter(|view| view.is_object()) else {
-            return;
-        };
+        let view = answer.get("run").filter(|view| view.is_object())?;
         self.learn_identity(
             answer.get("session").and_then(Value::as_str),
             view.get("agent"),
@@ -685,18 +712,15 @@ impl SessionFile {
             if let Some(index) = found {
                 self.runs.remove(index);
             }
-            return;
+            return None;
         }
         let index = match found {
             Some(index) => index,
             None => {
-                let Some(workspace_id) =
-                    uuid_text(view, "workspace_id").or_else(|| scope.workspace_id.clone())
-                else {
-                    return;
-                };
+                let workspace_id =
+                    uuid_text(view, "workspace_id").or_else(|| scope.workspace_id.clone())?;
                 if self.runs.len() >= MAX_RUNS || (run_id.is_none() && key.is_none()) {
-                    return;
+                    return None;
                 }
                 self.runs.push(Run {
                     workspace_id,
@@ -744,6 +768,7 @@ impl SessionFile {
         if let Some(agent) = view.get("agent").filter(|agent| agent.is_object()) {
             run.reported_agent = Some(agent.clone());
         }
+        Some(index)
     }
 
     /// A report that named no run went to the session's one open run. The
@@ -789,9 +814,9 @@ impl SessionFile {
         state: Option<&str>,
         scope: &Scope,
         now: u64,
-    ) {
+    ) -> Option<usize> {
         let (Some(session), Some(agent)) = (self.session.clone(), self.agent.clone()) else {
-            return;
+            return None;
         };
         let ticket = uuid_text(input, "ticket_id");
         let key = mcp_tools::domains::progress::run_key_for(
@@ -813,7 +838,7 @@ impl SessionFile {
             "session": session,
             "run_key": key,
         });
-        self.model_reported(input, &answer, scope, now);
+        self.model_reported(input, &answer, scope, now)
     }
 
     /// A tool call changed a ticket's status. Taking a ticket up starts a run
@@ -1207,13 +1232,15 @@ pub(crate) fn tool_finished(
         }
         file.cwd = cwd.to_string();
         refresh_host(file);
-        match &finding {
+        let part_before = file.session.clone();
+        let reported = match &finding {
             Finding::Identity { session, agent } => {
                 file.learn_identity(Some(session.as_str()), Some(agent));
+                None
             }
             Finding::Report(answer) => {
                 let scope = default_scope(&host, cwd);
-                file.model_reported(tool_input, answer, &scope, now);
+                file.model_reported(tool_input, answer, &scope, now)
             }
             Finding::ReportInText { run_id, state } => {
                 let scope = default_scope(&host, cwd);
@@ -1223,16 +1250,25 @@ pub(crate) fn tool_finished(
                     state.as_deref(),
                     &scope,
                     now,
-                );
+                )
             }
             Finding::Ticket(ticket) => {
                 let scope = default_scope(&host, cwd);
                 file.ticket_changed(&actor, ticket, &scope, now);
+                None
             }
+        };
+        if let Some(run) = reported.and_then(|index| file.runs.get_mut(index)) {
+            run.reported_by = actor.agent_id.map(str::to_string);
         }
         if signs_only {
             // The hooks report nothing of their own here.
             file.pending.clear();
+            // A session part that ended takes its default runs with it.
+            if let Some(ended) = part_before.filter(|before| file.session.as_ref() != Some(before))
+            {
+                file.forget_part(&ended);
+            }
         }
     });
     if fresh {
@@ -1305,14 +1341,18 @@ pub(crate) fn subagent_started(input: &Value) {
     });
 }
 
-/// SubagentStop.
+/// SubagentStop. With signs of life only, the runs the subagent reported
+/// last fall silent: no end is invented, and no more signs go out for them.
 pub(crate) fn subagent_stopped(input: &Value, cwd: &str) {
-    if Settings::from_env().signs_only() {
-        return;
-    }
     let (Some(path), Some(agent_id)) = (known_session(input), Actor::of(input).agent_id) else {
         return;
     };
+    if Settings::from_env().signs_only() {
+        update(&path, |file: &mut SessionFile| {
+            file.forget_subagent(agent_id)
+        });
+        return;
+    }
     let now = now_ms();
     update(&path, |file: &mut SessionFile| {
         file.subagent_stopped(agent_id, now)

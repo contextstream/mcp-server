@@ -77,6 +77,7 @@ phf = { version = "0.14", features = ["macros"] }
 
 # Regex (lightweight)
 regex-lite = "0.1"
+sha1 = "0.11"
 sha2 = "0.11"
 hex = "0.4"
 tiktoken-rs = "=0.12.1"

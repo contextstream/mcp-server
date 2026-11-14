@@ -22,8 +22,8 @@
 //!   step. The hosted HTTP gateway keeps no state between requests and runs
 //!   no timer; it tells the API to expect a longer silence instead and, in
 //!   the workspaces `CONTEXTSTREAM_RUN_PROGRESS_SIGNS_WORKSPACES` names,
-//!   counts a session's tool calls as a sign of life for that session's open
-//!   runs ([`sign_of_life`]).
+//!   counts a session's tool calls as a sign of life for the one run it can
+//!   show that session reported ([`sign_of_life`]).
 
 use async_trait::async_trait;
 use mcp_client::run_progress::{
@@ -1118,12 +1118,13 @@ pub(crate) fn run_key_of(given: Option<&str>, session: &str, ticket_id: Option<U
 
 /// What stands for "this MCP session" in a default run key. A local server
 /// process serves one client session, so it is the process. The hosted
-/// gateway uses the transport's session id; for a client on the stateless
-/// contract, which has none, the token the client sent to name its
-/// connection, together with the caller (`mcp_client::client_session`: the
-/// token alone is never used, so a token chosen under one key cannot name a
-/// session of another); else the caller alone, which is every session of
-/// that key. Each is a digest: none is sent as it is.
+/// gateway uses the transport's session id together with the caller; for a
+/// client on the stateless contract, which has none, the token the client
+/// sent to name its connection, together with the caller
+/// (`mcp_client::client_session`). Neither id is used alone: each is the
+/// client's to send, so an id another key presents names a session of that
+/// key, never one of the key that made it. Else the caller alone, which is
+/// every session of that key. Each is a digest: none is sent as it is.
 pub(crate) fn session_part(is_http: bool) -> String {
     if !is_http {
         static PROCESS: OnceLock<String> = OnceLock::new();
@@ -1131,10 +1132,18 @@ pub(crate) fn session_part(is_http: bool) -> String {
             .get_or_init(|| Uuid::new_v4().simple().to_string())
             .clone();
     }
-    if let Some(id) = mcp_client::get_task_mcp_session_id().filter(|id| !id.trim().is_empty()) {
-        return format!("s-{}", short_digest(&id));
-    }
     let caller = mcp_client::get_task_caller_cache_identity();
+    if let Some(id) = mcp_client::get_task_mcp_session_id().filter(|id| !id.trim().is_empty()) {
+        return match caller.as_deref() {
+            Some(caller) => format!(
+                "s-{}",
+                short_digest(&format!("mcp-session\n{caller}\n{id}"))
+            ),
+            // No credential: the id alone, as before; no sign goes out
+            // without a caller (see `sign_of_life_for`).
+            None => format!("s-{}", short_digest(&id)),
+        };
+    }
     if let (Some(caller), Some(token)) = (caller.as_deref(), mcp_client::client_session::current())
     {
         return format!(
@@ -1171,6 +1180,21 @@ fn short_digest(text: &str) -> String {
         write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
     }
     encoded
+}
+
+/// The id the API gives the run an MCP agent reports under `key` (its
+/// `source_run_id`) in `workspace_id`: `uuid5(workspace_id, "mcp:" + key)`
+/// (contextstream `progress/report.rs`, `report_run_id`).
+pub(crate) fn run_id_of_key(workspace_id: Uuid, key: &str) -> Uuid {
+    use sha1::{Digest, Sha1};
+
+    let mut hasher = Sha1::new();
+    hasher.update(workspace_id.as_bytes());
+    hasher.update(format!("{MCP_RUNTIME}:{}", key.trim()).as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_sha1_bytes(bytes).into_uuid()
 }
 
 fn run_memo_key(workspace_id: Uuid, run_key: &str) -> String {
@@ -1334,13 +1358,23 @@ pub(crate) async fn session_identity(
 /// gateway does exactly what it did before the setting existed.
 pub const SIGNS_WORKSPACES_ENV: &str = "CONTEXTSTREAM_RUN_PROGRESS_SIGNS_WORKSPACES";
 
-/// At most this often one session's tool calls signal its runs in one
+/// At most this often one session's tool calls signal its run in one
 /// workspace.
 const SIGN_OF_LIFE_EVERY: Duration = Duration::from_secs(60);
 
-/// Sessions one gateway process remembers the last sign of life of; past
-/// it, the memory starts over (one sign more than needed is harmless).
+/// At most this many signs a minute for one key in one workspace, whatever
+/// sessions it names: a client that sends a new connection token on every
+/// call is a new session each time, and costs the API no more than this.
+const SIGNS_PER_CALLER_EVERY_MINUTE: u32 = 60;
+
+/// Sessions (and keys) one gateway process remembers the last signs of.
+/// Past it, those older than a minute are forgotten, and when that is not
+/// enough, all of them (one sign more than needed is harmless).
 const MAX_SIGNED_SESSIONS: usize = 10_000;
+
+/// At most this many signs out at once in one gateway process; above it a
+/// sign is dropped, not queued.
+const MAX_SIGNS_IN_FLIGHT: usize = 64;
 
 /// The workspace ids a [`SIGNS_WORKSPACES_ENV`] value names: ids split by
 /// commas or white space. Anything that is not an id names nothing.
@@ -1348,6 +1382,7 @@ pub(crate) fn parse_workspace_list(raw: Option<&str>) -> Vec<Uuid> {
     raw.unwrap_or_default()
         .split(|c: char| c == ',' || c.is_whitespace())
         .filter_map(|id| Uuid::parse_str(id).ok())
+        .filter(|id| !id.is_nil())
         .collect()
 }
 
@@ -1363,25 +1398,38 @@ fn signs_workspaces() -> &'static [Uuid] {
 ///
 /// A local server keeps a reported run alive with a timer while its process
 /// lives. The gateway has neither, so a session that worked without
-/// reporting read as stalled. A tool call is evidence that its session is at
-/// work, so it counts as a heartbeat for that session's open runs when:
+/// reporting read as stalled. A tool call is evidence that ITS session is at
+/// work, so it counts as a heartbeat for the one run the gateway can show
+/// this session reported: the session's default run (its reports that name
+/// no run and no ticket), whose id follows from the session part
+/// ([`run_id_of_key`]). Nothing is listed, and no run is matched by its
+/// agent: an agent's name is the client's to send. It goes out when:
 /// - the call's workspace (its `workspace_id`, else the session's) is on
 ///   [`SIGNS_WORKSPACES_ENV`]; for any other workspace nothing is read,
 ///   sent or remembered;
 /// - the tool is not `progress`: a report is a signal of its own;
 /// - the caller is authenticated, and the gateway can tell its session from
-///   the key's other sessions (an `s-` session part) or its client named its
-///   agent: a call of a key that does neither may be any of its sessions';
-/// - the session sent no sign for the workspace in the last minute.
+///   the key's other sessions: an `s-` session part, bound to the caller
+///   ([`session_part`]). A name alone is never enough;
+/// - the session sent no sign for the workspace in the last minute, its key
+///   sent fewer than [`SIGNS_PER_CALLER_EVERY_MINUTE`] there, and fewer than
+///   [`MAX_SIGNS_IN_FLIGHT`] signs are out.
 ///
-/// The runs are the workspace's open runs under this session's own agent id
-/// that do not wait and whose agent reported on them within
-/// [`HEARTBEAT_IDLE_LIMIT`] (see [`signals_run`]). Each gets a bare report,
-/// which the API keeps as a heartbeat: it moves the run's last signal,
-/// brings a stalled run back, leaves a waiting run waiting and a run that
-/// ended by its own word ended. It carries the run's own agent as the API
-/// lists it, because every signal sets a run's agent. Sent detached, under
-/// the request's own credential.
+/// The sign reads that one run and, when it is there, at work (live, quiet
+/// or stalled; never one that waits or ended) and reported on by its agent
+/// within [`HEARTBEAT_IDLE_LIMIT`], sends it a bare report, which the API
+/// keeps as a heartbeat: it moves the run's last signal, brings a stalled
+/// run back, leaves a waiting run waiting and an ended run ended. It
+/// carries the run's own agent as the API answered it, because every signal
+/// sets a run's agent. Both requests go out once, detached, under the
+/// request's own credential and with no session refresh: a run that is not
+/// there, a refusal or a failure ends the sign quietly, and the session's
+/// next one is a minute later.
+///
+/// Not signalled here: runs reported under a custom `run_key` or on a
+/// ticket (their ids are not this session's to derive; ContextStream's
+/// hooks keep those alive from the run ids the session itself reported),
+/// and a subagent's run of its own (subagents share their session's part).
 pub async fn sign_of_life(
     client: &ContextStreamClient,
     session: &SessionManager,
@@ -1407,6 +1455,10 @@ pub(crate) async fn sign_of_life_for(
         return None;
     }
     let caller = mcp_client::get_task_caller_cache_identity()?;
+    let part = session_part(true);
+    if !is_one_session(&part, true) {
+        return None;
+    }
     let named = params
         .pointer("/arguments/workspace_id")
         .and_then(Value::as_str)
@@ -1422,88 +1474,167 @@ pub(crate) async fn sign_of_life_for(
     if !workspaces.contains(&workspace_id) {
         return None;
     }
-    let part = session_part(true);
-    let folder = session.state().await.folder_path;
-    let handle = mcp_client::agent_handle::agent_handle_of_caller(folder.as_deref());
-    if handle.is_none() && !is_one_session(&part, true) {
+    let due = signs_due()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .due(&part, &caller, workspace_id, Instant::now());
+    if !due {
         return None;
     }
-    let agent = agent_identity(handle, crate::client_identity::current_client_name(), &part);
-    // The API names an agent that has no id by its name.
-    let agent_id = str_field(&agent, "id")
-        .or_else(|| str_field(&agent, "name"))?
-        .to_string();
-    let key = format!(
-        "{}\n{part}\n{agent_id}\n{workspace_id}",
-        short_digest(&caller)
-    );
-    if !sign_due(&key, Instant::now()) {
-        return None;
-    }
+    let slot = SIGNS_IN_FLIGHT.take()?;
+    let run_id = run_id_of_key(workspace_id, &run_key_of(None, &part, None));
     let client = client.clone();
     Some(mcp_client::spawn_with_task_context(async move {
-        signal_open_runs(&client, workspace_id, &agent_id).await;
+        let _slot = slot;
+        signal_own_run(&client, workspace_id, run_id).await;
     }))
 }
 
-/// Whether the session `key` names is due a sign at `now`; when it is, `now`
-/// is remembered as its last.
-fn sign_due(key: &str, now: Instant) -> bool {
-    static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
-    let mut last = LAST
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if last
-        .get(key)
-        .is_some_and(|at| now.saturating_duration_since(*at) < SIGN_OF_LIFE_EVERY)
-    {
-        return false;
-    }
-    if last.len() >= MAX_SIGNED_SESSIONS {
-        last.retain(|_, at| now.saturating_duration_since(*at) < SIGN_OF_LIFE_EVERY);
-        if last.len() >= MAX_SIGNED_SESSIONS {
-            last.clear();
-        }
-    }
-    last.insert(key.to_string(), now);
-    true
+/// What one gateway process remembers of the signs it sent: the last one of
+/// each session in each workspace, and how many each key sent in each
+/// workspace in the current minute. Both are bounded
+/// ([`MAX_SIGNED_SESSIONS`]).
+#[derive(Debug, Default)]
+pub(crate) struct SignsDue {
+    sessions: HashMap<String, Instant>,
+    callers: HashMap<String, (Instant, u32)>,
 }
 
-/// Heartbeat the workspace's open runs that a tool call of `agent_id`'s
-/// session keeps alive ([`signals_run`]).
-async fn signal_open_runs(client: &ContextStreamClient, workspace_id: Uuid, agent_id: &str) {
-    let filter = RunFilter {
-        workspace_id: Some(workspace_id),
-        active: Some(true),
-        limit: Some(OPEN_RUNS_READ),
-        ..RunFilter::default()
-    };
-    let Ok(result) = client.list_run_progress(&filter).await else {
-        return;
-    };
-    let now = chrono::Utc::now();
-    for view in runs_of(&result) {
-        if !signals_run(view, agent_id, now) {
-            continue;
+impl SignsDue {
+    /// Whether the session `part` (an `s-` part, bound to `caller`) is due a
+    /// sign in `workspace_id` at `now`. When it is, the sign is counted, so a
+    /// sign that is then refused or finds nothing is still the minute's.
+    pub(crate) fn due(
+        &mut self,
+        part: &str,
+        caller: &str,
+        workspace_id: Uuid,
+        now: Instant,
+    ) -> bool {
+        let session = format!("{part}\n{workspace_id}");
+        if self
+            .sessions
+            .get(&session)
+            .is_some_and(|at| now.saturating_duration_since(*at) < SIGN_OF_LIFE_EVERY)
+        {
+            return false;
         }
-        let (Some(run_id), Some(agent)) = (str_field(view, "run_id"), view.get("agent")) else {
-            continue;
+        let caller = format!("{}\n{workspace_id}", short_digest(caller));
+        let (since, sent) = match self.callers.get(&caller) {
+            Some((since, sent)) if now.saturating_duration_since(*since) < SIGN_OF_LIFE_EVERY => {
+                (*since, *sent)
+            }
+            _ => (now, 0),
         };
-        let body = json!({"workspace_id": workspace_id, "run_id": run_id, "agent": agent});
-        if let Err(error) = client.report_run_progress(&body, 0).await {
-            tracing::debug!("sign of life not recorded: {}", error);
+        if sent >= SIGNS_PER_CALLER_EVERY_MINUTE {
+            return false;
+        }
+        make_room(&mut self.sessions, now, |at| *at);
+        make_room(&mut self.callers, now, |(since, _)| *since);
+        self.sessions.insert(session, now);
+        self.callers.insert(caller, (since, sent + 1));
+        true
+    }
+
+    /// How many sessions and keys are remembered.
+    #[cfg(test)]
+    pub(crate) fn remembered(&self) -> (usize, usize) {
+        (self.sessions.len(), self.callers.len())
+    }
+}
+
+/// Make room for one more in a memory of at most [`MAX_SIGNED_SESSIONS`]:
+/// forget what is a minute old, and when that is not enough, everything.
+fn make_room<V>(memory: &mut HashMap<String, V>, now: Instant, at: impl Fn(&V) -> Instant) {
+    if memory.len() < MAX_SIGNED_SESSIONS {
+        return;
+    }
+    memory.retain(|_, value| now.saturating_duration_since(at(value)) < SIGN_OF_LIFE_EVERY);
+    if memory.len() >= MAX_SIGNED_SESSIONS {
+        memory.clear();
+    }
+}
+
+/// The gateway process's memory of its signs.
+fn signs_due() -> &'static Mutex<SignsDue> {
+    static SIGNS: OnceLock<Mutex<SignsDue>> = OnceLock::new();
+    SIGNS.get_or_init(Default::default)
+}
+
+/// Signs out at once, against a cap: a sign takes a slot or is dropped.
+#[derive(Debug)]
+pub(crate) struct InFlight {
+    out: std::sync::atomic::AtomicUsize,
+    cap: usize,
+}
+
+impl InFlight {
+    pub(crate) const fn new(cap: usize) -> Self {
+        Self {
+            out: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// A slot for one more sign, when one is free; it is free again when
+    /// the slot is dropped.
+    pub(crate) fn take(&'static self) -> Option<SignSlot> {
+        if self.out.fetch_add(1, Ordering::AcqRel) >= self.cap {
+            self.out.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(SignSlot(self))
+    }
+}
+
+/// One sign's place among those out at once ([`InFlight`]).
+#[derive(Debug)]
+pub(crate) struct SignSlot(&'static InFlight);
+
+impl Drop for SignSlot {
+    fn drop(&mut self) {
+        self.0.out.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+static SIGNS_IN_FLIGHT: InFlight = InFlight::new(MAX_SIGNS_IN_FLIGHT);
+
+/// Read the session's own run, and when a tool call keeps it alive
+/// ([`signals_run`]), send it a bare report. One attempt each, quietly.
+async fn signal_own_run(client: &ContextStreamClient, workspace_id: Uuid, run_id: Uuid) {
+    let answer = match client.get_run_progress_quietly(workspace_id, run_id).await {
+        Ok(answer) => answer,
+        Err(error) => {
+            // Most often the session reported no default run here (404).
+            tracing::debug!("sign of life: the session's run was not read: {}", error);
             return;
         }
+    };
+    let view = answer
+        .get("run")
+        .filter(|run| run.is_object())
+        .unwrap_or(&answer);
+    if !signals_run(view, run_id, chrono::Utc::now()) {
+        return;
+    }
+    let Some(agent) = view.get("agent").filter(|agent| agent.is_object()) else {
+        return;
+    };
+    let body = json!({"workspace_id": workspace_id, "run_id": run_id, "agent": agent});
+    if let Err(error) = client.report_run_progress(&body, 0).await {
+        tracing::debug!("sign of life not recorded: {}", error);
     }
 }
 
-/// Whether a listed run is one a tool call of `agent_id`'s session keeps
-/// alive: its own, at work (live, quiet or stalled; never one that waits or
-/// ended), and reported on by its agent within [`HEARTBEAT_IDLE_LIMIT`]. A
-/// run whose last report the API does not say is left alone.
-fn signals_run(view: &Value, agent_id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
-    if view.pointer("/agent/id").and_then(Value::as_str) != Some(agent_id) {
+/// Whether the run the API answered for `run_id` is one a tool call of its
+/// session keeps alive: that run, an MCP agent's, at work (live, quiet or
+/// stalled; never one that waits or ended), and reported on by its agent
+/// within [`HEARTBEAT_IDLE_LIMIT`]. A run whose last report the API does not
+/// say is left alone.
+fn signals_run(view: &Value, run_id: Uuid, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if str_field(view, "run_id").and_then(|id| Uuid::parse_str(id).ok()) != Some(run_id)
+        || view.pointer("/agent/runtime").and_then(Value::as_str) != Some(MCP_RUNTIME)
+    {
         return false;
     }
     if !matches!(

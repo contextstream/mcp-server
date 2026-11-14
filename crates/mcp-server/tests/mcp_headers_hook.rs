@@ -163,3 +163,39 @@ fn a_reconnect_of_the_same_session_process_sends_the_same_id() {
         assert_eq!(text.len(), 32, "{text}");
     }
 }
+
+/// The agent's name goes beside the id only where the machine turned signs
+/// of life on (`CONTEXTSTREAM_RUN_PROGRESS_SIGNS=on`, off as shipped):
+/// otherwise a hosted session's runs keep the name they had.
+#[test]
+fn an_agent_name_is_sent_only_where_signs_of_life_are_on() {
+    let home = tempfile::tempdir().expect("a home");
+    for env in [
+        vec![("CONTEXTSTREAM_AGENT_NAME", "floor-live-runs")],
+        vec![("AGENT_NAME", "floor-live-runs")],
+        vec![
+            ("CONTEXTSTREAM_AGENT_NAME", "floor-live-runs"),
+            ("CONTEXTSTREAM_RUN_PROGRESS_SIGNS", "off"),
+        ],
+    ] {
+        let ran = run(home.path(), &env);
+        assert!(ran.success, "{}", ran.stderr);
+        // Exactly the one header, as before.
+        token_of(&ran);
+    }
+    let ran = run(
+        home.path(),
+        &[
+            ("CONTEXTSTREAM_AGENT_NAME", "floor-live-runs"),
+            ("CONTEXTSTREAM_RUN_PROGRESS_SIGNS", "on"),
+        ],
+    );
+    assert!(ran.success, "{}", ran.stderr);
+    let body: serde_json::Value =
+        serde_json::from_str(ran.stdout.trim()).unwrap_or_else(|_| panic!("{:?}", ran.stdout));
+    assert_eq!(
+        body["X-ContextStream-Agent-Name"], "floor-live-runs",
+        "{body}"
+    );
+    assert_eq!(body[HEADER].as_str().map(str::len), Some(32), "{body}");
+}

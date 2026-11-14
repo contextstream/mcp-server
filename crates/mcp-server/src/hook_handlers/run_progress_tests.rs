@@ -1018,3 +1018,130 @@ fn a_report_that_named_no_run_is_never_guessed_onto_another_run() {
     assert_eq!(file.runs[0].run_id.as_deref(), Some(RUN));
     assert!(file.runs[0].key.is_none());
 }
+
+// ============================================================================
+// Signs of life (CONTEXTSTREAM_RUN_PROGRESS_SIGNS)
+// ============================================================================
+
+#[test]
+fn signs_of_life_are_off_as_shipped_and_on_only_where_turned_on() {
+    let shipped = Settings::from_switches(None, None, None);
+    assert_eq!(shipped.signs, SIGNS_DEFAULT);
+    assert!(!shipped.signs && !shipped.enabled);
+    for word in ["on", "1", "true", "yes", " ON "] {
+        let settings = Settings::from_switches(None, None, Some(word));
+        assert!(settings.signs && settings.signs_only(), "{word}");
+        // Signs are not the automatic reports.
+        assert!(!settings.enabled, "{word}");
+    }
+    for word in ["off", "0", "perhaps", ""] {
+        assert!(!Settings::from_switches(None, None, Some(word)).signs, "{word:?}");
+    }
+    // Live progress off wins.
+    assert!(!Settings::from_switches(Some("off"), None, Some("on")).signs);
+    // With the automatic reports on, they do the work (their own keep-alive).
+    assert!(!Settings::from_switches(None, Some("on"), Some("on")).signs_only());
+}
+
+/// The session's run as a hosted report's answer names it, reported at `at`.
+fn reported(file: &mut SessionFile, input: Value, view: Value, at: u64) {
+    let answer = json!({
+        "run": view,
+        "written": ["run.step"],
+        "session": SESSION,
+        "run_key": "floor-live-runs",
+    });
+    file.model_reported(&input, &answer, &Scope::default(), at);
+}
+
+fn lane_view() -> Value {
+    json!({
+        "run_id": RUN,
+        "workspace_id": WORKSPACE,
+        "project_id": PROJECT,
+        "state": "working",
+        "liveness": "live",
+        "agent": {"id": "floor-live-runs", "name": "floor-live-runs", "runtime": "mcp", "client": "claude-code"},
+        "scope": {"workspace_id": WORKSPACE},
+    })
+}
+
+#[test]
+fn a_sign_of_life_follows_a_real_hook_event_and_says_only_who_and_which_run() {
+    let every = MINUTE;
+    let t0 = 1_000 * MINUTE;
+    let mut file = known();
+    reported(
+        &mut file,
+        json!({"run_key": "floor-live-runs", "step": "Building"}),
+        lane_view(),
+        t0,
+    );
+    // The report was a signal of its own, and nothing happened since.
+    assert!(file.signs_due(every, t0 + 5 * MINUTE).is_empty());
+    // A tool call half a minute on: due a minute after the report, not before.
+    file.hook_event(t0 + MINUTE / 2);
+    assert!(file.signs_due(every, t0 + MINUTE / 2).is_empty());
+    let due = file.signs_due(every, t0 + MINUTE);
+    assert_eq!(due.len(), 1, "{due:?}");
+    // Who and which run, and nothing else: under the agent the run was
+    // reported as (a heartbeat sets a run's agent), never the session's.
+    assert_eq!(
+        due[0].1,
+        json!({"workspace_id": WORKSPACE, "run_id": RUN, "agent": lane_view()["agent"]})
+    );
+    file.runs[0].signed_ms = t0 + MINUTE;
+    // Nothing more without another event, however long.
+    assert!(file.signs_due(every, t0 + 30 * MINUTE).is_empty());
+    // An event: due again, a minute after the last sign at the earliest.
+    file.hook_event(t0 + MINUTE + 1_000);
+    assert!(file.signs_due(every, t0 + MINUTE + 1_000).is_empty());
+    assert_eq!(file.signs_due(every, t0 + 2 * MINUTE).len(), 1);
+    // Nothing is queued: a sign is never a report of the hooks' own.
+    assert!(file.pending.is_empty());
+}
+
+#[test]
+fn no_sign_of_life_for_a_waiting_run_a_run_without_an_id_or_one_silent_for_hours() {
+    let every = MINUTE;
+    let t0 = 1_000 * MINUTE;
+    // The model said the run waits.
+    let mut file = known();
+    let mut waiting = lane_view();
+    waiting["state"] = json!("waiting_input");
+    waiting["liveness"] = json!("waiting");
+    reported(
+        &mut file,
+        json!({"run_key": "floor-live-runs", "waiting": {"on": "dependency", "question": "Review?"}}),
+        waiting,
+        t0,
+    );
+    assert_eq!(file.runs.len(), 1);
+    file.hook_event(t0 + 5 * MINUTE);
+    assert!(file.signs_due(every, t0 + 5 * MINUTE).is_empty());
+    // A run known by key only: a heartbeat by key could start a run.
+    let mut file = known();
+    let mut keyed = lane_view();
+    keyed["run_id"] = Value::Null;
+    reported(
+        &mut file,
+        json!({"run_key": "floor-live-runs", "step": "Building"}),
+        keyed,
+        t0,
+    );
+    assert_eq!(file.runs.len(), 1);
+    file.hook_event(t0 + 5 * MINUTE);
+    assert!(file.signs_due(every, t0 + 5 * MINUTE).is_empty());
+    // A run its agent has not reported on for four hours: silence is silence.
+    let mut file = known();
+    reported(
+        &mut file,
+        json!({"run_key": "floor-live-runs", "step": "Building"}),
+        lane_view(),
+        t0,
+    );
+    file.hook_event(t0 + 4 * 60 * MINUTE - MINUTE);
+    assert_eq!(file.signs_due(every, t0 + 4 * 60 * MINUTE - MINUTE).len(), 1);
+    file.hook_event(t0 + 4 * 60 * MINUTE);
+    assert!(file.signs_due(every, t0 + 4 * 60 * MINUTE).is_empty());
+}

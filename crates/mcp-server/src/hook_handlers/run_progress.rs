@@ -40,6 +40,17 @@
 //! `CONTEXTSTREAM_RUN_PROGRESS=off` turns live progress off altogether, the
 //! tool included, whatever the other switch says. An API that refuses a
 //! report (401, 403 or 404) ends reporting for the session.
+//!
+//! **Signs of life** (`CONTEXTSTREAM_RUN_PROGRESS_SIGNS=on`, off as shipped,
+//! [`SIGNS_DEFAULT`]) are the one piece of the above that needs no timer and
+//! says nothing of its own: for a run the model reported through `progress`
+//! (known by the id its answer named), a real hook event (a tool call starts
+//! or ends, a prompt arrives) is a sign the session is at work, and the
+//! detached process sends it as a bare report, at most once a minute per run
+//! ([`sign_every_ms`]), under the agent the run was reported as. Nothing for
+//! a run that waits or that its agent has not reported on for four hours;
+//! no run started on a ticket, no waiting at a turn's end, no coarse step,
+//! no end. With the automatic reports on, they do the work instead.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -58,6 +69,23 @@ use super::run_step_labels::step_for_tool;
 /// machine. Off as shipped: nothing is reported for a person who has not
 /// asked for it.
 pub(crate) const AUTOMATIC_REPORTS_DEFAULT: bool = false;
+
+/// Whether the hooks send a sign of life for the runs a session reported,
+/// without the automatic reports: after a real hook event (a tool call
+/// starts or ends, a prompt arrives), at most once per [`sign_every_ms`] per
+/// run, who and which run and nothing else. No timer, no waiting state, no
+/// run started or ended. Off as shipped (decision 47301037: nothing new
+/// reaches a customer before it has been seen working in our own
+/// workspaces); `CONTEXTSTREAM_RUN_PROGRESS_SIGNS=on` turns it on for a
+/// machine.
+pub(crate) const SIGNS_DEFAULT: bool = false;
+
+/// Overrides [`SIGNS_DEFAULT`] on this machine.
+const SIGNS_ENV: &str = "CONTEXTSTREAM_RUN_PROGRESS_SIGNS";
+
+/// A run its agent has not reported on for this long gets no sign of life:
+/// silence is silence (the hosted gateway's limit, and a local server's).
+const SIGNS_FOR_MS: u64 = 4 * 60 * 60 * 1000;
 
 /// Turns live progress off on this machine (shared with the `progress` tool).
 const ENABLED_ENV: &str = "CONTEXTSTREAM_RUN_PROGRESS";
@@ -115,26 +143,44 @@ pub(crate) const RECONNECTED: &str = "The session reconnected; its work continue
 /// What this machine allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Settings {
-    /// Whether the hooks report at all. Off: no state, no process, nothing
-    /// sent.
+    /// Whether the hooks report by themselves (the automatic reports). Off:
+    /// no state, no process, nothing sent, unless `signs` is on.
     pub enabled: bool,
+    /// Whether the hooks send signs of life ([`SIGNS_DEFAULT`]).
+    pub signs: bool,
 }
 
 impl Settings {
     pub(crate) fn from_env() -> Self {
-        Self::from_values(
+        Self::from_switches(
             std::env::var(ENABLED_ENV).ok().as_deref(),
             std::env::var(AUTOMATIC_ENV).ok().as_deref(),
+            std::env::var(SIGNS_ENV).ok().as_deref(),
         )
     }
 
     /// `live` is what `CONTEXTSTREAM_RUN_PROGRESS` says (off wins over
     /// everything); `automatic` is what `CONTEXTSTREAM_RUN_PROGRESS_AUTO` says.
     pub(crate) fn from_values(live: Option<&str>, automatic: Option<&str>) -> Self {
+        Self::from_switches(live, automatic, None)
+    }
+
+    /// The same, with what `CONTEXTSTREAM_RUN_PROGRESS_SIGNS` says.
+    pub(crate) fn from_switches(
+        live: Option<&str>,
+        automatic: Option<&str>,
+        signs: Option<&str>,
+    ) -> Self {
+        let live = switch(live).unwrap_or(true);
         Self {
-            enabled: switch(live).unwrap_or(true)
-                && switch(automatic).unwrap_or(AUTOMATIC_REPORTS_DEFAULT),
+            enabled: live && switch(automatic).unwrap_or(AUTOMATIC_REPORTS_DEFAULT),
+            signs: live && switch(signs).unwrap_or(SIGNS_DEFAULT),
         }
+    }
+
+    /// Signs of life only: the automatic reports are off.
+    pub(crate) fn signs_only(self) -> bool {
+        !self.enabled && self.signs
     }
 }
 
@@ -200,6 +246,16 @@ pub(crate) struct Run {
     /// The model said the run waits; the hooks leave that alone.
     #[serde(default)]
     pub model_waiting: bool,
+    /// When the model last reported the run: a report is a signal of its own.
+    #[serde(default)]
+    pub reported_ms: u64,
+    /// The run's agent as the report's answer named it. A sign of life
+    /// carries it, so it renames nothing (every signal sets a run's agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_agent: Option<Value>,
+    /// When the last sign of life for the run went out.
+    #[serde(default)]
+    pub signed_ms: u64,
 }
 
 /// What the hooks keep about one host session.
@@ -463,6 +519,52 @@ impl SessionFile {
         }
     }
 
+    /// A hook event that is evidence of work and says nothing else (signs of
+    /// life only): a tool call started, or a prompt arrived.
+    pub(crate) fn hook_event(&mut self, now: u64) {
+        self.last_hook_ms = now;
+        self.closed = false;
+    }
+
+    /// The signs of life due at `now` (signs only), as (run, body): one for
+    /// each run this session reported that has an id and does not wait, when
+    /// a hook event came after both its last report and its last sign, at
+    /// least `every_ms` after the later of the two, and within
+    /// [`SIGNS_FOR_MS`] of the report. A body says who and which run, under
+    /// the agent the run was reported as, and nothing else: no heartbeat_s,
+    /// no group, no scope.
+    pub(crate) fn signs_due(&self, every_ms: u64, now: u64) -> Vec<(String, Value)> {
+        let mut due = Vec::new();
+        for run in &self.runs {
+            let Some(run_id) = run.run_id.as_deref() else {
+                continue;
+            };
+            if run.model_waiting || run.hook_waiting || run.reported_ms == 0 {
+                continue;
+            }
+            let last = run.reported_ms.max(run.signed_ms);
+            if self.last_hook_ms <= last
+                || now.saturating_sub(last) < every_ms
+                || now.saturating_sub(run.reported_ms) >= SIGNS_FOR_MS
+            {
+                continue;
+            }
+            let Some(agent) = run
+                .reported_agent
+                .clone()
+                .or_else(|| run.agent.clone())
+                .or_else(|| self.agent.clone())
+            else {
+                continue;
+            };
+            due.push((
+                run_ident(run),
+                json!({"workspace_id": run.workspace_id, "run_id": run_id, "agent": agent}),
+            ));
+        }
+        due
+    }
+
     /// A tool call reported back.
     pub(crate) fn tool_ended(&mut self, now: u64) {
         self.last_hook_ms = now;
@@ -637,6 +739,10 @@ impl SessionFile {
         }
         // The model's word is the run's state now.
         run.hook_waiting = false;
+        run.reported_ms = now;
+        if let Some(agent) = view.get("agent").filter(|agent| agent.is_object()) {
+            run.reported_agent = Some(agent.clone());
+        }
     }
 
     /// A report that named no run went to the session's one open run. The
@@ -836,7 +942,8 @@ fn prune(dir: &Path) {
 /// The session's state file, when the hooks report on this machine and the
 /// host named its session.
 fn session_state(input: &Value) -> Option<(String, PathBuf)> {
-    if !Settings::from_env().enabled {
+    let settings = Settings::from_env();
+    if !settings.enabled && !settings.signs {
         return None;
     }
     let host = common::host_session_key(input)?;
@@ -1041,9 +1148,14 @@ pub(crate) fn tool_started(input: &Value, cwd: &str, tool: &str) {
     }
     let actor = Actor::of(input);
     let now = now_ms();
+    let signs_only = Settings::from_env().signs_only();
     update(&path, |file: &mut SessionFile| {
         refresh_host(file);
-        file.tool_started(&actor, tool, now);
+        if signs_only {
+            file.hook_event(now);
+        } else {
+            file.tool_started(&actor, tool, now);
+        }
     });
     ensure_beater(&path, cwd);
 }
@@ -1071,6 +1183,12 @@ pub(crate) fn tool_finished(
         return;
     };
     let finding = contextstream_tool.and_then(|tool| classify(tool, tool_input, &answer));
+    // Signs of life learn only the runs the model reported: a ticket's
+    // take-up starts nothing, and who the session is matters not.
+    let signs_only = Settings::from_env().signs_only();
+    let finding = finding.filter(|finding| {
+        !signs_only || matches!(finding, Finding::Report(_) | Finding::ReportInText { .. })
+    });
     let now = now_ms();
     let Some(finding) = finding else {
         if read(&path).is_some_and(|file| !file.runs.is_empty() && !file.refused) {
@@ -1111,6 +1229,10 @@ pub(crate) fn tool_finished(
                 file.ticket_changed(&actor, ticket, &scope, now);
             }
         }
+        if signs_only {
+            // The hooks report nothing of their own here.
+            file.pending.clear();
+        }
     });
     if fresh {
         if let Some(dir) = path.parent() {
@@ -1140,15 +1262,23 @@ pub(crate) fn prompt_submitted(input: &Value, cwd: &str) {
         return;
     }
     let now = now_ms();
+    let signs_only = Settings::from_env().signs_only();
     update(&path, |file: &mut SessionFile| {
         refresh_host(file);
-        file.prompt_submitted(now);
+        if signs_only {
+            file.hook_event(now);
+        } else {
+            file.prompt_submitted(now);
+        }
     });
     ensure_beater(&path, cwd);
 }
 
-/// Stop: the main agent's turn ended.
+/// Stop: the main agent's turn ended. Signs of life say nothing of it.
 pub(crate) fn turn_ended(input: &Value, cwd: &str) {
+    if Settings::from_env().signs_only() {
+        return;
+    }
     let Some(path) = known_session(input) else {
         return;
     };
@@ -1162,6 +1292,9 @@ pub(crate) fn turn_ended(input: &Value, cwd: &str) {
 
 /// SubagentStart.
 pub(crate) fn subagent_started(input: &Value) {
+    if Settings::from_env().signs_only() {
+        return;
+    }
     let (Some(path), Some(agent_id)) = (known_session(input), Actor::of(input).agent_id) else {
         return;
     };
@@ -1173,6 +1306,9 @@ pub(crate) fn subagent_started(input: &Value) {
 
 /// SubagentStop.
 pub(crate) fn subagent_stopped(input: &Value, cwd: &str) {
+    if Settings::from_env().signs_only() {
+        return;
+    }
     let (Some(path), Some(agent_id)) = (known_session(input), Actor::of(input).agent_id) else {
         return;
     };
@@ -1189,6 +1325,15 @@ pub(crate) async fn session_ended(input: &Value, cwd: &str) {
     let Some(path) = known_session(input) else {
         return;
     };
+    if Settings::from_env().signs_only() {
+        // Signs of life invent no end: the runs fall silent, and read so.
+        update(&path, |file: &mut SessionFile| {
+            file.runs.clear();
+            file.pending.clear();
+            file.closed = true;
+        });
+        return;
+    }
     let owes = update(&path, |file: &mut SessionFile| {
         file.end_all(SESSION_ENDED);
         file.subagents.clear();
@@ -1562,7 +1707,8 @@ pub async fn run_beater() -> anyhow::Result<()> {
 /// nothing has been open for a minute, the API refuses, or it cannot be
 /// reached five times in a row.
 async fn beat(path: &Path, cwd: &str) {
-    if !Settings::from_env().enabled {
+    let settings = Settings::from_env();
+    if !settings.enabled && !settings.signs {
         return;
     }
     let config = common::load_config(cwd);
@@ -1574,6 +1720,10 @@ async fn beat(path: &Path, cwd: &str) {
     };
     if let Some(dir) = path.parent() {
         prune(dir);
+    }
+    if settings.signs_only() {
+        signs(path, &config).await;
+        return;
     }
     let every_ms = beat_secs() * 1000;
     let tick = TICK.min(Duration::from_millis(every_ms));
@@ -1676,6 +1826,65 @@ async fn beat(path: &Path, cwd: &str) {
             }
         }
         if refused || failures >= FAILURE_LIMIT {
+            break;
+        }
+    }
+}
+
+/// The shortest span between two signs of life for one run: two beats, at
+/// most two minutes (a minute when nothing is set). Under the hosted path's
+/// promise of a signal every 120 s (stalled after 360 s), with room to spare.
+fn sign_every_ms() -> u64 {
+    (2 * beat_secs()).min(120) * 1000
+}
+
+/// Send a session's signs of life while there is something to send them for.
+/// Leaves when the session ended or has no run, when no hook event came for
+/// two intervals (the next one starts it again), when the API refuses, or
+/// when it cannot be reached five times in a row. No timer: a sign goes out
+/// only after a hook event ([`SessionFile::signs_due`]).
+async fn signs(path: &Path, config: &ApiConfig) {
+    let every_ms = sign_every_ms();
+    let mut failures = 0_u32;
+    loop {
+        tokio::time::sleep(TICK).await;
+        let now = now_ms();
+        let Some(file) = read(path) else {
+            break;
+        };
+        if file.refused
+            || file.closed
+            || file.runs.is_empty()
+            || now.saturating_sub(file.last_hook_ms) >= 2 * every_ms
+        {
+            break;
+        }
+        for (ident, body) in file.signs_due(every_ms, now) {
+            let ended = match send(config, &body).await {
+                Sent::Ok(answer) => {
+                    failures = 0;
+                    answer_says_ended(&answer)
+                }
+                Sent::Dropped => false,
+                Sent::Refused => {
+                    update(path, SessionFile::refuse);
+                    return;
+                }
+                Sent::Retry => {
+                    failures += 1;
+                    break;
+                }
+            };
+            update(path, |file: &mut SessionFile| {
+                if ended {
+                    // Someone ended the run by its own word: no more signs.
+                    file.runs.retain(|open| run_ident(open) != ident);
+                } else if let Some(run) = file.runs.iter_mut().find(|open| run_ident(open) == ident) {
+                    run.signed_ms = now;
+                }
+            });
+        }
+        if failures >= FAILURE_LIMIT {
             break;
         }
     }

@@ -1792,3 +1792,359 @@ fn a_report_sent_on_says_so_only_when_it_went_somewhere_else() {
     assert!(report.body.get("source_run_id").is_none());
     assert!(report.notes.is_empty(), "{:?}", report.notes);
 }
+
+// ============================================================================
+// The agent's name on the hosted gateway
+// ============================================================================
+
+/// Who calls the hosted gateway: the key, the token that names the
+/// connection, and the agent name the client sent.
+#[derive(Clone, Copy)]
+struct Caller<'a> {
+    key: Option<&'a str>,
+    token: Option<&'a str>,
+    name: Option<&'a str>,
+}
+
+const SESSION_A: Caller<'static> = Caller {
+    key: Some("key-1"),
+    token: Some(TOKEN_A),
+    name: None,
+};
+
+/// Run `work` as the hosted gateway runs a tool call of `caller` from Claude
+/// Code.
+async fn as_caller<T, F, Fut>(caller: Caller<'_>, work: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let name = caller.name.map(str::to_string);
+    hosted(caller.key, caller.token, || async move {
+        crate::client_identity::run_with_client_name(Some("claude-code".to_string()), async move {
+            match name {
+                Some(name) => mcp_client::agent_handle::run_with_header_handle(name, work).await,
+                None => work().await,
+            }
+        })
+        .await
+    })
+    .await
+}
+
+/// The agent a hosted report of `caller` is sent under.
+async fn reported_agent(caller: Caller<'_>) -> Value {
+    let fixture = Fixture::new();
+    let api = Api::start(vec![(
+        "POST /api/v1/run-progress/report",
+        200,
+        fixture.answer("working", &["run.step"]),
+    )])
+    .await;
+    let tool = fixture.hosted_tool(&api.base_url);
+    as_caller(caller, || async {
+        tool.execute(json!({"step": "Running the tests", "run_key": "floor-live-runs"}))
+            .await
+    })
+    .await
+    .expect("report");
+    let requests = api.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    requests[0].body["agent"].clone()
+}
+
+/// The hosted gateway's client and session, against a mock API.
+fn hosted_client(fixture: &Fixture, base_url: &str) -> (ContextStreamClient, Arc<SessionManager>) {
+    let mut config = TestFixtures::test_config();
+    config.api_url = base_url.to_string();
+    config.default_workspace_id = Some(fixture.workspace);
+    config.default_project_id = Some(fixture.project);
+    config.is_http_transport = true;
+    let client = ContextStreamClient::new(config.clone());
+    let session = Arc::new(SessionManager::new(client.clone(), config));
+    (client, session)
+}
+
+#[tokio::test]
+async fn a_client_that_sends_neither_header_keeps_todays_name_and_id() {
+    // Today's rule, spelt out: the client's product name and four characters
+    // of the session part; in the id, the client and eight.
+    let today = |part: &str| {
+        json!({
+            "id": format!("claude-code:{}", &part[2..10]),
+            "name": format!("Claude Code {}", &part[2..6]),
+            "runtime": "mcp",
+            "client": "claude-code",
+        })
+    };
+    let by_key = Caller {
+        key: Some("key-1"),
+        token: None,
+        name: None,
+    };
+    let part = hosted_part(Some("key-1"), None).await;
+    assert!(part.starts_with("c-"), "{part}");
+    assert_eq!(reported_agent(by_key).await, today(&part));
+    let part = hosted_part(Some("key-1"), Some(TOKEN_A)).await;
+    assert!(part.starts_with("s-"), "{part}");
+    assert_eq!(reported_agent(SESSION_A).await, today(&part));
+    // What init tells the hooks is the same agent.
+    let fixture = Fixture::new();
+    let (client, session) = hosted_client(&fixture, "http://127.0.0.1:9");
+    let identity = as_caller(SESSION_A, || async {
+        session_identity(&client, &session).await
+    })
+    .await
+    .expect("an identity");
+    assert_eq!(identity["agent"], today(&part));
+}
+
+#[tokio::test]
+async fn a_hosted_client_that_names_its_agent_reports_under_that_name() {
+    let lane = |name, token| Caller {
+        key: Some("key-1"),
+        token: Some(token),
+        name: Some(name),
+    };
+    // The name is the agent, as a local server's CONTEXTSTREAM_AGENT_NAME is.
+    assert_eq!(
+        reported_agent(lane("floor-live-runs", TOKEN_A)).await,
+        json!({"name": "floor-live-runs", "runtime": "mcp", "client": "claude-code"})
+    );
+    // Two lanes of one key are two names.
+    assert_eq!(
+        reported_agent(lane("floor-alive-4", TOKEN_B)).await["name"],
+        "floor-alive-4"
+    );
+    // init tells the hooks the same name.
+    let fixture = Fixture::new();
+    let (client, session) = hosted_client(&fixture, "http://127.0.0.1:9");
+    let identity = as_caller(lane("floor-live-runs", TOKEN_A), || async {
+        session_identity(&client, &session).await
+    })
+    .await
+    .expect("an identity");
+    assert_eq!(identity["agent"]["name"], "floor-live-runs");
+}
+
+// ============================================================================
+// A sign of life on the hosted gateway
+// ============================================================================
+
+const ENGINEERING: &str = "dc5fcbaf-dca4-4cd9-b395-c9393294704f";
+
+/// A run the mock API lists: its agent, how it reads, and how many minutes
+/// ago its agent last reported on it.
+fn listed_run(fixture: &Fixture, index: u128, agent_id: &str, liveness: &str, minutes_ago: i64) -> Value {
+    let mut view = fixture.view(match liveness {
+        "waiting" => "waiting_input",
+        "stalled" => "stalled",
+        _ => "working",
+    });
+    view["run_id"] = json!(Uuid::from_u128(index));
+    view["liveness"] = json!(liveness);
+    view["agent"] = json!({"id": agent_id, "name": "Claude Code 3fa9", "runtime": "mcp", "client": "claude-code"});
+    view["last_event_at"] =
+        json!((chrono::Utc::now() - chrono::Duration::minutes(minutes_ago)).to_rfc3339());
+    view
+}
+
+/// The agent id the runs of `caller` carry.
+async fn agent_id_of(caller: Caller<'_>) -> String {
+    as_caller(caller, || async {
+        let agent = agent_identity(
+            mcp_client::agent_handle::agent_handle_of_caller(None),
+            crate::client_identity::current_client_name(),
+            &session_part(true),
+        );
+        agent["id"]
+            .as_str()
+            .or_else(|| agent["name"].as_str())
+            .expect("an agent")
+            .to_string()
+    })
+    .await
+}
+
+/// One `tool` call of `caller` through the hosted gateway, with `listed` as
+/// the workspace's open runs and `workspaces` as the gateway's setting:
+/// whether a sign of life went out, and every request it made (target, body).
+async fn sign_for(
+    fixture: &Fixture,
+    caller: Caller<'_>,
+    workspaces: &[Uuid],
+    tool: &str,
+    listed: Vec<Value>,
+) -> (bool, Vec<(String, Value)>) {
+    let api = Api::start(vec![
+        (
+            "GET /api/v1/run-progress/runs?",
+            200,
+            json!({"success": true, "data": {"runs": listed}}),
+        ),
+        (
+            "POST /api/v1/run-progress/report",
+            200,
+            fixture.answer("working", &[]),
+        ),
+    ])
+    .await;
+    let (client, session) = hosted_client(fixture, &api.base_url);
+    let params = json!({"name": tool, "arguments": {"query": "anything"}});
+    let sent = as_caller(caller, || async {
+        sign_of_life_for(&client, &session, &params, workspaces).await
+    })
+    .await;
+    let went = sent.is_some();
+    if let Some(task) = sent {
+        task.await.expect("the sign of life finishes");
+    }
+    let requests = api
+        .requests()
+        .into_iter()
+        .map(|seen| (seen.target, seen.body))
+        .collect();
+    (went, requests)
+}
+
+#[tokio::test]
+async fn a_tool_call_keeps_the_sessions_open_runs_alive_where_the_gateway_is_told_to() {
+    let fixture = Fixture::new();
+    let me = agent_id_of(SESSION_A).await;
+    let listed = vec![
+        listed_run(&fixture, 1, &me, "live", 5),
+        listed_run(&fixture, 2, &me, "waiting", 5),
+        listed_run(&fixture, 3, "claude-code:0badc0de", "live", 5),
+        listed_run(&fixture, 4, &me, "stalled", 20),
+        listed_run(&fixture, 5, &me, "quiet", 4 * 60 + 5),
+    ];
+    let (went, requests) =
+        sign_for(&fixture, SESSION_A, &[fixture.workspace], "search", listed.clone()).await;
+    assert!(went);
+    let targets: Vec<&str> = requests.iter().map(|(target, _)| target.as_str()).collect();
+    assert_eq!(targets.len(), 3, "{targets:?}");
+    assert!(
+        targets[0].starts_with("/api/v1/run-progress/runs?")
+            && targets[0].contains("active=true")
+            && targets[0].contains(&format!("workspace_id={}", fixture.workspace)),
+        "{targets:?}"
+    );
+    // Its working run and its stalled one. Not the run that waits, not
+    // another agent's, not one its agent last reported on hours ago.
+    for ((target, body), index) in requests[1..].iter().zip([1_u128, 4]) {
+        assert_eq!(target, "/api/v1/run-progress/report");
+        // Who and which run and nothing about the work, under the run's own
+        // agent, so nothing is renamed.
+        assert_eq!(
+            body,
+            &json!({
+                "workspace_id": fixture.workspace,
+                "run_id": Uuid::from_u128(index),
+                "agent": listed[0]["agent"],
+            })
+        );
+    }
+    // At most once a minute for one session: the next call sends nothing.
+    let (went, requests) =
+        sign_for(&fixture, SESSION_A, &[fixture.workspace], "memory", listed).await;
+    assert!(!went);
+    assert!(requests.is_empty(), "{requests:?}");
+}
+
+#[tokio::test]
+async fn a_workspace_not_on_the_list_sees_exactly_todays_behaviour() {
+    let fixture = Fixture::new();
+    let me = agent_id_of(SESSION_A).await;
+    // The setting unset (as shipped), or naming other workspaces only: not a
+    // single request, whatever the session's runs.
+    for workspaces in [
+        vec![],
+        vec![Uuid::new_v4(), Uuid::parse_str(ENGINEERING).unwrap()],
+    ] {
+        let (went, requests) = sign_for(
+            &fixture,
+            SESSION_A,
+            &workspaces,
+            "search",
+            vec![listed_run(&fixture, 1, &me, "live", 5)],
+        )
+        .await;
+        assert!(!went && requests.is_empty(), "{workspaces:?}: {requests:?}");
+    }
+    // The setting: a comma list of ids; anything else in it names nothing.
+    assert_eq!(parse_workspace_list(None), Vec::<Uuid>::new());
+    assert_eq!(parse_workspace_list(Some("  ")), Vec::<Uuid>::new());
+    assert_eq!(
+        parse_workspace_list(Some(&format!(" {ENGINEERING}, nope ,{}", fixture.workspace))),
+        vec![Uuid::parse_str(ENGINEERING).unwrap(), fixture.workspace]
+    );
+    // A local server never signs: it has its own heartbeat.
+    let api = Api::start(vec![]).await;
+    let (client, session) = client_and_session(&api.base_url, fixture.workspace, Some(fixture.project));
+    let params = json!({"name": "search", "arguments": {}});
+    let local = as_caller(SESSION_A, || async {
+        sign_of_life_for(&client, &session, &params, &[fixture.workspace]).await
+    })
+    .await;
+    assert!(local.is_none());
+    assert!(api.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_session_the_gateway_cannot_tell_apart_gives_no_sign_of_life() {
+    let fixture = Fixture::new();
+    let here = [fixture.workspace];
+    // Every session of a key that names no connection looks alike: a call
+    // may be another session's.
+    let by_key = Caller {
+        key: Some("key-1"),
+        token: None,
+        name: None,
+    };
+    let me = agent_id_of(by_key).await;
+    let (went, requests) = sign_for(
+        &fixture,
+        by_key,
+        &here,
+        "search",
+        vec![listed_run(&fixture, 1, &me, "live", 5)],
+    )
+    .await;
+    assert!(!went && requests.is_empty(), "{requests:?}");
+    // No caller (no credential): nothing.
+    let nobody = Caller {
+        key: None,
+        token: Some(TOKEN_A),
+        name: None,
+    };
+    let (went, requests) = sign_for(&fixture, nobody, &here, "search", vec![]).await;
+    assert!(!went && requests.is_empty(), "{requests:?}");
+    // A report is a signal of its own.
+    let (went, requests) = sign_for(&fixture, SESSION_A, &here, "progress", vec![]).await;
+    assert!(!went && requests.is_empty(), "{requests:?}");
+    // An agent its client named is that agent, on whatever connection.
+    let named = Caller {
+        key: Some("key-1"),
+        token: None,
+        name: Some("floor-live-runs"),
+    };
+    let (went, requests) = sign_for(
+        &fixture,
+        named,
+        &here,
+        "search",
+        vec![
+            listed_run(&fixture, 1, "floor-live-runs", "live", 5),
+            listed_run(&fixture, 2, &me, "live", 5),
+        ],
+    )
+    .await;
+    assert!(went);
+    let reports: Vec<&Value> = requests
+        .iter()
+        .filter(|(target, _)| target.ends_with("/run-progress/report"))
+        .map(|(_, body)| body)
+        .collect();
+    assert_eq!(reports.len(), 1, "{requests:?}");
+    assert_eq!(reports[0]["run_id"], json!(Uuid::from_u128(1)));
+}

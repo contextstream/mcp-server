@@ -817,3 +817,100 @@ fn a_local_servers_words_are_enough_to_start_keep_alive_and_end_a_run() {
         1
     );
 }
+
+/// Signs of life (`CONTEXTSTREAM_RUN_PROGRESS_SIGNS=on`, the automatic
+/// reports off): a run the model reported is signalled after real tool calls
+/// only, at most once an interval (two beats: 2 s here), by who and which run.
+/// Nothing is started, set waiting, stepped or ended by the hooks.
+#[test]
+fn signs_of_life_follow_real_tool_calls_and_nothing_else() {
+    let api = FakeApi::start();
+    let sandbox = Sandbox::new(
+        &api,
+        &[
+            ("CONTEXTSTREAM_RUN_PROGRESS_AUTO", UNSET),
+            ("CONTEXTSTREAM_RUN_PROGRESS_SIGNS", "on"),
+        ],
+    );
+    let session = Session::new("host-session-a", SESSION_A);
+    sandbox.init(&session);
+    // A ticket taken up starts nothing in this mode.
+    sandbox.set_ticket(&session, TICKET_A, "in_progress");
+    let run_id = "44444444-4444-4444-8444-444444444444";
+    let agent = json!({"id": "floor-live-runs", "name": "floor-live-runs", "runtime": "mcp", "client": "claude-code"});
+    let view = json!({
+        "run_id": run_id,
+        "workspace_id": WORKSPACE,
+        "project_id": PROJECT,
+        "state": "working",
+        "liveness": "live",
+        "agent": agent,
+        "scope": {"workspace_id": WORKSPACE},
+    });
+    sandbox.tool_result(
+        &session,
+        "progress",
+        json!({"run_key": "floor-live-runs", "step": "Building the API"}),
+        json!({"run": view, "written": ["run.step"], "session": SESSION_A, "run_key": "floor-live-runs"}),
+    );
+    let pre = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "cargo build"}});
+    let post = json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cargo build"},
+        "tool_response": {"stdout": "", "stderr": "", "interrupted": false},
+    });
+    // The model works on, a tool call a second, and reports nothing.
+    for _ in 0..5 {
+        sandbox.hook(&session, "pre-tool-use", pre.clone());
+        std::thread::sleep(Duration::from_secs(1));
+        sandbox.hook(&session, "post-tool-use", post.clone());
+    }
+    let sign = api
+        .wait_for(SOON, |body| body["run_id"] == run_id)
+        .expect("a run at work is signalled");
+    // Who and which run, nothing else, under the agent the run was reported
+    // as: a signal sets a run's agent, so this renames nothing.
+    assert_eq!(
+        sign.body,
+        json!({"workspace_id": WORKSPACE, "run_id": run_id, "agent": agent})
+    );
+    // The turn ends: nothing says the run waits, and without a tool call
+    // nothing more is sent. No timer.
+    sandbox.hook(&session, "stop", json!({"hook_event_name": "Stop"}));
+    std::thread::sleep(Duration::from_secs(3));
+    let quiet_from = api.reports().len();
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(api.reports().len(), quiet_from, "silence is silence");
+    // A real tool call after the quiet spell is a sign again.
+    sandbox.hook(&session, "pre-tool-use", pre.clone());
+    std::thread::sleep(Duration::from_secs(3));
+    sandbox.hook(&session, "post-tool-use", post);
+    let deadline = Instant::now() + SOON;
+    while api.reports().len() == quiet_from && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(api.reports().len() > quiet_from, "a tool call is a sign of life");
+    // The session ends: no end is invented.
+    sandbox.hook(
+        &session,
+        "session-end",
+        json!({"hook_event_name": "SessionEnd", "reason": "other"}),
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    let reports = api.reports();
+    // Every report was a bare sign for the run the model reported, at least
+    // an interval apart: no run by key (the ticket), no status, step or wait.
+    for report in &reports {
+        assert_eq!(
+            report.body,
+            json!({"workspace_id": WORKSPACE, "run_id": run_id, "agent": agent})
+        );
+    }
+    for pair in reports.windows(2) {
+        assert!(
+            pair[1].at.duration_since(pair[0].at) >= Duration::from_millis(1_900),
+            "at most one sign an interval"
+        );
+    }
+}

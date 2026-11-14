@@ -20,7 +20,10 @@
 //!   on a timer until the run is reported finished or the process exits. A
 //!   heartbeat only proves that the client session is open, so it carries no
 //!   step. The hosted HTTP gateway keeps no state between requests and runs
-//!   no timer; it tells the API to expect a longer silence instead.
+//!   no timer; it tells the API to expect a longer silence instead and, in
+//!   the workspaces `CONTEXTSTREAM_RUN_PROGRESS_SIGNS_WORKSPACES` names,
+//!   counts a session's tool calls as a sign of life for that session's open
+//!   runs ([`sign_of_life`]).
 
 use async_trait::async_trait;
 use mcp_client::run_progress::{
@@ -255,8 +258,9 @@ impl ProgressTool {
         let folder = self.session.state().await.folder_path;
         let handle = if is_http {
             // The gateway's own environment and folder say nothing about the
-            // caller: only the folder the caller's session named counts.
-            mcp_client::agent_handle::agent_handle_of_folder(folder.as_deref())
+            // caller: only the name its client sent, or the folder its
+            // session named, counts.
+            mcp_client::agent_handle::agent_handle_of_caller(folder.as_deref())
         } else {
             let folder = folder.or_else(|| {
                 std::env::current_dir()
@@ -1312,7 +1316,7 @@ pub(crate) async fn session_identity(
     let part = session_part(is_http);
     let folder = session.state().await.folder_path;
     let handle = if is_http {
-        mcp_client::agent_handle::agent_handle_of_folder(folder.as_deref())
+        mcp_client::agent_handle::agent_handle_of_caller(folder.as_deref())
     } else {
         let folder = folder.or_else(|| {
             std::env::current_dir()
@@ -1323,6 +1327,199 @@ pub(crate) async fn session_identity(
     };
     let agent = agent_identity(handle, crate::client_identity::current_client_name(), &part);
     Some(json!({ "session": part, "agent": agent }))
+}
+
+/// The workspaces whose runs the hosted gateway keeps alive on a session's
+/// tool calls: a comma list of workspace ids. Unset or empty: none, and the
+/// gateway does exactly what it did before the setting existed.
+pub const SIGNS_WORKSPACES_ENV: &str = "CONTEXTSTREAM_RUN_PROGRESS_SIGNS_WORKSPACES";
+
+/// At most this often one session's tool calls signal its runs in one
+/// workspace.
+const SIGN_OF_LIFE_EVERY: Duration = Duration::from_secs(60);
+
+/// Sessions one gateway process remembers the last sign of life of; past
+/// it, the memory starts over (one sign more than needed is harmless).
+const MAX_SIGNED_SESSIONS: usize = 10_000;
+
+/// The workspace ids a [`SIGNS_WORKSPACES_ENV`] value names: ids split by
+/// commas or white space. Anything that is not an id names nothing.
+pub(crate) fn parse_workspace_list(raw: Option<&str>) -> Vec<Uuid> {
+    raw.unwrap_or_default()
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect()
+}
+
+/// The workspaces [`SIGNS_WORKSPACES_ENV`] names, read once.
+fn signs_workspaces() -> &'static [Uuid] {
+    static WORKSPACES: OnceLock<Vec<Uuid>> = OnceLock::new();
+    WORKSPACES.get_or_init(|| {
+        parse_workspace_list(std::env::var(SIGNS_WORKSPACES_ENV).ok().as_deref())
+    })
+}
+
+/// The hosted gateway's sign of life for the tool call in hand (`params` of
+/// `tools/call`): started before the tool runs, never waited on.
+///
+/// A local server keeps a reported run alive with a timer while its process
+/// lives. The gateway has neither, so a session that worked without
+/// reporting read as stalled. A tool call is evidence that its session is at
+/// work, so it counts as a heartbeat for that session's open runs when:
+/// - the call's workspace (its `workspace_id`, else the session's) is on
+///   [`SIGNS_WORKSPACES_ENV`]; for any other workspace nothing is read,
+///   sent or remembered;
+/// - the tool is not `progress`: a report is a signal of its own;
+/// - the caller is authenticated, and the gateway can tell its session from
+///   the key's other sessions (an `s-` session part) or its client named its
+///   agent: a call of a key that does neither may be any of its sessions';
+/// - the session sent no sign for the workspace in the last minute.
+///
+/// The runs are the workspace's open runs under this session's own agent id
+/// that do not wait and whose agent reported on them within
+/// [`HEARTBEAT_IDLE_LIMIT`] (see [`signals_run`]). Each gets a bare report,
+/// which the API keeps as a heartbeat: it moves the run's last signal,
+/// brings a stalled run back, leaves a waiting run waiting and a run that
+/// ended by its own word ended. It carries the run's own agent as the API
+/// lists it, because every signal sets a run's agent. Sent detached, under
+/// the request's own credential.
+pub async fn sign_of_life(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    params: &Value,
+) -> Option<tokio::task::JoinHandle<()>> {
+    sign_of_life_for(client, session, params, signs_workspaces()).await
+}
+
+/// [`sign_of_life`] for the workspaces `workspaces` (the setting's).
+pub(crate) async fn sign_of_life_for(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    params: &Value,
+    workspaces: &[Uuid],
+) -> Option<tokio::task::JoinHandle<()>> {
+    if workspaces.is_empty() || !reporting_enabled() {
+        return None;
+    }
+    if params.get("name").and_then(Value::as_str)? == TOOL_NAME {
+        return None;
+    }
+    if !client.config().await.is_http_transport {
+        return None;
+    }
+    let caller = mcp_client::get_task_caller_cache_identity()?;
+    let named = params
+        .pointer("/arguments/workspace_id")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id.trim()).ok());
+    let workspace_id = match named {
+        Some(id) => id,
+        None => super::scope::read_scope_defaults(client, Some(session))
+            .await
+            .0?,
+    };
+    if !workspaces.contains(&workspace_id) {
+        return None;
+    }
+    let part = session_part(true);
+    let folder = session.state().await.folder_path;
+    let handle = mcp_client::agent_handle::agent_handle_of_caller(folder.as_deref());
+    if handle.is_none() && !is_one_session(&part, true) {
+        return None;
+    }
+    let agent = agent_identity(handle, crate::client_identity::current_client_name(), &part);
+    // The API names an agent that has no id by its name.
+    let agent_id = str_field(&agent, "id")
+        .or_else(|| str_field(&agent, "name"))?
+        .to_string();
+    let key = format!(
+        "{}\n{part}\n{agent_id}\n{workspace_id}",
+        short_digest(&caller)
+    );
+    if !sign_due(&key, Instant::now()) {
+        return None;
+    }
+    let client = client.clone();
+    Some(mcp_client::spawn_with_task_context(async move {
+        signal_open_runs(&client, workspace_id, &agent_id).await;
+    }))
+}
+
+/// Whether the session `key` names is due a sign at `now`; when it is, `now`
+/// is remembered as its last.
+fn sign_due(key: &str, now: Instant) -> bool {
+    static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let mut last = LAST
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if last
+        .get(key)
+        .is_some_and(|at| now.saturating_duration_since(*at) < SIGN_OF_LIFE_EVERY)
+    {
+        return false;
+    }
+    if last.len() >= MAX_SIGNED_SESSIONS {
+        last.retain(|_, at| now.saturating_duration_since(*at) < SIGN_OF_LIFE_EVERY);
+        if last.len() >= MAX_SIGNED_SESSIONS {
+            last.clear();
+        }
+    }
+    last.insert(key.to_string(), now);
+    true
+}
+
+/// Heartbeat the workspace's open runs that a tool call of `agent_id`'s
+/// session keeps alive ([`signals_run`]).
+async fn signal_open_runs(client: &ContextStreamClient, workspace_id: Uuid, agent_id: &str) {
+    let filter = RunFilter {
+        workspace_id: Some(workspace_id),
+        active: Some(true),
+        limit: Some(OPEN_RUNS_READ),
+        ..RunFilter::default()
+    };
+    let Ok(result) = client.list_run_progress(&filter).await else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    for view in runs_of(&result) {
+        if !signals_run(view, agent_id, now) {
+            continue;
+        }
+        let (Some(run_id), Some(agent)) = (str_field(view, "run_id"), view.get("agent")) else {
+            continue;
+        };
+        let body = json!({"workspace_id": workspace_id, "run_id": run_id, "agent": agent});
+        if let Err(error) = client.report_run_progress(&body, 0).await {
+            tracing::debug!("sign of life not recorded: {}", error);
+            return;
+        }
+    }
+}
+
+/// Whether a listed run is one a tool call of `agent_id`'s session keeps
+/// alive: its own, at work (live, quiet or stalled; never one that waits or
+/// ended), and reported on by its agent within [`HEARTBEAT_IDLE_LIMIT`]. A
+/// run whose last report the API does not say is left alone.
+fn signals_run(view: &Value, agent_id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if view.pointer("/agent/id").and_then(Value::as_str) != Some(agent_id) {
+        return false;
+    }
+    if !matches!(
+        str_field(view, "liveness"),
+        Some("live" | "quiet" | "stalled")
+    ) || view.get("waiting").is_some_and(|waiting| !waiting.is_null())
+    {
+        return false;
+    }
+    let Some(reported) = str_field(view, "last_event_at")
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+    else {
+        return false;
+    };
+    now.signed_duration_since(reported.with_timezone(&chrono::Utc))
+        .to_std()
+        .map_or(true, |silent| silent < HEARTBEAT_IDLE_LIMIT)
 }
 
 /// Whether reporting is on: off only when `CONTEXTSTREAM_RUN_PROGRESS` says so.

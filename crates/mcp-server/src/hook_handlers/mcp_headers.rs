@@ -6,7 +6,11 @@
 //! connects to a remote server and adds the headers that command prints
 //! (`headersHelper`); setup writes this command there. It prints one header,
 //! [`mcp_client::client_session::HEADER`], with a random id: nothing of the
-//! machine, the person, the folder or the key is in it.
+//! machine, the person, the folder or the key is in it. When the session
+//! names its agent the way a local server reads it (`CONTEXTSTREAM_AGENT_NAME`
+//! or `AGENT_NAME`, else an `agent-<name>` working folder), it also prints
+//! [`mcp_client::agent_handle::HEADER`] with that name, so the hosted server
+//! reports the session's runs under it; without one, nothing more is sent.
 //!
 //! Claude Code runs the command again whenever it connects again. It names
 //! the session's own process to the command by its messaging socket
@@ -59,7 +63,11 @@ pub fn handle() -> anyhow::Result<()> {
     {
         std::thread::sleep(Duration::from_millis(delay.min(60_000)));
     }
-    let body = headers(std::env::var(ENABLED_ENV).ok().as_deref(), connection_token);
+    let body = headers(
+        std::env::var(ENABLED_ENV).ok().as_deref(),
+        connection_token,
+        agent_name(),
+    );
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{body}");
     let _ = out.flush();
@@ -68,7 +76,20 @@ pub fn handle() -> anyhow::Result<()> {
 
 /// What the command prints: the one header, or no header at all where live
 /// progress is turned off.
-fn headers(enabled: Option<&str>, token: impl FnOnce() -> String) -> serde_json::Value {
+/// The session's agent name, by the rule a local server uses: its
+/// `CONTEXTSTREAM_AGENT_NAME` (or `AGENT_NAME`), else a working folder named
+/// `agent-<name>` (`mcp_client::agent_handle::agent_handle`). Claude Code
+/// runs this command in the session's own environment.
+fn agent_name() -> Option<String> {
+    let folder = std::env::current_dir().ok();
+    mcp_client::agent_handle::agent_handle(folder.as_deref().and_then(|path| path.to_str()))
+}
+
+fn headers(
+    enabled: Option<&str>,
+    token: impl FnOnce() -> String,
+    name: Option<String>,
+) -> serde_json::Value {
     let off = enabled.is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -78,7 +99,12 @@ fn headers(enabled: Option<&str>, token: impl FnOnce() -> String) -> serde_json:
     if off {
         return serde_json::json!({});
     }
-    serde_json::json!({ client_session::HEADER: token() })
+    let mut body = serde_json::Map::new();
+    body.insert(client_session::HEADER.to_string(), token().into());
+    if let Some(name) = name {
+        body.insert(mcp_client::agent_handle::HEADER.to_string(), name.into());
+    }
+    serde_json::Value::Object(body)
 }
 
 /// The id of this connection: the one kept for the session's process when
@@ -183,14 +209,14 @@ mod tests {
 
     #[test]
     fn the_command_prints_one_header_with_a_token_the_gateway_accepts() {
-        let body = headers(None, client_session::new_token);
+        let body = headers(None, client_session::new_token, None);
         let fields = body.as_object().expect("an object");
         assert_eq!(fields.len(), 1, "{body}");
         let token = fields[client_session::HEADER].as_str().expect("a string");
         assert_eq!(client_session::accepted(token), Some(token));
         for on in ["on", "1", "true", "", "auto"] {
             assert_eq!(
-                headers(Some(on), || "t".repeat(32))
+                headers(Some(on), || "t".repeat(32), None)
                     .as_object()
                     .map(|o| o.len()),
                 Some(1),
@@ -202,9 +228,34 @@ mod tests {
     #[test]
     fn no_header_is_sent_where_live_progress_is_turned_off() {
         for off in ["off", "OFF", " 0 ", "false", "no", "disabled"] {
-            let body = headers(Some(off), || panic!("no token is made when it is off"));
+            let body = headers(
+                Some(off),
+                || panic!("no token is made when it is off"),
+                Some("floor-live-runs".to_string()),
+            );
             assert_eq!(body, serde_json::json!({}), "{off:?}");
         }
+    }
+
+    #[test]
+    fn a_named_agent_goes_beside_the_token_and_an_unnamed_one_sends_what_it_did() {
+        let named = headers(
+            None,
+            || "a".repeat(32),
+            Some("floor-live-runs".to_string()),
+        );
+        assert_eq!(
+            named,
+            serde_json::json!({
+                client_session::HEADER: "a".repeat(32),
+                mcp_client::agent_handle::HEADER: "floor-live-runs",
+            })
+        );
+        // No name: exactly the one header, as before.
+        assert_eq!(
+            headers(None, || "a".repeat(32), None),
+            serde_json::json!({ client_session::HEADER: "a".repeat(32) })
+        );
     }
 
     #[test]

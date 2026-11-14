@@ -57,6 +57,43 @@ pub fn agent_handle_of_folder(folder: Option<&str>) -> Option<String> {
     agent_handle_from(None, folder)
 }
 
+/// The header a hosted client names its agent in. `contextstream-mcp hook
+/// mcp-headers` sends it from the client's own `CONTEXTSTREAM_AGENT_NAME`
+/// (or `AGENT_NAME`), else its `agent-<name>` working folder: the rule a
+/// local server reads from its own environment ([`agent_handle`]).
+pub const HEADER: &str = "X-ContextStream-Agent-Name";
+
+/// The same name as an HTTP stack reads it.
+pub const HEADER_LOWERCASE: &str = "x-contextstream-agent-name";
+
+tokio::task_local! {
+    /// The handle the request in hand named in [`HEADER`], in its canonical
+    /// form. Set by the hosted transport only.
+    static TASK_HEADER_HANDLE: String;
+}
+
+/// Run a future for a request whose client named its agent `handle`.
+pub async fn run_with_header_handle<F, Fut>(handle: String, f: F) -> Fut::Output
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future,
+{
+    TASK_HEADER_HANDLE.scope(handle, f()).await
+}
+
+/// The handle the request in hand named in [`HEADER`]. `None` outside a
+/// hosted request and for a request that named none.
+pub fn header_handle() -> Option<String> {
+    TASK_HEADER_HANDLE.try_with(Clone::clone).ok()
+}
+
+/// A hosted caller's handle: the name its client sent in [`HEADER`], else an
+/// `agent-<name>` folder its session named. The gateway's own environment
+/// says nothing about the caller and is never read.
+pub fn agent_handle_of_caller(folder: Option<&str>) -> Option<String> {
+    header_handle().or_else(|| agent_handle_of_folder(folder))
+}
+
 fn agent_handle_from(env: Option<&str>, folder: Option<&str>) -> Option<String> {
     if let Some(handle) = env.and_then(normalize_agent_handle) {
         return Some(handle);
@@ -96,5 +133,30 @@ mod tests {
             Some("mcp-eng2c")
         );
         assert_eq!(agent_handle_of_folder(Some("/home/dev/project")), None);
+    }
+
+    #[tokio::test]
+    async fn a_hosted_caller_is_named_by_its_header_else_by_its_folder() {
+        assert_eq!(
+            agent_handle_of_caller(Some("/tmp/agent-qa-a")).as_deref(),
+            Some("qa-a")
+        );
+        assert_eq!(agent_handle_of_caller(None), None);
+        let (with_folder, alone, read) =
+            run_with_header_handle("floor-live-runs".to_string(), || async {
+                (
+                    agent_handle_of_caller(Some("/tmp/agent-qa-a")),
+                    agent_handle_of_caller(None),
+                    header_handle(),
+                )
+            })
+            .await;
+        // The client's own name wins over a folder, as the environment does
+        // on a local server.
+        assert_eq!(with_folder.as_deref(), Some("floor-live-runs"));
+        assert_eq!(alone.as_deref(), Some("floor-live-runs"));
+        assert_eq!(read.as_deref(), Some("floor-live-runs"));
+        // Outside a request that named one: nothing.
+        assert_eq!(header_handle(), None);
     }
 }

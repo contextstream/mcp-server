@@ -1403,14 +1403,27 @@ async fn serve_mcp_streamable(
                         "tools/call" => {
                             mcp_tools::client_identity::run_with_client_name(
                                 call_client_name,
-                                handle_call_tool_method(
-                                    &state,
-                                    request.params,
-                                    request.id.clone(),
-                                    wire_observation.clone(),
-                                    stateless_request,
-                                    request_registry,
-                                ),
+                                async {
+                                    // A tool call is a sign of life for its
+                                    // session's open runs, where the gateway
+                                    // is told to keep them alive. Started,
+                                    // never waited on.
+                                    let _ = mcp_tools::domains::progress::sign_of_life(
+                                        &state.client,
+                                        &state.session,
+                                        &request.params,
+                                    )
+                                    .await;
+                                    handle_call_tool_method(
+                                        &state,
+                                        request.params,
+                                        request.id.clone(),
+                                        wire_observation.clone(),
+                                        stateless_request,
+                                        request_registry,
+                                    )
+                                    .await
+                                },
                             )
                             .await
                         }
@@ -3768,6 +3781,10 @@ pub async fn auth_middleware(
     // `mcp_client::client_session`). Untrusted input: a value of any other
     // shape is ignored, and no tool uses it without the caller's identity.
     let client_session = client_session_from_headers(&headers);
+    // A client can name its agent (`mcp_client::agent_handle::HEADER`).
+    // Untrusted input too: a label for the caller's own reports, written only
+    // where the caller's credential may write.
+    let agent_handle = agent_handle_from_headers(&headers);
 
     // Wrap handler execution with per-request auth, config, and session-
     // identity context. SessionManager reads the session key via
@@ -3827,15 +3844,24 @@ pub async fn auth_middleware(
             None => exec_with_session().await,
         }
     };
+    let exec_with_agent_handle = || async move {
+        match agent_handle {
+            Some(handle) => {
+                mcp_client::agent_handle::run_with_header_handle(handle, exec_with_client_session)
+                    .await
+            }
+            None => exec_with_client_session().await,
+        }
+    };
     // The edge's view of the caller's location rides every API call made for
     // this request, and the tenant home the API names on those calls comes
     // back on this response so the Cloudflare MCP gateway can remember it.
     let (mut response, tenant_home) = mcp_client::run_capturing_tenant_home(|| async move {
         match edge_geography {
             Some(geography) => {
-                mcp_client::run_with_edge_geography(geography, exec_with_client_session).await
+                mcp_client::run_with_edge_geography(geography, exec_with_agent_handle).await
             }
-            None => exec_with_client_session().await,
+            None => exec_with_agent_handle().await,
         }
     })
     .await;
@@ -3844,6 +3870,17 @@ pub async fn auth_middleware(
         state.session.discard_transient_state(&key);
     }
     Ok(response)
+}
+
+/// The agent name a client sent (`mcp_client::agent_handle::HEADER`), in its
+/// canonical form. A value that is not a plausible handle is ignored, as if
+/// no header had been sent.
+fn agent_handle_from_headers(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(mcp_client::agent_handle::HEADER_LOWERCASE)?
+        .to_str()
+        .ok()?;
+    mcp_client::agent_handle::normalize_agent_handle(raw)
 }
 
 /// The token a client sent to name its connection, when it has the one shape
@@ -8807,6 +8844,62 @@ mod jsonrpc_envelope_tests {
                 assert_eq!(request.id, Some(serde_json::json!(1)))
             }
             _ => panic!("a 2.0 request is a request"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod agent_name_header_tests {
+    use super::{agent_handle_from_headers, HeaderMap};
+    use mcp_client::agent_handle::{HEADER, HEADER_LOWERCASE};
+
+    fn sent(value: &[u8]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_LOWERCASE,
+            axum::http::HeaderValue::from_bytes(value).expect("a header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn a_name_is_read_in_its_canonical_form_whatever_the_case_of_the_header_name() {
+        assert_eq!(
+            agent_handle_from_headers(&sent(b"floor-live-runs")).as_deref(),
+            Some("floor-live-runs")
+        );
+        assert_eq!(
+            agent_handle_from_headers(&sent(b"Agent-CC-QA")).as_deref(),
+            Some("cc-qa")
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_bytes(HEADER.as_bytes()).expect("a header name"),
+            "floor-alive-4".parse().expect("a header value"),
+        );
+        assert_eq!(
+            agent_handle_from_headers(&headers).as_deref(),
+            Some("floor-alive-4")
+        );
+    }
+
+    #[test]
+    fn anything_else_is_ignored_as_if_no_header_had_been_sent() {
+        assert_eq!(agent_handle_from_headers(&HeaderMap::new()), None);
+        let long = "x".repeat(65);
+        for refused in [
+            &b""[..],
+            b"   ",
+            b"two words",
+            b"a/b",
+            b"floor\xff",
+            long.as_bytes(),
+        ] {
+            assert_eq!(
+                agent_handle_from_headers(&sent(refused)),
+                None,
+                "{refused:?}"
+            );
         }
     }
 }

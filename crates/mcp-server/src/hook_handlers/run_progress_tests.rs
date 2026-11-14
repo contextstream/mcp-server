@@ -1035,7 +1035,10 @@ fn signs_of_life_are_off_as_shipped_and_on_only_where_turned_on() {
         assert!(!settings.enabled, "{word}");
     }
     for word in ["off", "0", "perhaps", ""] {
-        assert!(!Settings::from_switches(None, None, Some(word)).signs, "{word:?}");
+        assert!(
+            !Settings::from_switches(None, None, Some(word)).signs,
+            "{word:?}"
+        );
     }
     // Live progress off wins.
     assert!(!Settings::from_switches(Some("off"), None, Some("on")).signs);
@@ -1141,7 +1144,10 @@ fn no_sign_of_life_for_a_waiting_run_a_run_without_an_id_or_one_silent_for_hours
         t0,
     );
     file.hook_event(t0 + 4 * 60 * MINUTE - MINUTE);
-    assert_eq!(file.signs_due(every, t0 + 4 * 60 * MINUTE - MINUTE).len(), 1);
+    assert_eq!(
+        file.signs_due(every, t0 + 4 * 60 * MINUTE - MINUTE).len(),
+        1
+    );
     file.hook_event(t0 + 4 * 60 * MINUTE);
     assert!(file.signs_due(every, t0 + 4 * 60 * MINUTE).is_empty());
 }

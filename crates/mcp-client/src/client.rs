@@ -4929,6 +4929,7 @@ impl ContextStreamClient {
 
             let status = response.status();
             debug!("Response: {} (attempt {})", status, attempt + 1);
+            crate::run_progress::api_answered(effective_auth, &config, status.as_u16());
 
             if status.is_success() {
                 let parsed = self.parse_response(response).await;

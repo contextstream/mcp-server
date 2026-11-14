@@ -19,7 +19,7 @@
 //! - A local (stdio) server keeps a reported run alive with a bare heartbeat
 //!   on a timer until the run is reported finished or the process exits. A
 //!   heartbeat only proves that the client session is open, so it carries no
-//!   step. The hosted HTTP gateway keeps no state between requests and runs
+//!   step. The hosted HTTP gateway remembers no run between requests and runs
 //!   no timer; it tells the API to expect a longer silence instead and, in
 //!   the workspaces `CONTEXTSTREAM_RUN_PROGRESS_SIGNS_WORKSPACES` names,
 //!   counts a session's tool calls as a sign of life for the one run it can
@@ -1118,13 +1118,14 @@ pub(crate) fn run_key_of(given: Option<&str>, session: &str, ticket_id: Option<U
 
 /// What stands for "this MCP session" in a default run key. A local server
 /// process serves one client session, so it is the process. The hosted
-/// gateway uses the transport's session id together with the caller; for a
-/// client on the stateless contract, which has none, the token the client
-/// sent to name its connection, together with the caller
-/// (`mcp_client::client_session`). Neither id is used alone: each is the
-/// client's to send, so an id another key presents names a session of that
-/// key, never one of the key that made it. Else the caller alone, which is
-/// every session of that key. Each is a digest: none is sent as it is.
+/// gateway uses the transport's session id together with the caller
+/// ([`caller_of_request`]); for a client on the stateless contract, which has
+/// none, the token the client sent to name its connection, together with the
+/// caller (`mcp_client::client_session`). Neither id is used alone: each is
+/// the client's to send, so an id another caller presents names a session of
+/// that caller, never one of the caller that made it. Else the caller alone,
+/// which is every session of that caller. Each is a digest: none is sent as
+/// it is.
 pub(crate) fn session_part(is_http: bool) -> String {
     if !is_http {
         static PROCESS: OnceLock<String> = OnceLock::new();
@@ -1132,15 +1133,17 @@ pub(crate) fn session_part(is_http: bool) -> String {
             .get_or_init(|| Uuid::new_v4().simple().to_string())
             .clone();
     }
-    let caller = mcp_client::get_task_caller_cache_identity();
+    let caller = caller_of_request();
     if let Some(id) = mcp_client::get_task_mcp_session_id().filter(|id| !id.trim().is_empty()) {
         return match caller.as_deref() {
             Some(caller) => format!(
                 "s-{}",
                 short_digest(&format!("mcp-session\n{caller}\n{id}"))
             ),
-            // No credential: the id alone, as before; no sign goes out
-            // without a caller (see `sign_of_life_for`).
+            // No credential at all: only a gateway that asks for none, and
+            // sends the API a key of its own, gets here. Its callers are one
+            // account, and the id alone keeps their reports apart, as before.
+            // Such a caller never gets a sign (see `sign_of_life_for`).
             None => format!("s-{}", short_digest(&id)),
         };
     }
@@ -1153,13 +1156,81 @@ pub(crate) fn session_part(is_http: bool) -> String {
     }
     match caller {
         Some(caller) => format!("c-{}", short_digest(&caller)),
+        // No credential at all (see above).
         None => "mcp".to_string(),
     }
 }
 
+/// Who is calling the hosted gateway, for a session part. Every request that
+/// carries a credential has a caller, and no caller is a credential or any
+/// part of one that could be read back:
+/// - the identity the gateway derived, when it has one: the subject of a
+///   token it verified itself, else a digest of the API key
+///   (`get_task_caller_cache_identity`);
+/// - else, for a bearer token the gateway does not verify (the hosted
+///   gateway holds no secret to: the API verifies the token on every request
+///   it is sent with), a digest of the subject the token names. A client
+///   replaces an OAuth access token every hour, and the subject stays, so the
+///   caller's session keeps its run across the change;
+/// - a bearer token that names no subject: a digest of the whole token. When
+///   that token is replaced the caller is a new one: its session's next
+///   report starts a new default run, and the run it leaves gets no more
+///   signs and falls silent. A run left behind is the smaller harm than a run
+///   two callers share, which is what no identity meant.
+///
+/// The subject is read, not verified, and that is enough here: the gateway
+/// writes nothing on its own authority. A report or a sign under a part goes
+/// to the API with the very token the subject was read from, and the API
+/// refuses a token it did not issue, so only a token issued to a subject
+/// ever writes under that subject's part; a sign also waits until the API
+/// was seen to accept the token ([`sign_of_life_for`]). Where a gateway
+/// sends the API a key of its own in place of the caller's token, its callers
+/// are one account to the API, and the subject, like a session id, only
+/// keeps their reports apart.
+///
+/// `None`: the request carries no credential.
+pub(crate) fn caller_of_request() -> Option<String> {
+    if let Some(known) = mcp_client::get_task_caller_cache_identity() {
+        return Some(known);
+    }
+    let auth = mcp_client::get_task_auth_override()?;
+    let token = auth
+        .jwt
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())?;
+    Some(match mcp_client::run_progress::bearer_subject(token) {
+        Some(subject) => format!(
+            "csrp:v1:s:{}",
+            framed_digest(CALLER_DOMAIN, &["bearer-subject", &subject])
+        ),
+        None => format!(
+            "csrp:v1:t:{}",
+            framed_digest(CALLER_DOMAIN, &["bearer-token", token])
+        ),
+    })
+}
+
+/// The domain of a caller's digest ([`caller_of_request`]).
+const CALLER_DOMAIN: &str = "contextstream-run-progress-caller-v1";
+
+/// A digest of `fields` under `domain`. Every field is framed by its length,
+/// so no two lists of fields read alike, and the domain keeps the digest
+/// apart from every other digest of the same text.
+fn framed_digest(domain: &str, fields: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for field in std::iter::once(&domain).chain(fields) {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// Whether a session part stands for one session of a client (see
 /// [`session_part`]): a local server's process or a hosted `s-` part. A `c-`
-/// part is every session of a key, and `mcp` is everyone.
+/// part is every session of a caller, and `mcp` is everyone.
 fn is_one_session(session: &str, is_http: bool) -> bool {
     !is_http || session.starts_with("s-")
 }
@@ -1367,30 +1438,67 @@ const SIGN_OF_LIFE_EVERY: Duration = Duration::from_secs(60);
 /// call is a new session each time, and costs the API no more than this.
 const SIGNS_PER_CALLER_EVERY_MINUTE: u32 = 60;
 
-/// Sessions (and keys) one gateway process remembers the last signs of.
-/// Past it, those older than a minute are forgotten, and when that is not
-/// enough, all of them (one sign more than needed is harmless).
+/// Sessions (and keys, and accepted credentials) one gateway process
+/// remembers. At the bound, those too old to count are forgotten, and when
+/// that leaves no room, the new one is not remembered: its sign is dropped.
+/// What is remembered is never thrown away to make room, so a flood of new
+/// callers cannot make the gateway forget whom it throttles.
 const MAX_SIGNED_SESSIONS: usize = 10_000;
+
+/// A full memory is searched for entries to forget at most this often, so a
+/// flood of new callers costs it one search a second, not one a call.
+const SWEEP_FULL_MEMORY_EVERY: Duration = Duration::from_secs(1);
+
+/// How long an answer of the API that accepted a credential counts
+/// ([`Accepted`]).
+const ACCEPTED_FOR: Duration = Duration::from_secs(600);
 
 /// At most this many signs out at once in one gateway process; above it a
 /// sign is dropped, not queued.
 const MAX_SIGNS_IN_FLIGHT: usize = 64;
 
 /// The workspace ids a [`SIGNS_WORKSPACES_ENV`] value names: ids split by
-/// commas or white space. Anything that is not an id names nothing.
+/// commas or white space. A value with anything in it that is not a
+/// workspace id names nothing at all: a list someone mistyped turns the
+/// signs off, it does not turn them on for the part that could be read.
 pub(crate) fn parse_workspace_list(raw: Option<&str>) -> Vec<Uuid> {
-    raw.unwrap_or_default()
+    let mut ids = Vec::new();
+    for entry in raw
+        .unwrap_or_default()
         .split(|c: char| c == ',' || c.is_whitespace())
-        .filter_map(|id| Uuid::parse_str(id).ok())
-        .filter(|id| !id.is_nil())
-        .collect()
+        .filter(|entry| !entry.is_empty())
+    {
+        match Uuid::parse_str(entry) {
+            Ok(id) if !id.is_nil() => ids.push(id),
+            _ => return Vec::new(),
+        }
+    }
+    ids
 }
 
 /// The workspaces [`SIGNS_WORKSPACES_ENV`] names, read once.
 fn signs_workspaces() -> &'static [Uuid] {
     static WORKSPACES: OnceLock<Vec<Uuid>> = OnceLock::new();
-    WORKSPACES
-        .get_or_init(|| parse_workspace_list(std::env::var(SIGNS_WORKSPACES_ENV).ok().as_deref()))
+    WORKSPACES.get_or_init(|| {
+        let raw = std::env::var(SIGNS_WORKSPACES_ENV).ok();
+        let workspaces = parse_workspace_list(raw.as_deref());
+        if workspaces.is_empty() && raw.is_some_and(|raw| !raw.trim().is_empty()) {
+            tracing::warn!(
+                "{SIGNS_WORKSPACES_ENV} is not a list of workspace ids: no sign of life is sent"
+            );
+        }
+        workspaces
+    })
+}
+
+/// Called once when the hosted gateway starts. Where the gateway keeps runs
+/// alive ([`SIGNS_WORKSPACES_ENV`] names a workspace), it starts to note
+/// which credentials the API accepts ([`Accepted`]); as shipped (the setting
+/// unset) this does nothing, and nothing is noted.
+pub fn watch_for_signs_of_life() {
+    if !signs_workspaces().is_empty() {
+        mcp_client::observe_api_answers(api_answered);
+    }
 }
 
 /// The hosted gateway's sign of life for the tool call in hand (`params` of
@@ -1405,15 +1513,23 @@ fn signs_workspaces() -> &'static [Uuid] {
 /// ([`run_id_of_key`]). Nothing is listed, and no run is matched by its
 /// agent: an agent's name is the client's to send. It goes out when:
 /// - the call's workspace (its `workspace_id`, else the session's) is on
-///   [`SIGNS_WORKSPACES_ENV`]; for any other workspace nothing is read,
-///   sent or remembered;
-/// - the tool is not `progress`: a report is a signal of its own;
-/// - the caller is authenticated, and the gateway can tell its session from
-///   the key's other sessions: an `s-` session part, bound to the caller
-///   ([`session_part`]). A name alone is never enough;
-/// - the session sent no sign for the workspace in the last minute, its key
-///   sent fewer than [`SIGNS_PER_CALLER_EVERY_MINUTE`] there, and fewer than
-///   [`MAX_SIGNS_IN_FLIGHT`] signs are out.
+///   [`SIGNS_WORKSPACES_ENV`]; for any other workspace nothing is read or
+///   sent, and no sign is remembered;
+/// - the tool is not `progress`, called by its name or through the router
+///   (`execute_operation`): a report is a signal of its own;
+/// - the request carries a credential, and the gateway can tell its session
+///   from the caller's other sessions: an `s-` session part, bound to the
+///   caller ([`session_part`]). A name alone is never enough;
+/// - the API was seen to accept that credential ([`Accepted`]): in the last
+///   [`ACCEPTED_FOR`] it answered a request this gateway process sent under
+///   this very credential with success (the check `initialize` and every
+///   stateless request make, or any tool's own request), and has not
+///   answered one with 401 since. The gateway never asks the API in order to
+///   find out, so a credential the API never accepted causes no request;
+/// - the session sent no sign for the workspace in the last minute, its
+///   caller sent fewer than [`SIGNS_PER_CALLER_EVERY_MINUTE`] there, the
+///   memory of signs has room, and fewer than [`MAX_SIGNS_IN_FLIGHT`] signs
+///   are out.
 ///
 /// The sign reads that one run and, when it is there, at work (live, quiet
 /// or stalled; never one that waits or ended) and reported on by its agent
@@ -1438,6 +1554,27 @@ pub async fn sign_of_life(
     sign_of_life_for(client, session, params, signs_workspaces()).await
 }
 
+/// The router's tool that runs another tool: `arguments.name` is the tool
+/// and `arguments.arguments` its arguments.
+const ROUTER_TOOL: &str = "execute_operation";
+
+/// The tool a `tools/call` runs and its arguments: the call's own, or, when
+/// the call goes through the router ([`ROUTER_TOOL`]), the tool the router
+/// is asked to run and that tool's arguments.
+fn called_tool(params: &Value) -> Option<(&str, Option<&Value>)> {
+    let name = params.get("name").and_then(Value::as_str)?;
+    let arguments = params.get("arguments");
+    if name == ROUTER_TOOL {
+        if let Some(inner) = arguments
+            .and_then(|arguments| arguments.get("name"))
+            .and_then(Value::as_str)
+        {
+            return Some((inner, arguments.and_then(|outer| outer.get("arguments"))));
+        }
+    }
+    Some((name, arguments))
+}
+
 /// [`sign_of_life`] for the workspaces `workspaces` (the setting's).
 pub(crate) async fn sign_of_life_for(
     client: &ContextStreamClient,
@@ -1448,19 +1585,34 @@ pub(crate) async fn sign_of_life_for(
     if workspaces.is_empty() || !reporting_enabled() {
         return None;
     }
-    if params.get("name").and_then(Value::as_str)? == TOOL_NAME {
+    let (tool, arguments) = called_tool(params)?;
+    if tool == TOOL_NAME {
         return None;
     }
-    if !client.config().await.is_http_transport {
+    let config = client.config().await;
+    if !config.is_http_transport {
         return None;
     }
-    let caller = mcp_client::get_task_caller_cache_identity()?;
+    // No credential of the caller's own: no caller, so no run is derived
+    // and nothing is asked.
+    let auth = mcp_client::get_task_auth_override()?;
+    let credential = mcp_client::sent_credential(&auth, &config)?;
+    let caller = caller_of_request()?;
     let part = session_part(true);
     if !is_one_session(&part, true) {
         return None;
     }
-    let named = params
-        .pointer("/arguments/workspace_id")
+    // Before anything is asked or remembered for this call: the API was
+    // seen to accept the credential the sign would go out under.
+    let accepted = accepted()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_accepted(&credential_digest(credential), Instant::now());
+    if !accepted {
+        return None;
+    }
+    let named = arguments
+        .and_then(|arguments| arguments.get("workspace_id"))
         .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id.trim()).ok());
     let workspace_id = match named {
@@ -1498,6 +1650,8 @@ pub(crate) async fn sign_of_life_for(
 pub(crate) struct SignsDue {
     sessions: HashMap<String, Instant>,
     callers: HashMap<String, (Instant, u32)>,
+    /// When each memory, full, was last searched for entries to forget.
+    swept: (Option<Instant>, Option<Instant>),
 }
 
 impl SignsDue {
@@ -1529,8 +1683,25 @@ impl SignsDue {
         if sent >= SIGNS_PER_CALLER_EVERY_MINUTE {
             return false;
         }
-        make_room(&mut self.sessions, now, |at| *at);
-        make_room(&mut self.callers, now, |(since, _)| *since);
+        // A memory with no room for this session or this caller: no sign.
+        let keep = SIGN_OF_LIFE_EVERY;
+        if !has_room(
+            &mut self.sessions,
+            &mut self.swept.0,
+            &session,
+            now,
+            keep,
+            |at| *at,
+        ) || !has_room(
+            &mut self.callers,
+            &mut self.swept.1,
+            &caller,
+            now,
+            keep,
+            |(since, _)| *since,
+        ) {
+            return false;
+        }
         self.sessions.insert(session, now);
         self.callers.insert(caller, (since, sent + 1));
         true
@@ -1543,22 +1714,117 @@ impl SignsDue {
     }
 }
 
-/// Make room for one more in a memory of at most [`MAX_SIGNED_SESSIONS`]:
-/// forget what is a minute old, and when that is not enough, everything.
-fn make_room<V>(memory: &mut HashMap<String, V>, now: Instant, at: impl Fn(&V) -> Instant) {
-    if memory.len() < MAX_SIGNED_SESSIONS {
-        return;
+/// Whether a memory of at most [`MAX_SIGNED_SESSIONS`] has room for `key`:
+/// it holds `key` already, or is not full, or is not full once what is
+/// older than `keep_for` is forgotten. What is younger is never forgotten
+/// here: without room the new entry is the one that is left out. A full
+/// memory is searched at most every [`SWEEP_FULL_MEMORY_EVERY`] (`swept` is
+/// when it last was); between two searches it has no room.
+fn has_room<V>(
+    memory: &mut HashMap<String, V>,
+    swept: &mut Option<Instant>,
+    key: &str,
+    now: Instant,
+    keep_for: Duration,
+    at: impl Fn(&V) -> Instant,
+) -> bool {
+    if memory.len() < MAX_SIGNED_SESSIONS || memory.contains_key(key) {
+        return true;
     }
-    memory.retain(|_, value| now.saturating_duration_since(at(value)) < SIGN_OF_LIFE_EVERY);
-    if memory.len() >= MAX_SIGNED_SESSIONS {
-        memory.clear();
+    if swept.is_some_and(|at| now.saturating_duration_since(at) < SWEEP_FULL_MEMORY_EVERY) {
+        return false;
     }
+    *swept = Some(now);
+    memory.retain(|_, value| now.saturating_duration_since(at(value)) < keep_for);
+    memory.len() < MAX_SIGNED_SESSIONS
 }
 
 /// The gateway process's memory of its signs.
 fn signs_due() -> &'static Mutex<SignsDue> {
     static SIGNS: OnceLock<Mutex<SignsDue>> = OnceLock::new();
     SIGNS.get_or_init(Default::default)
+}
+
+/// The credentials one gateway process saw the API accept, each by a digest
+/// and the time of the last such answer; never the credential or a part of
+/// it. Bounded ([`MAX_SIGNED_SESSIONS`]), and only a credential the API
+/// accepted takes a place in it.
+///
+/// "Accepted" is the same on both contracts: the API answered a request this
+/// process sent under exactly this credential with success, within
+/// [`ACCEPTED_FOR`], and has not answered one with 401 since. On the
+/// stateless contract every request is checked against the API before it is
+/// served; on the session-id contract only `initialize` is, so there the
+/// first such answer is `initialize`'s check or a tool's own request, and a
+/// session that only ever calls tools the API refuses is never signed.
+#[derive(Debug, Default)]
+pub(crate) struct Accepted {
+    seen: HashMap<String, Instant>,
+    /// When the memory, full, was last searched for entries to forget.
+    swept: Option<Instant>,
+}
+
+impl Accepted {
+    /// The API answered a request sent under the credential `digest` with
+    /// the HTTP status `status`.
+    pub(crate) fn answered(&mut self, digest: String, status: u16, now: Instant) {
+        match status {
+            200..=299 => {
+                let keep = ACCEPTED_FOR;
+                if has_room(&mut self.seen, &mut self.swept, &digest, now, keep, |at| {
+                    *at
+                }) {
+                    self.seen.insert(digest, now);
+                }
+            }
+            401 => {
+                self.seen.remove(&digest);
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the API accepted the credential `digest` within
+    /// [`ACCEPTED_FOR`] of `now`.
+    pub(crate) fn is_accepted(&self, digest: &str, now: Instant) -> bool {
+        self.seen
+            .get(digest)
+            .is_some_and(|at| now.saturating_duration_since(*at) < ACCEPTED_FOR)
+    }
+
+    /// How many credentials are remembered.
+    #[cfg(test)]
+    pub(crate) fn remembered(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+/// The gateway process's memory of the credentials the API accepted.
+fn accepted() -> &'static Mutex<Accepted> {
+    static ACCEPTED: OnceLock<Mutex<Accepted>> = OnceLock::new();
+    ACCEPTED.get_or_init(Default::default)
+}
+
+/// What stands for a credential in [`Accepted`]: a digest of its kind and
+/// the whole of it.
+pub(crate) fn credential_digest(credential: mcp_client::SentCredential<'_>) -> String {
+    let (kind, secret) = match credential {
+        mcp_client::SentCredential::ApiKey(key) => ("api-key", key),
+        mcp_client::SentCredential::Bearer(token) => ("bearer", token),
+    };
+    framed_digest("contextstream-run-progress-accepted-v1", &[kind, secret])
+}
+
+/// The API answered a request that carried a caller's own credential (the
+/// client tells, once [`watch_for_signs_of_life`] asked it to).
+pub(crate) fn api_answered(credential: mcp_client::SentCredential<'_>, status: u16) {
+    if !matches!(status, 200..=299 | 401) {
+        return;
+    }
+    accepted()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .answered(credential_digest(credential), status, Instant::now());
 }
 
 /// Signs out at once, against a cap: a sign takes a slot or is dropped.

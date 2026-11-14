@@ -1209,12 +1209,13 @@ pub(crate) fn tool_finished(
         return;
     };
     let finding = contextstream_tool.and_then(|tool| classify(tool, tool_input, &answer));
-    // Signs of life learn only the runs the model reported: a ticket's
-    // take-up starts nothing, and who the session is matters not.
+    // Signs of life learn the runs the model reported, and who the session
+    // is: a local server's report says which run only together with the
+    // session `init` named, and a session part that changed (the client
+    // reconnected) takes its default runs with it. A ticket's take-up starts
+    // nothing in this mode.
     let signs_only = Settings::from_env().signs_only();
-    let finding = finding.filter(|finding| {
-        !signs_only || matches!(finding, Finding::Report(_) | Finding::ReportInText { .. })
-    });
+    let finding = finding.filter(|finding| !signs_only || !matches!(finding, Finding::Ticket(_)));
     let now = now_ms();
     let Some(finding) = finding else {
         if read(&path).is_some_and(|file| !file.runs.is_empty() && !file.refused) {

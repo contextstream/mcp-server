@@ -2859,16 +2859,26 @@ async fn credential_refused(state: &HttpState, headers: &HeaderMap) -> Option<&'
         return None;
     }
     let auth = extract_auth_override(headers)?;
-    let (identity, refusal) = match (auth.jwt.as_deref(), auth.api_key.as_deref()) {
+    let refusal = match (auth.jwt.as_deref(), auth.api_key.as_deref()) {
         (Some(_), _) if state.jwt_secret.is_some() => return None,
-        (Some(token), _) => (
-            SessionKey::Jwt(token.to_string()).atlas_user_scope_token(),
-            INITIALIZE_TOKEN_REFUSED_MESSAGE,
-        ),
-        (None, Some(api_key)) => (
-            SessionKey::ApiKey(api_key.to_string()).atlas_user_scope_token(),
-            INITIALIZE_KEY_REFUSED_MESSAGE,
-        ),
+        (Some(_), _) => INITIALIZE_TOKEN_REFUSED_MESSAGE,
+        (None, Some(_)) => INITIALIZE_KEY_REFUSED_MESSAGE,
+        (None, None) => return None,
+    };
+    (credential_verdict(state, &auth).await == Some(false)).then_some(refusal)
+}
+
+/// What the API says of the credential of `auth` (its bearer token, else its
+/// API key): `Some(true)` accepted, `Some(false)` refused with a definite
+/// 401, `None` when it could not be asked (unreachable, slow or failing) or
+/// there is no credential. A verdict is remembered per credential, by a
+/// digest, for [`INITIALIZE_KEY_ACCEPTED_TTL`] (accepted) or
+/// [`INITIALIZE_KEY_REFUSED_TTL`] (refused); without one the API is asked,
+/// under the task-local auth override, which must be `auth`.
+async fn credential_verdict(state: &HttpState, auth: &AuthOverride) -> Option<bool> {
+    let identity = match (auth.jwt.as_deref(), auth.api_key.as_deref()) {
+        (Some(token), _) => SessionKey::Jwt(token.to_string()).atlas_user_scope_token(),
+        (None, Some(api_key)) => SessionKey::ApiKey(api_key.to_string()).atlas_user_scope_token(),
         (None, None) => return None,
     };
     let now = Instant::now();
@@ -2885,7 +2895,7 @@ async fn credential_refused(state: &HttpState, headers: &HeaderMap) -> Option<&'
                 INITIALIZE_KEY_REFUSED_TTL
             };
             if now.duration_since(at) < ttl {
-                return (!accepted).then_some(refusal);
+                return Some(accepted);
             }
         }
     }
@@ -2907,7 +2917,18 @@ async fn credential_refused(state: &HttpState, headers: &HeaderMap) -> Option<&'
         }
         verdicts.insert(identity, (accepted, now));
     }
-    (!accepted).then_some(refusal)
+    Some(accepted)
+}
+
+/// Whether the API accepted exactly the bearer token of `auth`: a verdict of
+/// this process, asked for when there is none ([`credential_verdict`]). Never
+/// on a gateway that has an API key of its own: it sends that key in the
+/// token's place, so what the API answers says nothing about the token.
+async fn bearer_token_accepted(state: &HttpState, auth: &AuthOverride) -> bool {
+    if state.client.config().await.api_key.is_some() {
+        return false;
+    }
+    run_with_auth_override(auth.clone(), || credential_verdict(state, auth)).await == Some(true)
 }
 
 async fn handle_initialize_method(
@@ -3752,9 +3773,26 @@ pub async fn auth_middleware(
             None,
         )
     } else {
+        // A caller the gateway cannot name itself: a bearer token it holds
+        // no secret to verify, and no key. The API is asked once per token
+        // (a remembered verdict, mostly) whether it accepts it, because only
+        // an accepted token's subject counts as the caller.
+        let bearer_caller = match auth.as_ref() {
+            Some(a) if jwt_subject.is_none() && a.api_key.is_none() => {
+                match a.jwt.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                    Some(token) => Some(unverified_bearer_caller(
+                        token,
+                        bearer_token_accepted(&state, a).await,
+                    )),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
         derive_http_session_context(
             jwt_subject.as_deref(),
             auth.as_ref().and_then(|a| a.api_key.as_deref()),
+            bearer_caller.as_deref(),
             mcp_session_id.as_deref(),
             &request_nonce,
         )
@@ -3990,13 +4028,78 @@ fn derive_stateless_http_request_key(
     SessionKey::for_anonymous_http(&partition)
 }
 
+/// The longest subject a bearer token may name and still count as one.
+const MAX_BEARER_SUBJECT: usize = 256;
+
+/// The subject (`sub`) a bearer token names, when the token is a JWT that
+/// names one. Read from the token as it came: nothing is verified here.
+fn unverified_bearer_subject(token: &str) -> Option<String> {
+    use base64::Engine;
+
+    let mut segments = token.split('.');
+    let (_, claims, _) = (segments.next()?, segments.next()?, segments.next()?);
+    if segments.next().is_some() {
+        return None;
+    }
+    let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(claims.trim_end_matches('='))
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&claims).ok()?;
+    let subject = claims.get("sub")?.as_str()?.trim();
+    (!subject.is_empty()
+        && subject.len() <= MAX_BEARER_SUBJECT
+        && !subject.chars().any(char::is_control))
+    .then(|| subject.to_string())
+}
+
+/// Who a bearer token the gateway cannot verify stands for, in a session
+/// partition (the hosted gateway holds no secret to verify one with: the API
+/// verifies the token on every request it is sent with). A digest, never the
+/// token or the subject:
+/// - of the subject the token names, once the API accepted exactly this token
+///   (`accepted`): the API verified it, so the subject is the caller. A
+///   client replaces an access token every hour and the subject stays, so
+///   the caller keeps its session, and with it the folder, workspace and
+///   project the session was set to;
+/// - of the whole token otherwise: a token the API refused or could not be
+///   asked about, and one that names no subject. Whatever subject such a
+///   token names, and whatever session id comes with it, its session is its
+///   own and starts empty, so a token made up to name another caller's
+///   subject gets nothing of that caller's session, and is answered as any
+///   new session is.
+fn unverified_bearer_caller(token: &str, accepted: bool) -> String {
+    use sha2::{Digest, Sha256};
+
+    let subject = accepted.then(|| unverified_bearer_subject(token)).flatten();
+    let (kind, text) = match subject.as_deref() {
+        Some(subject) => ("accepted-subject", subject),
+        None => ("token", token),
+    };
+    let mut hasher = Sha256::new();
+    for field in ["contextstream-http-unverified-bearer-v1", kind, text] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// Resolve the HTTP task-local session context without ever representing an
-/// anonymous request as `SessionKey::Local`. Anonymous requests with a valid
-/// MCP session header are stable only within that session; when the header is
-/// absent the transport-provided nonce creates a one-request partition.
+/// anonymous request as `SessionKey::Local`. Every caller's session is its
+/// own: the partition is the caller together with the MCP session id it
+/// presents, so an id another caller presents is another, empty session, and
+/// is answered as any new session is. The gateway keeps no record of the ids
+/// it issued (several processes serve one name), so an id it never issued is
+/// not refused: it is a session of the caller that presents it, like any
+/// other. The caller is the subject the gateway verified, else the API key,
+/// else what a bearer token it could not verify stands for (`bearer_caller`,
+/// from [`unverified_bearer_caller`]). Only a request with no credential at
+/// all is anonymous: with a valid MCP session header it is stable only within
+/// that session; when the header is absent the transport-provided nonce
+/// creates a one-request partition.
 fn derive_http_session_context(
     jwt_subject: Option<&str>,
     api_key: Option<&str>,
+    bearer_caller: Option<&str>,
     mcp_session_id: Option<&str>,
     anonymous_request_nonce: &str,
 ) -> (SessionKey, Option<String>) {
@@ -4016,10 +4119,11 @@ fn derive_http_session_context(
     let effective_session_id = mcp_session_id
         .map(str::to_string)
         .unwrap_or_else(|| format!("anonymous-request:{anonymous_request_nonce}"));
-    (
-        SessionKey::for_anonymous_http(&effective_session_id),
-        Some(effective_session_id),
-    )
+    let session_key = match bearer_caller {
+        Some(caller) => SessionKey::for_unverified_bearer_http(caller, &effective_session_id),
+        None => SessionKey::for_anonymous_http(&effective_session_id),
+    };
+    (session_key, Some(effective_session_id))
 }
 
 // ============================================================================
@@ -5863,14 +5967,141 @@ mod tests {
             assert!(extract_auth_override(&headers).is_none());
         }
 
+        /// A bearer token shaped as the API's are: `claims` and a made-up
+        /// signature. Nothing can verify it, as on the hosted gateway.
+        fn unverifiable_bearer(claims: Value, signature: &str) -> String {
+            use base64::Engine;
+
+            let encode =
+                |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+            format!(
+                "{}.{}.{signature}",
+                encode(br#"{"alg":"RS256","typ":"JWT"}"#),
+                encode(claims.to_string().as_bytes())
+            )
+        }
+
+        /// Ticket 11bc49fb item 10. A signed-in caller's session is its own:
+        /// the session id another signed-in caller presents is another
+        /// session, where before the id alone named it. The subject a token
+        /// names is the caller only once the API accepted that token.
+        #[test]
+        fn a_signed_in_callers_session_is_keyed_by_the_caller_and_the_session_id() {
+            let session = |token: &str, accepted: bool, session_id: &str| {
+                let caller = unverified_bearer_caller(token, accepted);
+                derive_http_session_context(None, None, Some(&caller), Some(session_id), "unused")
+            };
+            let ann = unverifiable_bearer(json!({"sub": "user-ann", "jti": "1"}), "signature-1");
+            let bob = unverifiable_bearer(json!({"sub": "user-bob"}), "signature-b");
+            let (anns, effective) = session(&ann, true, "session-1");
+            // Tools are still told the session id the client presented.
+            assert_eq!(effective.as_deref(), Some("session-1"));
+            assert_eq!(anns, session(&ann, true, "session-1").0);
+            assert_ne!(
+                anns,
+                session(&bob, true, "session-1").0,
+                "two callers with one session id share a session"
+            );
+            assert_ne!(anns, session(&ann, true, "session-2").0);
+            // A replaced token the API accepted names the same subject: the
+            // same session.
+            let replaced =
+                unverifiable_bearer(json!({"sub": "user-ann", "jti": "2"}), "signature-2");
+            assert_eq!(anns, session(&replaced, true, "session-1").0);
+            // A token the API did not accept is not its subject, whatever it
+            // names: with Ann's session id it is a session of its own, and
+            // another such token is another one.
+            let forged = unverifiable_bearer(json!({"sub": "user-ann"}), "forged");
+            let forgeds = session(&forged, false, "session-1").0;
+            assert_ne!(
+                forgeds, anns,
+                "an unaccepted token is in its subject's session"
+            );
+            assert_eq!(forgeds, session(&forged, false, "session-1").0);
+            assert_ne!(forgeds, session(&replaced, false, "session-1").0);
+            // Ann's own token, before the API has answered for it, is not yet
+            // her either.
+            assert_ne!(session(&ann, false, "session-1").0, anns);
+            // A token that names no subject is a caller of its own, accepted
+            // or not, and another such token is another caller.
+            for accepted in [true, false] {
+                let nobody = session("opaque.token.one", accepted, "session-1").0;
+                assert_eq!(nobody, session("opaque.token.one", accepted, "session-1").0);
+                assert_ne!(nobody, session("opaque.token.two", accepted, "session-1").0);
+                assert_ne!(nobody, anns);
+                for claims in [
+                    json!({}),
+                    json!({"sub": ""}),
+                    json!({"sub": 7}),
+                    json!(["user-ann"]),
+                ] {
+                    let one = session(
+                        &unverifiable_bearer(claims.clone(), "s1"),
+                        accepted,
+                        "session-1",
+                    )
+                    .0;
+                    let two = session(
+                        &unverifiable_bearer(claims.clone(), "s2"),
+                        accepted,
+                        "session-1",
+                    )
+                    .0;
+                    assert_ne!(one, two, "{claims}");
+                    assert_ne!(one, anns, "{claims}");
+                }
+            }
+            // A token whose text is a subject's is not that subject.
+            assert_ne!(session("user-ann", true, "session-1").0, anns);
+            assert_ne!(
+                unverified_bearer_caller("user-ann", false),
+                unverified_bearer_caller(&ann, true)
+            );
+            // Not cacheable, as before, and nothing of the token, the
+            // subject or the session id is kept.
+            let SessionKey::AnonymousHttp(partition) = &anns else {
+                panic!("expected a non-cacheable partition")
+            };
+            assert_eq!(anns.atlas_user_scope_token(), None);
+            let caller = unverified_bearer_caller(&ann, true);
+            for kept in ["user-ann", "signature-1", "session-1", ann.as_str()] {
+                assert!(!partition.contains(kept), "{kept} in {partition}");
+                assert!(!caller.contains(kept), "{kept} in {caller}");
+            }
+            // No session id a request without a credential presents names a
+            // signed-in caller's session.
+            for presented in ["session-1", partition.as_str(), caller.as_str()] {
+                assert_ne!(
+                    derive_http_session_context(None, None, None, Some(presented), "unused").0,
+                    anns
+                );
+            }
+            // Without a session id, every request is a session of its own.
+            let (first, first_id) =
+                derive_http_session_context(None, None, Some(&caller), None, "a");
+            let (second, _) = derive_http_session_context(None, None, Some(&caller), None, "b");
+            assert_ne!(first, second);
+            assert_eq!(first_id.as_deref(), Some("anonymous-request:a"));
+            // A caller the gateway named itself is who it was: a bearer
+            // caller does not come into it.
+            assert_eq!(
+                derive_http_session_context(Some("user-ann"), None, Some(&caller), Some("s"), "n"),
+                derive_http_session_context(Some("user-ann"), None, None, Some("s"), "n")
+            );
+            assert_eq!(
+                derive_http_session_context(None, Some("key-1"), Some(&caller), Some("s"), "n"),
+                derive_http_session_context(None, Some("key-1"), None, Some("s"), "n")
+            );
+        }
+
         #[test]
         fn anonymous_http_sessions_are_partitioned_and_non_cacheable() {
             let (session_a, effective_a) =
-                derive_http_session_context(None, None, Some("mcp-session-a"), "unused-a");
+                derive_http_session_context(None, None, None, Some("mcp-session-a"), "unused-a");
             let (session_a_repeat, effective_a_repeat) =
-                derive_http_session_context(None, None, Some("mcp-session-a"), "unused-b");
+                derive_http_session_context(None, None, None, Some("mcp-session-a"), "unused-b");
             let (session_b, effective_b) =
-                derive_http_session_context(None, None, Some("mcp-session-b"), "unused-c");
+                derive_http_session_context(None, None, None, Some("mcp-session-b"), "unused-c");
 
             assert_eq!(session_a, session_a_repeat);
             assert_eq!(effective_a.as_deref(), Some("mcp-session-a"));
@@ -5884,10 +6115,20 @@ mod tests {
         #[test]
         fn authenticated_cache_identity_is_stable_across_mcp_sessions() {
             let api_key = "api-key-that-must-not-enter-cache-identities";
-            let (session_a, _) =
-                derive_http_session_context(None, Some(api_key), Some("session-a"), "unused-a");
-            let (session_b, _) =
-                derive_http_session_context(None, Some(api_key), Some("session-b"), "unused-b");
+            let (session_a, _) = derive_http_session_context(
+                None,
+                Some(api_key),
+                None,
+                Some("session-a"),
+                "unused-a",
+            );
+            let (session_b, _) = derive_http_session_context(
+                None,
+                Some(api_key),
+                None,
+                Some("session-b"),
+                "unused-b",
+            );
             assert_ne!(
                 session_a, session_b,
                 "mutable session state must remain isolated"
@@ -5918,9 +6159,9 @@ mod tests {
         #[test]
         fn anonymous_http_without_session_header_is_unique_per_request() {
             let (first, first_effective) =
-                derive_http_session_context(None, None, None, "request-nonce-a");
+                derive_http_session_context(None, None, None, None, "request-nonce-a");
             let (second, second_effective) =
-                derive_http_session_context(None, None, None, "request-nonce-b");
+                derive_http_session_context(None, None, None, None, "request-nonce-b");
 
             assert_ne!(first, second);
             assert_ne!(first_effective, second_effective);
@@ -5942,9 +6183,9 @@ mod tests {
             let api_key = "api-key-sensitive";
             let session_id = "mcp-session-sensitive";
             let (jwt, _) =
-                derive_http_session_context(Some(subject), None, Some(session_id), "unused");
+                derive_http_session_context(Some(subject), None, None, Some(session_id), "unused");
             let (api, _) =
-                derive_http_session_context(None, Some(api_key), Some(session_id), "unused");
+                derive_http_session_context(None, Some(api_key), None, Some(session_id), "unused");
 
             let jwt_debug = format!("{jwt:?}");
             let api_debug = format!("{api:?}");

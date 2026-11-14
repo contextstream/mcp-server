@@ -641,6 +641,22 @@ impl SessionKey {
         ))
     }
 
+    /// Build the HTTP session partition of a caller that presented a bearer
+    /// token the gateway could not verify itself. `caller` stands for the
+    /// token (a digest, never the token), so the partition is that caller's
+    /// own: a session id another caller presents is another partition. It is
+    /// non-cacheable, like an anonymous partition, because the gateway did
+    /// not establish who the caller is; the variant label keeps it apart from
+    /// every anonymous partition, whatever session id an anonymous request
+    /// presents.
+    pub fn for_unverified_bearer_http(caller: &str, mcp_session_id: &str) -> Self {
+        Self::AnonymousHttp(http_session_partition_digest(
+            "unverified_bearer_http",
+            caller,
+            Some(mcp_session_id),
+        ))
+    }
+
     /// Build a non-cacheable anonymous HTTP session partition. Callers must
     /// pass either the validated MCP session id or a request-unique nonce.
     pub fn for_anonymous_http(partition_id: &str) -> Self {
@@ -738,6 +754,50 @@ mod session_key_tests {
         assert_ne!(
             a, b,
             "JWT and api-key with identical bytes must never collide"
+        );
+    }
+
+    #[test]
+    fn an_unverified_bearer_partition_is_the_callers_own_and_not_cacheable() {
+        let ann = SessionKey::for_unverified_bearer_http("caller-ann", "session-1");
+        assert_eq!(
+            ann,
+            SessionKey::for_unverified_bearer_http("caller-ann", "session-1")
+        );
+        // Another caller with the same session id, and the same caller with
+        // another session id, are other partitions.
+        assert_ne!(
+            ann,
+            SessionKey::for_unverified_bearer_http("caller-bob", "session-1")
+        );
+        assert_ne!(
+            ann,
+            SessionKey::for_unverified_bearer_http("caller-ann", "session-2")
+        );
+        // The gateway did not establish who this is: no cache identity.
+        let SessionKey::AnonymousHttp(partition) = &ann else {
+            panic!("expected a non-cacheable partition")
+        };
+        assert_eq!(ann.atlas_user_scope_token(), None);
+        assert!(!partition.contains("caller-ann") && !partition.contains("session-1"));
+        // No session id an anonymous request presents names this partition:
+        // not the partition's own text, and not its parts put together.
+        for presented in [
+            partition.as_str(),
+            "caller-ann",
+            "session-1",
+            "caller-ann session-1",
+        ] {
+            assert_ne!(ann, SessionKey::for_anonymous_http(presented));
+        }
+        // Nor is it a verified subject's or a key's with the same text.
+        assert_ne!(
+            ann,
+            SessionKey::for_http_jwt("caller-ann", Some("session-1"))
+        );
+        assert_ne!(
+            ann,
+            SessionKey::for_http_api_key("caller-ann", Some("session-1"))
         );
     }
 

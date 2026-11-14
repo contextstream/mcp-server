@@ -890,7 +890,10 @@ fn signs_of_life_follow_real_tool_calls_and_nothing_else() {
     while api.reports().len() == quiet_from && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
     }
-    assert!(api.reports().len() > quiet_from, "a tool call is a sign of life");
+    assert!(
+        api.reports().len() > quiet_from,
+        "a tool call is a sign of life"
+    );
     // The session ends: no end is invented.
     sandbox.hook(
         &session,

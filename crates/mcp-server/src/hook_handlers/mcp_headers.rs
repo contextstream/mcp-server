@@ -239,11 +239,7 @@ mod tests {
 
     #[test]
     fn a_named_agent_goes_beside_the_token_and_an_unnamed_one_sends_what_it_did() {
-        let named = headers(
-            None,
-            || "a".repeat(32),
-            Some("floor-live-runs".to_string()),
-        );
+        let named = headers(None, || "a".repeat(32), Some("floor-live-runs".to_string()));
         assert_eq!(
             named,
             serde_json::json!({

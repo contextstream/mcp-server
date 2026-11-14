@@ -1931,11 +1931,15 @@ async fn a_hosted_client_that_names_its_agent_reports_under_that_name() {
 // A sign of life on the hosted gateway
 // ============================================================================
 
-const ENGINEERING: &str = "dc5fcbaf-dca4-4cd9-b395-c9393294704f";
-
 /// A run the mock API lists: its agent, how it reads, and how many minutes
 /// ago its agent last reported on it.
-fn listed_run(fixture: &Fixture, index: u128, agent_id: &str, liveness: &str, minutes_ago: i64) -> Value {
+fn listed_run(
+    fixture: &Fixture,
+    index: u128,
+    agent_id: &str,
+    liveness: &str,
+    minutes_ago: i64,
+) -> Value {
     let mut view = fixture.view(match liveness {
         "waiting" => "waiting_input",
         "stalled" => "stalled",
@@ -2018,8 +2022,14 @@ async fn a_tool_call_keeps_the_sessions_open_runs_alive_where_the_gateway_is_tol
         listed_run(&fixture, 4, &me, "stalled", 20),
         listed_run(&fixture, 5, &me, "quiet", 4 * 60 + 5),
     ];
-    let (went, requests) =
-        sign_for(&fixture, SESSION_A, &[fixture.workspace], "search", listed.clone()).await;
+    let (went, requests) = sign_for(
+        &fixture,
+        SESSION_A,
+        &[fixture.workspace],
+        "search",
+        listed.clone(),
+    )
+    .await;
     assert!(went);
     let targets: Vec<&str> = requests.iter().map(|(target, _)| target.as_str()).collect();
     assert_eq!(targets.len(), 3, "{targets:?}");
@@ -2057,10 +2067,7 @@ async fn a_workspace_not_on_the_list_sees_exactly_todays_behaviour() {
     let me = agent_id_of(SESSION_A).await;
     // The setting unset (as shipped), or naming other workspaces only: not a
     // single request, whatever the session's runs.
-    for workspaces in [
-        vec![],
-        vec![Uuid::new_v4(), Uuid::parse_str(ENGINEERING).unwrap()],
-    ] {
+    for workspaces in [vec![], vec![Uuid::new_v4(), Uuid::new_v4()]] {
         let (went, requests) = sign_for(
             &fixture,
             SESSION_A,
@@ -2074,13 +2081,15 @@ async fn a_workspace_not_on_the_list_sees_exactly_todays_behaviour() {
     // The setting: a comma list of ids; anything else in it names nothing.
     assert_eq!(parse_workspace_list(None), Vec::<Uuid>::new());
     assert_eq!(parse_workspace_list(Some("  ")), Vec::<Uuid>::new());
+    let other = Uuid::new_v4();
     assert_eq!(
-        parse_workspace_list(Some(&format!(" {ENGINEERING}, nope ,{}", fixture.workspace))),
-        vec![Uuid::parse_str(ENGINEERING).unwrap(), fixture.workspace]
+        parse_workspace_list(Some(&format!(" {other}, nope ,{}", fixture.workspace))),
+        vec![other, fixture.workspace]
     );
     // A local server never signs: it has its own heartbeat.
     let api = Api::start(vec![]).await;
-    let (client, session) = client_and_session(&api.base_url, fixture.workspace, Some(fixture.project));
+    let (client, session) =
+        client_and_session(&api.base_url, fixture.workspace, Some(fixture.project));
     let params = json!({"name": "search", "arguments": {}});
     let local = as_caller(SESSION_A, || async {
         sign_of_life_for(&client, &session, &params, &[fixture.workspace]).await

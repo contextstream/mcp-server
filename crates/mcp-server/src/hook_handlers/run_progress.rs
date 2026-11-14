@@ -161,6 +161,7 @@ impl Settings {
 
     /// `live` is what `CONTEXTSTREAM_RUN_PROGRESS` says (off wins over
     /// everything); `automatic` is what `CONTEXTSTREAM_RUN_PROGRESS_AUTO` says.
+    #[cfg(test)]
     pub(crate) fn from_values(live: Option<&str>, automatic: Option<&str>) -> Self {
         Self::from_switches(live, automatic, None)
     }
@@ -1879,7 +1880,8 @@ async fn signs(path: &Path, config: &ApiConfig) {
                 if ended {
                     // Someone ended the run by its own word: no more signs.
                     file.runs.retain(|open| run_ident(open) != ident);
-                } else if let Some(run) = file.runs.iter_mut().find(|open| run_ident(open) == ident) {
+                } else if let Some(run) = file.runs.iter_mut().find(|open| run_ident(open) == ident)
+                {
                     run.signed_ms = now;
                 }
             });

@@ -1354,9 +1354,8 @@ pub(crate) fn parse_workspace_list(raw: Option<&str>) -> Vec<Uuid> {
 /// The workspaces [`SIGNS_WORKSPACES_ENV`] names, read once.
 fn signs_workspaces() -> &'static [Uuid] {
     static WORKSPACES: OnceLock<Vec<Uuid>> = OnceLock::new();
-    WORKSPACES.get_or_init(|| {
-        parse_workspace_list(std::env::var(SIGNS_WORKSPACES_ENV).ok().as_deref())
-    })
+    WORKSPACES
+        .get_or_init(|| parse_workspace_list(std::env::var(SIGNS_WORKSPACES_ENV).ok().as_deref()))
 }
 
 /// The hosted gateway's sign of life for the tool call in hand (`params` of
@@ -1414,9 +1413,11 @@ pub(crate) async fn sign_of_life_for(
         .and_then(|id| Uuid::parse_str(id.trim()).ok());
     let workspace_id = match named {
         Some(id) => id,
-        None => super::scope::read_scope_defaults(client, Some(session))
-            .await
-            .0?,
+        None => {
+            super::scope::read_scope_defaults(client, Some(session))
+                .await
+                .0?
+        }
     };
     if !workspaces.contains(&workspace_id) {
         return None;
@@ -1508,7 +1509,9 @@ fn signals_run(view: &Value, agent_id: &str, now: chrono::DateTime<chrono::Utc>)
     if !matches!(
         str_field(view, "liveness"),
         Some("live" | "quiet" | "stalled")
-    ) || view.get("waiting").is_some_and(|waiting| !waiting.is_null())
+    ) || view
+        .get("waiting")
+        .is_some_and(|waiting| !waiting.is_null())
     {
         return false;
     }

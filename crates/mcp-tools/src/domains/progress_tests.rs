@@ -1369,8 +1369,29 @@ fn a_report_is_labelled_for_the_write_latency_histogram_and_a_read_is_not() {
 const TOKEN_A: &str = "0123456789abcdef0123456789abcdef";
 const TOKEN_B: &str = "fedcba9876543210fedcba9876543210";
 
+/// What the gateway's middleware holds of a request that carried the API
+/// key `key`.
+fn key_auth(key: &str) -> mcp_types::AuthOverride {
+    mcp_types::AuthOverride {
+        api_key: Some(key.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The API answered a request sent under `auth` with `status`, as the
+/// client tells the gateway (the gateway has no key of its own to send).
+fn api_answers(auth: &mcp_types::AuthOverride, status: u16) {
+    let mut config = TestFixtures::test_config();
+    config.api_key = None;
+    api_answered(
+        mcp_client::sent_credential(auth, &config).expect("a credential of the caller's"),
+        status,
+    );
+}
+
 /// Run `work` as the hosted gateway runs a request of `caller` that carried
-/// `token` in the header that names a connection.
+/// `token` in the header that names a connection. `caller` is the API key
+/// the request carried, and the API has accepted it.
 async fn hosted<T, F, Fut>(caller: Option<&str>, token: Option<&str>, work: F) -> T
 where
     F: FnOnce() -> Fut,
@@ -1379,7 +1400,14 @@ where
     let caller = caller.map(str::to_string);
     let as_caller = || async move {
         match caller {
-            Some(caller) => mcp_client::run_with_caller_cache_identity(caller, work).await,
+            Some(caller) => {
+                let auth = key_auth(&caller);
+                api_answers(&auth, 200);
+                mcp_client::run_with_auth_override(auth, || {
+                    mcp_client::run_with_caller_cache_identity(caller, work)
+                })
+                .await
+            }
             None => work().await,
         }
     };
@@ -1987,9 +2015,20 @@ async fn sign_for(
     tool: &str,
     listed: Vec<Value>,
 ) -> (bool, Vec<(String, Value)>) {
+    let params = json!({"name": tool, "arguments": {"query": "anything"}});
+    sign_for_call(fixture, caller, workspaces, params, listed).await
+}
+
+/// [`sign_for`] for a whole `tools/call` (`params`).
+async fn sign_for_call(
+    fixture: &Fixture,
+    caller: Caller<'_>,
+    workspaces: &[Uuid],
+    params: Value,
+    listed: Vec<Value>,
+) -> (bool, Vec<(String, Value)>) {
     let api = Api::start(routes_knowing(fixture, &listed)).await;
     let (client, session) = hosted_client(fixture, &api.base_url);
-    let params = json!({"name": tool, "arguments": {"query": "anything"}});
     let sent = as_caller(caller, || async {
         sign_of_life_for(&client, &session, &params, workspaces).await
     })
@@ -2090,14 +2129,40 @@ async fn a_workspace_not_on_the_list_sees_exactly_todays_behaviour() {
         .await;
         assert!(!went && requests.is_empty(), "{workspaces:?}: {requests:?}");
     }
-    // The setting: a comma list of ids; anything else in it names nothing.
+    // The setting: a list of ids, split by commas or white space.
     assert_eq!(parse_workspace_list(None), Vec::<Uuid>::new());
     assert_eq!(parse_workspace_list(Some("  ")), Vec::<Uuid>::new());
     let other = Uuid::new_v4();
-    assert_eq!(
-        parse_workspace_list(Some(&format!(" {other}, nope ,{}", fixture.workspace))),
-        vec![other, fixture.workspace]
-    );
+    let here = fixture.workspace;
+    for list in [
+        format!("{other},{here}"),
+        format!(" {other} ,\n{here},, "),
+        format!("{other} {here}"),
+    ] {
+        assert_eq!(
+            parse_workspace_list(Some(&list)),
+            vec![other, here],
+            "{list:?}"
+        );
+    }
+    // Anything in it that is not a workspace id, and the whole list names
+    // nothing: a mistyped setting turns the signs off, never half on.
+    for list in [
+        format!(" {other}, nope ,{here}"),
+        format!("{here},bad"),
+        format!("{here},{}", Uuid::nil()),
+        format!("{here};{other}"),
+        format!("[\"{here}\"]"),
+        format!("{here},*"),
+        format!("{here},all"),
+        format!("{here}x"),
+    ] {
+        assert_eq!(
+            parse_workspace_list(Some(&list)),
+            Vec::<Uuid>::new(),
+            "{list:?}"
+        );
+    }
     // A local server never signs: it has its own heartbeat.
     let api = Api::start(vec![]).await;
     let (client, session) =
@@ -2604,8 +2669,8 @@ fn the_memory_of_signs_is_bounded_and_forgets_the_old_first() {
     assert_eq!(due.remembered(), (MAX_SIGNED_SESSIONS, MAX_SIGNED_SESSIONS));
     assert!(due.due("s-new", "key-new", workspace, start + SIGN_OF_LIFE_EVERY));
     assert_eq!(due.remembered(), (1, 1));
-    // Full of signs of this minute: all are forgotten (one sign more each
-    // is harmless), never more than the bound is kept.
+    // Full of signs of this minute: there is no room for a new one, and
+    // none is forgotten for it (see the test of a full memory below).
     let mut due = SignsDue::default();
     for index in 0..MAX_SIGNED_SESSIONS {
         due.due(
@@ -2615,11 +2680,608 @@ fn the_memory_of_signs_is_bounded_and_forgets_the_old_first() {
             start,
         );
     }
-    assert!(due.due(
+    assert!(!due.due(
         "s-new",
         "key-new",
         workspace,
         start + Duration::from_secs(1)
     ));
-    assert_eq!(due.remembered(), (1, 1));
+    assert_eq!(due.remembered(), (MAX_SIGNED_SESSIONS, MAX_SIGNED_SESSIONS));
+}
+
+// ============================================================================
+// The second reading of 60ecd07: MUST 1 (a caller the gateway cannot name
+// itself is still a caller) and MUST 3 (a full memory of signs)
+// ============================================================================
+
+/// A bearer token shaped as the API's are: `claims` and a made-up signature.
+fn bearer_token(claims: Value, signature: &str) -> String {
+    use base64::Engine;
+
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    format!(
+        "{}.{}.{signature}",
+        encode(br#"{"alg":"RS256","typ":"JWT"}"#),
+        encode(claims.to_string().as_bytes())
+    )
+}
+
+/// Run `work` as a request that presented the bearer token `token` to a
+/// gateway that holds no secret to verify it with: it has the token, and no
+/// verified subject and no key.
+async fn as_bearer<T, F, Fut>(token: &str, work: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let auth = mcp_types::AuthOverride {
+        jwt: Some(token.to_string()),
+        ..Default::default()
+    };
+    mcp_client::run_with_auth_override(auth, work).await
+}
+
+/// The session part of a request of `token`: in the legacy session
+/// `session_id`, from the connection `connection`, or with neither.
+async fn bearer_part(token: &str, session_id: Option<&str>, connection: Option<&str>) -> String {
+    as_bearer(token, || async {
+        let part = || async { session_part(true) };
+        let in_connection = || async {
+            match connection {
+                Some(connection) => {
+                    mcp_client::client_session::run_with(connection.to_string(), part).await
+                }
+                None => part().await,
+            }
+        };
+        match session_id {
+            Some(id) => mcp_client::run_with_mcp_session_id(id.to_string(), in_connection).await,
+            None => in_connection().await,
+        }
+    })
+    .await
+}
+
+/// MUST 1. Two people signed in with tokens the gateway cannot verify are two
+/// callers: the session id, or the connection token, one of them presents
+/// never names a session of the other, and neither is everyone.
+#[tokio::test]
+async fn a_caller_the_gateway_cannot_name_itself_is_still_a_caller() {
+    let ann = bearer_token(json!({"sub": "user-ann"}), "signature-a");
+    let bob = bearer_token(json!({"sub": "user-bob"}), "signature-b");
+    // The legacy contract: one session id, two callers, two sessions.
+    let ann_legacy = bearer_part(&ann, Some("sid-42"), None).await;
+    let bob_legacy = bearer_part(&bob, Some("sid-42"), None).await;
+    assert!(
+        ann_legacy.starts_with("s-") && ann_legacy.len() == 18,
+        "{ann_legacy}"
+    );
+    assert_eq!(ann_legacy, bearer_part(&ann, Some("sid-42"), None).await);
+    assert_ne!(
+        ann_legacy, bob_legacy,
+        "two callers with one session id are one session"
+    );
+    // The stateless contract: one connection token, two callers, two
+    // sessions; and a caller that names no connection is its own, not
+    // everyone.
+    let ann_stateless = bearer_part(&ann, None, Some(TOKEN_A)).await;
+    let bob_stateless = bearer_part(&bob, None, Some(TOKEN_A)).await;
+    assert!(ann_stateless.starts_with("s-"), "{ann_stateless}");
+    assert_ne!(ann_stateless, bob_stateless);
+    let ann_alone = bearer_part(&ann, None, None).await;
+    let bob_alone = bearer_part(&bob, None, None).await;
+    assert!(
+        ann_alone.starts_with("c-") && bob_alone.starts_with("c-"),
+        "{ann_alone} {bob_alone}"
+    );
+    assert_ne!(ann_alone, bob_alone);
+    // Nothing of a token or of the subject it names is in a part.
+    for part in [&ann_legacy, &ann_stateless, &ann_alone] {
+        assert!(!part.contains("user") && !part.contains("signature"));
+    }
+}
+
+/// MUST 3. A memory full of this minute's signs has no room for a new
+/// session or key: that sign is dropped and what is remembered stays, so a
+/// flood of new callers cannot make the gateway forget whom it throttles.
+#[test]
+fn a_full_memory_of_signs_drops_the_new_sign_and_keeps_its_throttles() {
+    let workspace = Uuid::new_v4();
+    let start = Instant::now();
+    let mut due = SignsDue::default();
+    // One key uses up its minute.
+    for index in 0..SIGNS_PER_CALLER_EVERY_MINUTE {
+        assert!(due.due(&format!("s-busy-{index}"), "key-busy", workspace, start));
+    }
+    assert!(!due.due("s-busy-more", "key-busy", workspace, start));
+    // Other callers fill the memory within the same minute.
+    let soon = start + Duration::from_secs(1);
+    let mut index = 0;
+    while due.remembered().0 < MAX_SIGNED_SESSIONS {
+        assert!(due.due(
+            &format!("s-{index}"),
+            &format!("key-{index}"),
+            workspace,
+            soon
+        ));
+        index += 1;
+    }
+    // One more caller: no room, so no sign, and nothing is forgotten.
+    let full = due.remembered();
+    assert!(
+        !due.due("s-new", "key-new", workspace, soon),
+        "a full memory let a new sign through"
+    );
+    assert_eq!(due.remembered(), full, "a full memory forgot its signs");
+    // The busy key is as throttled as it was: no new session of it, and no
+    // second sign for one that had its own.
+    assert!(!due.due("s-busy-more", "key-busy", workspace, soon));
+    assert!(!due.due("s-busy-0", "key-busy", workspace, soon));
+    // A minute on the old signs are forgotten, and there is room again.
+    assert!(due.due("s-new", "key-new", workspace, soon + SIGN_OF_LIFE_EVERY));
+    // The memory of sessions was full and is searched; the memory of keys
+    // was not, and forgets its old entries when it is.
+    let (sessions, keys) = due.remembered();
+    assert_eq!(sessions, 1);
+    assert!(keys <= MAX_SIGNED_SESSIONS);
+}
+
+/// A full memory is searched for entries to forget at most once a second,
+/// however many new callers knock: between two searches it has no room.
+#[test]
+fn a_full_memory_is_searched_for_room_at_most_once_a_second() {
+    let start = Instant::now();
+    let keep = Duration::from_secs(60);
+    let mut memory: HashMap<String, Instant> = (0..MAX_SIGNED_SESSIONS)
+        .map(|index| (format!("old-{index}"), start))
+        .collect();
+    let mut swept = None;
+    let room = |memory: &mut HashMap<String, Instant>, swept: &mut Option<Instant>, at: Instant| {
+        has_room(memory, swept, "new", at, keep, |at| *at)
+    };
+    // Full of entries that still count: searched once, no room.
+    let soon = start + Duration::from_secs(59);
+    assert!(!room(&mut memory, &mut swept, soon));
+    assert_eq!(swept, Some(soon));
+    // The entries are old enough to go a moment later, but the memory was
+    // just searched: not again within the second.
+    let old_enough = start + keep;
+    assert!(old_enough.saturating_duration_since(soon) >= SWEEP_FULL_MEMORY_EVERY);
+    let within = soon + Duration::from_millis(500);
+    assert!(!room(&mut memory, &mut swept, within));
+    assert_eq!((memory.len(), swept), (MAX_SIGNED_SESSIONS, Some(soon)));
+    // A second after the search it is searched again, and has room.
+    assert!(room(&mut memory, &mut swept, old_enough));
+    assert_eq!((memory.len(), swept), (0, Some(old_enough)));
+    // One it holds always has room, searched or not.
+    let mut memory: HashMap<String, Instant> = (0..MAX_SIGNED_SESSIONS)
+        .map(|index| (format!("old-{index}"), start))
+        .collect();
+    let mut swept = Some(start);
+    assert!(has_room(
+        &mut memory,
+        &mut swept,
+        "old-7",
+        start,
+        keep,
+        |at| *at
+    ));
+    assert_eq!(swept, Some(start));
+}
+
+/// MUST 1. Who a bearer token the gateway cannot verify stands for: the
+/// subject it names, so a replaced token is the same caller; with no subject
+/// to read, the token itself. Never the text of either.
+#[tokio::test]
+async fn who_a_bearer_token_stands_for() {
+    async fn caller(token: &str) -> String {
+        as_bearer(token, || async { caller_of_request() })
+            .await
+            .expect("a request with a bearer token has a caller")
+    }
+    let first = bearer_token(json!({"sub": "user-ann", "jti": "1", "exp": 1}), "s1");
+    let second = bearer_token(json!({"sub": "user-ann", "jti": "2", "exp": 2}), "s2");
+    let ann = caller(&first).await;
+    assert!(ann.starts_with("csrp:v1:s:"), "{ann}");
+    assert_eq!(
+        ann,
+        caller(&second).await,
+        "a replaced token is its subject"
+    );
+    assert_ne!(
+        ann,
+        caller(&bearer_token(json!({"sub": "user-bob"}), "s1")).await
+    );
+    assert!(!ann.contains("user-ann") && !ann.contains("s1"), "{ann}");
+    // Nothing that reads as a subject: the whole token is the caller, and
+    // another token is another caller.
+    for claims in [
+        json!({}),
+        json!({"sub": ""}),
+        json!({"sub": "  "}),
+        json!({"sub": 7}),
+        json!({"sub": ["user-ann"]}),
+        json!({"sub": "user\nann"}),
+        json!({"sub": "x".repeat(mcp_client::run_progress::MAX_SUBJECT + 1)}),
+        json!(["user-ann"]),
+    ] {
+        let one = caller(&bearer_token(claims.clone(), "s1")).await;
+        let two = caller(&bearer_token(claims.clone(), "s2")).await;
+        assert!(one.starts_with("csrp:v1:t:"), "{claims}: {one}");
+        assert_ne!(one, two, "{claims}");
+        assert_eq!(one, caller(&bearer_token(claims, "s1")).await);
+    }
+    for token in ["opaque.token.one", "a.b.c.d", "no-dots", "..", "a.!!!.c"] {
+        let one = caller(token).await;
+        assert!(one.starts_with("csrp:v1:t:"), "{token}: {one}");
+        assert!(!one.contains(token), "{one}");
+    }
+    assert_ne!(
+        caller("opaque.token.one").await,
+        caller("opaque.token.two").await
+    );
+    // A token whose text is a subject's is not that subject.
+    assert_ne!(caller("user-ann").await, ann);
+    // The identity the gateway derived itself (a verified subject, a key)
+    // is the caller as it is.
+    let derived = hosted(Some("key-1"), None, || async { caller_of_request() }).await;
+    assert_eq!(derived.as_deref(), Some("key-1"));
+    // No credential: no caller.
+    assert_eq!(caller_of_request(), None);
+    let empty = mcp_client::run_with_auth_override(mcp_types::AuthOverride::default(), || async {
+        caller_of_request()
+    })
+    .await;
+    assert_eq!(empty, None);
+    let blank = mcp_types::AuthOverride {
+        jwt: Some("  ".to_string()),
+        ..Default::default()
+    };
+    let blank = mcp_client::run_with_auth_override(blank, || async { caller_of_request() }).await;
+    assert_eq!(blank, None);
+}
+
+/// The hosted gateway's client and session: no key of its own, so a
+/// caller's own credential is what its requests carry.
+fn hosted_client_without_a_key(
+    fixture: &Fixture,
+    base_url: &str,
+) -> (ContextStreamClient, Arc<SessionManager>) {
+    let mut config = TestFixtures::test_config();
+    config.api_url = base_url.to_string();
+    config.api_key = None;
+    config.default_workspace_id = Some(fixture.workspace);
+    config.default_project_id = Some(fixture.project);
+    config.is_http_transport = true;
+    let client = ContextStreamClient::new(config.clone());
+    let session = Arc::new(SessionManager::new(client.clone(), config));
+    (client, session)
+}
+
+/// One `search` call that carried the credential `auth`, in the legacy
+/// session `session_id`, through a hosted gateway whose setting names the
+/// fixture's workspace and whose API knows the runs `listed`. `identity` is
+/// what the middleware derived for the caller (for a key), if anything.
+/// Nothing here says the API accepted the credential. Whether a sign went
+/// out, and every request made (target, body).
+async fn sign_under(
+    fixture: &Fixture,
+    auth: &mcp_types::AuthOverride,
+    identity: Option<&str>,
+    session_id: &str,
+    listed: Vec<Value>,
+) -> (bool, Vec<(String, Value)>) {
+    let api = Api::start(routes_knowing(fixture, &listed)).await;
+    let (client, session) = hosted_client_without_a_key(fixture, &api.base_url);
+    let params = json!({"name": "search", "arguments": {"query": "anything"}});
+    let here = [fixture.workspace];
+    let call = || async {
+        mcp_client::run_with_mcp_session_id(session_id.to_string(), || async {
+            crate::client_identity::run_with_client_name(
+                Some("claude-code".to_string()),
+                sign_of_life_for(&client, &session, &params, &here),
+            )
+            .await
+        })
+        .await
+    };
+    let sent = mcp_client::run_with_auth_override(auth.clone(), || async {
+        match identity {
+            Some(identity) => {
+                mcp_client::run_with_caller_cache_identity(identity.to_string(), call).await
+            }
+            None => call().await,
+        }
+    })
+    .await;
+    let went = sent.is_some();
+    if let Some(task) = sent {
+        task.await.expect("the sign of life finishes");
+    }
+    let requests = api
+        .requests()
+        .into_iter()
+        .map(|seen| (seen.target, seen.body))
+        .collect();
+    (went, requests)
+}
+
+fn bearer_auth(token: &str) -> mcp_types::AuthOverride {
+    mcp_types::AuthOverride {
+        jwt: Some(token.to_string()),
+        ..Default::default()
+    }
+}
+
+/// A run at work in the fixture's workspace, with the id of the default run
+/// of the session part `part`.
+fn default_run_of(fixture: &Fixture, part: &str) -> Value {
+    let mut run = listed_run(fixture, 0, "claude-code:0badc0de", "live", 5);
+    run["run_id"] = json!(run_id_of_key(
+        fixture.workspace,
+        &run_key_of(None, part, None)
+    ));
+    run
+}
+
+/// MUST 1. A signed-in caller's tool call signals its own session's run and
+/// never another caller's, though both present one session id.
+#[tokio::test]
+async fn a_signed_in_callers_tool_call_signals_its_own_run_and_never_anothers() {
+    let fixture = Fixture::new();
+    let ann = bearer_token(json!({"sub": Uuid::new_v4()}), "signature-a");
+    let bob = bearer_token(json!({"sub": Uuid::new_v4()}), "signature-b");
+    let ann_run = default_run_of(&fixture, &bearer_part(&ann, Some("sid-42"), None).await);
+    let ann_target = format!(
+        "/api/v1/run-progress/runs/{}?workspace_id={}",
+        ann_run["run_id"].as_str().expect("a run id"),
+        fixture.workspace
+    );
+    api_answers(&bearer_auth(&ann), 200);
+    api_answers(&bearer_auth(&bob), 200);
+    // Bob presents Ann's session id: his call reads a run of his own (there
+    // is none), and Ann's run is neither read nor signalled.
+    let (went, requests) = sign_under(
+        &fixture,
+        &bearer_auth(&bob),
+        None,
+        "sid-42",
+        vec![ann_run.clone()],
+    )
+    .await;
+    assert!(went, "{requests:?}");
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_ne!(requests[0].0, ann_target);
+    assert!(requests[0].0.starts_with("/api/v1/run-progress/runs/"));
+    // Ann's own call signals it.
+    let (went, requests) = sign_under(
+        &fixture,
+        &bearer_auth(&ann),
+        None,
+        "sid-42",
+        vec![ann_run.clone()],
+    )
+    .await;
+    assert!(went, "{requests:?}");
+    assert_eq!(requests[0].0, ann_target);
+    assert_eq!(
+        reports_in(&requests),
+        vec![&json!({
+            "workspace_id": fixture.workspace,
+            "run_id": ann_run["run_id"],
+            "agent": ann_run["agent"],
+        })]
+    );
+    // A request with no credential at all, in that session: no caller, so
+    // no run is derived and nothing is asked.
+    let (went, requests) = sign_under(
+        &fixture,
+        &mcp_types::AuthOverride::default(),
+        None,
+        "sid-42",
+        vec![ann_run],
+    )
+    .await;
+    assert!(!went && requests.is_empty(), "{requests:?}");
+}
+
+/// MUST 3. No sign goes out under a credential the API was not seen to
+/// accept: nothing is asked, and nothing is remembered of the call. Only a
+/// success counts, and a 401 takes it back.
+#[tokio::test]
+async fn a_sign_waits_until_the_api_was_seen_to_accept_the_credential() {
+    let fixture = Fixture::new();
+    let key = format!("key-{}", Uuid::new_v4());
+    let auth = key_auth(&key);
+    let run = |session_id: &'static str| {
+        let part = mcp_client::run_with_mcp_session_id(session_id.to_string(), || {
+            mcp_client::run_with_caller_cache_identity(key.clone(), || async { session_part(true) })
+        });
+        async { default_run_of(&fixture, &part.await) }
+    };
+    let first = run("sid-1").await;
+    // Never seen: nothing.
+    let (went, requests) =
+        sign_under(&fixture, &auth, Some(&key), "sid-1", vec![first.clone()]).await;
+    assert!(!went && requests.is_empty(), "{requests:?}");
+    // An answer that is not a success says nothing of the credential.
+    for status in [403, 404, 429, 500, 503] {
+        api_answers(&auth, status);
+        let (went, requests) =
+            sign_under(&fixture, &auth, Some(&key), "sid-1", vec![first.clone()]).await;
+        assert!(!went && requests.is_empty(), "{status}: {requests:?}");
+    }
+    // The calls above were not counted against the session's minute: once
+    // the API accepted the key, the session's next call signals its run.
+    api_answers(&auth, 200);
+    let (went, requests) =
+        sign_under(&fixture, &auth, Some(&key), "sid-1", vec![first.clone()]).await;
+    assert!(went, "{requests:?}");
+    assert_eq!(reports_in(&requests).len(), 1, "{requests:?}");
+    // Another key was not accepted by that.
+    let other = format!("key-{}", Uuid::new_v4());
+    let (went, requests) =
+        sign_under(&fixture, &key_auth(&other), Some(&other), "sid-1", vec![]).await;
+    assert!(!went && requests.is_empty(), "{requests:?}");
+    // The API refuses the key (401): no further sign, in any session.
+    api_answers(&auth, 401);
+    let second = run("sid-2").await;
+    let (went, requests) = sign_under(&fixture, &auth, Some(&key), "sid-2", vec![second]).await;
+    assert!(!went && requests.is_empty(), "{requests:?}");
+}
+
+/// MUST 3. The gateway learns which credentials the API accepts from the
+/// answers to the requests it sends anyway: it asks nothing to find out.
+#[tokio::test]
+async fn the_client_tells_which_credentials_the_api_accepts() {
+    mcp_client::observe_api_answers(api_answered);
+    let fixture = Fixture::new();
+    let key = format!("key-{}", Uuid::new_v4());
+    let seen = |key: &str| {
+        accepted()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_accepted(
+                &credential_digest(mcp_client::SentCredential::ApiKey(key)),
+                Instant::now(),
+            )
+    };
+    assert!(!seen(&key));
+    let body = json!({"workspace_id": fixture.workspace, "source_run_id": "a-run"});
+    let accepting = Api::start(vec![(
+        "POST /api/v1/run-progress/report",
+        200,
+        fixture.answer("working", &[]),
+    )])
+    .await;
+    let (client, _) = hosted_client_without_a_key(&fixture, &accepting.base_url);
+    mcp_client::run_with_auth_override(key_auth(&key), || async {
+        client.report_run_progress(&body, 0).await
+    })
+    .await
+    .expect("the report is accepted");
+    assert_eq!(accepting.requests().len(), 1);
+    assert!(seen(&key), "a success under the key was not noted");
+    // A request the gateway sends under no caller's credential says nothing
+    // of any caller.
+    assert!(!seen("test-api-key"));
+    // The API refuses the key: it is no longer accepted.
+    let refusing = Api::start(vec![(
+        "POST /api/v1/run-progress/report",
+        401,
+        json!({"success": false, "error": {"message": "Invalid API key"}}),
+    )])
+    .await;
+    let (client, _) = hosted_client_without_a_key(&fixture, &refusing.base_url);
+    let refused = mcp_client::run_with_auth_override(key_auth(&key), || async {
+        client.report_run_progress(&body, 0).await
+    })
+    .await;
+    assert!(refused.is_err());
+    assert!(!seen(&key), "a 401 under the key was not noted");
+}
+
+/// MUST 3. The memory of accepted credentials: only a success puts one in,
+/// a 401 takes it out, it counts for [`ACCEPTED_FOR`], and a full memory
+/// keeps what it has and leaves the new one out.
+#[test]
+fn the_memory_of_accepted_credentials_is_bounded_and_keeps_what_it_has() {
+    let start = Instant::now();
+    let second = Duration::from_secs(1);
+    let mut seen = Accepted::default();
+    seen.answered("a".into(), 204, start);
+    assert!(seen.is_accepted("a", start));
+    assert!(seen.is_accepted("a", start + ACCEPTED_FOR - second));
+    assert!(!seen.is_accepted("a", start + ACCEPTED_FOR));
+    for status in [301, 400, 403, 404, 429, 500, 503] {
+        seen.answered("b".into(), status, start);
+        assert!(!seen.is_accepted("b", start), "{status}");
+        seen.answered("a".into(), status, start);
+        assert!(seen.is_accepted("a", start), "{status}");
+    }
+    seen.answered("a".into(), 401, start);
+    assert!(!seen.is_accepted("a", start));
+    assert_eq!(seen.remembered(), 0);
+
+    let mut seen = Accepted::default();
+    for index in 0..MAX_SIGNED_SESSIONS {
+        seen.answered(format!("c-{index}"), 200, start);
+    }
+    let soon = start + second;
+    seen.answered("new".into(), 200, soon);
+    assert!(
+        !seen.is_accepted("new", soon),
+        "a full memory took one more"
+    );
+    assert_eq!(seen.remembered(), MAX_SIGNED_SESSIONS);
+    assert!(seen.is_accepted("c-0", soon), "a full memory forgot one");
+    // One it has is still refreshed.
+    seen.answered("c-0".into(), 200, soon);
+    // Once the others are too old to count they are forgotten for a new one.
+    let later = start + ACCEPTED_FOR;
+    seen.answered("new".into(), 200, later);
+    assert!(seen.is_accepted("new", later));
+    assert!(seen.is_accepted("c-0", later));
+    assert_eq!(seen.remembered(), 2);
+}
+
+/// SHOULD 1. A tool run through the router (`execute_operation`) counts as
+/// that tool: `progress` is a report and gives no sign, and any other tool's
+/// workspace is the one its own arguments name.
+#[tokio::test]
+async fn a_tool_run_through_the_router_counts_as_that_tool() {
+    let fixture = Fixture::new();
+    let through_router = |tool: &str, arguments: Value| json!({"name": "execute_operation", "arguments": {"name": tool, "arguments": arguments}});
+    let (went, requests) = sign_for_call(
+        &fixture,
+        SESSION_A,
+        &[fixture.workspace],
+        through_router("progress", json!({"step": "Building"})),
+        vec![],
+    )
+    .await;
+    assert!(!went && requests.is_empty(), "{requests:?}");
+    // The setting names another workspace than the session's: a tool that
+    // names it in its own arguments is signalled there.
+    let other = Uuid::new_v4();
+    let (went, requests) = sign_for_call(
+        &fixture,
+        SESSION_A,
+        &[other],
+        through_router("search", json!({"query": "x", "workspace_id": other})),
+        vec![],
+    )
+    .await;
+    assert!(went, "{requests:?}");
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(
+        requests[0].0.ends_with(&format!("?workspace_id={other}")),
+        "{requests:?}"
+    );
+    // A tool that names none is in the session's workspace, which the
+    // setting does not name here.
+    let session_b = Caller {
+        key: Some("key-1"),
+        token: Some(TOKEN_B),
+        name: None,
+    };
+    let (went, requests) = sign_for_call(
+        &fixture,
+        session_b,
+        &[other],
+        through_router("search", json!({"query": "x"})),
+        vec![],
+    )
+    .await;
+    assert!(!went && requests.is_empty(), "{requests:?}");
+    // The router asked for nothing it can name: the call is the router's.
+    let (went, requests) = sign_for_call(
+        &fixture,
+        session_b,
+        &[fixture.workspace],
+        json!({"name": "execute_operation", "arguments": {}}),
+        vec![],
+    )
+    .await;
+    assert!(went, "{requests:?}");
 }

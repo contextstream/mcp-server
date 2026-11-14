@@ -1089,3 +1089,84 @@ fn a_default_run_of_a_session_part_that_ended_gets_no_further_sign() {
             .unwrap_or_default()
     );
 }
+
+// ============================================================================
+// The second reading of 60ecd07, MUST 2: signs of life know who the session is
+// ============================================================================
+
+/// The client reconnects and the server says so in `init`'s answer (a new
+/// session part), and the model then works on without reporting: the old
+/// part's default run is no longer this session's, and gets no further sign.
+#[test]
+fn a_reconnect_init_announces_ends_the_signs_for_the_old_parts_default_run() {
+    let api = FakeApi::start();
+    let sandbox = review_signs_sandbox(&api);
+    let mut session = Session::new("host-session-reconnect", SESSION_A);
+    sandbox.init(&session);
+    let old_run = "88888888-8888-4888-8888-888888888888";
+    let old_key = format!("{SESSION_A}:session");
+    sandbox.tool_result(
+        &session,
+        "progress",
+        json!({"step": "Building"}),
+        json!({"run": review_view(old_run), "written": ["run.step"], "session": SESSION_A, "run_key": old_key}),
+    );
+    // The same editor session, a new server session: `init` names it.
+    session.server_session = SESSION_B;
+    sandbox.init(&session);
+    // The model works on and reports nothing.
+    review_work(&sandbox, &session, 5);
+    std::thread::sleep(Duration::from_secs(3));
+    let signs: Vec<String> = api
+        .reports()
+        .into_iter()
+        .map(|report| report.body.to_string())
+        .collect();
+    assert!(
+        signs.is_empty(),
+        "the ended part's default run was signalled: {signs:?}"
+    );
+}
+
+/// A local server answers in words only. Signs of life learn who the session
+/// is from `init`'s line and the run from `progress`'s, and signal that run
+/// under that agent.
+#[test]
+fn a_local_servers_words_are_enough_for_signs_of_life() {
+    let api = FakeApi::start();
+    let sandbox = review_signs_sandbox(&api);
+    let session = Session::new("host-session-words", SESSION_A);
+    let identity = json!({"session": SESSION_A, "agent": session.agent()});
+    sandbox.tool_words(
+        &session,
+        "init",
+        json!({"folder_path": sandbox.repo}),
+        &format!(
+            "Session ready for workspace: Testing\nResolved workspace_id: {WORKSPACE}\nLive progress identity (read by ContextStream's hooks; nothing for you to do): {identity}\n\n[ACCOUNT_CONTEXT]"
+        ),
+    );
+    let run_id = "66666666-6666-4666-8666-666666666666";
+    sandbox.tool_words(
+        &session,
+        "progress",
+        json!({"workspace_id": WORKSPACE, "step": "Reading the handler"}),
+        &format!("[PROGRESS] Recorded: step. state=working run_id={run_id}"),
+    );
+    review_work(&sandbox, &session, 5);
+    let sign = api
+        .wait_for(SOON, |body| body["run_id"] == run_id)
+        .expect("a run a local server reported is signalled");
+    // Who and which run, under the agent `init` named, and nothing else.
+    assert_eq!(
+        sign.body,
+        json!({"workspace_id": WORKSPACE, "run_id": run_id, "agent": session.agent()})
+    );
+    // Nothing but signs for that run was sent: the hooks start, step and end
+    // nothing in this mode.
+    for report in api.reports() {
+        assert_eq!(
+            report.body,
+            json!({"workspace_id": WORKSPACE, "run_id": run_id, "agent": session.agent()})
+        );
+    }
+}

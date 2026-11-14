@@ -797,6 +797,10 @@ pub async fn run_http_server(
     if mcp_tools::wire_tokens::exact_tokenizer_required() {
         mcp_tools::wire_tokens::warm_o200k();
     }
+    // Where the gateway is told to keep runs alive, a sign of life goes out
+    // only under a credential the API was seen to accept. As shipped (the
+    // setting unset) this does nothing.
+    mcp_tools::domains::progress::watch_for_signs_of_life();
 
     let state = HttpState {
         registry,

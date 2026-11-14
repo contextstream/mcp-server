@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.79
 
 - Fixed: `init` through the hosted server created an empty project for a fresh clone of a repository that already had one. A cloud runner names a clone `<owner>-<repo>` (`contextstream-contextcode`), the hosted server cannot read the folder, and no project is called that, so the folder matched nothing and a project named after it was created; the session then searched an empty index and saved to the wrong project. Three changes:
   - A folder named `<owner>-<repo>` resolves to the one project in the workspace whose repository that is, ahead of a project that only shares the folder's name and has no repository. When two projects hold the repository, `init` leaves the choice to the API, which names both.
@@ -8,6 +8,7 @@
   - The hosted server no longer reads a Git remote from its own disk when a caller's `folder_path` happens to exist there.
 - Rules: the "Initialize once" step now prescribes `init(folder_path, workspace_id, repository_url="<git remote get-url origin>")`. It used to prescribe `project_id="<id>"`, which a fresh clone has no value for (its rules carry a workspace id and a project name), so agents left it out or sent the placeholder. The checkout's own Git remote is what an agent can always fill in, and it finds the project from any clone on any machine. The rules do not gain a project id line: a rules file is committed, copied into new repositories and kept after a project is merged away, and an id in it would be sent as an explicit choice that outranks the checkout's repository. `init`'s descriptions of `repository_url`, `folder_path` and `skip_project_creation` say when to pass each. Installed rules files keep working as they are; `contextstream-mcp update-rules` refreshes them.
 - A project with no repository on record (made by hand, by an older client, or by a hosted `init` before this release) links itself the first time a session names its repository. With a current API: `init` with `repository_url` adopts the one such project named after the repository (`contextcode`, or `contextstream-contextcode` as a hosted `init` used to name it) and records the remote on it; `init` with `project_id` and `repository_url` records the remote on the project named, whatever it is called. After that every clone resolves by repository, with or without the remote in the call. The `[SCOPE_RESOLUTION]` answer for an unmatched folder gives both calls, and an `init` that names a project for an unreadable folder without a remote is told the one call that links it.
+- Dependencies: `quinn-udp` in the lockfile moves from 0.5.14 to 0.5.16 for the advisory RUSTSEC-2026-0538. It is only reqwest's optional HTTP/3 dependency and is not compiled into any build, so nothing changes in the binaries.
 
 ## 1.0.78
 

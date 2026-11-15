@@ -1422,6 +1422,17 @@ impl StudioTool {
             }
             None => None,
         };
+        // A count the agent confirms is not the person's go (crate::go_ahead): asked and
+        // accepted above, or nothing is sent.
+        if asked.is_none() && crate::go_ahead::asked_only() {
+            return Ok(ToolResult::with_structured(
+                format!(
+                    "Not sent: {}. Nothing was sent.",
+                    crate::go_ahead::NOT_ASKED
+                ),
+                json!({"sent": false, "campaign_id": campaign_id, "go_ahead": "asked_only"}),
+            ));
+        }
         match (asked, input.confirm_recipients) {
             (Some(true), _) => {}
             (Some(false), _) => {
@@ -2883,6 +2894,16 @@ impl StudioTool {
             }
             None => None,
         };
+        // The same for an address the agent confirms (crate::go_ahead).
+        if asked.is_none() && crate::go_ahead::asked_only() {
+            return Ok(ToolResult::with_structured(
+                format!(
+                    "Not removed: {}. {email} stays on the suppression list.",
+                    crate::go_ahead::NOT_ASKED
+                ),
+                json!({"removed": false, "email": email, "go_ahead": "asked_only"}),
+            ));
+        }
         let confirmed = input.confirm_email.as_deref().and_then(address_of);
         match (asked, confirmed) {
             (Some(true), _) => {}

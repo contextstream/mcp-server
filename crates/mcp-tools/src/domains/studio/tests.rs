@@ -634,6 +634,66 @@ async fn a_connection_with_a_spend_ceiling_makes_nothing_priced_above_it() {
     assert_eq!(stub.posts_to("/create/jobs").len(), 1);
 }
 
+/// A connection that takes a go-ahead only from the person (crate::go_ahead): the price the
+/// agent passes makes nothing, with no client to ask and with a question that got no answer;
+/// asked and accepted, it is made as before.
+#[tokio::test]
+async fn where_only_the_persons_own_go_ahead_counts_an_accepted_price_makes_nothing() {
+    let stub = Stub::start(api(Arc::new(Mutex::new(("queued".into(), false))))).await;
+    let tool = stub.tool();
+    let asked_only = || mcp_types::config::ConfigOverride {
+        go_ahead_asked_only: Some(true),
+        ..Default::default()
+    };
+    let not_made = |result: &ToolResult| {
+        let text = text_of(result);
+        assert!(
+            text.starts_with("Not made: on this connection a go-ahead counts only when the person is asked and says yes, and they could not be asked"),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was spent"), "{text}");
+        assert_eq!(structured(result)["made"], false);
+        assert_eq!(structured(result)["go_ahead"], "asked_only");
+    };
+    // A client that cannot ask: the agent's accepted price is not the person's.
+    let unasked = mcp_client::run_with_config_override(asked_only(), || async {
+        tool.execute(json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 412}))
+            .await
+            .unwrap()
+    })
+    .await;
+    not_made(&unasked);
+    // A client that can ask, and a question nobody answered.
+    let silent = Arc::new(FakeClient::default());
+    let unanswered = mcp_client::run_with_config_override(asked_only(), || {
+        run_with_call_peer(
+            CallPeer::new(silent.clone(), None, true),
+            tool.execute(
+                json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 412}),
+            ),
+        )
+    })
+    .await
+    .unwrap();
+    not_made(&unanswered);
+    assert_eq!(silent.sent.lock().unwrap().len(), 1, "the person was asked");
+    assert!(stub.posts_to("/create/jobs").is_empty());
+    // Asked, and the person says yes: made.
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() =
+        Some(json!({"action": "accept", "content": {"confirm": true}}));
+    let made = mcp_client::run_with_config_override(asked_only(), || {
+        run_with_call_peer(
+            CallPeer::new(client.clone(), None, true),
+            tool.execute(json!({"action": "make", "plan_id": QUOTE})),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(!made.is_error, "{}", text_of(&made));
+    assert_eq!(stub.posts_to("/create/jobs").len(), 1);
+}
+
 #[tokio::test]
 async fn make_on_a_rehearsal_connection_is_a_create_rehearsal_and_says_so() {
     let stub = Stub::start(api(Arc::new(Mutex::new(("queued".into(), false))))).await;

@@ -3421,6 +3421,10 @@ fn extract_config_override(headers: &HeaderMap) -> Option<ConfigOverride> {
             headers,
             mcp_tools::spend::MAX_SPEND_HEADER,
         )),
+        // Sent at all, it is on unless it says off; a value that cannot be read is on.
+        go_ahead_asked_only: headers
+            .get(mcp_tools::go_ahead::GO_AHEAD_HEADER)
+            .map(|value| mcp_tools::go_ahead::on(value.to_str().ok())),
     };
 
     if override_config.is_empty() {
@@ -6041,6 +6045,49 @@ mod tests {
                 override_config.effective_acceleration_enabled(),
                 Some(false),
                 "new acceleration header must take precedence over deprecated Atlas alias"
+            );
+        }
+
+        #[test]
+        fn test_extract_config_override_reads_the_go_ahead_header_to_the_safe_side() {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-contextstream-search-limit", "25".parse().unwrap());
+            assert_eq!(
+                extract_config_override(&headers)
+                    .expect("config override")
+                    .go_ahead_asked_only,
+                None,
+                "a normal connection takes the agent's word as before"
+            );
+            for (sent, asked_only) in [
+                ("asked", true),
+                ("1", true),
+                ("", true),
+                ("agent", true),
+                ("off", false),
+                ("0", false),
+            ] {
+                let mut only = HeaderMap::new();
+                only.insert("X-ContextStream-Go-Ahead", sent.parse().unwrap());
+                assert_eq!(
+                    extract_config_override(&only)
+                        .expect("the header alone is an override")
+                        .go_ahead_asked_only,
+                    Some(asked_only),
+                    "{sent:?}"
+                );
+            }
+            // A value that is not text is still a setting that was meant.
+            let mut unread = HeaderMap::new();
+            unread.insert(
+                "X-ContextStream-Go-Ahead",
+                axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+            );
+            assert_eq!(
+                extract_config_override(&unread)
+                    .expect("config override")
+                    .go_ahead_asked_only,
+                Some(true)
             );
         }
 

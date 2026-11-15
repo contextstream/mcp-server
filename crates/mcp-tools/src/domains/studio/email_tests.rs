@@ -691,6 +691,80 @@ async fn a_send_needs_the_persons_go_and_the_count_they_saw() {
     assert_eq!(structured(&sent)["follow_up"]["action"], "email_report");
 }
 
+/// A connection that takes a go-ahead only from the person (crate::go_ahead): the count the
+/// agent confirms sends nothing and takes no address off the suppression list; asked and
+/// accepted, both go as before.
+#[tokio::test]
+async fn where_only_the_persons_own_go_ahead_counts_the_agents_confirmation_sends_nothing() {
+    let stub = Stub::start(usual()).await;
+    let tool = stub.tool();
+    let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
+    let asked_only = || mcp_types::config::ConfigOverride {
+        go_ahead_asked_only: Some(true),
+        ..Default::default()
+    };
+    let send = json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37});
+    let unasked = mcp_client::run_with_config_override(asked_only(), || async {
+        tool.execute(send.clone()).await.unwrap()
+    })
+    .await;
+    let text = text_of(&unasked);
+    assert!(
+        text.starts_with("Not sent: on this connection a go-ahead counts only when the person is asked and says yes, and they could not be asked"),
+        "{text}"
+    );
+    assert!(text.contains("Nothing was sent"), "{text}");
+    assert_eq!(structured(&unasked)["sent"], false);
+    assert_eq!(structured(&unasked)["go_ahead"], "asked_only");
+    // A question nobody answered is not a yes either.
+    let silent = Arc::new(FakeClient::default());
+    let unanswered = mcp_client::run_with_config_override(asked_only(), || {
+        run_with_call_peer(
+            CallPeer::new(silent.clone(), None, true),
+            tool.execute(send.clone()),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        text_of(&unanswered).starts_with("Not sent: on this connection"),
+        "{}",
+        text_of(&unanswered)
+    );
+    assert!(stub.calls_to("POST", &schedule).is_empty());
+
+    // The suppression list: the address the agent confirms is not the person's go-ahead.
+    let remove = json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example", "confirm_email": "grace@northwind.example"});
+    let kept = mcp_client::run_with_config_override(asked_only(), || async {
+        tool.execute(remove.clone()).await.unwrap()
+    })
+    .await;
+    let text = text_of(&kept);
+    assert!(
+        text.starts_with("Not removed: on this connection a go-ahead counts only when the person is asked and says yes, and they could not be asked"),
+        "{text}"
+    );
+    assert_eq!(structured(&kept)["removed"], false);
+    assert!(stub
+        .calls_to("POST", "/create/email/suppressions/remove")
+        .is_empty());
+
+    // Asked, and the person says yes: sent.
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() =
+        Some(json!({"action": "accept", "content": {"confirm": true}}));
+    let sent = mcp_client::run_with_config_override(asked_only(), || {
+        run_with_call_peer(
+            CallPeer::new(client.clone(), None, true),
+            tool.execute(json!({"action": "email_send", "campaign_id": CAMPAIGN})),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(!sent.is_error, "{}", text_of(&sent));
+    assert_eq!(stub.calls_to("POST", &schedule).len(), 1);
+}
+
 #[tokio::test]
 async fn a_send_asks_the_person_when_the_client_can() {
     let stub = Stub::start(usual()).await;

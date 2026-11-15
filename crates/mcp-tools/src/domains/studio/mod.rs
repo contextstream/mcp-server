@@ -928,6 +928,17 @@ impl StudioTool {
             }
             None => None,
         };
+        // A go-ahead the agent passes is not the person's (crate::go_ahead): asked and accepted
+        // above, or nothing is made.
+        if asked.is_none() && crate::go_ahead::asked_only() {
+            return Ok(ToolResult::with_structured(
+                format!(
+                    "Not made: {}. Nothing was spent.",
+                    crate::go_ahead::NOT_ASKED
+                ),
+                json!({"made": false, "plan_id": quote_id, "go_ahead": "asked_only"}),
+            ));
+        }
         match (asked, input.accepted_price_credits) {
             (Some(true), _) => {}
             (Some(false), _) => {

@@ -322,6 +322,11 @@ pub struct ConfigOverride {
     /// what its film's accepted plan allows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_spend_credits: Option<u32>,
+    /// A go-ahead counts only when the person was asked through the client and said yes
+    /// (`X-ContextStream-Go-Ahead`; see `mcp_tools::go_ahead`): what the agent passes as the
+    /// person's go-ahead is not taken. ContextStudio's recording machines send it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub go_ahead_asked_only: Option<bool>,
 }
 
 impl ConfigOverride {
@@ -347,6 +352,7 @@ impl ConfigOverride {
             && self.slipstream_auto_accept_max_credits.is_none()
             && self.studio_rehearsal.is_none()
             && self.max_spend_credits.is_none()
+            && self.go_ahead_asked_only.is_none()
     }
 
     pub fn affects_tool_registry(&self) -> bool {

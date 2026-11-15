@@ -18,6 +18,7 @@
 pub mod atlas_flags;
 pub mod client_identity;
 pub mod domains;
+pub mod go_ahead;
 pub mod input_shape;
 pub mod notices;
 pub mod peer;

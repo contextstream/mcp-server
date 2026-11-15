@@ -181,6 +181,14 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
             .and_then(|value| value.trim().parse::<u32>().ok())
             .unwrap_or(0);
 
+    // The most one call may spend (mcp_tools::spend): unset, none; anything but a whole number
+    // of credits, 0.
+    let max_spend_credits = mcp_tools::spend::ceiling_from(
+        std::env::var(mcp_tools::spend::MAX_SPEND_ENV)
+            .ok()
+            .as_deref(),
+    );
+
     Ok(Config {
         api_url,
         api_key,
@@ -208,6 +216,7 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
         http_local_files,
         account_mode_preference,
         slipstream_auto_accept_max_credits,
+        max_spend_credits,
     })
 }
 

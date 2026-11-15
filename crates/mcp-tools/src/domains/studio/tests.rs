@@ -570,6 +570,70 @@ async fn make_spends_nothing_without_the_persons_go_ahead() {
     assert!(out.get("rehearsal").is_none());
 }
 
+/// A connection's spend ceiling (mcp_tools::spend): the studio makes nothing priced above it,
+/// whatever the agent accepts and before the person is asked; at or under it, as before.
+#[tokio::test]
+async fn a_connection_with_a_spend_ceiling_makes_nothing_priced_above_it() {
+    let stub = Stub::start(api(Arc::new(Mutex::new(("queued".into(), false))))).await;
+    let tool = stub.tool();
+    let with_ceiling = |most: u32| mcp_types::config::ConfigOverride {
+        max_spend_credits: Some(most),
+        ..Default::default()
+    };
+    // The plan costs up to 412 credits. A ceiling of 0 (every film that is not a making), and
+    // one just under the price: nothing is made, even with the price accepted.
+    for most in [0, 411] {
+        let refused = mcp_client::run_with_config_override(with_ceiling(most), || async {
+            tool.execute(json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 412}))
+                .await
+                .unwrap()
+        })
+        .await;
+        let text = text_of(&refused);
+        assert!(
+            text.starts_with(&format!(
+                "Not made: this connection may spend at most {most} credits"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("up to 412 credits") && text.contains("Nothing was spent"),
+            "{text}"
+        );
+        let out = structured(&refused);
+        assert_eq!(out["made"], false);
+        assert_eq!(out["max_spend_credits"], most);
+        assert_eq!(out["price_credits"], 412);
+        assert!(stub.posts_to("/create/jobs").is_empty(), "ceiling {most}");
+    }
+    // A client that can ask the person is not asked a price the connection may not spend.
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() =
+        Some(json!({"action": "accept", "content": {"confirm": true}}));
+    let not_asked = mcp_client::run_with_config_override(with_ceiling(0), || {
+        run_with_call_peer(
+            CallPeer::new(client.clone(), None, true),
+            tool.execute(json!({"action": "make", "plan_id": QUOTE})),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        text_of(&not_asked).starts_with("Not made: this connection may spend at most 0 credits")
+    );
+    assert!(client.sent.lock().unwrap().is_empty(), "nobody is asked");
+    assert!(stub.posts_to("/create/jobs").is_empty());
+    // At the price: made, as on a connection with no ceiling.
+    let made = mcp_client::run_with_config_override(with_ceiling(412), || async {
+        tool.execute(json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 412}))
+            .await
+            .unwrap()
+    })
+    .await;
+    assert!(!made.is_error, "{}", text_of(&made));
+    assert_eq!(stub.posts_to("/create/jobs").len(), 1);
+}
+
 #[tokio::test]
 async fn make_on_a_rehearsal_connection_is_a_create_rehearsal_and_says_so() {
     let stub = Stub::start(api(Arc::new(Mutex::new(("queued".into(), false))))).await;

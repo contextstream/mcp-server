@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- New: a connection can hold itself to a spend ceiling, the most one call may spend in credits, whatever the person or the agent accepts: `CONTEXTSTREAM_MAX_SPEND_CREDITS` for a local binary, the header `X-ContextStream-Max-Spend-Credits` on a hosted connection (the gateway never takes one from its own environment). Unset, there is none; set to anything but a whole number of credits, it is 0. With one, the studio's `make` makes nothing priced above it and does not ask the person a price it may not spend; an agent `run` priced above it, metered per model call (no price to hold it to) or automatic does not run. Each answers in plain words and nothing is charged. ContextStudio's recording machines set it on the MCP their recorded session uses: 0 for every film that is not a making, the accepted plan's own upper price for one that is, because a client that cannot show the studio's price form makes on the agent's own `accepted_price_credits`.
+
 ## 1.0.79
 
 - Fixed: `init` through the hosted server created an empty project for a fresh clone of a repository that already had one. A cloud runner names a clone `<owner>-<repo>` (`contextstream-contextcode`), the hosted server cannot read the folder, and no project is called that, so the folder matched nothing and a project named after it was created; the session then searched an empty index and saved to the wrong project. Three changes:

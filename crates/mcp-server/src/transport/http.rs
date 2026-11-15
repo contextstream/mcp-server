@@ -3416,6 +3416,11 @@ fn extract_config_override(headers: &HeaderMap) -> Option<ConfigOverride> {
         })
         .and_then(|value| value.trim().parse::<u32>().ok()),
         studio_rehearsal: parse_header_bool(headers, mcp_tools::domains::studio::REHEARSAL_HEADER),
+        // A ceiling the connection sets for itself: anything but a whole number of credits is 0.
+        max_spend_credits: mcp_tools::spend::ceiling_from(header_str(
+            headers,
+            mcp_tools::spend::MAX_SPEND_HEADER,
+        )),
     };
 
     if override_config.is_empty() {
@@ -6037,6 +6042,30 @@ mod tests {
                 Some(false),
                 "new acceleration header must take precedence over deprecated Atlas alias"
             );
+        }
+
+        #[test]
+        fn test_extract_config_override_reads_the_spend_ceiling_header_to_the_safe_side() {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-contextstream-search-limit", "25".parse().unwrap());
+            assert_eq!(
+                extract_config_override(&headers)
+                    .expect("config override")
+                    .max_spend_credits,
+                None,
+                "a normal connection sets no ceiling"
+            );
+            for (sent, ceiling) in [("30000", 30_000), ("0", 0), ("lots", 0), ("-5", 0), ("", 0)] {
+                let mut only = HeaderMap::new();
+                only.insert("X-ContextStream-Max-Spend-Credits", sent.parse().unwrap());
+                assert_eq!(
+                    extract_config_override(&only)
+                        .expect("the header alone is an override")
+                        .max_spend_credits,
+                    Some(ceiling),
+                    "{sent:?}"
+                );
+            }
         }
 
         #[test]

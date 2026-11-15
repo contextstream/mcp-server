@@ -24,6 +24,7 @@ pub mod peer;
 pub mod portable_schema;
 pub mod registry;
 pub mod schema;
+pub mod spend;
 pub mod wire_tokens;
 
 #[cfg(test)]

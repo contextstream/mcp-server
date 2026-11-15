@@ -308,6 +308,27 @@ impl SlipstreamTool {
         let prepared = catalog::prepare_input(entry, task_input, Some(project_id))
             .map_err(Error::Validation)?;
 
+        // The connection's own ceiling (crate::spend) bounds the run whatever is accepted: a price
+        // above it, or none to hold it to (metered per model call), and nothing runs.
+        if let Some(most) = self.client.config().await.max_spend_credits {
+            let over = match entry.price_credits {
+                Some(price) if price <= 0 => false,
+                Some(price) => price > i64::from(most),
+                None => true,
+            };
+            if over {
+                return Ok(ToolResult::with_structured(
+                    format!(
+                        "Not run: this connection may spend at most {most} credits on one run, and {} ({}) costs {}. Nothing was charged.",
+                        entry.id,
+                        entry.name,
+                        entry.price_label()
+                    ),
+                    json!({"ran": false, "agent": entry.id, "price_credits": entry.price_credits, "max_spend_credits": most}),
+                ));
+            }
+        }
+
         // The price: accepted by the person, or under their auto-accept cap.
         let cap = self.auto_accept_max_credits().await;
         let mut notes = prepared.notes.clone();
@@ -454,6 +475,16 @@ impl SlipstreamTool {
                 json!({"ran": false, "automatic": true, "agent": agent}),
             )
         };
+        // A connection with a spend ceiling (crate::spend) takes no automatic run: its price is
+        // the workspace setting's, not one this connection was asked to hold.
+        if let Some(most) = self.client.config().await.max_spend_credits {
+            return Ok(ToolResult::with_structured(
+                format!(
+                    "Not run: this connection may spend at most {most} credits, and it takes no automatic run. Nothing was charged."
+                ),
+                json!({"ran": false, "automatic": true, "agent": agent, "max_spend_credits": most}),
+            ));
+        }
         let Some(caller) = caller_identity(&self.client).await else {
             return Ok(not_run(
                 "automatic runs need a signed-in caller.".to_string(),

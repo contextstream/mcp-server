@@ -1,6 +1,9 @@
 //! UserPromptSubmit hook handler.
 //!
 //! Injects ContextStream context (preferences, lessons, rules) on every user message.
+//! In Claude Code and Codex a session gets the standing part of it once per
+//! window (`CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS`, default 600; `0` repeats
+//! it with every prompt): see `mid_run_notices::throttle_prompt_standing_text`.
 //!
 //! PERFORMANCE: Fast path via /api/v1/context/hook (~20-50ms, Redis-cached).
 //! Falls back to a static reminder if the API is unreachable.
@@ -233,17 +236,35 @@ fn write_editor_output(
     Ok(())
 }
 
+/// The whole prompt context, nothing left out.
+#[cfg(test)]
 fn build_context_message(editor: EditorFormat, base_context: String, input: &Value) -> String {
+    build_context_message_with(editor, base_context, input, |standing| standing)
+}
+
+/// The prompt context in two parts. The standing part (workflow block, hook
+/// context or fallback reminder, lifecycle note) is what every prompt of a
+/// session would repeat, and goes through `standing_filter`. The guidance
+/// chosen from this prompt's own words (save, handoff, resume) follows it and
+/// is never filtered.
+fn build_context_message_with(
+    editor: EditorFormat,
+    base_context: String,
+    input: &Value,
+    standing_filter: impl FnOnce(String) -> String,
+) -> String {
     let core = build_harness_teaching(
         Some(editor.harness_id()),
         HarnessTeachingDelivery::HookReminder,
     )
     .rendered_guidance;
-    let mut context_parts = vec![core, base_context];
+    let mut standing_parts = vec![core, base_context];
 
     if !matches!(editor, EditorFormat::Claude) {
-        context_parts.push(MISSING_LIFECYCLE_COMPENSATION.to_string());
+        standing_parts.push(MISSING_LIFECYCLE_COMPENSATION.to_string());
     }
+
+    let mut context_parts = vec![standing_filter(standing_parts.join("\n\n"))];
 
     if let Some(save_guidance) = save_intent::guidance_for_input(input) {
         context_parts.push(save_guidance);
@@ -537,7 +558,17 @@ pub async fn handle() -> Result<()> {
         contextagents_fut,
     );
 
-    let mut combined = build_context_message(editor, context, &input);
+    // Standing text goes to a session once per window, not with every prompt.
+    // Only for the Claude Code and Codex format: both run the session-start
+    // hook that makes the next prompt full again after a compaction. Editors
+    // without that hook keep getting everything with every prompt.
+    let mut combined = build_context_message_with(editor, context, &input, |standing| {
+        if matches!(editor, EditorFormat::Claude) {
+            super::mid_run_notices::throttle_prompt_standing_text(&input, &cwd, standing)
+        } else {
+            standing
+        }
+    });
     // Indexing paused because the account is out of credits: told once.
     let credit_notice = super::credit_notice::take(&cwd);
     if let Some(hold) = credit_notice.as_ref() {
@@ -1016,6 +1047,37 @@ mod tests {
         });
         let message = build_context_message(EditorFormat::Claude, "base".to_string(), &input);
         assert!(message.contains("[CONTEXTSTREAM DOCUMENT STORAGE]"));
+    }
+
+    #[test]
+    fn the_standing_filter_never_sees_guidance_chosen_from_the_prompt() {
+        let input = serde_json::json!({
+            "prompt": "Please save this decision for future reference."
+        });
+        let mut seen = String::new();
+        let message =
+            build_context_message_with(EditorFormat::Claude, "base".to_string(), &input, |text| {
+                seen = text;
+                "[FILTERED]".to_string()
+            });
+        // The filter gets the workflow block and the hook context, nothing else.
+        assert!(seen.starts_with("[CONTEXTSTREAM WORKFLOW "));
+        assert!(seen.ends_with("\n\nbase"));
+        assert!(!seen.contains("CONTEXTSTREAM DOCUMENT STORAGE"));
+        // Whatever it returns, the prompt's own guidance follows.
+        assert!(message.starts_with("[FILTERED]\n\n"));
+        assert!(message.contains("CONTEXTSTREAM DOCUMENT STORAGE"));
+
+        // With nothing filtered the message is the one every prompt got before.
+        assert_eq!(
+            build_context_message_with(EditorFormat::Claude, "base".to_string(), &input, |text| {
+                text
+            }),
+            format!(
+                "{seen}\n\n{}",
+                save_intent::guidance_for_input(&input).unwrap()
+            )
+        );
     }
 
     #[test]

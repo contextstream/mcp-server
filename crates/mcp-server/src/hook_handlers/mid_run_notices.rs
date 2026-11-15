@@ -19,11 +19,18 @@
 //!   project made for the scratch folder.
 //!
 //! `CONTEXTSTREAM_MID_RUN_NOTICES=0` turns delivery off.
+//!
+//! The same state file also holds what the prompt hook needs to show its
+//! standing text once per window instead of with every prompt (see
+//! [`throttle_prompt_standing_text`]). That part does not depend on the switch
+//! above: its own switch is `CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS` (`0`
+//! repeats everything with every prompt).
 
 use chrono::Utc;
 use mcp_session::auto_init::checkout_binding_workspace;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -43,6 +50,16 @@ const MAX_DELIVERED_IDS: usize = 256;
 const MAX_SEEN_STATIC_LINES: usize = 256;
 /// Notices waiting for the next hook; older ones give way to newer.
 const MAX_PENDING_NOTICES: usize = 16;
+/// How long the prompt hook leaves out standing lines it already showed.
+const DEFAULT_STANDING_REPEAT_SECS: u64 = 600;
+/// A session's state file is removed after `MAX_SESSION_AGE`, so no window
+/// outlives it.
+const MAX_STANDING_REPEAT_SECS: u64 = 24 * 60 * 60;
+/// Standing lines remembered per window. Past this the oldest are forgotten,
+/// and a forgotten line is simply shown again.
+const MAX_STANDING_LINE_HASHES: usize = 256;
+/// Notice ids the prompt hook's one-line count spells out; the rest are counted.
+const MAX_LISTED_UNACKED_NOTICES: usize = 5;
 /// The background poll is off the hook's path, so it can wait for a slow API.
 const POLL_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const ACK_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -68,6 +85,20 @@ pub(crate) struct MidRunSessionState {
     /// Rendered notices fetched by a background poll, waiting for a hook.
     #[serde(default)]
     pub pending: Vec<String>,
+    /// When the prompt hook last delivered its standing text in full. Zero:
+    /// the next prompt is delivered in full (a new session, or one whose
+    /// context was just compacted).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub standing_window_started_unix_ms: u64,
+    /// Short hashes of the standing lines the prompt hook delivered in this
+    /// window (at most `MAX_STANDING_LINE_HASHES`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub standing_line_hashes: Vec<String>,
+    /// `[COORDINATION]` notices the prompt hook printed in this window, by
+    /// notice id (`id:<id>`) and by item (`item:<uuid>`); at most
+    /// `MAX_DELIVERED_IDS`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub standing_notice_tokens: Vec<String>,
     /// The folder the hooks ran in, which the MCP server compares with its
     /// own to tell whether hooks deliver notices for its session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,6 +122,10 @@ pub(crate) struct ResolvedHookScope {
     pub agent_name: Option<String>,
     pub coordination_session_id: Option<String>,
     pub host_session_id: Option<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn sessions_dir() -> Option<PathBuf> {
@@ -831,6 +866,388 @@ pub(crate) fn record_prompt_delivery(input: &Value, cwd: &str, context_text: &st
                 );
             }
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Prompt hook: standing text once per window
+// ---------------------------------------------------------------------------
+
+/// The window in milliseconds, from `CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS`
+/// (default 600). Zero turns the throttle off: every prompt gets everything.
+pub(crate) fn standing_repeat_ms() -> u64 {
+    std::env::var("CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|secs| secs.min(MAX_STANDING_REPEAT_SECS))
+        .unwrap_or(DEFAULT_STANDING_REPEAT_SECS)
+        * 1_000
+}
+
+/// True when `line` opens a block of hook text: `[PREFERENCE] ...`, and also
+/// `[CONTEXTSTREAM WORKFLOW harness_teaching_v4]`, whose name `starts_with_tag`
+/// does not take.
+fn opens_standing_block(line: &str) -> bool {
+    line.strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .is_some_and(|(tag, _)| {
+            tag.len() <= 64
+                && tag.starts_with(|c: char| c.is_ascii_uppercase())
+                && tag
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '-' | '.'))
+        })
+}
+
+/// Blocks the prompt hook never leaves out: they are about this prompt, or
+/// the API hands them out once.
+fn is_per_prompt_block(header: &str) -> bool {
+    header.starts_with("[INSTRUCT]") || header.starts_with("[CONTEXTSTREAM_NOTICE]")
+}
+
+/// The `item=<uuid>` a `[COORDINATION]` notice names: the same item can come
+/// back under a new notice id.
+fn extract_notice_item_from_line(line: &str) -> Option<String> {
+    let marker = "item=";
+    let start = line.find(marker)? + marker.len();
+    let candidate = line.get(start..start + 36)?;
+    Uuid::parse_str(candidate).ok().map(|item| item.to_string())
+}
+
+/// What a standing line is remembered by: the trimmed line and, for a line
+/// without a tag of its own, the header it stands under.
+fn standing_line_hash(header: &str, line: &str) -> String {
+    let mut hash = sha256_hex(format!("{}\n{}", header.trim(), line.trim()).as_bytes());
+    hash.truncate(16);
+    hash
+}
+
+/// A header line (or none, for text before any header) and the untagged lines
+/// under it, up to the next header or blank line.
+struct StandingBlock<'a> {
+    header: Option<&'a str>,
+    lines: Vec<&'a str>,
+    /// A blank line separated this block from the one before it.
+    after_blank: bool,
+    /// Lines from `<name>` to `</name>` (the API wraps critical alerts in
+    /// `<system-reminder>`): delivered whole or not at all, so a closing tag
+    /// never goes out without its opening one.
+    wrapped: bool,
+}
+
+/// The name in a line that is exactly `<name>`.
+fn wrapper_open_name(line: &str) -> Option<&str> {
+    let name = line.strip_prefix('<')?.strip_suffix('>')?;
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+    .then_some(name)
+}
+
+fn standing_blocks(text: &str) -> Vec<StandingBlock<'_>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut blocks: Vec<StandingBlock<'_>> = Vec::new();
+    let mut open = false;
+    let mut after_blank = false;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim();
+        index += 1;
+        if trimmed.is_empty() {
+            open = false;
+            after_blank = true;
+            continue;
+        }
+        let wrapped_end = wrapper_open_name(trimmed).and_then(|name| {
+            let close = format!("</{name}>");
+            lines[index..]
+                .iter()
+                .position(|later| later.trim() == close)
+                .map(|offset| index + offset)
+        });
+        if let Some(end) = wrapped_end {
+            blocks.push(StandingBlock {
+                header: None,
+                lines: lines[index - 1..=end].to_vec(),
+                after_blank,
+                wrapped: true,
+            });
+            index = end + 1;
+            open = false;
+            after_blank = false;
+        } else if opens_standing_block(trimmed) {
+            blocks.push(StandingBlock {
+                header: Some(line),
+                lines: Vec::new(),
+                after_blank,
+                wrapped: false,
+            });
+            open = true;
+            after_blank = false;
+        } else if let Some(block) = blocks.last_mut().filter(|_| open) {
+            block.lines.push(line);
+        } else {
+            blocks.push(StandingBlock {
+                header: None,
+                lines: vec![line],
+                after_blank,
+                wrapped: false,
+            });
+            open = true;
+            after_blank = false;
+        }
+    }
+    blocks
+}
+
+/// The tokens a `[COORDINATION]` block is remembered by, and its notice id.
+fn coordination_tokens(block: &StandingBlock<'_>) -> (Vec<String>, Option<String>) {
+    let mut joined = block.header.unwrap_or_default().trim().to_string();
+    for line in &block.lines {
+        joined.push(' ');
+        joined.push_str(line.trim());
+    }
+    let notice_id = extract_notice_id_from_line(&joined);
+    let mut tokens: Vec<String> = Vec::new();
+    if let Some(id) = notice_id.as_deref() {
+        tokens.push(format!("id:{id}"));
+    }
+    if let Some(item) = extract_notice_item_from_line(&joined) {
+        tokens.push(format!("item:{item}"));
+    }
+    if tokens.is_empty() {
+        tokens.push(format!("text:{}", sha256_hex(joined.as_bytes())));
+    }
+    (tokens, notice_id)
+}
+
+fn push_standing_block<'a>(out: &mut Vec<&'a str>, after_blank: bool, lines: &[&'a str]) {
+    if lines.is_empty() {
+        return;
+    }
+    if after_blank && !out.is_empty() {
+        out.push("");
+    }
+    out.extend_from_slice(lines);
+}
+
+/// One line for the notices left out: how many, and how to act on them.
+fn unacknowledged_notices_line(count: usize, ids: &[String]) -> String {
+    let (noun, verb) = if count == 1 {
+        ("notice", "is")
+    } else {
+        ("notices", "are")
+    };
+    let mut line =
+        format!("[COORDINATION] {count} {noun} shown earlier {verb} still unacknowledged: ");
+    let listed: Vec<&String> = ids.iter().take(MAX_LISTED_UNACKED_NOTICES).collect();
+    if let Some((first, rest)) = listed.split_first() {
+        line.push_str(&format!(
+            "ack via coordination(action=\"ack\", notice_id=\"{first}\")"
+        ));
+        for id in rest {
+            line.push_str(&format!(" / \"{id}\""));
+        }
+        line.push_str(", or read coordination(action=\"inbox\").");
+    } else {
+        line.push_str("read coordination(action=\"inbox\").");
+    }
+    line
+}
+
+/// What the prompt hook shows of its standing text (workflow block, hook
+/// context, lifecycle note) for one prompt, and what it remembers of it.
+///
+/// - No window open (first prompt of a session, a reset, or `window_ms` since
+///   the last full delivery): `text` is returned as it is and a window starts.
+/// - Inside a window: a line already delivered in it is left out, by equality
+///   of the trimmed line (not by its tag). A line that is new is delivered; a
+///   new line without a tag of its own (a numbered step, a `- ` bullet) comes
+///   with its header, and a new header comes with its whole block. One line
+///   says how much was left out and when it was shown.
+/// - A `[COORDINATION]` notice is printed once per window, by notice id or by
+///   the item it names; after that one line counts the notices still coming
+///   back and names their ids. Nothing is acknowledged here.
+/// - `[INSTRUCT]` and `[CONTEXTSTREAM_NOTICE]` blocks are always delivered.
+///
+/// The memory is bounded: `MAX_STANDING_LINE_HASHES` lines and
+/// `MAX_DELIVERED_IDS` notice tokens per window, the oldest giving way (what
+/// is forgotten is shown again), and the state file itself is removed after
+/// `MAX_SESSION_AGE` without a hook call, after which the next prompt is full.
+pub(crate) fn filter_standing_text(
+    entry: &mut MidRunSessionState,
+    text: &str,
+    now_ms: u64,
+    window_ms: u64,
+) -> String {
+    let started = entry.standing_window_started_unix_ms;
+    let window_open = started != 0 && now_ms >= started && now_ms - started < window_ms;
+    let blocks = standing_blocks(text);
+    if !window_open {
+        entry.standing_window_started_unix_ms = now_ms;
+        entry.standing_line_hashes.clear();
+        entry.standing_notice_tokens.clear();
+    }
+    // What was delivered before this prompt: a line this text holds twice is
+    // judged the same way both times.
+    let seen_lines: HashSet<String> = entry.standing_line_hashes.iter().cloned().collect();
+    let seen_notices: HashSet<String> = entry.standing_notice_tokens.iter().cloned().collect();
+
+    let mut out: Vec<&str> = Vec::new();
+    let mut omitted_lines = 0usize;
+    let mut unacked_count = 0usize;
+    let mut unacked_ids: Vec<String> = Vec::new();
+
+    for block in &blocks {
+        let header = block.header.unwrap_or_default();
+        let whole: Vec<&str> = block
+            .header
+            .iter()
+            .copied()
+            .chain(block.lines.iter().copied())
+            .collect();
+
+        if is_per_prompt_block(header.trim()) {
+            push_standing_block(&mut out, block.after_blank, &whole);
+            continue;
+        }
+
+        if header.trim().starts_with("[COORDINATION]") {
+            let (tokens, notice_id) = coordination_tokens(block);
+            let shown = tokens.iter().any(|token| seen_notices.contains(token));
+            for token in tokens {
+                push_bounded(&mut entry.standing_notice_tokens, token, MAX_DELIVERED_IDS);
+            }
+            if shown {
+                unacked_count += 1;
+                if let Some(id) = notice_id.filter(|id| !unacked_ids.contains(id)) {
+                    unacked_ids.push(id);
+                }
+            } else {
+                push_standing_block(&mut out, block.after_blank, &whole);
+            }
+            continue;
+        }
+
+        if block.wrapped {
+            let region: Vec<&str> = block.lines.iter().map(|line| line.trim()).collect();
+            let hash = standing_line_hash("", &region.join("\n"));
+            if seen_lines.contains(&hash) {
+                omitted_lines += whole.len();
+            } else {
+                push_standing_block(&mut out, block.after_blank, &whole);
+            }
+            push_bounded(
+                &mut entry.standing_line_hashes,
+                hash,
+                MAX_STANDING_LINE_HASHES,
+            );
+            continue;
+        }
+
+        let header_hash = block.header.map(|line| standing_line_hash("", line));
+        let header_is_new = header_hash
+            .as_ref()
+            .is_some_and(|hash| !seen_lines.contains(hash));
+        let line_hashes: Vec<String> = block
+            .lines
+            .iter()
+            .map(|line| standing_line_hash(header, line))
+            .collect();
+        let mut keep: Vec<&str> = Vec::new();
+        if header_is_new {
+            // A header not shown yet brings its whole block.
+            keep = whole;
+        } else {
+            let new_lines: Vec<&str> = block
+                .lines
+                .iter()
+                .zip(&line_hashes)
+                .filter(|(_, hash)| !seen_lines.contains(*hash))
+                .map(|(line, _)| *line)
+                .collect();
+            if !new_lines.is_empty() {
+                keep.extend(block.header);
+                keep.extend(new_lines);
+            }
+            omitted_lines += whole.len() - keep.len();
+        }
+        for hash in header_hash.into_iter().chain(line_hashes) {
+            push_bounded(
+                &mut entry.standing_line_hashes,
+                hash,
+                MAX_STANDING_LINE_HASHES,
+            );
+        }
+        push_standing_block(&mut out, block.after_blank, &keep);
+    }
+
+    if omitted_lines == 0 && unacked_count == 0 {
+        // Nothing was left out: the text goes out byte for byte.
+        return text.to_string();
+    }
+
+    let mut rendered: Vec<String> = Vec::new();
+    if omitted_lines > 0 {
+        let lines = if omitted_lines == 1 { "line" } else { "lines" };
+        let minutes = now_ms.saturating_sub(started) / 60_000;
+        let ago = if minutes == 0 {
+            "under a minute ago".to_string()
+        } else {
+            format!("{minutes} min ago")
+        };
+        rendered.push(format!(
+            "[CONTEXTSTREAM] Standing guidance ({omitted_lines} {lines}) was shown {ago} and still applies."
+        ));
+    }
+    rendered.extend(out.into_iter().map(str::to_string));
+    if unacked_count > 0 {
+        rendered.push(unacknowledged_notices_line(unacked_count, &unacked_ids));
+    }
+    rendered.join("\n")
+}
+
+/// The standing text of a prompt hook's answer, with what this session was
+/// already shown in the current window left out (see [`filter_standing_text`]).
+///
+/// The text comes back unchanged when the throttle is off
+/// (`CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS=0`), when the payload names no
+/// session (the state would be keyed by folder, which several sessions share),
+/// and whenever the state cannot be locked, read or written: a failure never
+/// costs the session its guidance. `CONTEXTSTREAM_MID_RUN_NOTICES=0` does not
+/// turn this off.
+pub(crate) fn throttle_prompt_standing_text(input: &Value, cwd: &str, text: String) -> String {
+    let window_ms = standing_repeat_ms();
+    if window_ms == 0 || common::host_session_key(input).is_none() {
+        return text;
+    }
+    let key = session_state_key(input, cwd);
+    let now_ms = now_unix_ms();
+    let filtered = update_session_entry(&key, |entry| {
+        filter_standing_text(entry, &text, now_ms, window_ms)
+    });
+    filtered.unwrap_or(text)
+}
+
+/// Forget what the prompt hook showed this session, so its next prompt is
+/// delivered in full. Called when a session starts, resumes or comes back from
+/// a compaction: what was shown earlier is no longer in the model's view.
+pub(crate) fn reset_prompt_standing_window(input: &Value, cwd: &str) {
+    if common::host_session_key(input).is_none() {
+        return;
+    }
+    let key = session_state_key(input, cwd);
+    // A session no prompt hook has throttled has nothing to forget.
+    if read_session_entry_fast(&key).is_none_or(|entry| entry.standing_window_started_unix_ms == 0)
+    {
+        return;
+    }
+    let _ = update_session_entry(&key, |entry| {
+        entry.standing_window_started_unix_ms = 0;
+        entry.standing_line_hashes.clear();
+        entry.standing_notice_tokens.clear();
     });
 }
 
@@ -1686,5 +2103,389 @@ mod tests {
         assert!(session_path(&"a".repeat(64)).is_some());
         assert!(session_path("../../etc/passwd").is_none());
         assert!(session_path(&"g".repeat(64)).is_none());
+    }
+
+    // --- Prompt hook: standing text once per window ---
+
+    const WINDOW_MS: u64 = 600_000;
+    const T0: u64 = 1_800_000_000_000;
+
+    /// A prompt hook answer of the shape the API sends, with synthetic text:
+    /// workflow header and six numbered steps, a blank line, then the tagged
+    /// lines, a coaching block and the coordination notices.
+    struct HookText {
+        preferences: Vec<String>,
+        decisions: Vec<String>,
+        coaching: Vec<String>,
+        notices: Vec<String>,
+    }
+
+    impl HookText {
+        fn new() -> Self {
+            Self {
+                preferences: (1..=5)
+                    .map(|n| format!("[PREFERENCE] style: rule_{n}: {{\"value\":\"choice {n}\"}}"))
+                    .collect(),
+                decisions: (1..=3)
+                    .map(|n| format!("[DECISION] (today old) Decision number {n}"))
+                    .collect(),
+                coaching: (1..=5).map(|n| format!("- Coached rule {n}")).collect(),
+                notices: Vec::new(),
+            }
+        }
+
+        fn render(&self) -> String {
+            let mut lines: Vec<String> =
+                vec!["[CONTEXTSTREAM WORKFLOW harness_teaching_v4]".to_string()];
+            lines.extend((1..=6).map(|n| format!("{n}) Step {n} — `tool_{n}(...)`")));
+            lines.push(String::new());
+            lines.push("[CONTEXTSTREAM] Default: call context(user_message=\"...\") first.".into());
+            lines.extend(self.preferences.iter().cloned());
+            lines.extend((1..=5).map(|n| format!("[LESSONS_WARNING] Lesson {n} — what to do")));
+            lines.extend(self.decisions.iter().cloned());
+            lines.push("[HOOK CONTEXT] Reuse the same session_id across turns.".into());
+            if !self.coaching.is_empty() {
+                lines.push(COACHING_HEADER.to_string());
+                lines.extend(self.coaching.iter().cloned());
+            }
+            lines.extend(self.notices.iter().cloned());
+            lines.join("\n")
+        }
+    }
+
+    const COACHING_HEADER: &str =
+        "[COACHING] You have corrected the agent on these before — do NOT repeat them:";
+    const ITEM_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const NOTICE_A1: &str = "10101010-1010-4010-8010-101010101010";
+    const NOTICE_A2: &str = "20202020-2020-4020-8020-202020202020";
+    const ITEM_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const NOTICE_B1: &str = "30303030-3030-4030-8030-303030303030";
+
+    fn notice(item: &str, notice_id: &str, text: &str) -> String {
+        format!(
+            "[COORDINATION] (info) from Acme/widgets: item={item} {text} — ack via coordination(action=\"ack\", notice_id=\"{notice_id}\") or reply via coordination(action=\"reply\", notice_id=\"{notice_id}\", message=\"...\")"
+        )
+    }
+
+    fn note(lines: usize, ago: &str) -> String {
+        format!(
+            "[CONTEXTSTREAM] Standing guidance ({lines} lines) was shown {ago} and still applies."
+        )
+    }
+
+    fn line_count(text: &str) -> usize {
+        text.lines().filter(|line| !line.trim().is_empty()).count()
+    }
+
+    #[test]
+    fn the_first_prompt_is_full_and_the_next_in_the_window_is_one_line() {
+        let mut state = MidRunSessionState::default();
+        let text = HookText::new().render();
+        assert_eq!(filter_standing_text(&mut state, &text, T0, WINDOW_MS), text);
+        assert_eq!(state.standing_window_started_unix_ms, T0);
+
+        let second = filter_standing_text(&mut state, &text, T0 + 20_000, WINDOW_MS);
+        assert_eq!(second, note(line_count(&text), "under a minute ago"));
+        let later = filter_standing_text(&mut state, &text, T0 + 599_999, WINDOW_MS);
+        assert_eq!(later, note(line_count(&text), "9 min ago"));
+        // The window counts from the full delivery, not from the last prompt.
+        assert_eq!(state.standing_window_started_unix_ms, T0);
+    }
+
+    #[test]
+    fn after_the_window_the_prompt_is_full_again_and_a_new_window_starts() {
+        let mut state = MidRunSessionState::default();
+        let mut text = HookText::new();
+        text.notices
+            .push(notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed."));
+        let text = text.render();
+        assert_eq!(filter_standing_text(&mut state, &text, T0, WINDOW_MS), text);
+        assert_ne!(
+            filter_standing_text(&mut state, &text, T0 + 1, WINDOW_MS),
+            text
+        );
+
+        let expired = T0 + WINDOW_MS;
+        assert_eq!(
+            filter_standing_text(&mut state, &text, expired, WINDOW_MS),
+            text
+        );
+        assert_eq!(state.standing_window_started_unix_ms, expired);
+        assert_ne!(
+            filter_standing_text(&mut state, &text, expired + 1, WINDOW_MS),
+            text
+        );
+
+        // A clock that went backwards never keeps guidance from a session.
+        assert_eq!(
+            filter_standing_text(&mut state, &text, T0 - 5, WINDOW_MS),
+            text
+        );
+    }
+
+    #[test]
+    fn a_new_line_in_the_window_is_delivered_alone_with_the_note() {
+        let mut state = MidRunSessionState::default();
+        let mut text = HookText::new();
+        let first = text.render();
+        filter_standing_text(&mut state, &first, T0, WINDOW_MS);
+
+        // A new decision pushes the oldest of the three out.
+        text.decisions.remove(2);
+        text.decisions
+            .insert(0, "[DECISION] (today old) A decision made just now".into());
+        let second = filter_standing_text(&mut state, &text.render(), T0 + 120_000, WINDOW_MS);
+        assert_eq!(
+            second,
+            format!(
+                "{}\n[DECISION] (today old) A decision made just now",
+                note(line_count(&first) - 1, "2 min ago")
+            )
+        );
+
+        // A preference set that changed: only the preference that is new.
+        text.preferences[1] = "[PREFERENCE] style: rule_2: {\"value\":\"changed\"}".into();
+        let third = filter_standing_text(&mut state, &text.render(), T0 + 180_000, WINDOW_MS);
+        assert_eq!(
+            third,
+            format!(
+                "{}\n[PREFERENCE] style: rule_2: {{\"value\":\"changed\"}}",
+                note(line_count(&first) - 1, "3 min ago")
+            )
+        );
+
+        // The decision that was pushed out and comes back was shown already.
+        let fourth = filter_standing_text(&mut state, &first, T0 + 240_000, WINDOW_MS);
+        assert_eq!(fourth, note(line_count(&first), "4 min ago"));
+    }
+
+    #[test]
+    fn a_line_without_a_tag_of_its_own_comes_with_its_header() {
+        let mut state = MidRunSessionState::default();
+        let mut text = HookText::new();
+        let bullets = std::mem::take(&mut text.coaching);
+        let without_coaching = text.render();
+        filter_standing_text(&mut state, &without_coaching, T0, WINDOW_MS);
+
+        // The coaching block appears inside the window: header and bullets.
+        text.coaching = bullets.clone();
+        let appeared = filter_standing_text(&mut state, &text.render(), T0 + 60_000, WINDOW_MS);
+        assert_eq!(
+            appeared,
+            format!(
+                "{}\n{COACHING_HEADER}\n{}",
+                note(line_count(&without_coaching), "1 min ago"),
+                bullets.join("\n")
+            )
+        );
+
+        // A new bullet under the header that was shown brings the header.
+        text.coaching.push("- A rule learned a moment ago".into());
+        let grown = filter_standing_text(&mut state, &text.render(), T0 + 61_000, WINDOW_MS);
+        assert_eq!(
+            grown,
+            format!(
+                "{}\n{COACHING_HEADER}\n- A rule learned a moment ago",
+                note(line_count(&without_coaching) + bullets.len(), "1 min ago")
+            )
+        );
+
+        // The same words under another header are another line.
+        let moved = format!("{}\n[OTHER RULES] Also:\n- Coached rule 1", text.render());
+        let moved = filter_standing_text(&mut state, &moved, T0 + 62_000, WINDOW_MS);
+        assert!(moved.ends_with("\n[OTHER RULES] Also:\n- Coached rule 1"));
+    }
+
+    #[test]
+    fn a_coordination_notice_is_printed_once_then_counted_with_its_id() {
+        let mut state = MidRunSessionState::default();
+        let mut text = HookText::new();
+        let standing = line_count(&text.render());
+        let notice_a = notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed.");
+        text.notices.push(notice_a.clone());
+        let first = filter_standing_text(&mut state, &text.render(), T0, WINDOW_MS);
+        assert!(first.ends_with(&notice_a));
+
+        // Still unacknowledged on the next prompt: counted, with the id to ack.
+        let second = filter_standing_text(&mut state, &text.render(), T0 + 1_000, WINDOW_MS);
+        assert_eq!(
+            second,
+            format!(
+                "{}\n[COORDINATION] 1 notice shown earlier is still unacknowledged: ack via coordination(action=\"ack\", notice_id=\"{NOTICE_A1}\"), or read coordination(action=\"inbox\").",
+                note(standing, "under a minute ago")
+            )
+        );
+        assert!(!second.contains("Migration 12"));
+
+        // A second notice arrives: printed in full, the first one counted.
+        let notice_b = notice(ITEM_B, NOTICE_B1, "Both sessions edit the importer.");
+        text.notices.push(notice_b.clone());
+        let third = filter_standing_text(&mut state, &text.render(), T0 + 2_000, WINDOW_MS);
+        assert_eq!(
+            third,
+            format!(
+                "{}\n{notice_b}\n[COORDINATION] 1 notice shown earlier is still unacknowledged: ack via coordination(action=\"ack\", notice_id=\"{NOTICE_A1}\"), or read coordination(action=\"inbox\").",
+                note(standing, "under a minute ago")
+            )
+        );
+
+        // The same item under a new notice id is not printed again, and the
+        // count names the id that acknowledges it now.
+        text.notices[0] = notice(ITEM_A, NOTICE_A2, "Migration 12 is claimed.");
+        let fourth = filter_standing_text(&mut state, &text.render(), T0 + 3_000, WINDOW_MS);
+        assert_eq!(
+            fourth,
+            format!(
+                "{}\n[COORDINATION] 2 notices shown earlier are still unacknowledged: ack via coordination(action=\"ack\", notice_id=\"{NOTICE_A2}\") / \"{NOTICE_B1}\", or read coordination(action=\"inbox\").",
+                note(standing, "under a minute ago")
+            )
+        );
+
+        // Acknowledged: the API stops sending them and the count goes.
+        text.notices.clear();
+        let fifth = filter_standing_text(&mut state, &text.render(), T0 + 4_000, WINDOW_MS);
+        assert_eq!(fifth, note(standing, "under a minute ago"));
+    }
+
+    #[test]
+    fn a_notice_without_an_id_or_an_item_is_printed_once_by_its_text() {
+        let mut state = MidRunSessionState::default();
+        let text = "[CONTEXTSTREAM] Default.\n[COORDINATION] (info) from Acme: the staging box is\nbeing rebuilt until noon.";
+        assert_eq!(filter_standing_text(&mut state, text, T0, WINDOW_MS), text);
+        assert_eq!(
+            filter_standing_text(&mut state, text, T0 + 1, WINDOW_MS),
+            "[CONTEXTSTREAM] Standing guidance (1 line) was shown under a minute ago and still applies.\n[COORDINATION] 1 notice shown earlier is still unacknowledged: read coordination(action=\"inbox\")."
+        );
+    }
+
+    #[test]
+    fn instruct_entries_and_the_credit_notice_are_delivered_with_every_prompt() {
+        let mut state = MidRunSessionState::default();
+        let text = format!(
+            "{}\n[INSTRUCT] Answer in French\nuntil told otherwise.\n[CONTEXTSTREAM_NOTICE] Indexing is paused.",
+            HookText::new().render()
+        );
+        filter_standing_text(&mut state, &text, T0, WINDOW_MS);
+        let second = filter_standing_text(&mut state, &text, T0 + 1_000, WINDOW_MS);
+        assert_eq!(
+            second,
+            format!(
+                "{}\n[INSTRUCT] Answer in French\nuntil told otherwise.\n[CONTEXTSTREAM_NOTICE] Indexing is paused.",
+                note(line_count(&text) - 3, "under a minute ago")
+            )
+        );
+        assert!(state.standing_line_hashes.len() == line_count(&text) - 3);
+    }
+
+    #[test]
+    fn a_block_that_is_new_in_the_window_is_delivered_whole_then_left_out() {
+        let mut state = MidRunSessionState::default();
+        let api_text = HookText::new().render();
+        filter_standing_text(&mut state, &api_text, T0, WINDOW_MS);
+
+        // The API stops answering: the static reminder takes the hook
+        // context's place. Its first delivery is whole.
+        let workflow: String = api_text.lines().take(7).collect::<Vec<_>>().join("\n");
+        let reminder = "[CONTEXTSTREAM EXTENDED GUIDANCE]\nAUTO-GROUNDING: read `[GROUNDING]` first.\nRESUME: call session(action=\"resume\").\n[END]";
+        let offline = format!("{workflow}\n\n{reminder}");
+        let first = filter_standing_text(&mut state, &offline, T0 + 1_000, WINDOW_MS);
+        assert_eq!(
+            first,
+            format!("{}\n{reminder}", note(7, "under a minute ago"))
+        );
+        let second = filter_standing_text(&mut state, &offline, T0 + 2_000, WINDOW_MS);
+        assert_eq!(second, note(11, "under a minute ago"));
+    }
+
+    #[test]
+    fn a_wrapped_alert_block_goes_out_whole_or_not_at_all() {
+        let mut state = MidRunSessionState::default();
+        let wrap = |alerts: &str| {
+            format!("[CONTEXTSTREAM] Default.\n<system-reminder>\n{alerts}\n</system-reminder>\n[PREFERENCE] tabs")
+        };
+        filter_standing_text(
+            &mut state,
+            "[CONTEXTSTREAM] Default.\n[PREFERENCE] tabs",
+            T0,
+            WINDOW_MS,
+        );
+
+        // The alerts appear inside the window: the whole wrapped block.
+        let one = wrap("[GRAPH_ALERT] cycle in module a");
+        assert_eq!(
+            filter_standing_text(&mut state, &one, T0 + 1, WINDOW_MS),
+            format!(
+                "{}\n<system-reminder>\n[GRAPH_ALERT] cycle in module a\n</system-reminder>",
+                note(2, "under a minute ago")
+            )
+        );
+        assert_eq!(
+            filter_standing_text(&mut state, &one, T0 + 2, WINDOW_MS),
+            note(5, "under a minute ago")
+        );
+
+        // A second alert: the block again, both tags with it.
+        let two = wrap("[GRAPH_ALERT] cycle in module a\n[GRAPH_ALERT] cycle in module b");
+        assert_eq!(
+            filter_standing_text(&mut state, &two, T0 + 3, WINDOW_MS),
+            format!(
+                "{}\n<system-reminder>\n[GRAPH_ALERT] cycle in module a\n[GRAPH_ALERT] cycle in module b\n</system-reminder>",
+                note(2, "under a minute ago")
+            )
+        );
+    }
+
+    #[test]
+    fn the_standing_memory_is_bounded_and_absent_from_a_state_that_never_used_it() {
+        let untouched = serde_json::to_string(&MidRunSessionState::default()).unwrap();
+        assert!(!untouched.contains("standing_"));
+
+        let mut state = MidRunSessionState::default();
+        let long: String = (0..400)
+            .map(|n| format!("[RULE] number {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(filter_standing_text(&mut state, &long, T0, WINDOW_MS), long);
+        assert_eq!(state.standing_line_hashes.len(), MAX_STANDING_LINE_HASHES);
+        // The lines that fell out of the memory are shown again.
+        let again = filter_standing_text(&mut state, &long, T0 + 1, WINDOW_MS);
+        assert_eq!(line_count(&again), 1 + 400 - MAX_STANDING_LINE_HASHES);
+
+        // A state file written before these fields existed reads as no window.
+        let old: MidRunSessionState =
+            serde_json::from_str(r#"{"last_poll_unix_ms":5,"delivered_notice_ids":["x"]}"#)
+                .unwrap();
+        assert_eq!(old.standing_window_started_unix_ms, 0);
+    }
+
+    #[test]
+    fn block_headers_are_told_from_ordinary_lines() {
+        for header in [
+            "[CONTEXTSTREAM WORKFLOW harness_teaching_v4]",
+            "[PREFERENCE] style: tabs",
+            "[DECISION] (today old) Ship it",
+            "[END]",
+        ] {
+            assert!(opens_standing_block(header), "{header}");
+        }
+        for line in [
+            "1) Initialize once — `init(...)`",
+            "- A coached rule",
+            "[] empty",
+            "[lowercase] words",
+            "If ContextStream surfaces `[LESSONS_WARNING]`, follow it.",
+            "<system-reminder>",
+        ] {
+            assert!(!opens_standing_block(line), "{line}");
+        }
+        assert_eq!(
+            extract_notice_item_from_line(&notice(ITEM_A, NOTICE_A1, "x")).as_deref(),
+            Some(ITEM_A)
+        );
+        assert_eq!(
+            extract_notice_item_from_line("item=not-a-uuid and more text here, long enough"),
+            None
+        );
+        assert_eq!(extract_notice_item_from_line("item=é"), None);
     }
 }

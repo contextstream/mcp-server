@@ -44,6 +44,10 @@ pub async fn handle() -> Result<()> {
         })
         .unwrap_or_default();
 
+    // Startup, resume, clear or compact: what the prompt hook showed earlier
+    // is not in the model's view now, so its next prompt is delivered in full.
+    super::mid_run_notices::reset_prompt_standing_window(&input, &cwd);
+
     // Keep the gate specific to the host session. Replayed startup/resume
     // events and parallel sessions in this checkout must not reset it.
     prompt_state::cleanup_stale(360);

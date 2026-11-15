@@ -21,6 +21,13 @@ pub async fn handle() -> Result<()> {
 
     let input = read_stdin_json()?;
 
+    // The compaction dropped what the prompt hook showed earlier: its next
+    // prompt is delivered in full.
+    super::mid_run_notices::reset_prompt_standing_window(
+        &input,
+        &super::common::extract_cwd(&input),
+    );
+
     // Codex takes no context from a PostCompact hook: its output type holds only
     // the universal fields (continue, stopReason, suppressOutput, systemMessage)
     // and a `{"additionalContext": ...}` answer fails the hook as invalid JSON

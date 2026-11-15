@@ -3,7 +3,9 @@
 //! Injects ContextStream context (preferences, lessons, rules) on every user message.
 //! In Claude Code and Codex a session gets the standing part of it once per
 //! window (`CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS`, default 600; `0` repeats
-//! it with every prompt): see `mid_run_notices::throttle_prompt_standing_text`.
+//! everything with every prompt) and a coordination notice in full once, then
+//! as a count (`CONTEXTSTREAM_HOOK_NOTICE_REPEAT_SECS`, default 1800): see
+//! `mid_run_notices::throttle_prompt_standing_text`.
 //!
 //! PERFORMANCE: Fast path via /api/v1/context/hook (~20-50ms, Redis-cached).
 //! Falls back to a static reminder if the API is unreachable.

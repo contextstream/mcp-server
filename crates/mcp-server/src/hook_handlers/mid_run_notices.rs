@@ -22,9 +22,11 @@
 //!
 //! The same state file also holds what the prompt hook needs to show its
 //! standing text once per window instead of with every prompt (see
-//! [`throttle_prompt_standing_text`]). That part does not depend on the switch
-//! above: its own switch is `CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS` (`0`
-//! repeats everything with every prompt).
+//! [`throttle_prompt_standing_text`]), and a coordination notice in full once
+//! and then as a count. That part does not depend on the switch above: its own
+//! switches are `CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS` (`0` repeats
+//! everything with every prompt) and `CONTEXTSTREAM_HOOK_NOTICE_REPEAT_SECS`
+//! (`0` repeats every pending notice in full with every prompt).
 
 use chrono::Utc;
 use mcp_session::auto_init::checkout_binding_workspace;
@@ -58,6 +60,9 @@ const MAX_STANDING_REPEAT_SECS: u64 = 24 * 60 * 60;
 /// Standing lines remembered per window. Past this the oldest are forgotten,
 /// and a forgotten line is simply shown again.
 const MAX_STANDING_LINE_HASHES: usize = 256;
+/// How long the prompt hook only counts a coordination notice it printed in
+/// full: a notice still unacknowledged after this is printed in full again.
+const DEFAULT_NOTICE_REPEAT_SECS: u64 = 30 * 60;
 /// Notice ids the prompt hook's one-line count spells out; the rest are counted.
 const MAX_LISTED_UNACKED_NOTICES: usize = 5;
 /// The background poll is off the hook's path, so it can wait for a slow API.
@@ -94,11 +99,11 @@ pub(crate) struct MidRunSessionState {
     /// window (at most `MAX_STANDING_LINE_HASHES`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub standing_line_hashes: Vec<String>,
-    /// `[COORDINATION]` notices the prompt hook printed in this window, by
-    /// notice id (`id:<id>`) and by item (`item:<uuid>`); at most
-    /// `MAX_DELIVERED_IDS`.
+    /// When the prompt hook last printed each `[COORDINATION]` notice in full,
+    /// by notice id (`id:<id>`) and by item (`item:<uuid>`); at most
+    /// `MAX_DELIVERED_IDS`. Not tied to the standing window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub standing_notice_tokens: Vec<String>,
+    pub standing_notice_copies: Vec<NoticeCopy>,
     /// The folder the hooks ran in, which the MCP server compares with its
     /// own to tell whether hooks deliver notices for its session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +118,14 @@ pub(crate) struct MidRunSessionState {
     pub agent_name: Option<String>,
     #[serde(default)]
     pub updated_at: String,
+}
+
+/// The last full copy of a coordination notice the prompt hook printed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NoticeCopy {
+    pub token: String,
+    #[serde(default)]
+    pub at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -873,15 +886,64 @@ pub(crate) fn record_prompt_delivery(input: &Value, cwd: &str, context_text: &st
 // Prompt hook: standing text once per window
 // ---------------------------------------------------------------------------
 
-/// The window in milliseconds, from `CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS`
-/// (default 600). Zero turns the throttle off: every prompt gets everything.
-pub(crate) fn standing_repeat_ms() -> u64 {
-    std::env::var("CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS")
+/// How long the prompt hook leaves out what it showed, in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StandingRepeat {
+    /// Standing lines: `CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS` (default
+    /// 600). Zero turns the whole throttle off: every prompt gets everything,
+    /// notices included.
+    pub standing_ms: u64,
+    /// The full copy of a coordination notice:
+    /// `CONTEXTSTREAM_HOOK_NOTICE_REPEAT_SECS` (default 1800). Zero prints
+    /// every pending notice in full with every prompt.
+    pub notice_ms: u64,
+}
+
+impl StandingRepeat {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            standing_ms: repeat_ms_from_env(
+                "CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS",
+                DEFAULT_STANDING_REPEAT_SECS,
+            ),
+            notice_ms: repeat_ms_from_env(
+                "CONTEXTSTREAM_HOOK_NOTICE_REPEAT_SECS",
+                DEFAULT_NOTICE_REPEAT_SECS,
+            ),
+        }
+    }
+}
+
+/// A number of seconds from the environment, as milliseconds; the default
+/// when it is unset or no number.
+fn repeat_ms_from_env(name: &str, default_secs: u64) -> u64 {
+    std::env::var(name)
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .map(|secs| secs.min(MAX_STANDING_REPEAT_SECS))
-        .unwrap_or(DEFAULT_STANDING_REPEAT_SECS)
+        .unwrap_or(default_secs)
         * 1_000
+}
+
+/// Remember `at_unix_ms` as the last full copy of the notice these tokens name.
+fn record_notice_copy(entry: &mut MidRunSessionState, tokens: Vec<String>, at_unix_ms: u64) {
+    for token in tokens {
+        if let Some(copy) = entry
+            .standing_notice_copies
+            .iter_mut()
+            .find(|copy| copy.token == token)
+        {
+            copy.at_unix_ms = at_unix_ms;
+            continue;
+        }
+        if entry.standing_notice_copies.len() >= MAX_DELIVERED_IDS {
+            let excess = entry.standing_notice_copies.len() + 1 - MAX_DELIVERED_IDS;
+            entry.standing_notice_copies.drain(0..excess);
+        }
+        entry
+            .standing_notice_copies
+            .push(NoticeCopy { token, at_unix_ms });
+    }
 }
 
 /// True when `line` opens a block of hook text: `[PREFERENCE] ...`, and also
@@ -1067,33 +1129,39 @@ fn unacknowledged_notices_line(count: usize, ids: &[String]) -> String {
 ///   new line without a tag of its own (a numbered step, a `- ` bullet) comes
 ///   with its header, and a new header comes with its whole block. One line
 ///   says how much was left out and when it was shown.
-/// - A `[COORDINATION]` notice is printed once per window, by notice id or by
+/// - A `[COORDINATION]` notice is printed in full once, by notice id or by
 ///   the item it names; after that one line counts the notices still coming
-///   back and names their ids. Nothing is acknowledged here.
+///   back and names their ids. Nothing is acknowledged here. This has its own
+///   clock: a full delivery of the standing text does not bring a notice
+///   back. A notice still pending `repeat.notice_ms` after its last full copy
+///   is printed in full again.
 /// - `[INSTRUCT]` and `[CONTEXTSTREAM_NOTICE]` blocks are always delivered.
 ///
-/// The memory is bounded: `MAX_STANDING_LINE_HASHES` lines and
-/// `MAX_DELIVERED_IDS` notice tokens per window, the oldest giving way (what
-/// is forgotten is shown again), and the state file itself is removed after
+/// The memory is bounded: `MAX_STANDING_LINE_HASHES` lines per window and
+/// `MAX_DELIVERED_IDS` notice tokens, the oldest giving way (what is
+/// forgotten is shown again), and the state file itself is removed after
 /// `MAX_SESSION_AGE` without a hook call, after which the next prompt is full.
 pub(crate) fn filter_standing_text(
     entry: &mut MidRunSessionState,
     text: &str,
     now_ms: u64,
-    window_ms: u64,
+    repeat: StandingRepeat,
 ) -> String {
     let started = entry.standing_window_started_unix_ms;
-    let window_open = started != 0 && now_ms >= started && now_ms - started < window_ms;
+    let window_open = started != 0 && now_ms >= started && now_ms - started < repeat.standing_ms;
     let blocks = standing_blocks(text);
     if !window_open {
         entry.standing_window_started_unix_ms = now_ms;
         entry.standing_line_hashes.clear();
-        entry.standing_notice_tokens.clear();
     }
+    // A full copy older than the notice window stands in for nothing.
+    entry
+        .standing_notice_copies
+        .retain(|copy| now_ms.saturating_sub(copy.at_unix_ms) < repeat.notice_ms);
     // What was delivered before this prompt: a line this text holds twice is
     // judged the same way both times.
     let seen_lines: HashSet<String> = entry.standing_line_hashes.iter().cloned().collect();
-    let seen_notices: HashSet<String> = entry.standing_notice_tokens.iter().cloned().collect();
+    let seen_copies: Vec<NoticeCopy> = entry.standing_notice_copies.clone();
 
     let mut out: Vec<&str> = Vec::new();
     let mut omitted_lines = 0usize;
@@ -1115,12 +1183,19 @@ pub(crate) fn filter_standing_text(
         }
 
         if header.trim().starts_with("[COORDINATION]") {
-            let (tokens, notice_id) = coordination_tokens(block);
-            let shown = tokens.iter().any(|token| seen_notices.contains(token));
-            for token in tokens {
-                push_bounded(&mut entry.standing_notice_tokens, token, MAX_DELIVERED_IDS);
+            if repeat.notice_ms == 0 {
+                push_standing_block(&mut out, block.after_blank, &whole);
+                continue;
             }
-            if shown {
+            let (tokens, notice_id) = coordination_tokens(block);
+            // The last full copy of this notice, or of the item it names.
+            let shown_at = seen_copies
+                .iter()
+                .filter(|copy| tokens.contains(&copy.token) && now_ms >= copy.at_unix_ms)
+                .map(|copy| copy.at_unix_ms)
+                .max();
+            record_notice_copy(entry, tokens, shown_at.unwrap_or(now_ms));
+            if shown_at.is_some() {
                 unacked_count += 1;
                 if let Some(id) = notice_id.filter(|id| !unacked_ids.contains(id)) {
                     unacked_ids.push(id);
@@ -1213,26 +1288,28 @@ pub(crate) fn filter_standing_text(
 /// already shown in the current window left out (see [`filter_standing_text`]).
 ///
 /// The text comes back unchanged when the throttle is off
-/// (`CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS=0`), when the payload names no
+/// (`CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS=0`, which also repeats every
+/// notice; `CONTEXTSTREAM_HOOK_NOTICE_REPEAT_SECS=0` repeats only the notices),
+/// when the payload names no
 /// session (the state would be keyed by folder, which several sessions share),
 /// and whenever the state cannot be locked, read or written: a failure never
 /// costs the session its guidance. `CONTEXTSTREAM_MID_RUN_NOTICES=0` does not
 /// turn this off.
 pub(crate) fn throttle_prompt_standing_text(input: &Value, cwd: &str, text: String) -> String {
-    let window_ms = standing_repeat_ms();
-    if window_ms == 0 || common::host_session_key(input).is_none() {
+    let repeat = StandingRepeat::from_env();
+    if repeat.standing_ms == 0 || common::host_session_key(input).is_none() {
         return text;
     }
     let key = session_state_key(input, cwd);
     let now_ms = now_unix_ms();
     let filtered = update_session_entry(&key, |entry| {
-        filter_standing_text(entry, &text, now_ms, window_ms)
+        filter_standing_text(entry, &text, now_ms, repeat)
     });
     filtered.unwrap_or(text)
 }
 
 /// Forget what the prompt hook showed this session, so its next prompt is
-/// delivered in full. Called when a session starts, resumes or comes back from
+/// delivered in full, coordination notices included. Called when a session starts, resumes or comes back from
 /// a compaction: what was shown earlier is no longer in the model's view.
 pub(crate) fn reset_prompt_standing_window(input: &Value, cwd: &str) {
     if common::host_session_key(input).is_none() {
@@ -1247,7 +1324,7 @@ pub(crate) fn reset_prompt_standing_window(input: &Value, cwd: &str) {
     let _ = update_session_entry(&key, |entry| {
         entry.standing_window_started_unix_ms = 0;
         entry.standing_line_hashes.clear();
-        entry.standing_notice_tokens.clear();
+        entry.standing_notice_copies.clear();
     });
 }
 
@@ -2107,7 +2184,10 @@ mod tests {
 
     // --- Prompt hook: standing text once per window ---
 
-    const WINDOW_MS: u64 = 600_000;
+    const REPEAT: StandingRepeat = StandingRepeat {
+        standing_ms: 600_000,
+        notice_ms: 1_800_000,
+    };
     const T0: u64 = 1_800_000_000_000;
 
     /// A prompt hook answer of the shape the API sends, with synthetic text:
@@ -2181,12 +2261,12 @@ mod tests {
     fn the_first_prompt_is_full_and_the_next_in_the_window_is_one_line() {
         let mut state = MidRunSessionState::default();
         let text = HookText::new().render();
-        assert_eq!(filter_standing_text(&mut state, &text, T0, WINDOW_MS), text);
+        assert_eq!(filter_standing_text(&mut state, &text, T0, REPEAT), text);
         assert_eq!(state.standing_window_started_unix_ms, T0);
 
-        let second = filter_standing_text(&mut state, &text, T0 + 20_000, WINDOW_MS);
+        let second = filter_standing_text(&mut state, &text, T0 + 20_000, REPEAT);
         assert_eq!(second, note(line_count(&text), "under a minute ago"));
-        let later = filter_standing_text(&mut state, &text, T0 + 599_999, WINDOW_MS);
+        let later = filter_standing_text(&mut state, &text, T0 + 599_999, REPEAT);
         assert_eq!(later, note(line_count(&text), "9 min ago"));
         // The window counts from the full delivery, not from the last prompt.
         assert_eq!(state.standing_window_started_unix_ms, T0);
@@ -2195,30 +2275,27 @@ mod tests {
     #[test]
     fn after_the_window_the_prompt_is_full_again_and_a_new_window_starts() {
         let mut state = MidRunSessionState::default();
-        let mut text = HookText::new();
-        text.notices
-            .push(notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed."));
-        let text = text.render();
-        assert_eq!(filter_standing_text(&mut state, &text, T0, WINDOW_MS), text);
+        let text = HookText::new().render();
+        assert_eq!(filter_standing_text(&mut state, &text, T0, REPEAT), text);
         assert_ne!(
-            filter_standing_text(&mut state, &text, T0 + 1, WINDOW_MS),
+            filter_standing_text(&mut state, &text, T0 + 1, REPEAT),
             text
         );
 
-        let expired = T0 + WINDOW_MS;
+        let expired = T0 + REPEAT.standing_ms;
         assert_eq!(
-            filter_standing_text(&mut state, &text, expired, WINDOW_MS),
+            filter_standing_text(&mut state, &text, expired, REPEAT),
             text
         );
         assert_eq!(state.standing_window_started_unix_ms, expired);
         assert_ne!(
-            filter_standing_text(&mut state, &text, expired + 1, WINDOW_MS),
+            filter_standing_text(&mut state, &text, expired + 1, REPEAT),
             text
         );
 
         // A clock that went backwards never keeps guidance from a session.
         assert_eq!(
-            filter_standing_text(&mut state, &text, T0 - 5, WINDOW_MS),
+            filter_standing_text(&mut state, &text, T0 - 5, REPEAT),
             text
         );
     }
@@ -2228,13 +2305,13 @@ mod tests {
         let mut state = MidRunSessionState::default();
         let mut text = HookText::new();
         let first = text.render();
-        filter_standing_text(&mut state, &first, T0, WINDOW_MS);
+        filter_standing_text(&mut state, &first, T0, REPEAT);
 
         // A new decision pushes the oldest of the three out.
         text.decisions.remove(2);
         text.decisions
             .insert(0, "[DECISION] (today old) A decision made just now".into());
-        let second = filter_standing_text(&mut state, &text.render(), T0 + 120_000, WINDOW_MS);
+        let second = filter_standing_text(&mut state, &text.render(), T0 + 120_000, REPEAT);
         assert_eq!(
             second,
             format!(
@@ -2245,7 +2322,7 @@ mod tests {
 
         // A preference set that changed: only the preference that is new.
         text.preferences[1] = "[PREFERENCE] style: rule_2: {\"value\":\"changed\"}".into();
-        let third = filter_standing_text(&mut state, &text.render(), T0 + 180_000, WINDOW_MS);
+        let third = filter_standing_text(&mut state, &text.render(), T0 + 180_000, REPEAT);
         assert_eq!(
             third,
             format!(
@@ -2255,7 +2332,7 @@ mod tests {
         );
 
         // The decision that was pushed out and comes back was shown already.
-        let fourth = filter_standing_text(&mut state, &first, T0 + 240_000, WINDOW_MS);
+        let fourth = filter_standing_text(&mut state, &first, T0 + 240_000, REPEAT);
         assert_eq!(fourth, note(line_count(&first), "4 min ago"));
     }
 
@@ -2265,11 +2342,11 @@ mod tests {
         let mut text = HookText::new();
         let bullets = std::mem::take(&mut text.coaching);
         let without_coaching = text.render();
-        filter_standing_text(&mut state, &without_coaching, T0, WINDOW_MS);
+        filter_standing_text(&mut state, &without_coaching, T0, REPEAT);
 
         // The coaching block appears inside the window: header and bullets.
         text.coaching = bullets.clone();
-        let appeared = filter_standing_text(&mut state, &text.render(), T0 + 60_000, WINDOW_MS);
+        let appeared = filter_standing_text(&mut state, &text.render(), T0 + 60_000, REPEAT);
         assert_eq!(
             appeared,
             format!(
@@ -2281,7 +2358,7 @@ mod tests {
 
         // A new bullet under the header that was shown brings the header.
         text.coaching.push("- A rule learned a moment ago".into());
-        let grown = filter_standing_text(&mut state, &text.render(), T0 + 61_000, WINDOW_MS);
+        let grown = filter_standing_text(&mut state, &text.render(), T0 + 61_000, REPEAT);
         assert_eq!(
             grown,
             format!(
@@ -2292,7 +2369,7 @@ mod tests {
 
         // The same words under another header are another line.
         let moved = format!("{}\n[OTHER RULES] Also:\n- Coached rule 1", text.render());
-        let moved = filter_standing_text(&mut state, &moved, T0 + 62_000, WINDOW_MS);
+        let moved = filter_standing_text(&mut state, &moved, T0 + 62_000, REPEAT);
         assert!(moved.ends_with("\n[OTHER RULES] Also:\n- Coached rule 1"));
     }
 
@@ -2303,11 +2380,11 @@ mod tests {
         let standing = line_count(&text.render());
         let notice_a = notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed.");
         text.notices.push(notice_a.clone());
-        let first = filter_standing_text(&mut state, &text.render(), T0, WINDOW_MS);
+        let first = filter_standing_text(&mut state, &text.render(), T0, REPEAT);
         assert!(first.ends_with(&notice_a));
 
         // Still unacknowledged on the next prompt: counted, with the id to ack.
-        let second = filter_standing_text(&mut state, &text.render(), T0 + 1_000, WINDOW_MS);
+        let second = filter_standing_text(&mut state, &text.render(), T0 + 1_000, REPEAT);
         assert_eq!(
             second,
             format!(
@@ -2320,7 +2397,7 @@ mod tests {
         // A second notice arrives: printed in full, the first one counted.
         let notice_b = notice(ITEM_B, NOTICE_B1, "Both sessions edit the importer.");
         text.notices.push(notice_b.clone());
-        let third = filter_standing_text(&mut state, &text.render(), T0 + 2_000, WINDOW_MS);
+        let third = filter_standing_text(&mut state, &text.render(), T0 + 2_000, REPEAT);
         assert_eq!(
             third,
             format!(
@@ -2332,7 +2409,7 @@ mod tests {
         // The same item under a new notice id is not printed again, and the
         // count names the id that acknowledges it now.
         text.notices[0] = notice(ITEM_A, NOTICE_A2, "Migration 12 is claimed.");
-        let fourth = filter_standing_text(&mut state, &text.render(), T0 + 3_000, WINDOW_MS);
+        let fourth = filter_standing_text(&mut state, &text.render(), T0 + 3_000, REPEAT);
         assert_eq!(
             fourth,
             format!(
@@ -2343,17 +2420,130 @@ mod tests {
 
         // Acknowledged: the API stops sending them and the count goes.
         text.notices.clear();
-        let fifth = filter_standing_text(&mut state, &text.render(), T0 + 4_000, WINDOW_MS);
+        let fifth = filter_standing_text(&mut state, &text.render(), T0 + 4_000, REPEAT);
         assert_eq!(fifth, note(standing, "under a minute ago"));
+    }
+
+    fn counted(ids: &[&str]) -> String {
+        let (noun, verb) = if ids.len() == 1 {
+            ("notice", "is")
+        } else {
+            ("notices", "are")
+        };
+        let rest: String = ids[1..].iter().map(|id| format!(" / \"{id}\"")).collect();
+        format!(
+            "[COORDINATION] {} {noun} shown earlier {verb} still unacknowledged: ack via coordination(action=\"ack\", notice_id=\"{}\"){rest}, or read coordination(action=\"inbox\").",
+            ids.len(),
+            ids[0]
+        )
+    }
+
+    #[test]
+    fn a_notice_is_not_brought_back_by_a_full_delivery_of_the_standing_text() {
+        const MINUTE: u64 = 60_000;
+        let mut state = MidRunSessionState::default();
+        let mut text = HookText::new();
+        let standing = text.render();
+        let notice_a = notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed.");
+        text.notices.push(notice_a.clone());
+        let first = filter_standing_text(&mut state, &text.render(), T0, REPEAT);
+        assert_eq!(first, format!("{standing}\n{notice_a}"));
+
+        // Ten and twenty minutes later the standing text is due in full. The
+        // notice was shown: it is counted, not printed.
+        for minutes in [10, 20] {
+            let full =
+                filter_standing_text(&mut state, &text.render(), T0 + minutes * MINUTE, REPEAT);
+            assert_eq!(
+                full,
+                format!("{standing}\n{}", counted(&[NOTICE_A1])),
+                "{minutes} min"
+            );
+        }
+
+        // A different notice arrives meanwhile: in full, once.
+        let notice_b = notice(ITEM_B, NOTICE_B1, "Both sessions edit the importer.");
+        text.notices.push(notice_b.clone());
+        let arrived = filter_standing_text(&mut state, &text.render(), T0 + 25 * MINUTE, REPEAT);
+        assert_eq!(
+            arrived,
+            format!(
+                "{}\n{notice_b}\n{}",
+                note(line_count(&standing), "5 min ago"),
+                counted(&[NOTICE_A1])
+            )
+        );
+        let both = filter_standing_text(&mut state, &text.render(), T0 + 26 * MINUTE, REPEAT);
+        assert!(both.ends_with(&counted(&[NOTICE_A1, NOTICE_B1])), "{both}");
+        assert!(!both.contains("Migration 12") && !both.contains("importer"));
+
+        // Just short of thirty minutes after its full copy: counted.
+        let short = filter_standing_text(&mut state, &text.render(), T0 + 30 * MINUTE - 1, REPEAT);
+        assert!(
+            short.ends_with(&counted(&[NOTICE_A1, NOTICE_B1])),
+            "{short}"
+        );
+
+        // Still pending thirty minutes after its full copy: in full again.
+        // The other notice, five minutes younger, stays counted.
+        let again = filter_standing_text(&mut state, &text.render(), T0 + 30 * MINUTE, REPEAT);
+        assert_eq!(
+            again,
+            format!("{standing}\n{notice_a}\n{}", counted(&[NOTICE_B1]))
+        );
+        let after = filter_standing_text(&mut state, &text.render(), T0 + 31 * MINUTE, REPEAT);
+        assert!(
+            after.ends_with(&counted(&[NOTICE_A1, NOTICE_B1])),
+            "{after}"
+        );
+
+        // The item under a new notice id keeps the item's clock.
+        text.notices[0] = notice(ITEM_A, NOTICE_A2, "Migration 12 is claimed.");
+        let renamed = filter_standing_text(&mut state, &text.render(), T0 + 32 * MINUTE, REPEAT);
+        assert!(
+            renamed.ends_with(&counted(&[NOTICE_A2, NOTICE_B1])),
+            "{renamed}"
+        );
+        let due = filter_standing_text(&mut state, &text.render(), T0 + 60 * MINUTE, REPEAT);
+        assert!(
+            due.contains("Migration 12") && due.contains("importer"),
+            "{due}"
+        );
+        assert!(!due.contains("still unacknowledged"));
+    }
+
+    #[test]
+    fn a_notice_window_of_zero_prints_every_pending_notice_with_every_prompt() {
+        let every_prompt = StandingRepeat {
+            notice_ms: 0,
+            ..REPEAT
+        };
+        let mut state = MidRunSessionState::default();
+        let mut text = HookText::new();
+        let standing = line_count(&text.render());
+        let notice_a = notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed.");
+        text.notices.push(notice_a.clone());
+        let text = text.render();
+        assert_eq!(
+            filter_standing_text(&mut state, &text, T0, every_prompt),
+            text
+        );
+        for second in 1..=2 {
+            assert_eq!(
+                filter_standing_text(&mut state, &text, T0 + second * 1_000, every_prompt),
+                format!("{}\n{notice_a}", note(standing, "under a minute ago"))
+            );
+        }
+        assert!(state.standing_notice_copies.is_empty());
     }
 
     #[test]
     fn a_notice_without_an_id_or_an_item_is_printed_once_by_its_text() {
         let mut state = MidRunSessionState::default();
         let text = "[CONTEXTSTREAM] Default.\n[COORDINATION] (info) from Acme: the staging box is\nbeing rebuilt until noon.";
-        assert_eq!(filter_standing_text(&mut state, text, T0, WINDOW_MS), text);
+        assert_eq!(filter_standing_text(&mut state, text, T0, REPEAT), text);
         assert_eq!(
-            filter_standing_text(&mut state, text, T0 + 1, WINDOW_MS),
+            filter_standing_text(&mut state, text, T0 + 1, REPEAT),
             "[CONTEXTSTREAM] Standing guidance (1 line) was shown under a minute ago and still applies.\n[COORDINATION] 1 notice shown earlier is still unacknowledged: read coordination(action=\"inbox\")."
         );
     }
@@ -2365,8 +2555,8 @@ mod tests {
             "{}\n[INSTRUCT] Answer in French\nuntil told otherwise.\n[CONTEXTSTREAM_NOTICE] Indexing is paused.",
             HookText::new().render()
         );
-        filter_standing_text(&mut state, &text, T0, WINDOW_MS);
-        let second = filter_standing_text(&mut state, &text, T0 + 1_000, WINDOW_MS);
+        filter_standing_text(&mut state, &text, T0, REPEAT);
+        let second = filter_standing_text(&mut state, &text, T0 + 1_000, REPEAT);
         assert_eq!(
             second,
             format!(
@@ -2381,19 +2571,19 @@ mod tests {
     fn a_block_that_is_new_in_the_window_is_delivered_whole_then_left_out() {
         let mut state = MidRunSessionState::default();
         let api_text = HookText::new().render();
-        filter_standing_text(&mut state, &api_text, T0, WINDOW_MS);
+        filter_standing_text(&mut state, &api_text, T0, REPEAT);
 
         // The API stops answering: the static reminder takes the hook
         // context's place. Its first delivery is whole.
         let workflow: String = api_text.lines().take(7).collect::<Vec<_>>().join("\n");
         let reminder = "[CONTEXTSTREAM EXTENDED GUIDANCE]\nAUTO-GROUNDING: read `[GROUNDING]` first.\nRESUME: call session(action=\"resume\").\n[END]";
         let offline = format!("{workflow}\n\n{reminder}");
-        let first = filter_standing_text(&mut state, &offline, T0 + 1_000, WINDOW_MS);
+        let first = filter_standing_text(&mut state, &offline, T0 + 1_000, REPEAT);
         assert_eq!(
             first,
             format!("{}\n{reminder}", note(7, "under a minute ago"))
         );
-        let second = filter_standing_text(&mut state, &offline, T0 + 2_000, WINDOW_MS);
+        let second = filter_standing_text(&mut state, &offline, T0 + 2_000, REPEAT);
         assert_eq!(second, note(11, "under a minute ago"));
     }
 
@@ -2407,27 +2597,27 @@ mod tests {
             &mut state,
             "[CONTEXTSTREAM] Default.\n[PREFERENCE] tabs",
             T0,
-            WINDOW_MS,
+            REPEAT,
         );
 
         // The alerts appear inside the window: the whole wrapped block.
         let one = wrap("[GRAPH_ALERT] cycle in module a");
         assert_eq!(
-            filter_standing_text(&mut state, &one, T0 + 1, WINDOW_MS),
+            filter_standing_text(&mut state, &one, T0 + 1, REPEAT),
             format!(
                 "{}\n<system-reminder>\n[GRAPH_ALERT] cycle in module a\n</system-reminder>",
                 note(2, "under a minute ago")
             )
         );
         assert_eq!(
-            filter_standing_text(&mut state, &one, T0 + 2, WINDOW_MS),
+            filter_standing_text(&mut state, &one, T0 + 2, REPEAT),
             note(5, "under a minute ago")
         );
 
         // A second alert: the block again, both tags with it.
         let two = wrap("[GRAPH_ALERT] cycle in module a\n[GRAPH_ALERT] cycle in module b");
         assert_eq!(
-            filter_standing_text(&mut state, &two, T0 + 3, WINDOW_MS),
+            filter_standing_text(&mut state, &two, T0 + 3, REPEAT),
             format!(
                 "{}\n<system-reminder>\n[GRAPH_ALERT] cycle in module a\n[GRAPH_ALERT] cycle in module b\n</system-reminder>",
                 note(2, "under a minute ago")
@@ -2445,10 +2635,10 @@ mod tests {
             .map(|n| format!("[RULE] number {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(filter_standing_text(&mut state, &long, T0, WINDOW_MS), long);
+        assert_eq!(filter_standing_text(&mut state, &long, T0, REPEAT), long);
         assert_eq!(state.standing_line_hashes.len(), MAX_STANDING_LINE_HASHES);
         // The lines that fell out of the memory are shown again.
-        let again = filter_standing_text(&mut state, &long, T0 + 1, WINDOW_MS);
+        let again = filter_standing_text(&mut state, &long, T0 + 1, REPEAT);
         assert_eq!(line_count(&again), 1 + 400 - MAX_STANDING_LINE_HASHES);
 
         // A state file written before these fields existed reads as no window.

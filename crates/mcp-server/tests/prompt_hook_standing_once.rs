@@ -274,13 +274,38 @@ impl Sandbox {
         (files[0].clone(), state)
     }
 
-    /// Moves the session's window start `secs` into the past.
-    fn age_window(&self, secs: u64) {
+    /// Lets `secs` pass for the session: its window start and the full
+    /// copies of its notices move that far into the past.
+    fn age(&self, secs: u64) {
         let (path, mut state) = self.only_state();
         let started = state["standing_window_started_unix_ms"].as_u64().unwrap();
         state["standing_window_started_unix_ms"] = json!(started - secs * 1_000);
+        if let Some(copies) = state
+            .get_mut("standing_notice_copies")
+            .and_then(Value::as_array_mut)
+        {
+            for copy in copies {
+                let at = copy["at_unix_ms"].as_u64().unwrap();
+                copy["at_unix_ms"] = json!(at - secs * 1_000);
+            }
+        }
         std::fs::write(path, state.to_string()).unwrap();
     }
+}
+
+/// The one line that stands for notices printed in full earlier.
+fn counted(ids: &[&str]) -> String {
+    let (noun, verb) = if ids.len() == 1 {
+        ("notice", "is")
+    } else {
+        ("notices", "are")
+    };
+    let rest: String = ids[1..].iter().map(|id| format!(" / \"{id}\"")).collect();
+    format!(
+        "[COORDINATION] {} {noun} shown earlier {verb} still unacknowledged: ack via coordination(action=\"ack\", notice_id=\"{}\"){rest}, or read coordination(action=\"inbox\").",
+        ids.len(),
+        ids[0]
+    )
 }
 
 /// The context of a Claude Code or Codex prompt hook output. The output is
@@ -460,37 +485,151 @@ fn a_coordination_notice_is_printed_once_then_counted_until_it_is_gone() {
 
 #[test]
 fn when_the_window_has_passed_the_prompt_is_full_again() {
-    let mut text = HookText::new();
-    text.notices
-        .push(notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed."));
+    let text = HookText::new();
     let api = Api::start(&text);
     let sandbox = Sandbox::new();
     let first = sandbox.prompt(&api, "s1");
 
     // Nine minutes in, the default window of 600 s still holds.
-    sandbox.age_window(540);
-    let inside = sandbox.prompt(&api, "s1");
-    assert!(
-        inside.starts_with(&note(line_count(&first) - 1, "9 min ago")),
-        "{inside}"
+    sandbox.age(540);
+    assert_eq!(
+        sandbox.prompt(&api, "s1"),
+        note(line_count(&first), "9 min ago")
     );
 
-    sandbox.age_window(61);
-    assert_eq!(sandbox.prompt(&api, "s1"), first, "full, notice included");
+    sandbox.age(61);
+    assert_eq!(sandbox.prompt(&api, "s1"), first);
     // That delivery started a new window.
-    let again = sandbox.prompt(&api, "s1");
-    assert!(
-        again.starts_with(&note(line_count(&first) - 1, "under a minute ago")),
-        "{again}"
+    assert_eq!(
+        sandbox.prompt(&api, "s1"),
+        note(line_count(&first), "under a minute ago")
     );
 
     // A shorter window from the environment.
     let short = [("CONTEXTSTREAM_HOOK_STANDING_REPEAT_SECS", "120")];
-    sandbox.age_window(121);
+    sandbox.age(121);
     assert_eq!(
         sandbox.prompt_with(Some(&api), Some("s1"), "Explain this module.", &short),
         first
     );
+}
+
+#[test]
+fn a_notice_is_in_full_once_per_session_and_again_after_thirty_minutes() {
+    let mut text = HookText::new();
+    let notice_a = notice(
+        ITEM_A,
+        NOTICE_A1,
+        "Migration 12 is claimed by another session.",
+    );
+    text.notices.push(notice_a.clone());
+    let api = Api::start(&text);
+    let sandbox = Sandbox::new();
+
+    let first = sandbox.prompt(&api, "s1");
+    let standing = first
+        .strip_suffix(&format!("\n{notice_a}"))
+        .expect("the notice ends the first prompt")
+        .to_string();
+    let one_line = note(line_count(&standing), "under a minute ago");
+
+    // Ten minutes and twenty minutes in, the standing text is due in full.
+    // The notice was shown at the start: it is counted, not printed again.
+    for minutes in [10, 20] {
+        sandbox.age(601);
+        assert_eq!(
+            sandbox.prompt(&api, "s1"),
+            format!("{standing}\n{}", counted(&[NOTICE_A1])),
+            "{minutes} min"
+        );
+    }
+
+    // A different notice arrives meanwhile: in full once, then counted too.
+    let notice_b = notice(ITEM_B, NOTICE_B1, "Both sessions edit the importer.");
+    text.notices.push(notice_b.clone());
+    api.serve(&text);
+    assert_eq!(
+        sandbox.prompt(&api, "s1"),
+        format!("{one_line}\n{notice_b}\n{}", counted(&[NOTICE_A1]))
+    );
+    assert_eq!(
+        sandbox.prompt(&api, "s1"),
+        format!("{one_line}\n{}", counted(&[NOTICE_A1, NOTICE_B1]))
+    );
+
+    // Thirty minutes after its full copy and still pending: the first notice
+    // is in full again. The second, ten minutes old, stays counted.
+    sandbox.age(601);
+    assert_eq!(
+        sandbox.prompt(&api, "s1"),
+        format!("{standing}\n{notice_a}\n{}", counted(&[NOTICE_B1]))
+    );
+    assert_eq!(
+        sandbox.prompt(&api, "s1"),
+        format!("{one_line}\n{}", counted(&[NOTICE_A1, NOTICE_B1]))
+    );
+
+    // After a compaction the model no longer sees either: both in full.
+    sandbox.hook(
+        "post-compact",
+        json!({"hook_event_name": "PostCompact", "session_id": "s1", "cwd": sandbox.home.path(), "trigger": "auto"}),
+        None,
+        &[],
+    );
+    assert_eq!(
+        sandbox.prompt(&api, "s1"),
+        format!("{standing}\n{notice_a}\n{notice_b}")
+    );
+    assert_eq!(
+        sandbox.prompt(&api, "s1"),
+        format!("{one_line}\n{}", counted(&[NOTICE_A1, NOTICE_B1]))
+    );
+
+    // A shorter notice window from the environment.
+    let short = [("CONTEXTSTREAM_HOOK_NOTICE_REPEAT_SECS", "120")];
+    sandbox.age(121);
+    assert_eq!(
+        sandbox.prompt_with(Some(&api), Some("s1"), "Explain this module.", &short),
+        format!(
+            "{}\n{notice_a}\n{notice_b}",
+            note(line_count(&standing), "2 min ago")
+        )
+    );
+}
+
+#[test]
+fn a_notice_window_of_zero_prints_pending_notices_with_every_prompt() {
+    let mut text = HookText::new();
+    let notice_a = notice(
+        ITEM_A,
+        NOTICE_A1,
+        "Migration 12 is claimed by another session.",
+    );
+    text.notices.push(notice_a.clone());
+    let api = Api::start(&text);
+    let sandbox = Sandbox::new();
+    let every_prompt = [("CONTEXTSTREAM_HOOK_NOTICE_REPEAT_SECS", "0")];
+    let prompt = || {
+        sandbox.prompt_with(
+            Some(&api),
+            Some("s1"),
+            "Explain this module.",
+            &every_prompt,
+        )
+    };
+
+    let first = prompt();
+    assert!(first.ends_with(&notice_a), "{first}");
+    // The standing lines are still left out; the notice is there every time.
+    for _ in 0..2 {
+        assert_eq!(
+            prompt(),
+            format!(
+                "{}\n{notice_a}",
+                note(line_count(&first) - 1, "under a minute ago")
+            )
+        );
+    }
 }
 
 #[test]

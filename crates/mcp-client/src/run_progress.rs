@@ -79,27 +79,58 @@ pub fn bearer_subject(token: &str) -> Option<String> {
         .then(|| subject.to_string())
 }
 
-/// Told of an answer of the API: the caller's credential the request carried
-/// and the HTTP status.
-pub type ApiAnswerObserver = fn(SentCredential<'_>, u16);
+/// What an answer of the API says about the caller's credential its request
+/// carried. Most answers say nothing: a success may come from a route that
+/// never looked at the credential (the API answers what is public, and what
+/// takes a credential or none, with success whatever came with the request).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiAnswer {
+    /// The API said whose credential it is: the user `GET /auth/me` answered
+    /// with ([`ContextStreamClient::me`]). The one answer that says so, and
+    /// the API gives it only for a credential it verified.
+    Names(Uuid),
+    /// The API refused the credential (401), on any route.
+    Refuses,
+}
+
+/// Told what an answer of the API said about the caller's credential its
+/// request carried.
+pub type ApiAnswerObserver = fn(SentCredential<'_>, ApiAnswer);
 
 static API_ANSWER_OBSERVER: OnceLock<ApiAnswerObserver> = OnceLock::new();
 
-/// From now on, tell `observer` of every answer the API gives to a request
-/// that carried a caller's own credential (the hosted gateway's signs of life
-/// go out only for a credential the API was seen to accept). Nothing is
-/// observed until this is called, and the first observer stays.
+/// From now on, tell `observer` whenever an answer of the API says something
+/// about a caller's own credential ([`ApiAnswer`]): the hosted gateway's
+/// signs of life go out only for a credential the API said whose it is.
+/// Nothing is observed until this is called, and the first observer stays.
 pub fn observe_api_answers(observer: ApiAnswerObserver) {
     let _ = API_ANSWER_OBSERVER.set(observer);
 }
 
-/// The API answered a request sent under `auth` with `status`.
-pub(crate) fn api_answered(auth: Option<&AuthOverride>, config: &Config, status: u16) {
+fn tell(auth: Option<&AuthOverride>, config: &Config, answer: ApiAnswer) {
     let Some(observer) = API_ANSWER_OBSERVER.get() else {
         return;
     };
     if let Some(credential) = auth.and_then(|auth| sent_credential(auth, config)) {
-        observer(credential, status);
+        observer(credential, answer);
+    }
+}
+
+/// The API answered a request sent under `auth` with the HTTP status
+/// `status`. Every way the client asks the API tells this, and only a
+/// refusal (401) says something about the credential: a success does not
+/// say that the route looked at it.
+pub(crate) fn api_answered(auth: Option<&AuthOverride>, config: &Config, status: u16) {
+    if status == 401 {
+        tell(auth, config, ApiAnswer::Refuses);
+    }
+}
+
+/// The API answered `GET /auth/me`, sent under `auth`, with `user`: it said
+/// whose credential the request carried.
+pub(crate) fn api_named_caller(auth: Option<&AuthOverride>, config: &Config, user: Uuid) {
+    if !user.is_nil() {
+        tell(auth, config, ApiAnswer::Names(user));
     }
 }
 
@@ -188,6 +219,32 @@ impl RunFilter {
 }
 
 impl ContextStreamClient {
+    /// The API said who the credential of the request in hand belongs to:
+    /// `user` is its answer to `GET /auth/me`.
+    pub(crate) async fn caller_named(&self, user: &mcp_types::api::User) {
+        let auth = crate::get_task_auth_override();
+        api_named_caller(auth.as_ref(), &self.config().await, user.id);
+    }
+
+    /// Ask the API whose credential the request in hand carries, for a side
+    /// channel: `GET /auth/me`, one attempt, no retry and no session refresh.
+    /// What it says is told to the observer of the API's answers
+    /// ([`observe_api_answers`]).
+    pub async fn name_caller_quietly(&self) -> Result<()> {
+        let user: mcp_types::api::User = self
+            .get_without_session_refresh(
+                "/auth/me",
+                RequestOptions {
+                    timeout: Some(READ_TIMEOUT),
+                    retries: Some(0),
+                    ..RequestOptions::default()
+                },
+            )
+            .await?;
+        self.caller_named(&user).await;
+        Ok(())
+    }
+
     /// Report what a run is doing. Endpoint: `POST /run-progress/report`,
     /// answered with `{run, written, cursor}`.
     ///

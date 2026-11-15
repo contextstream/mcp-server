@@ -238,7 +238,9 @@ pub use plan_loops::{
     PlanLoopGate,
 };
 pub use retry::IngestFailure;
-pub use run_progress::{observe_api_answers, sent_credential, RunFilter, SentCredential};
+pub use run_progress::{
+    observe_api_answers, sent_credential, ApiAnswer, RunFilter, SentCredential,
+};
 pub use ticket::{
     append_ticket_extras, canonical_linked_item_kind, format_linked_summary,
     format_ticket_assignee_summary, format_ticket_fields_not_saved, format_ticket_linked_summary,

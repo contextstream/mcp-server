@@ -329,6 +329,28 @@ impl SlipstreamTool {
             }
         }
 
+        // A run never asks the person, so where only their own go-ahead counts
+        // (crate::go_ahead) a price the agent accepts runs nothing: a free agent runs, a priced
+        // one only under the person's own auto-accept cap, and one metered per model call,
+        // which nobody accepted beforehand, does not.
+        if crate::go_ahead::asked_only() {
+            let own_cap = self.auto_accept_max_credits().await;
+            let goes = match entry.price_credits {
+                Some(price) if price <= 0 => true,
+                Some(price) => own_cap > 0 && price <= i64::from(own_cap),
+                None => false,
+            };
+            if !goes {
+                return Ok(ToolResult::with_structured(
+                    format!(
+                        "Not run: {} (an agent run does not ask them). Nothing was charged.",
+                        crate::go_ahead::NOT_ASKED
+                    ),
+                    json!({"ran": false, "agent": entry.id, "go_ahead": "asked_only"}),
+                ));
+            }
+        }
+
         // The price: accepted by the person, or under their auto-accept cap.
         let cap = self.auto_accept_max_credits().await;
         let mut notes = prepared.notes.clone();
@@ -475,6 +497,16 @@ impl SlipstreamTool {
                 json!({"ran": false, "automatic": true, "agent": agent}),
             )
         };
+        // Nor does an automatic run ask the person (crate::go_ahead).
+        if crate::go_ahead::asked_only() {
+            return Ok(ToolResult::with_structured(
+                format!(
+                    "Not run: {} (an automatic run does not ask them). Nothing was charged.",
+                    crate::go_ahead::NOT_ASKED
+                ),
+                json!({"ran": false, "automatic": true, "agent": agent, "go_ahead": "asked_only"}),
+            ));
+        }
         // A connection with a spend ceiling (crate::spend) takes no automatic run: its price is
         // the workspace setting's, not one this connection was asked to hold.
         if let Some(most) = self.client.config().await.max_spend_credits {

@@ -947,6 +947,58 @@ async fn a_spend_ceiling_bounds_every_run_on_the_connection() {
     assert_eq!(stub.task_posts().len(), 1);
 }
 
+/// A connection that takes a go-ahead only from the person (crate::go_ahead): an agent run
+/// never asks them, so a price the agent accepts runs nothing; nor does a run metered per
+/// model call, nor an automatic one. The person's own auto-accept cap still runs it.
+#[tokio::test]
+async fn where_only_the_persons_own_go_ahead_counts_an_accepted_price_runs_nothing() {
+    let stub = Stub::api(live_catalog(), |request| {
+        if request.method == "POST" {
+            Answer::ok(task_view("succeeded", true))
+        } else {
+            Answer::error(404, "no")
+        }
+    })
+    .await;
+    let asked_only = || mcp_types::config::ConfigOverride {
+        go_ahead_asked_only: Some(true),
+        ..Default::default()
+    };
+    let (tool, _) = stub.tool(stub.config("key-go-ahead"));
+    for extra in [
+        json!({"accepted_price_credits": 1200}),
+        json!({"accepted_price_credits": 1_000_000}),
+        json!({"automatic": true}),
+    ] {
+        let refused = mcp_client::run_with_config_override(asked_only(), || async {
+            tool.execute(run_input(extra.clone())).await.unwrap()
+        })
+        .await;
+        let text = text_of(&refused);
+        assert!(
+            text.starts_with("Not run: on this connection a go-ahead counts only when the person is asked and says yes, and they could not be asked"),
+            "{extra}: {text}"
+        );
+        assert!(text.contains("Nothing was charged"), "{text}");
+        assert_eq!(refused.structured_content.as_ref().unwrap()["ran"], false);
+        assert_eq!(
+            refused.structured_content.as_ref().unwrap()["go_ahead"],
+            "asked_only"
+        );
+    }
+    assert!(stub.task_posts().is_empty());
+
+    // The person's own standing cap is not the agent's word: it still runs.
+    let mut config = stub.config("key-go-ahead-cap");
+    config.slipstream_auto_accept_max_credits = 1200;
+    let (tool, _) = stub.tool(config);
+    mcp_client::run_with_config_override(asked_only(), || async {
+        tool.execute(run_input(json!({}))).await.unwrap()
+    })
+    .await;
+    assert_eq!(stub.task_posts().len(), 1);
+}
+
 #[tokio::test]
 async fn a_retried_run_carries_the_same_idempotency_key() {
     let stub = Stub::api(live_catalog(), |request| {

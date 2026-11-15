@@ -365,6 +365,14 @@ struct DeleteTool {
 #[async_trait]
 impl ToolHandler for DeleteTool {
     async fn execute(&self, mut input: Value) -> Result<ToolResult> {
+        // Where a go-ahead counts only when the person was asked (crate::go_ahead): this tool
+        // never asks them, so it deletes nothing there.
+        if crate::go_ahead::asked_only() {
+            return Ok(ToolResult::error(format!(
+                "Not deleted: {} (the delete tool does not ask them). Nothing was changed.",
+                crate::go_ahead::NOT_ASKED
+            )));
+        }
         let requested =
             normalized_action(input.get("action").and_then(Value::as_str).unwrap_or(""));
         let Some((moved, handler)) = self
@@ -513,6 +521,57 @@ mod tests {
         assert!(
             refused.to_string().contains("workspace.delete"),
             "{refused}"
+        );
+    }
+
+    /// A connection that takes a go-ahead only from the person (crate::go_ahead): the
+    /// `delete` tool never asks them, so it deletes nothing there.
+    #[tokio::test]
+    async fn where_only_the_persons_own_go_ahead_counts_nothing_is_deleted() {
+        let workspace = Arc::new(Recording {
+            metadata: ToolMetadata {
+                name: "workspace".to_string(),
+                title: "Workspace".to_string(),
+                description: "test".to_string(),
+                category: ToolCategory::Workspace,
+                annotations: ToolAnnotations::destructive(),
+                is_pro: false,
+                required_tier: None,
+            },
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let tool = DeleteTool {
+            actions: vec![(separated("workspace", "delete").unwrap(), workspace.clone())],
+            schema: json!({}),
+            metadata: ToolMetadata {
+                name: DELETE_TOOL.to_string(),
+                title: "Delete".to_string(),
+                description: DESCRIPTION.to_string(),
+                category: ToolCategory::Utility,
+                annotations: ToolAnnotations::destructive(),
+                is_pro: false,
+                required_tier: None,
+            },
+        };
+        let config = mcp_types::config::ConfigOverride {
+            go_ahead_asked_only: Some(true),
+            ..Default::default()
+        };
+        let refused = mcp_client::run_with_config_override(config, || async {
+            tool.execute(json!({"action": "workspace.delete", "workspace_id": "w1"}))
+                .await
+                .unwrap()
+        })
+        .await;
+        assert!(refused.is_error);
+        let text = format!("{:?}", refused.content);
+        assert!(
+            text.contains("Not deleted: on this connection a go-ahead counts only when the person is asked and says yes, and they could not be asked"),
+            "{text}"
+        );
+        assert!(
+            workspace.calls.lock().unwrap().is_empty(),
+            "nothing reached the action"
         );
     }
 

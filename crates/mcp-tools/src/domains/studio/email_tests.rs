@@ -1952,8 +1952,8 @@ fn addresses_contacts_and_operations_read_plainly() {
 // ============================================================================
 
 use super::email_sequences::{
-    changes_words, rule_words, state_words, step_line, step_number, summary_line, window_days,
-    SEQUENCES_ACTION, SEQUENCES_NOT_OFFERED,
+    changes_words, rule_words, sending_words, skip_words, state_words, step_line, step_number,
+    summary_line, totals_words, window_days, SEQUENCES_ACTION, SEQUENCES_NOT_OFFERED,
 };
 
 const SEQUENCE: &str = "33333333-3333-4333-8333-333333333333";
@@ -2006,21 +2006,23 @@ fn sequence_detail() -> Value {
             {
                 "id": STEP_ONE, "number": 1, "name": "Step 1", "subject": "Your first step",
                 "published": true, "delay_days": 0, "delay_hours": 0, "day": 0.0,
-                "totals": {"sent": 150, "delivered": 0, "opened": 60, "clicked": 9, "bounced": 0, "complained": 0, "unsubscribed": 0},
+                "totals": {"sent": 150, "opened": 60, "clicked": 9},
                 "window": {"sent": 28, "delivered": 28, "opened": 10, "clicked": 3, "bounced": 0, "complained": 0, "unsubscribed": 0},
                 "waiting": 0, "next_due_at": null, "last_sent_at": "2026-11-14T23:08:07Z"
             },
             {
                 "id": STEP_TWO, "number": 2, "name": "Step 2", "subject": "Pick your path",
                 "published": true, "delay_days": 2, "delay_hours": 0, "day": 2.0,
-                "totals": {"sent": 145, "delivered": 0, "opened": 50, "clicked": 7, "bounced": 0, "complained": 0, "unsubscribed": 0},
+                "totals": {"sent": 145, "opened": 50, "clicked": 7},
                 "window": {"sent": 28, "delivered": 28, "opened": 11, "clicked": 2, "bounced": 0, "complained": 0, "unsubscribed": 0},
                 "waiting": 1, "next_due_at": "2026-11-16T23:07:00Z", "last_sent_at": "2026-11-14T12:24:03Z"
             }
         ],
         "skipped": [
-            {"status": "skipped", "reason": "Recipient is an invalid or test address", "count": 23},
-            {"status": "skipped", "reason": "Recipient has unsubscribed", "count": 12}
+            {"status": "skipped", "reason": "Recipient is an invalid or test address", "withheld": false, "count": 23},
+            {"status": "skipped", "reason": "Recipient has unsubscribed", "withheld": false, "count": 12},
+            {"status": "failed", "reason": null, "withheld": true, "count": 4},
+            {"status": "skipped", "reason": null, "withheld": false, "count": 1}
         ],
         "window_totals": {"sent": 56, "delivered": 56, "opened": 21, "clicked": 5, "bounced": 0, "complained": 0, "unsubscribed": 0},
         "as_of": "2026-11-14T23:17:00Z"
@@ -2041,7 +2043,7 @@ fn sequences_api() -> Responder {
                 200,
                 json!({
                     "sequence_id": SEQUENCE, "id": STEP_TWO, "number": 2, "name": "Step 2",
-                    "published": true, "subject": "Pick your path", "headline": "Three ways in",
+                    "published": true, "sequence_state": "running", "subject": "Pick your path", "headline": "Three ways in",
                     "message": "<p>There are three ways to begin:</p>",
                     "editor_mode": "richtext", "cta_text": "Choose one", "cta_url": "https://example.com/start",
                     "signature_type": "founder", "delay_days": 2, "delay_hours": 0,
@@ -2133,7 +2135,13 @@ async fn one_sequence_shows_its_people_its_emails_and_their_numbers() {
         ),
         "{said}"
     );
-    assert!(said.contains("Not sent in the last 7 days: 23 skipped (Recipient is an invalid or test address); 12 skipped (Recipient has unsubscribed)."), "{said}");
+    assert!(said.contains("Not sent in the last 7 days: 23 skipped (Recipient is an invalid or test address); 12 skipped (Recipient has unsubscribed); 4 failed (reason withheld: the mail provider's own text, which stays in the admin); 1 skipped (no reason stored)."), "{said}");
+    // A step's own totals are the three the API answers; nothing is added beside them.
+    assert_eq!(
+        structured(&result)["steps"][0]["totals"],
+        json!({"sent": 150, "opened": 60, "clicked": 9})
+    );
+    assert!(!said.contains('?'), "{said}");
     assert!(said.contains(&format!("A change is made at https://admin.example.com/email/campaigns/{SEQUENCE}, and a save there is live at once: there is no draft.")), "{said}");
     assert_eq!(structured(&result)["steps"][1]["window"]["opened"], 11);
     let requests = stub.requests();
@@ -2256,6 +2264,231 @@ async fn an_account_sequences_arent_offered_to_gets_one_plain_refusal() {
     );
 }
 
+/// The detail and the step text as `change` leaves them, for one sequence with two emails.
+fn changed_api(change: fn(&mut Value, &mut Value)) -> Responder {
+    Arc::new(move |request: &Recorded| {
+        let mut detail = sequence_detail();
+        let mut step = json!({
+            "sequence_id": SEQUENCE, "id": STEP_TWO, "number": 2, "name": "Step 2",
+            "published": true, "sequence_state": "running", "subject": "Pick your path", "headline": null,
+            "message": "<p>Body</p>", "editor_mode": "richtext", "cta_text": null, "cta_url": null,
+            "signature_type": null, "delay_days": 2, "delay_hours": 0,
+            "admin_url": format!("https://admin.example.com/email/campaigns/{SEQUENCE}")
+        });
+        change(&mut detail, &mut step);
+        match request.path.as_str() {
+            "/admin/email/sequences" => bare(200, json!({"as_of": "2026-11-14T23:17:00Z"})),
+            path if path.ends_with(&format!("/steps/{STEP_TWO}")) => bare(200, step),
+            _ => bare(200, detail),
+        }
+    })
+}
+
+async fn step_text(change: fn(&mut Value, &mut Value)) -> String {
+    let stub = Stub::start(changed_api(change)).await;
+    let result = stub
+        .tool()
+        .execute(json!({"action": "email_sequences", "sequence_id": SEQUENCE, "step": 2}))
+        .await
+        .unwrap();
+    assert!(!result.is_error, "{}", text_of(&result));
+    text_of(&result)
+}
+
+#[tokio::test]
+async fn whether_an_emails_text_is_being_sent_is_said_only_as_the_api_answered_it() {
+    let running = step_text(|_, _| {}).await;
+    assert!(
+        running.contains("\nThis is the text being sent now. Nothing here changes it."),
+        "{running}"
+    );
+
+    let unpublished = step_text(|_, step| step["published"] = json!(false)).await;
+    assert!(
+        unpublished
+            .starts_with("Email 2 of “Getting Started” (not published, so it is not sent; day 2):"),
+        "{unpublished}"
+    );
+    assert!(
+        unpublished.contains(
+            "This email is not published, so this text is not being sent. Nothing here changes it."
+        ),
+        "{unpublished}"
+    );
+    assert!(!unpublished.contains("being sent now"), "{unpublished}");
+
+    let paused = step_text(|_, step| step["sequence_state"] = json!("paused")).await;
+    assert!(
+        paused.contains("The sequence is paused, so this text is not being sent now."),
+        "{paused}"
+    );
+    assert!(
+        !paused.contains("This is the text being sent now"),
+        "{paused}"
+    );
+
+    let stopped = step_text(|_, step| step["sequence_state"] = json!("not_running")).await;
+    assert!(
+        stopped.contains("The sequence is not running, so this text is not being sent now."),
+        "{stopped}"
+    );
+
+    let enrolled_only = step_text(|_, step| step["sequence_state"] = json!("enrolled_only")).await;
+    assert!(enrolled_only.contains("This is the text being sent to the people already in the sequence; nobody new is enrolled."), "{enrolled_only}");
+
+    // An answer that does not say: nothing is claimed either way.
+    let silent = step_text(|_, step| {
+        step.as_object_mut().unwrap().remove("sequence_state");
+        step.as_object_mut().unwrap().remove("published");
+        step.as_object_mut().unwrap().remove("editor_mode");
+        step.as_object_mut().unwrap().remove("message");
+        step.as_object_mut().unwrap().remove("subject");
+    })
+    .await;
+    assert!(
+        silent.starts_with(
+            "Email 2 of “Getting Started” (whether it is published was not answered; day 2):"
+        ),
+        "{silent}"
+    );
+    assert!(
+        silent.contains("Whether this text is being sent now was not answered."),
+        "{silent}"
+    );
+    assert!(
+        silent.contains("Subject: (subject not answered)"),
+        "{silent}"
+    );
+    assert!(
+        silent.contains("Body, as stored:\n(the body was not answered)"),
+        "{silent}"
+    );
+    assert!(
+        !silent.contains("plain") && !silent.contains("being sent now.\n"),
+        "{silent}"
+    );
+    for state in ["draining", ""] {
+        assert_eq!(
+            sending_words(&json!({"published": true, "sequence_state": state})),
+            "Whether this text is being sent now was not answered."
+        );
+    }
+    assert_eq!(
+        sending_words(&json!({"published": false, "sequence_state": "running"})),
+        "This email is not published, so this text is not being sent."
+    );
+}
+
+#[tokio::test]
+async fn an_answer_that_lacks_something_is_never_filled_in() {
+    // A 200 without the list is not "no sequences".
+    let stub = Stub::start(changed_api(|_, _| {})).await;
+    let error = stub
+        .tool()
+        .execute(json!({"action": "email_sequences"}))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("couldn't be read"), "{error}");
+    // A list that is there and empty is.
+    let empty = Stub::start(Arc::new(|_: &Recorded| bare(200, json!({"sequences": []})))).await;
+    let result = empty
+        .tool()
+        .execute(json!({"action": "email_sequences"}))
+        .await
+        .unwrap();
+    assert_eq!(text_of(&result), "No email sequences yet.");
+
+    // A detail without its sequence or its emails can't be read either.
+    for change in [
+        (|detail: &mut Value, _: &mut Value| {
+            detail.as_object_mut().unwrap().remove("sequence");
+        }) as fn(&mut Value, &mut Value),
+        |detail, _| {
+            detail.as_object_mut().unwrap().remove("steps");
+        },
+    ] {
+        let stub = Stub::start(changed_api(change)).await;
+        for call in [
+            json!({"action": "email_sequences", "sequence_id": SEQUENCE}),
+            json!({"action": "email_sequences", "sequence_id": SEQUENCE, "step": 2}),
+        ] {
+            match stub.tool().execute(call.clone()).await {
+                Err(error) => assert!(error.to_string().contains("couldn't be read"), "{error}"),
+                Ok(result) => {
+                    // The step's text needs only the emails: without the sequence it still reads.
+                    assert!(call.get("step").is_some() && !result.is_error, "{call}");
+                }
+            }
+        }
+    }
+
+    // Numbers the answer does not carry are said as not answered, never as zero or "none".
+    let stub = Stub::start(changed_api(|detail, _| {
+        let sequence = detail["sequence"].as_object_mut().unwrap();
+        for key in [
+            "state",
+            "exit_applies",
+            "steps",
+            "totals",
+            "people",
+            "people_mid_sequence",
+        ] {
+            sequence.remove(key);
+        }
+        sequence["automation"] = json!({});
+        detail.as_object_mut().unwrap().remove("people");
+        detail.as_object_mut().unwrap().remove("window_totals");
+        detail.as_object_mut().unwrap().remove("skipped");
+        detail["steps"][0] = json!({"id": STEP_ONE, "subject": ""});
+    }))
+    .await;
+    let result = stub
+        .tool()
+        .execute(json!({"action": "email_sequences", "sequence_id": SEQUENCE, "days": 7}))
+        .await
+        .unwrap();
+    let said = text_of(&result);
+    assert!(said.starts_with("Getting Started: where it stands was not answered. how many emails it has was not answered; what starts it was not answered; what ends it was not answered."), "{said}");
+    assert!(said.contains("People: not answered so far, not answered in the last 7 days, not answered part-way through, not answered left on paying, not answered unsubscribed, not answered bounced, complaints not answered."), "{said}");
+    assert!(said.contains("In the last 7 days: sent not answered, delivered not answered, opened not answered, clicked not answered, bounced not answered, unsubscribed not answered, complaints not answered."), "{said}");
+    assert!(
+        said.contains("; ? is a number that was not answered):"),
+        "{said}"
+    );
+    assert!(said.contains("?. (no subject): day not answered; ?/?/?; ?/?/?; whether it is published was not answered; how many are waiting was not answered"), "{said}");
+    assert!(
+        said.contains("Why sends were not made in the last 7 days was not answered."),
+        "{said}"
+    );
+    for invented in [
+        "no complaints",
+        "sent 0",
+        "0 people",
+        "0 so far",
+        "it has no",
+        "status unknown",
+        "no reason",
+        "/0/",
+    ] {
+        assert!(!said.contains(invented), "{invented:?} in {said}");
+    }
+
+    let line = summary_line(&json!({"name": "A sequence"}));
+    assert_eq!(
+        line,
+        "- A sequence: where it stands was not answered. how many emails it has was not answered; what starts it was not answered; what ends it was not answered. how many people so far was not answered, not answered part-way through. All time: sent not answered, delivered not answered, opened not answered, clicked not answered, bounced not answered, unsubscribed not answered, complaints not answered. (sequence_id not answered)"
+    );
+    assert_eq!(totals_words(&json!({"sent": 5, "complained": 0})), "sent 5, delivered not answered, opened not answered, clicked not answered, bounced not answered, unsubscribed not answered, no complaints");
+    assert_eq!(
+        skip_words(&json!({"status": "failed", "count": 2})),
+        "2 failed (reason not answered)"
+    );
+    assert_eq!(
+        skip_words(&json!({"reason": "Recipient has unsubscribed", "withheld": false})),
+        "? not sent (Recipient has unsubscribed)"
+    );
+}
+
 #[tokio::test]
 async fn a_bad_call_is_refused_before_anything_is_asked() {
     let stub = Stub::start(sequences_api()).await;
@@ -2317,11 +2550,19 @@ fn a_sequences_state_and_rules_are_said_from_the_apis_fields() {
     assert_eq!(state_words(&other), "state draining");
     assert_eq!(
         rule_words(&other),
-        "its trigger is joined_audience; it has no exit"
+        "its trigger is joined_audience; what ends it was not answered"
     );
+    // An answer without a state says so: the status is not passed off as where it stands.
     let mut older = sequence_summary();
     older.as_object_mut().unwrap().remove("state");
-    assert_eq!(state_words(&older), "status sending");
+    assert_eq!(state_words(&older), "where it stands was not answered");
+    // Whether the exit is applied is the API's to say: without it, it is not assumed.
+    let mut unsaid = sequence_summary();
+    unsaid.as_object_mut().unwrap().remove("exit_applies");
+    assert_eq!(
+        rule_words(&unsaid),
+        "a new Starter sign-up starts it; paying is its exit (whether that is being applied was not answered)"
+    );
 
     // Where a change is made, and whether a save is live, are the API's to say.
     assert!(changes_words(&running).ends_with("a save there is live at once: there is no draft."));

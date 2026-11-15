@@ -13,6 +13,11 @@
 //! Nothing here drafts, publishes, pauses or sends, and no recipient is named: the API
 //! counts people and never lists them. What a state means is the API's to say (its `state`,
 //! `exit_applies` and `edits_live_on_save` fields); this file only puts them in words.
+//!
+//! One rule for every sentence below: it says what the API answered and nothing else. A field
+//! the answer does not carry is said as "not answered", never as zero, "none" or a default;
+//! and whether an email's text is being sent is said from the API's `published` and
+//! `sequence_state`, never assumed.
 
 use mcp_client::studio::StudioAnswer;
 use mcp_types::{tool::ToolResult, Error, Result};
@@ -57,8 +62,33 @@ fn text(value: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn count(value: &Value, pointer: &str) -> i64 {
-    value.pointer(pointer).and_then(Value::as_i64).unwrap_or(0)
+/// A number the API answered, or `None`: a missing number is never read as zero.
+fn count(value: &Value, pointer: &str) -> Option<i64> {
+    value.pointer(pointer).and_then(Value::as_i64)
+}
+
+pub(crate) const NOT_ANSWERED: &str = "not answered";
+const UNREADABLE: &str = "ContextStream's answer about email sequences couldn't be read: try again in a few minutes. Nothing was changed.";
+
+/// "1,124", or "not answered".
+fn number(value: Option<i64>) -> String {
+    value
+        .map(credits)
+        .unwrap_or_else(|| NOT_ANSWERED.to_string())
+}
+
+/// "1,124", or "?" where three numbers share a line (the line's legend says what "?" is).
+fn short(value: Option<i64>) -> String {
+    value.map(credits).unwrap_or_else(|| "?".to_string())
+}
+
+/// "no complaints", "3 complained", or that it was not answered.
+fn complaints(value: Option<i64>) -> String {
+    match value {
+        Some(0) => "no complaints".to_string(),
+        Some(complained) => format!("{} complained", credits(complained)),
+        None => "complaints not answered".to_string(),
+    }
 }
 
 /// An ISO time as "2026-11-02 09:00 UTC".
@@ -70,11 +100,11 @@ fn moment(value: Option<&str>) -> Option<String> {
     ))
 }
 
-fn people(count: i64) -> String {
-    if count == 1 {
-        "1 person".to_string()
-    } else {
-        format!("{} people", credits(count))
+fn people(count: Option<i64>) -> String {
+    match count {
+        Some(1) => "1 person so far".to_string(),
+        Some(count) => format!("{} people so far", credits(count)),
+        None => "how many people so far was not answered".to_string(),
     }
 }
 
@@ -93,18 +123,15 @@ pub(crate) fn state_words(sequence: &Value) -> String {
     match sequence.get("state").and_then(Value::as_str) {
         Some("running") => "running".to_string(),
         Some("paused") => "paused: nothing is being sent".to_string(),
-        Some("not_running") => format!(
-            "not running (status {})",
-            text(sequence, "status").unwrap_or_else(|| "unknown".to_string())
-        ),
+        Some("not_running") => match text(sequence, "status") {
+            Some(status) => format!("not running (status {status})"),
+            None => "not running".to_string(),
+        },
         Some("enrolled_only") => {
             "sending only to the people already in it: nobody new is enrolled".to_string()
         }
         Some(other) => format!("state {other}"),
-        None => format!(
-            "status {}",
-            text(sequence, "status").unwrap_or_else(|| "unknown".to_string())
-        ),
+        None => "where it stands was not answered".to_string(),
     }
 }
 
@@ -117,18 +144,26 @@ pub(crate) fn rule_words(sequence: &Value) -> String {
     {
         Some("starter_signup") => "a new Starter sign-up starts it".to_string(),
         Some(other) => format!("its trigger is {other}"),
-        None => "it has no trigger".to_string(),
+        None => "what starts it was not answered".to_string(),
     };
-    let applies = sequence.get("exit_applies").and_then(Value::as_bool) != Some(false);
-    let exit = match sequence
-        .pointer("/automation/exit_condition")
-        .and_then(Value::as_str)
-    {
-        Some("paid_subscription") if applies => "paying ends it".to_string(),
-        Some("paid_subscription") => "paying no longer ends it".to_string(),
-        Some(other) if applies => format!("its exit is {other}"),
-        Some(other) => format!("its exit ({other}) is not being applied"),
-        None => "it has no exit".to_string(),
+    let applies = sequence.get("exit_applies").and_then(Value::as_bool);
+    let exit = match (
+        sequence
+            .pointer("/automation/exit_condition")
+            .and_then(Value::as_str),
+        applies,
+    ) {
+        (Some("paid_subscription"), Some(true)) => "paying ends it".to_string(),
+        (Some("paid_subscription"), Some(false)) => "paying no longer ends it".to_string(),
+        (Some("paid_subscription"), None) => {
+            "paying is its exit (whether that is being applied was not answered)".to_string()
+        }
+        (Some(other), Some(true)) => format!("its exit is {other}"),
+        (Some(other), Some(false)) => format!("its exit ({other}) is not being applied"),
+        (Some(other), None) => {
+            format!("its exit is {other} (whether that is being applied was not answered)")
+        }
+        (None, _) => "what ends it was not answered".to_string(),
     };
     format!("{trigger}; {exit}")
 }
@@ -148,25 +183,22 @@ pub(crate) fn changes_words(sequence: &Value) -> String {
 
 /// "sent 1,124, delivered 1,075, opened 340, clicked 36, bounced 21, unsubscribed 4, no complaints".
 pub(crate) fn totals_words(totals: &Value) -> String {
-    let complained = count(totals, "/complained");
     format!(
         "sent {}, delivered {}, opened {}, clicked {}, bounced {}, unsubscribed {}, {}",
-        credits(count(totals, "/sent")),
-        credits(count(totals, "/delivered")),
-        credits(count(totals, "/opened")),
-        credits(count(totals, "/clicked")),
-        credits(count(totals, "/bounced")),
-        credits(count(totals, "/unsubscribed")),
-        if complained == 0 {
-            "no complaints".to_string()
-        } else {
-            format!("{} complained", credits(complained))
-        }
+        number(count(totals, "/sent")),
+        number(count(totals, "/delivered")),
+        number(count(totals, "/opened")),
+        number(count(totals, "/clicked")),
+        number(count(totals, "/bounced")),
+        number(count(totals, "/unsubscribed")),
+        complaints(count(totals, "/complained"))
     )
 }
 
 fn emails_words(sequence: &Value) -> String {
-    let steps = count(sequence, "/steps");
+    let Some(steps) = count(sequence, "/steps") else {
+        return "how many emails it has was not answered".to_string();
+    };
     let published = sequence
         .pointer("/automation/published_steps")
         .and_then(Value::as_i64)
@@ -183,47 +215,112 @@ fn emails_words(sequence: &Value) -> String {
 /// One line for one sequence in the list.
 pub(crate) fn summary_line(sequence: &Value) -> String {
     let name = text(sequence, "name").unwrap_or_else(|| "A sequence".to_string());
-    let id = text(sequence, "id").unwrap_or_default();
+    let id = text(sequence, "id").unwrap_or_else(|| NOT_ANSWERED.to_string());
     let last = moment(sequence.get("last_sent_at").and_then(Value::as_str))
         .map(|at| format!(" Last send {at}."))
         .unwrap_or_default();
     format!(
-        "- {name}: {}. {}; {}. {} so far, {} part-way through. All time: {}.{last} (sequence_id {id})",
+        "- {name}: {}. {}; {}. {}, {} part-way through. All time: {}.{last} (sequence_id {id})",
         state_words(sequence),
         emails_words(sequence),
         rule_words(sequence),
         people(count(sequence, "/people")),
-        credits(count(sequence, "/people_mid_sequence")),
+        number(count(sequence, "/people_mid_sequence")),
         totals_words(sequence.get("totals").unwrap_or(&Value::Null)),
     )
 }
 
 /// One line for one email of a sequence.
 pub(crate) fn step_line(step: &Value) -> String {
-    let number = count(step, "/number");
-    let subject = text(step, "subject").unwrap_or_else(|| "(no subject)".to_string());
-    let day = step.get("day").and_then(Value::as_f64).unwrap_or(0.0);
     let mut line = format!(
-        "{number}. {subject}: {}; {}/{}/{}; {}/{}/{}",
-        day_words(day),
-        credits(count(step, "/window/sent")),
-        credits(count(step, "/window/opened")),
-        credits(count(step, "/window/clicked")),
-        credits(count(step, "/totals/sent")),
-        credits(count(step, "/totals/opened")),
-        credits(count(step, "/totals/clicked")),
+        "{}. {}: {}; {}/{}/{}; {}/{}/{}",
+        short(count(step, "/number")),
+        subject_words(step),
+        day_of(step),
+        short(count(step, "/window/sent")),
+        short(count(step, "/window/opened")),
+        short(count(step, "/window/clicked")),
+        short(count(step, "/totals/sent")),
+        short(count(step, "/totals/opened")),
+        short(count(step, "/totals/clicked")),
     );
-    if step.get("published").and_then(Value::as_bool) == Some(false) {
-        line.push_str("; not published, so it is not sent");
+    match step.get("published").and_then(Value::as_bool) {
+        Some(true) => {}
+        Some(false) => line.push_str("; not published, so it is not sent"),
+        None => line.push_str("; whether it is published was not answered"),
     }
-    let waiting = count(step, "/waiting");
-    if waiting > 0 {
-        line.push_str(&format!("; {} waiting", credits(waiting)));
-        if let Some(next) = moment(step.get("next_due_at").and_then(Value::as_str)) {
-            line.push_str(&format!(", next {next}"));
+    match count(step, "/waiting") {
+        Some(waiting) if waiting > 0 => {
+            line.push_str(&format!("; {} waiting", credits(waiting)));
+            if let Some(next) = moment(step.get("next_due_at").and_then(Value::as_str)) {
+                line.push_str(&format!(", next {next}"));
+            }
         }
+        Some(_) => {}
+        None => line.push_str("; how many are waiting was not answered"),
     }
     line
+}
+
+/// The subject as answered; an empty one and one the answer does not carry are told apart.
+fn subject_words(step: &Value) -> String {
+    match step.get("subject").and_then(Value::as_str).map(str::trim) {
+        Some("") => "(no subject)".to_string(),
+        Some(subject) => subject.to_string(),
+        None => "(subject not answered)".to_string(),
+    }
+}
+
+/// "day 2", or that the day was not answered.
+fn day_of(step: &Value) -> String {
+    match step.get("day").and_then(Value::as_f64) {
+        Some(day) => day_words(day),
+        None => "day not answered".to_string(),
+    }
+}
+
+/// One group of sends that were not made: how many, skipped or failed, and why. The API
+/// answers a reason only when it is one of the admin's own sentences; the mail provider's
+/// own text is counted and withheld, and that is said as it is.
+pub(crate) fn skip_words(row: &Value) -> String {
+    let why = match (
+        text(row, "reason"),
+        row.get("withheld").and_then(Value::as_bool),
+    ) {
+        (Some(reason), _) => reason,
+        (None, Some(true)) => {
+            "reason withheld: the mail provider's own text, which stays in the admin".to_string()
+        }
+        (None, Some(false)) => "no reason stored".to_string(),
+        (None, None) => "reason not answered".to_string(),
+    };
+    format!(
+        "{} {} ({why})",
+        short(count(row, "/count")),
+        text(row, "status").unwrap_or_else(|| "not sent".to_string()),
+    )
+}
+
+/// Whether an email's text is being sent, from the two fields the API answers with the text
+/// (`published` and `sequence_state`). Nothing is said that they do not say.
+pub(crate) fn sending_words(step: &Value) -> &'static str {
+    match (
+        step.get("published").and_then(Value::as_bool),
+        step.get("sequence_state").and_then(Value::as_str),
+    ) {
+        (Some(false), _) => "This email is not published, so this text is not being sent.",
+        (Some(true), Some("running")) => "This is the text being sent now.",
+        (Some(true), Some("paused")) => {
+            "The sequence is paused, so this text is not being sent now."
+        }
+        (Some(true), Some("not_running")) => {
+            "The sequence is not running, so this text is not being sent now."
+        }
+        (Some(true), Some("enrolled_only")) => {
+            "This is the text being sent to the people already in the sequence; nobody new is enrolled."
+        }
+        _ => "Whether this text is being sent now was not answered.",
+    }
 }
 
 /// What the API said, for a person: a sign-in, the offer, something missing, or nothing
@@ -295,12 +392,15 @@ impl StudioTool {
         if !answer.is_success() {
             return Self::sequences_refused(&answer, NO_SEQUENCE);
         }
-        let sequences = answer
+        // An answer without the list is not "no sequences": it is an answer that can't be read.
+        let Some(sequences) = answer
             .data
             .get("sequences")
             .and_then(Value::as_array)
             .cloned()
-            .unwrap_or_default();
+        else {
+            return Err(Error::Network(UNREADABLE.to_string()));
+        };
         if sequences.is_empty() {
             return Ok(ToolResult::with_structured(
                 "No email sequences yet.".to_string(),
@@ -334,7 +434,12 @@ impl StudioTool {
             return Self::sequences_refused(&answer, NO_SEQUENCE);
         }
         let detail = &answer.data;
-        let sequence = detail.get("sequence").cloned().unwrap_or(Value::Null);
+        let (Some(sequence), Some(steps)) = (
+            detail.get("sequence").filter(|s| s.is_object()).cloned(),
+            detail.get("steps").and_then(Value::as_array).cloned(),
+        ) else {
+            return Err(Error::Network(UNREADABLE.to_string()));
+        };
         let name = text(&sequence, "name").unwrap_or_else(|| "The sequence".to_string());
         let days = detail
             .get("window_days")
@@ -345,7 +450,6 @@ impl StudioTool {
         } else {
             format!("the last {days} days")
         };
-        let complained = count(detail, "/people/complained");
         let mut lines = vec![
             format!(
                 "{name}: {}. {}; {}.",
@@ -355,17 +459,13 @@ impl StudioTool {
             ),
             format!(
                 "People: {} so far, {} in {window}, {} part-way through, {} left on paying, {} unsubscribed, {} bounced, {}.",
-                credits(count(detail, "/people/all_time")),
-                credits(count(detail, "/people/enrolled_in_window")),
-                credits(count(detail, "/people/mid_sequence")),
-                credits(count(detail, "/people/exited_paid")),
-                credits(count(detail, "/people/unsubscribed")),
-                credits(count(detail, "/people/bounced")),
-                if complained == 0 {
-                    "no complaints".to_string()
-                } else {
-                    format!("{} complained", credits(complained))
-                }
+                number(count(detail, "/people/all_time")),
+                number(count(detail, "/people/enrolled_in_window")),
+                number(count(detail, "/people/mid_sequence")),
+                number(count(detail, "/people/exited_paid")),
+                number(count(detail, "/people/unsubscribed")),
+                number(count(detail, "/people/bounced")),
+                complaints(count(detail, "/people/complained"))
             ),
             format!(
                 "In {window}: {}.",
@@ -376,35 +476,27 @@ impl StudioTool {
                 totals_words(sequence.get("totals").unwrap_or(&Value::Null))
             ),
         ];
-        let steps = detail
-            .get("steps")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
         if !steps.is_empty() {
+            let step_lines: Vec<String> = steps.iter().map(step_line).collect();
             lines.push(format!(
-                "Emails (day after enrollment; sent/opened/clicked in {window}; sent/opened/clicked all time):"
+                "Emails (day after enrollment; sent/opened/clicked in {window}; sent/opened/clicked all time{}):",
+                if step_lines.iter().any(|line| line.contains('?')) {
+                    "; ? is a number that was not answered"
+                } else {
+                    ""
+                }
             ));
-            lines.extend(steps.iter().map(step_line));
+            lines.extend(step_lines);
         }
-        let skipped: Vec<String> = detail
-            .get("skipped")
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.iter()
-                    .map(|row| {
-                        format!(
-                            "{} {} ({})",
-                            credits(count(row, "/count")),
-                            text(row, "status").unwrap_or_else(|| "skipped".to_string()),
-                            text(row, "reason").unwrap_or_else(|| "no reason given".to_string())
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !skipped.is_empty() {
-            lines.push(format!("Not sent in {window}: {}.", skipped.join("; ")));
+        match detail.get("skipped").and_then(Value::as_array) {
+            Some(rows) if !rows.is_empty() => lines.push(format!(
+                "Not sent in {window}: {}.",
+                rows.iter().map(skip_words).collect::<Vec<_>>().join("; ")
+            )),
+            Some(_) => {}
+            None => lines.push(format!(
+                "Why sends were not made in {window} was not answered."
+            )),
         }
         if let Some(at) = moment(detail.get("as_of").and_then(Value::as_str)) {
             lines.push(format!(
@@ -427,12 +519,9 @@ impl StudioTool {
         if !answer.is_success() {
             return Self::sequences_refused(&answer, NO_SEQUENCE);
         }
-        let steps = answer
-            .data
-            .get("steps")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let Some(steps) = answer.data.get("steps").and_then(Value::as_array).cloned() else {
+            return Err(Error::Network(UNREADABLE.to_string()));
+        };
         let name = answer
             .data
             .pointer("/sequence/name")
@@ -465,20 +554,16 @@ impl StudioTool {
             );
         }
         let step = &content.data;
-        let day = found.get("day").and_then(Value::as_f64).unwrap_or(0.0);
         let mut lines = vec![format!(
             "Email {number} of “{name}” ({}; {}):",
-            if step.get("published").and_then(Value::as_bool) == Some(false) {
-                "not published, so it is not sent"
-            } else {
-                "published"
+            match step.get("published").and_then(Value::as_bool) {
+                Some(true) => "published",
+                Some(false) => "not published, so it is not sent",
+                None => "whether it is published was not answered",
             },
-            day_words(day)
+            day_of(found)
         )];
-        lines.push(format!(
-            "Subject: {}",
-            text(step, "subject").unwrap_or_else(|| "(none)".to_string())
-        ));
+        lines.push(format!("Subject: {}", subject_words(step)));
         if let Some(headline) = text(step, "headline") {
             lines.push(format!("Headline: {headline}"));
         }
@@ -488,23 +573,32 @@ impl StudioTool {
             (None, Some(url)) => lines.push(format!("Button link: {url}")),
             (None, None) => {}
         }
+        lines.push(match text(step, "editor_mode") {
+            Some(mode) => format!("Body, as stored ({mode}):"),
+            None => "Body, as stored:".to_string(),
+        });
+        lines.push(match step.get("message").and_then(Value::as_str) {
+            Some(body) => body.to_string(),
+            None => "(the body was not answered)".to_string(),
+        });
         lines.push(format!(
-            "Body, as stored ({}):",
-            text(step, "editor_mode").unwrap_or_else(|| "plain".to_string())
-        ));
-        lines.push(
-            step.get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        );
-        lines.push(format!(
-            "This is the text being sent now. Nothing here changes it.{}",
+            "{} Nothing here changes it.{}",
+            sending_words(step),
             changes_words(answer.data.get("sequence").unwrap_or(&Value::Null))
         ));
+        // What the API answered for this email, with the two things its sequence answered
+        // about it (both only when they were answered).
         let mut structured = step.clone();
-        structured["day"] = json!(day);
-        structured["sequence_name"] = json!(name);
+        if let Some(day) = found.get("day").filter(|day| day.is_number()) {
+            structured["day"] = day.clone();
+        }
+        if let Some(name) = answer
+            .data
+            .pointer("/sequence/name")
+            .filter(|n| n.is_string())
+        {
+            structured["sequence_name"] = name.clone();
+        }
         Ok(ToolResult::with_structured(lines.join("\n"), structured))
     }
 }

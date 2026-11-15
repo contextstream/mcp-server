@@ -2678,4 +2678,52 @@ mod tests {
         );
         assert_eq!(extract_notice_item_from_line("item=é"), None);
     }
+
+    // --- Reviewer (review-prompt-hook-standing-1): a notice is not hidden by
+    // the item it names when its words are new. Both tests FAIL on 5cb65cda. ---
+
+    #[test]
+    fn review_a_reply_on_an_item_already_shown_is_printed_in_full() {
+        let mut state = MidRunSessionState::default();
+        let mut text = HookText::new();
+        text.notices
+            .push(notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed."));
+        filter_standing_text(&mut state, &text.render(), T0, REPEAT);
+
+        // The other session answers on the same item: the API's reply notice
+        // keeps the item id (handlers/coordination.rs, reply_notice_for) and
+        // carries words this session has never seen.
+        let reply = notice(
+            ITEM_A,
+            NOTICE_A2,
+            "Reply from session lane-y: STOP, I am rewriting migration 12 now; do not push it",
+        );
+        text.notices.push(reply.clone());
+        let second = filter_standing_text(&mut state, &text.render(), T0 + 60_000, REPEAT);
+        assert!(
+            second.lines().any(|line| line == reply),
+            "the reply was never shown, yet it is counted as 'shown earlier':\n{second}"
+        );
+    }
+
+    #[test]
+    fn review_a_notice_that_quotes_an_item_in_its_words_is_printed_in_full() {
+        let mut state = MidRunSessionState::default();
+        let mut text = HookText::new();
+        text.notices
+            .push(notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed."));
+        filter_standing_text(&mut state, &text.render(), T0, REPEAT);
+
+        // A notice with no item of its own (a lease conflict) whose reason
+        // mentions an item: the `item=` pattern takes the reason's uuid.
+        let lease = format!(
+            "[COORDINATION] (important) from Acme/widgets: deploy is held by lane z (it follows item={ITEM_A}); wait for it — ack via coordination(action=\"ack\", notice_id=\"{NOTICE_B1}\")"
+        );
+        text.notices.push(lease.clone());
+        let second = filter_standing_text(&mut state, &text.render(), T0 + 60_000, REPEAT);
+        assert!(
+            second.lines().any(|line| line == lease),
+            "a notice never shown is counted as 'shown earlier':\n{second}"
+        );
+    }
 }

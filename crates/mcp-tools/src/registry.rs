@@ -1097,6 +1097,13 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| Error::Tool(format!("Unknown tool: {}", name)))?;
+        // Where only the person's own go-ahead counts, nothing that cannot be undone runs on the
+        // agent's word, under any name (crate::go_ahead::refusal).
+        if let Some(refusal) =
+            crate::go_ahead::refusal(name, tool.metadata.annotations.destructive, &input)
+        {
+            return Ok(ToolResult::error(refusal));
+        }
         // An irreversible action runs only through `delete`, whose listing
         // says it destroys; its old tool says it does not (#330, #334).
         if let Some(refusal) = crate::domains::destructive::moved_refusal(name, &input) {
@@ -1471,6 +1478,13 @@ impl ToolRegistry {
             .operations
             .get(name)
             .ok_or_else(|| Error::Tool(format!("Unknown operation: {}", name)))?;
+        // The operations catalog keeps every action, the irreversible ones included: held here
+        // as in `execute` (crate::go_ahead::refusal).
+        if let Some(refusal) =
+            crate::go_ahead::refusal(name, operation.metadata.annotations.destructive, &input)
+        {
+            return Ok(ToolResult::error(refusal));
+        }
 
         if let Some(result) = self.plan_restriction_for_tool(&operation.metadata).await {
             return Ok(result);

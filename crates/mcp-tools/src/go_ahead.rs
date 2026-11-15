@@ -46,6 +46,41 @@ pub fn asked_only() -> bool {
         .unwrap_or_else(|| std::env::var_os(GO_AHEAD_ENV).is_some_and(|value| on(value.to_str())))
 }
 
+/// Why the tool or operation `name` is not run on this connection: where only the person's own
+/// go-ahead counts ([`asked_only`]), nothing runs that cannot be undone or that says it may
+/// destroy, since none of those ask the person. Decided by structure, never by words: the
+/// actions that cannot be undone (`destructive::SEPARATED_ACTIONS`), under their own tool's name
+/// with that action, as a one-action tool named `<tool>_<action>` (`memory_delete_doc`), or
+/// through the `delete` tool; and any other tool whose own listing says it is destructive
+/// (`workflow_delete`, `memory_update_doc`). A tool that lost its irreversible actions to
+/// `delete` (`memory`) is held to those actions alone, so its other actions still run.
+/// Checked once in the registry, before any tool or operation runs (review of 93d4920, M1).
+pub fn refusal(name: &str, destructive: bool, input: &serde_json::Value) -> Option<String> {
+    use crate::domains::destructive::{is_split_tool, DELETE_TOOL, SEPARATED_ACTIONS};
+    if !asked_only() {
+        return None;
+    }
+    let action = input
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .map(|action| action.trim().to_lowercase());
+    let removes = name == DELETE_TOOL
+        || SEPARATED_ACTIONS.iter().any(|moved| {
+            (moved.tool == name && action.as_deref() == Some(moved.action))
+                || name == format!("{}_{}", moved.tool, moved.action)
+        });
+    if removes {
+        return Some(format!(
+            "Not deleted: {NOT_ASKED} (`{name}` does not ask them). Nothing was changed."
+        ));
+    }
+    (destructive && !is_split_tool(name)).then(|| {
+        format!(
+            "Not done: {NOT_ASKED} (`{name}` may remove or overwrite what it names and does not ask them). Nothing was changed."
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::on;

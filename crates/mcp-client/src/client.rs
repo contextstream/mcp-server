@@ -5141,6 +5141,7 @@ impl ContextStreamClient {
             }
         })?;
         observe_tenant_home_header(response.headers());
+        crate::run_progress::api_answered(effective_auth, &config, response.status().as_u16());
 
         if !response.status().is_success() {
             return Err(self.parse_error(response).await);
@@ -5271,6 +5272,7 @@ impl ContextStreamClient {
         })?;
         observe_tenant_home_header(response.headers());
         let status = response.status().as_u16();
+        crate::run_progress::api_answered(auth, &config, status);
         let headers = response.headers().clone();
         if response
             .content_length()
@@ -5495,7 +5497,11 @@ impl ContextStreamClient {
 
     /// Get current user info.
     pub async fn me(&self) -> Result<User> {
-        self.get("/auth/me").await
+        let user: User = self.get("/auth/me").await?;
+        // The one answer in which the API says whose credential a request
+        // carried (`run_progress::ApiAnswer::Names`).
+        self.caller_named(&user).await;
+        Ok(user)
     }
 
     /// Read account learning without changing consent or caching its state.

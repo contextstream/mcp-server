@@ -1378,15 +1378,54 @@ fn key_auth(key: &str) -> mcp_types::AuthOverride {
     }
 }
 
-/// The API answered a request sent under `auth` with `status`, as the
-/// client tells the gateway (the gateway has no key of its own to send).
+/// The user the API names for a credential in these tests: one a
+/// credential.
+fn user_of_credential(credential: mcp_client::SentCredential<'_>) -> Uuid {
+    use sha2::{Digest, Sha256};
+
+    let text = match credential {
+        mcp_client::SentCredential::ApiKey(key) => key,
+        mcp_client::SentCredential::Bearer(token) => token,
+    };
+    Uuid::from_slice(&Sha256::digest(text.as_bytes())[..16]).expect("sixteen bytes")
+}
+
+/// What the client tells the gateway (which has no key of its own to send)
+/// of the API's answers to requests sent under `auth`: with 200, that the
+/// API was asked whose the credential is and named a user; with 401, that it
+/// refused the credential. Of any other answer the client tells nothing.
 fn api_answers(auth: &mcp_types::AuthOverride, status: u16) {
     let mut config = TestFixtures::test_config();
     config.api_key = None;
-    api_answered(
-        mcp_client::sent_credential(auth, &config).expect("a credential of the caller's"),
-        status,
-    );
+    let credential =
+        mcp_client::sent_credential(auth, &config).expect("a credential of the caller's");
+    let answer = match status {
+        200 => mcp_client::ApiAnswer::Names(user_of_credential(credential)),
+        401 => mcp_client::ApiAnswer::Refuses,
+        _ => return,
+    };
+    api_answered(credential, answer);
+}
+
+/// Whose the API said the key `key` is, as the gateway remembers it now.
+fn accepted_user_of_key(key: &str) -> Option<String> {
+    accepted()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .user_of(
+            &credential_digest(mcp_client::SentCredential::ApiKey(key)),
+            Instant::now(),
+        )
+        .map(str::to_string)
+}
+
+/// The API's answer to `GET /auth/me` for the user `user`.
+fn me_answer(user: Uuid) -> Value {
+    json!({"success": true, "data": {
+        "id": user,
+        "email": "qa@example.com",
+        "created_at": "2026-01-01T00:00:00Z",
+    }})
 }
 
 /// Run `work` as the hosted gateway runs a request of `caller` that carried
@@ -2837,7 +2876,9 @@ fn a_full_memory_is_searched_for_room_at_most_once_a_second() {
         .collect();
     let mut swept = None;
     let room = |memory: &mut HashMap<String, Instant>, swept: &mut Option<Instant>, at: Instant| {
-        has_room(memory, swept, "new", at, keep, |at| *at)
+        has_room(memory, swept, "new", at, |kept| {
+            at.saturating_duration_since(*kept) < keep
+        })
     };
     // Full of entries that still count: searched once, no room.
     let soon = start + Duration::from_secs(59);
@@ -2858,14 +2899,7 @@ fn a_full_memory_is_searched_for_room_at_most_once_a_second() {
         .map(|index| (format!("old-{index}"), start))
         .collect();
     let mut swept = Some(start);
-    assert!(has_room(
-        &mut memory,
-        &mut swept,
-        "old-7",
-        start,
-        keep,
-        |at| *at
-    ));
+    assert!(has_room(&mut memory, &mut swept, "old-7", start, |_| true));
     assert_eq!(swept, Some(start));
 }
 
@@ -3130,41 +3164,72 @@ async fn a_sign_waits_until_the_api_was_seen_to_accept_the_credential() {
     assert!(!went && requests.is_empty(), "{requests:?}");
 }
 
-/// MUST 3. The gateway learns which credentials the API accepts from the
-/// answers to the requests it sends anyway: it asks nothing to find out.
+/// The delta reading's MUST 1. The gateway learns whose a credential is from
+/// the one answer in which the API says so (`GET /auth/me`). A success of
+/// any other request says nothing of the credential (the API answers what is
+/// public with success whatever came with it), and a 401 takes the word
+/// back.
 #[tokio::test]
-async fn the_client_tells_which_credentials_the_api_accepts() {
+async fn only_the_apis_word_on_whose_a_credential_is_accepts_it() {
     mcp_client::observe_api_answers(api_answered);
     let fixture = Fixture::new();
     let key = format!("key-{}", Uuid::new_v4());
-    let seen = |key: &str| {
-        accepted()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_accepted(
-                &credential_digest(mcp_client::SentCredential::ApiKey(key)),
-                Instant::now(),
-            )
-    };
-    assert!(!seen(&key));
+    let user = Uuid::new_v4();
+    assert_eq!(accepted_user_of_key(&key), None);
     let body = json!({"workspace_id": fixture.workspace, "source_run_id": "a-run"});
-    let accepting = Api::start(vec![(
-        "POST /api/v1/run-progress/report",
-        200,
-        fixture.answer("working", &[]),
-    )])
+    let api = Api::start(vec![
+        (
+            "POST /api/v1/run-progress/report",
+            200,
+            fixture.answer("working", &[]),
+        ),
+        (
+            "GET /api/v1/mcp/version",
+            200,
+            json!({"success": true, "data": {"latest_version": "1.0.80"}}),
+        ),
+        ("GET /api/v1/auth/me", 200, me_answer(user)),
+    ])
     .await;
-    let (client, _) = hosted_client_without_a_key(&fixture, &accepting.base_url);
+    let (client, _) = hosted_client_without_a_key(&fixture, &api.base_url);
+    // Two successes under the key: a report the API recorded, and a route
+    // that needs no credential. Neither says whose the key is.
     mcp_client::run_with_auth_override(key_auth(&key), || async {
-        client.report_run_progress(&body, 0).await
+        client
+            .report_run_progress(&body, 0)
+            .await
+            .expect("the report is recorded");
+        let _: Value = client
+            .get("/mcp/version")
+            .await
+            .expect("the version is public");
+    })
+    .await;
+    assert_eq!(api.requests().len(), 2);
+    assert_eq!(
+        accepted_user_of_key(&key),
+        None,
+        "a success that names nobody accepted the key"
+    );
+    // The API says whose the key is.
+    mcp_client::run_with_auth_override(key_auth(&key), || async { client.me().await })
+        .await
+        .expect("the API names the caller");
+    assert_eq!(accepted_user_of_key(&key), Some(user_digest(user)));
+    // Nothing of the user's id is kept.
+    assert!(!user_digest(user).contains(&user.simple().to_string()[..8]));
+    // The side channel's question is the same question.
+    let other = format!("key-{}", Uuid::new_v4());
+    mcp_client::run_with_auth_override(key_auth(&other), || async {
+        client.name_caller_quietly().await
     })
     .await
-    .expect("the report is accepted");
-    assert_eq!(accepting.requests().len(), 1);
-    assert!(seen(&key), "a success under the key was not noted");
+    .expect("the API names the caller");
+    assert_eq!(accepted_user_of_key(&other), Some(user_digest(user)));
     // A request the gateway sends under no caller's credential says nothing
     // of any caller.
-    assert!(!seen("test-api-key"));
+    client.me().await.expect("the API answers");
+    assert_eq!(accepted_user_of_key("test-api-key"), None);
     // The API refuses the key: it is no longer accepted.
     let refusing = Api::start(vec![(
         "POST /api/v1/run-progress/report",
@@ -3178,51 +3243,271 @@ async fn the_client_tells_which_credentials_the_api_accepts() {
     })
     .await;
     assert!(refused.is_err());
-    assert!(!seen(&key), "a 401 under the key was not noted");
+    assert_eq!(
+        accepted_user_of_key(&key),
+        None,
+        "a 401 under the key was not noted"
+    );
+    assert_eq!(accepted_user_of_key(&other), Some(user_digest(user)));
 }
 
-/// MUST 3. The memory of accepted credentials: only a success puts one in,
-/// a 401 takes it out, it counts for [`ACCEPTED_FOR`], and a full memory
-/// keeps what it has and leaves the new one out.
+/// The memory of accepted credentials: only the API's word puts one in, a
+/// refusal takes it out, the word counts for [`ACCEPTED_FOR`], and a full
+/// memory keeps what it has and leaves the new one out.
 #[test]
 fn the_memory_of_accepted_credentials_is_bounded_and_keeps_what_it_has() {
     let start = Instant::now();
     let second = Duration::from_secs(1);
     let mut seen = Accepted::default();
-    seen.answered("a".into(), 204, start);
-    assert!(seen.is_accepted("a", start));
-    assert!(seen.is_accepted("a", start + ACCEPTED_FOR - second));
-    assert!(!seen.is_accepted("a", start + ACCEPTED_FOR));
-    for status in [301, 400, 403, 404, 429, 500, 503] {
-        seen.answered("b".into(), status, start);
-        assert!(!seen.is_accepted("b", start), "{status}");
-        seen.answered("a".into(), status, start);
-        assert!(seen.is_accepted("a", start), "{status}");
-    }
-    seen.answered("a".into(), 401, start);
-    assert!(!seen.is_accepted("a", start));
+    seen.named("a".into(), "ann", start);
+    assert_eq!(seen.user_of("a", start), Some("ann"));
+    assert_eq!(
+        seen.user_of("a", start + ACCEPTED_FOR - second),
+        Some("ann")
+    );
+    assert_eq!(seen.user_of("a", start + ACCEPTED_FOR), None);
+    assert_eq!(seen.user_of("b", start), None);
+    // The gateway's door lets a credential through on the API's answer for
+    // ten minutes: the word counts a little longer than that.
+    assert!(ACCEPTED_FOR > Duration::from_secs(600));
+    seen.refused("a");
+    assert_eq!(seen.user_of("a", start), None);
     assert_eq!(seen.remembered(), 0);
 
     let mut seen = Accepted::default();
     for index in 0..MAX_SIGNED_SESSIONS {
-        seen.answered(format!("c-{index}"), 200, start);
+        seen.named(format!("c-{index}"), &format!("user-{index}"), start);
     }
     let soon = start + second;
-    seen.answered("new".into(), 200, soon);
-    assert!(
-        !seen.is_accepted("new", soon),
+    seen.named("new".into(), "user-new", soon);
+    assert_eq!(
+        seen.user_of("new", soon),
+        None,
         "a full memory took one more"
     );
     assert_eq!(seen.remembered(), MAX_SIGNED_SESSIONS);
-    assert!(seen.is_accepted("c-0", soon), "a full memory forgot one");
+    assert!(
+        seen.user_of("c-0", soon).is_some(),
+        "a full memory forgot one"
+    );
     // One it has is still refreshed.
-    seen.answered("c-0".into(), 200, soon);
+    seen.named("c-0".into(), "user-0", soon);
     // Once the others are too old to count they are forgotten for a new one.
     let later = start + ACCEPTED_FOR;
-    seen.answered("new".into(), 200, later);
-    assert!(seen.is_accepted("new", later));
-    assert!(seen.is_accepted("c-0", later));
+    seen.named("new".into(), "user-new", later);
+    assert_eq!(seen.user_of("new", later), Some("user-new"));
+    assert_eq!(seen.user_of("c-0", later), Some("user-0"));
     assert_eq!(seen.remembered(), 2);
+}
+
+/// The delta reading's MUST 1, third part. One user's credentials take a few
+/// places in the memory and no more, so no one account fills it: one more,
+/// and the one the API named longest ago makes way.
+#[test]
+fn one_users_credentials_take_a_few_places_and_no_more() {
+    let start = Instant::now();
+    let at = |index: usize| start + Duration::from_secs(index as u64);
+    let mut seen = Accepted::default();
+    seen.named("bob-0".into(), "bob", start);
+    let more = 5;
+    for index in 0..MAX_CREDENTIALS_OF_ONE_USER + more {
+        seen.named(format!("ann-{index}"), "ann", at(index));
+    }
+    assert_eq!(seen.remembered(), MAX_CREDENTIALS_OF_ONE_USER + 1);
+    let now = at(MAX_CREDENTIALS_OF_ONE_USER + more);
+    for index in 0..MAX_CREDENTIALS_OF_ONE_USER + more {
+        assert_eq!(
+            seen.user_of(&format!("ann-{index}"), now).is_some(),
+            index >= more,
+            "ann-{index}"
+        );
+    }
+    // Another user's credential is not what makes way.
+    assert_eq!(seen.user_of("bob-0", now), Some("bob"));
+    // A credential it has is refreshed in its place.
+    seen.named(format!("ann-{more}"), "ann", now);
+    assert_eq!(seen.remembered(), MAX_CREDENTIALS_OF_ONE_USER + 1);
+}
+
+/// A credential a run was reported under, while the API's word on it was
+/// fresh, stays accepted for as long as a tool call can signal that run; a
+/// report under a credential with no fresh word accepts nothing, and has the
+/// API asked, at most once a while.
+#[test]
+fn a_credential_with_a_run_stays_accepted_as_long_as_the_run_can_be_signalled() {
+    let start = Instant::now();
+    let second = Duration::from_secs(1);
+    assert_eq!(ACCEPTED_WITH_A_RUN_FOR, HEARTBEAT_IDLE_LIMIT + ACCEPTED_FOR);
+    let mut seen = Accepted::default();
+    seen.named("a".into(), "ann", start);
+    // The last moment the word is fresh: the report needs no question.
+    let reported = start + ACCEPTED_FOR - second;
+    assert!(!seen.reported("a", reported));
+    // The run can be signalled for HEARTBEAT_IDLE_LIMIT after the report.
+    let last_sign = reported + HEARTBEAT_IDLE_LIMIT - second;
+    assert_eq!(seen.user_of("a", last_sign), Some("ann"));
+    assert_eq!(seen.user_of("a", start + ACCEPTED_WITH_A_RUN_FOR), None);
+
+    // No fresh word: the report accepts nothing, and the API is to be asked.
+    let mut seen = Accepted::default();
+    seen.named("b".into(), "bob", start);
+    let stale = start + ACCEPTED_FOR;
+    assert!(seen.reported("b", stale));
+    assert_eq!(seen.user_of("b", stale), None, "a report alone accepted it");
+    assert!(seen.reported("never-named", stale));
+    assert_eq!(seen.user_of("never-named", stale), None);
+    // Not again for a while.
+    assert!(!seen.reported("b", stale + second));
+    assert!(!seen.reported("never-named", stale + ASK_WHOSE_EVERY - second));
+    assert!(seen.reported("b", stale + ASK_WHOSE_EVERY));
+    // The API says whose it is: the report it was asked for gives it its run.
+    let named = stale + ASK_WHOSE_EVERY + second;
+    seen.named("b".into(), "bob", named);
+    assert!(!seen.reported("b", named));
+    assert_eq!(seen.user_of("b", named + HEARTBEAT_IDLE_LIMIT), Some("bob"));
+    // A word that stopped counting takes its run with it.
+    let much_later = named + ACCEPTED_WITH_A_RUN_FOR;
+    assert_eq!(seen.user_of("b", much_later), None);
+    seen.named("b".into(), "bob", much_later);
+    assert_eq!(seen.user_of("b", much_later + ACCEPTED_FOR), None);
+    // A refusal ends it at once, run or no run.
+    seen.named("b".into(), "bob", much_later);
+    assert!(!seen.reported("b", much_later));
+    seen.refused("b");
+    assert_eq!(seen.user_of("b", much_later), None);
+}
+
+/// The delta reading's MUST 1, second part. Signs are counted against the
+/// user the API named for the credential, and a session's minute is that
+/// user's: nothing another user's request says of itself (a session part)
+/// spends them.
+#[test]
+fn signs_are_counted_against_the_user_the_api_named() {
+    let workspace = Uuid::new_v4();
+    let start = Instant::now();
+    let mut due = SignsDue::default();
+    assert!(due.due("s-shared", "ann", workspace, start));
+    // Bob's request says it is the same session: it is his own, and Ann's
+    // minute stands as it was.
+    assert!(due.due("s-shared", "bob", workspace, start));
+    assert!(!due.due("s-shared", "ann", workspace, start + Duration::from_secs(1)));
+    assert!(!due.due("s-shared", "bob", workspace, start + Duration::from_secs(1)));
+    // Bob spends all of his signs of the minute: Ann still has hers.
+    for index in 1..SIGNS_PER_CALLER_EVERY_MINUTE {
+        assert!(due.due(&format!("s-bob-{index}"), "bob", workspace, start));
+    }
+    assert!(!due.due("s-bob-more", "bob", workspace, start));
+    assert!(due.due("s-ann-2", "ann", workspace, start));
+}
+
+/// One report under `key` that the API recorded in `workspace`, on a
+/// gateway that keeps `workspaces` alive: whether the API was asked whose
+/// the key is.
+async fn reported_under(
+    client: &ContextStreamClient,
+    key: &str,
+    workspace: Uuid,
+    workspaces: &[Uuid],
+) -> bool {
+    let task = mcp_client::run_with_auth_override(key_auth(key), || async {
+        caller_reported_for(client, workspace, workspaces).await
+    })
+    .await;
+    let asked = task.is_some();
+    if let Some(task) = task {
+        task.await.expect("the question finishes");
+    }
+    asked
+}
+
+/// On the session-id contract the gateway's door sees a credential only at
+/// `initialize`. A report the API recorded under a credential it has no
+/// fresh word on has the API asked whose it is: once, only for a workspace
+/// the gateway keeps alive, and a credential the API then refuses is not
+/// accepted and not asked about again for a while.
+#[tokio::test]
+async fn a_recorded_report_has_the_api_asked_whose_the_credential_is() {
+    mcp_client::observe_api_answers(api_answered);
+    let fixture = Fixture::new();
+    let here = [fixture.workspace];
+    let key = format!("key-{}", Uuid::new_v4());
+    let user = Uuid::new_v4();
+    let api = Api::start(vec![("GET /api/v1/auth/me", 200, me_answer(user))]).await;
+    let (client, _) = hosted_client_without_a_key(&fixture, &api.base_url);
+
+    // Another workspace: nothing is asked and nothing is remembered.
+    assert!(!reported_under(&client, &key, Uuid::new_v4(), &here).await);
+    assert!(!reported_under(&client, &key, fixture.workspace, &[]).await);
+    assert!(api.requests().is_empty());
+
+    assert!(reported_under(&client, &key, fixture.workspace, &here).await);
+    let asked = api.requests();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(
+        (asked[0].method.as_str(), asked[0].target.as_str()),
+        ("GET", "/api/v1/auth/me")
+    );
+    assert_eq!(accepted_user_of_key(&key), Some(user_digest(user)));
+    // The word is fresh: the next reports ask nothing.
+    assert!(!reported_under(&client, &key, fixture.workspace, &here).await);
+    assert_eq!(api.requests().len(), 1);
+    // The credential has a run: it counts beyond the fresh word.
+    let digest = credential_digest(mcp_client::SentCredential::ApiKey(&key));
+    let beyond = Instant::now() + ACCEPTED_FOR + Duration::from_secs(1);
+    assert!(accepted()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .user_of(&digest, beyond)
+        .is_some());
+
+    // A credential the API refuses when asked: not accepted, and not asked
+    // about again at once.
+    let refusing = Api::start(vec![(
+        "GET /api/v1/auth/me",
+        401,
+        json!({"success": false, "error": {"message": "Invalid API key"}}),
+    )])
+    .await;
+    let (client, _) = hosted_client_without_a_key(&fixture, &refusing.base_url);
+    let refused = format!("key-{}", Uuid::new_v4());
+    assert!(reported_under(&client, &refused, fixture.workspace, &here).await);
+    assert_eq!(accepted_user_of_key(&refused), None);
+    assert!(!reported_under(&client, &refused, fixture.workspace, &here).await);
+    assert_eq!(refusing.requests().len(), 1);
+
+    // No credential of the caller's: nothing.
+    assert!(caller_reported_for(&client, fixture.workspace, &here)
+        .await
+        .is_none());
+}
+
+/// The delta reading's MUST 3. The folder a hosted session named names the
+/// agent only of a caller the gateway derived an identity for itself. A
+/// signed-in caller it cannot verify has the session state of its session
+/// id, which another caller may present: a folder found there names nobody.
+#[tokio::test]
+async fn a_session_folder_names_the_agent_only_of_a_caller_the_gateway_derived() {
+    let folder = || Some("/work/agent-hijacked".to_string());
+    assert_eq!(session_folder_of_caller(folder()), None);
+    let token = bearer_token(json!({"sub": Uuid::new_v4()}), "signature");
+    let signed_in = mcp_client::run_with_auth_override(bearer_auth(&token), || async {
+        session_folder_of_caller(folder())
+    })
+    .await;
+    assert_eq!(signed_in, None);
+    let with_a_key =
+        mcp_client::run_with_caller_cache_identity("key-partition".to_string(), || async {
+            session_folder_of_caller(folder())
+        })
+        .await;
+    assert_eq!(with_a_key, folder());
+    assert_eq!(
+        mcp_client::run_with_caller_cache_identity("key-partition".to_string(), || async {
+            session_folder_of_caller(None)
+        })
+        .await,
+        None
+    );
 }
 
 /// SHOULD 1. A tool run through the router (`execute_operation`) counts as

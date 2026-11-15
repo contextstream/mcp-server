@@ -260,7 +260,9 @@ impl ProgressTool {
             // The gateway's own environment and folder say nothing about the
             // caller: only the name its client sent, or the folder its
             // session named, counts.
-            mcp_client::agent_handle::agent_handle_of_caller(folder.as_deref())
+            mcp_client::agent_handle::agent_handle_of_caller(
+                session_folder_of_caller(folder).as_deref(),
+            )
         } else {
             let folder = folder.or_else(|| {
                 std::env::current_dir()
@@ -322,6 +324,13 @@ impl ProgressTool {
         let retries = u32::from(report.is_terminal());
         match self.client.report_run_progress(&report.body, retries).await {
             Ok(mut answer) => {
+                // The API recorded a report of this caller's: where the
+                // gateway keeps runs alive, the credential it went under now
+                // has a run to keep alive.
+                if is_http {
+                    let _ =
+                        caller_reported_for(&self.client, workspace_id, signs_workspaces()).await;
+                }
                 // What stands for this session and the key this report went
                 // to: ContextStream's hooks read them from the answer, so the
                 // signals they send land on the same run under the same agent.
@@ -1397,6 +1406,18 @@ fn shown_client_name(raw: &str) -> String {
     known.to_string()
 }
 
+/// The folder a hosted session named, where it can name the caller's agent:
+/// only for a caller the gateway derived an identity for itself (an API key,
+/// or a token it verified), whose session state is that caller's alone. A
+/// signed-in caller whose token the gateway cannot verify has the state of
+/// its session id, which is the client's to send: whoever presents the same
+/// id reads and writes the same state, so a folder found there may be
+/// another caller's, and names nobody. Such a caller's agent is named by the
+/// header its client sent, or by its own session part.
+pub(crate) fn session_folder_of_caller(folder: Option<String>) -> Option<String> {
+    folder.filter(|_| mcp_client::get_task_caller_cache_identity().is_some())
+}
+
 /// What `init` tells ContextStream's hooks about this session's runs: the
 /// session part default run keys start with, and the agent reports name.
 /// `None` when live progress is off on this machine.
@@ -1411,7 +1432,9 @@ pub(crate) async fn session_identity(
     let part = session_part(is_http);
     let folder = session.state().await.folder_path;
     let handle = if is_http {
-        mcp_client::agent_handle::agent_handle_of_caller(folder.as_deref())
+        mcp_client::agent_handle::agent_handle_of_caller(
+            session_folder_of_caller(folder).as_deref(),
+        )
     } else {
         let folder = folder.or_else(|| {
             std::env::current_dir()
@@ -1449,9 +1472,27 @@ const MAX_SIGNED_SESSIONS: usize = 10_000;
 /// flood of new callers costs it one search a second, not one a call.
 const SWEEP_FULL_MEMORY_EVERY: Duration = Duration::from_secs(1);
 
-/// How long an answer of the API that accepted a credential counts
-/// ([`Accepted`]).
-const ACCEPTED_FOR: Duration = Duration::from_secs(600);
+/// How long the API's word on whose a credential is counts ([`Accepted`]):
+/// a little longer than the gateway keeps the API's answer at its door (ten
+/// minutes, `INITIALIZE_KEY_ACCEPTED_TTL` of the HTTP transport), so a
+/// credential the door still lets through on that answer is never
+/// unaccepted here in between.
+const ACCEPTED_FOR: Duration = Duration::from_secs(605);
+
+/// How long that word counts for a credential a run was reported under
+/// ([`Accepted::reported`]): as long as a tool call can still signal that
+/// run. The report found the word fresh or had the API asked again, so the
+/// word is at most [`ACCEPTED_FOR`] older than the report.
+const ACCEPTED_WITH_A_RUN_FOR: Duration = HEARTBEAT_IDLE_LIMIT.saturating_add(ACCEPTED_FOR);
+
+/// At most this many credentials of one user are remembered as accepted:
+/// one more, and the one the API named longest ago makes way. A person has
+/// a few keys and one token an hour; no one user fills the memory.
+const MAX_CREDENTIALS_OF_ONE_USER: usize = 16;
+
+/// At most this often the API is asked whose a credential is after a report
+/// under it ([`caller_reported_for`]).
+const ASK_WHOSE_EVERY: Duration = Duration::from_secs(60);
 
 /// At most this many signs out at once in one gateway process; above it a
 /// sign is dropped, not queued.
@@ -1520,16 +1561,22 @@ pub fn watch_for_signs_of_life() {
 /// - the request carries a credential, and the gateway can tell its session
 ///   from the caller's other sessions: an `s-` session part, bound to the
 ///   caller ([`session_part`]). A name alone is never enough;
-/// - the API was seen to accept that credential ([`Accepted`]): in the last
-///   [`ACCEPTED_FOR`] it answered a request this gateway process sent under
-///   this very credential with success (the check `initialize` and every
-///   stateless request make, or any tool's own request), and has not
-///   answered one with 401 since. The gateway never asks the API in order to
-///   find out, so a credential the API never accepted causes no request;
-/// - the session sent no sign for the workspace in the last minute, its
-///   caller sent fewer than [`SIGNS_PER_CALLER_EVERY_MINUTE`] there, the
-///   memory of signs has room, and fewer than [`MAX_SIGNS_IN_FLIGHT`] signs
-///   are out.
+/// - the API said whose that credential is ([`Accepted`]): it answered
+///   `GET /auth/me`, sent by this gateway process under this very
+///   credential, with a user, and has not answered a request under it with
+///   401 since. A success of any other route says nothing: the API answers
+///   what is public with success whatever credential came with it. That
+///   word counts for [`ACCEPTED_FOR`], and for a credential a run was
+///   reported under for as long as the run can be signalled
+///   ([`ACCEPTED_WITH_A_RUN_FOR`]). The gateway asks at its door
+///   (`initialize`, and every stateless request) and after the API recorded
+///   a report under a credential it has no fresh word on
+///   ([`caller_reported_for`]); it never asks for a sign, so a credential
+///   the API never accepted causes no request of the gateway's own;
+/// - the session sent no sign for the workspace in the last minute, the
+///   user the API named sent fewer than [`SIGNS_PER_CALLER_EVERY_MINUTE`]
+///   there under all credentials and sessions together, the memory of signs
+///   has room, and fewer than [`MAX_SIGNS_IN_FLIGHT`] signs are out.
 ///
 /// The sign reads that one run and, when it is there, at work (live, quiet
 /// or stalled; never one that waits or ended) and reported on by its agent
@@ -1597,20 +1644,19 @@ pub(crate) async fn sign_of_life_for(
     // and nothing is asked.
     let auth = mcp_client::get_task_auth_override()?;
     let credential = mcp_client::sent_credential(&auth, &config)?;
-    let caller = caller_of_request()?;
+    caller_of_request()?;
     let part = session_part(true);
     if !is_one_session(&part, true) {
         return None;
     }
-    // Before anything is asked or remembered for this call: the API was
-    // seen to accept the credential the sign would go out under.
-    let accepted = accepted()
+    // Before anything is asked or remembered for this call: the API said
+    // whose credential the sign would go out under. The sign is counted
+    // against that user, never against a name the request itself carries.
+    let user = accepted()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .is_accepted(&credential_digest(credential), Instant::now());
-    if !accepted {
-        return None;
-    }
+        .user_of(&credential_digest(credential), Instant::now())
+        .map(str::to_string)?;
     let named = arguments
         .and_then(|arguments| arguments.get("workspace_id"))
         .and_then(Value::as_str)
@@ -1626,14 +1672,16 @@ pub(crate) async fn sign_of_life_for(
     if !workspaces.contains(&workspace_id) {
         return None;
     }
+    // A place among the signs out first: a sign that cannot go out is not
+    // counted as the session's for this minute.
+    let slot = SIGNS_IN_FLIGHT.take()?;
     let due = signs_due()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .due(&part, &caller, workspace_id, Instant::now());
+        .due(&part, &user, workspace_id, Instant::now());
     if !due {
         return None;
     }
-    let slot = SIGNS_IN_FLIGHT.take()?;
     let run_id = run_id_of_key(workspace_id, &run_key_of(None, &part, None));
     let client = client.clone();
     Some(mcp_client::spawn_with_task_context(async move {
@@ -1643,9 +1691,12 @@ pub(crate) async fn sign_of_life_for(
 }
 
 /// What one gateway process remembers of the signs it sent: the last one of
-/// each session in each workspace, and how many each key sent in each
+/// each session in each workspace, and how many each user sent in each
 /// workspace in the current minute. Both are bounded
-/// ([`MAX_SIGNED_SESSIONS`]).
+/// ([`MAX_SIGNED_SESSIONS`]), and both are kept by the user the API named
+/// for the credential ([`Accepted::user_of`]): what a request says of
+/// itself (a session id, a token's subject) never counts against another
+/// user's signs.
 #[derive(Debug, Default)]
 pub(crate) struct SignsDue {
     sessions: HashMap<String, Instant>,
@@ -1655,17 +1706,12 @@ pub(crate) struct SignsDue {
 }
 
 impl SignsDue {
-    /// Whether the session `part` (an `s-` part, bound to `caller`) is due a
-    /// sign in `workspace_id` at `now`. When it is, the sign is counted, so a
-    /// sign that is then refused or finds nothing is still the minute's.
-    pub(crate) fn due(
-        &mut self,
-        part: &str,
-        caller: &str,
-        workspace_id: Uuid,
-        now: Instant,
-    ) -> bool {
-        let session = format!("{part}\n{workspace_id}");
+    /// Whether the session `part` (an `s-` part) of `user` (the user the API
+    /// named for the call's credential) is due a sign in `workspace_id` at
+    /// `now`. When it is, the sign is counted, so a sign that is then refused
+    /// or finds nothing is still the minute's.
+    pub(crate) fn due(&mut self, part: &str, user: &str, workspace_id: Uuid, now: Instant) -> bool {
+        let session = format!("{user}\n{part}\n{workspace_id}");
         if self
             .sessions
             .get(&session)
@@ -1673,7 +1719,7 @@ impl SignsDue {
         {
             return false;
         }
-        let caller = format!("{}\n{workspace_id}", short_digest(caller));
+        let caller = format!("{user}\n{workspace_id}");
         let (since, sent) = match self.callers.get(&caller) {
             Some((since, sent)) if now.saturating_duration_since(*since) < SIGN_OF_LIFE_EVERY => {
                 (*since, *sent)
@@ -1683,22 +1729,16 @@ impl SignsDue {
         if sent >= SIGNS_PER_CALLER_EVERY_MINUTE {
             return false;
         }
-        // A memory with no room for this session or this caller: no sign.
-        let keep = SIGN_OF_LIFE_EVERY;
-        if !has_room(
-            &mut self.sessions,
-            &mut self.swept.0,
-            &session,
-            now,
-            keep,
-            |at| *at,
-        ) || !has_room(
+        // A memory with no room for this session or this user: no sign.
+        let counts = |at: Instant| now.saturating_duration_since(at) < SIGN_OF_LIFE_EVERY;
+        if !has_room(&mut self.sessions, &mut self.swept.0, &session, now, |at| {
+            counts(*at)
+        }) || !has_room(
             &mut self.callers,
             &mut self.swept.1,
             &caller,
             now,
-            keep,
-            |(since, _)| *since,
+            |(since, _)| counts(*since),
         ) {
             return false;
         }
@@ -1707,7 +1747,7 @@ impl SignsDue {
         true
     }
 
-    /// How many sessions and keys are remembered.
+    /// How many sessions and users are remembered.
     #[cfg(test)]
     pub(crate) fn remembered(&self) -> (usize, usize) {
         (self.sessions.len(), self.callers.len())
@@ -1715,18 +1755,17 @@ impl SignsDue {
 }
 
 /// Whether a memory of at most [`MAX_SIGNED_SESSIONS`] has room for `key`:
-/// it holds `key` already, or is not full, or is not full once what is
-/// older than `keep_for` is forgotten. What is younger is never forgotten
-/// here: without room the new entry is the one that is left out. A full
-/// memory is searched at most every [`SWEEP_FULL_MEMORY_EVERY`] (`swept` is
-/// when it last was); between two searches it has no room.
+/// it holds `key` already, or is not full, or is not full once what no
+/// longer counts (`counts`) is forgotten. What still counts is never
+/// forgotten here: without room the new entry is the one that is left out.
+/// A full memory is searched at most every [`SWEEP_FULL_MEMORY_EVERY`]
+/// (`swept` is when it last was); between two searches it has no room.
 fn has_room<V>(
     memory: &mut HashMap<String, V>,
     swept: &mut Option<Instant>,
     key: &str,
     now: Instant,
-    keep_for: Duration,
-    at: impl Fn(&V) -> Instant,
+    counts: impl Fn(&V) -> bool,
 ) -> bool {
     if memory.len() < MAX_SIGNED_SESSIONS || memory.contains_key(key) {
         return true;
@@ -1735,7 +1774,7 @@ fn has_room<V>(
         return false;
     }
     *swept = Some(now);
-    memory.retain(|_, value| now.saturating_duration_since(at(value)) < keep_for);
+    memory.retain(|_, value| counts(value));
     memory.len() < MAX_SIGNED_SESSIONS
 }
 
@@ -1745,51 +1784,138 @@ fn signs_due() -> &'static Mutex<SignsDue> {
     SIGNS.get_or_init(Default::default)
 }
 
-/// The credentials one gateway process saw the API accept, each by a digest
-/// and the time of the last such answer; never the credential or a part of
-/// it. Bounded ([`MAX_SIGNED_SESSIONS`]), and only a credential the API
-/// accepted takes a place in it.
+/// The credentials the API told one gateway process whose they are, each by
+/// a digest; never a credential, a user's id or a part of either. Bounded
+/// ([`MAX_SIGNED_SESSIONS`]), and only a credential the API named takes a
+/// place in it, at most [`MAX_CREDENTIALS_OF_ONE_USER`] a user: no caller
+/// the API did not accept can fill it, and no one user can.
 ///
-/// "Accepted" is the same on both contracts: the API answered a request this
-/// process sent under exactly this credential with success, within
-/// [`ACCEPTED_FOR`], and has not answered one with 401 since. On the
-/// stateless contract every request is checked against the API before it is
-/// served; on the session-id contract only `initialize` is, so there the
-/// first such answer is `initialize`'s check or a tool's own request, and a
-/// session that only ever calls tools the API refuses is never signed.
+/// "Accepted" is the same on both contracts: the API answered
+/// `GET /auth/me`, sent by this process under exactly this credential, with
+/// a user, within [`ACCEPTED_FOR`] (within [`ACCEPTED_WITH_A_RUN_FOR`] for a
+/// credential a run was reported under), and has not answered a request
+/// under it with 401 since. Nothing else counts: a success of another route
+/// does not say that the route looked at the credential. On the stateless
+/// contract every request is checked against the API at the door; on the
+/// session-id contract only `initialize` is, so there a credential the door
+/// never saw (a replaced token, a session that outlived its gateway
+/// process) is accepted once the API recorded a report under it and then
+/// said whose it is ([`caller_reported_for`]); until then its session is
+/// not signed.
 #[derive(Debug, Default)]
 pub(crate) struct Accepted {
-    seen: HashMap<String, Instant>,
+    seen: HashMap<String, Named>,
     /// When the memory, full, was last searched for entries to forget.
     swept: Option<Instant>,
+    /// When the API was last asked whose a credential is after a report
+    /// under it, and when that memory, full, was last searched.
+    asked: HashMap<String, Instant>,
+    asked_swept: Option<Instant>,
+}
+
+/// What is remembered of a credential the API named.
+#[derive(Debug, Clone)]
+struct Named {
+    /// A digest of the user the API said it belongs to ([`user_digest`]).
+    user: String,
+    /// When the API last said so.
+    at: Instant,
+    /// Whether a run was reported under it, in a workspace the gateway
+    /// keeps alive, while the API's word on it was fresh.
+    has_run: bool,
+}
+
+impl Named {
+    /// Whether the API said so within [`ACCEPTED_FOR`] of `now`.
+    fn is_fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) < ACCEPTED_FOR
+    }
+
+    /// Whether the credential is accepted at `now`.
+    fn counts(&self, now: Instant) -> bool {
+        self.is_fresh(now)
+            || (self.has_run && now.saturating_duration_since(self.at) < ACCEPTED_WITH_A_RUN_FOR)
+    }
 }
 
 impl Accepted {
-    /// The API answered a request sent under the credential `digest` with
-    /// the HTTP status `status`.
-    pub(crate) fn answered(&mut self, digest: String, status: u16, now: Instant) {
-        match status {
-            200..=299 => {
-                let keep = ACCEPTED_FOR;
-                if has_room(&mut self.seen, &mut self.swept, &digest, now, keep, |at| {
-                    *at
-                }) {
-                    self.seen.insert(digest, now);
-                }
+    /// The API said the credential `digest` belongs to `user` (a digest).
+    pub(crate) fn named(&mut self, digest: String, user: &str, now: Instant) {
+        if let Some(known) = self.seen.get_mut(&digest) {
+            // What was true of a word that no longer counts, or of another
+            // user, is not true of this one.
+            if !known.counts(now) || known.user != user {
+                known.has_run = false;
             }
-            401 => {
+            known.user = user.to_string();
+            known.at = now;
+            return;
+        }
+        // One user's credentials take a few places and no more: the ones
+        // named longest ago make way for the new one.
+        let mut of_user: Vec<(Instant, String)> = self
+            .seen
+            .iter()
+            .filter(|(_, known)| known.user == user)
+            .map(|(digest, known)| (known.at, digest.clone()))
+            .collect();
+        if of_user.len() >= MAX_CREDENTIALS_OF_ONE_USER {
+            of_user.sort();
+            let excess = of_user.len() + 1 - MAX_CREDENTIALS_OF_ONE_USER;
+            for (_, digest) in of_user.into_iter().take(excess) {
                 self.seen.remove(&digest);
             }
-            _ => {}
+        }
+        if has_room(&mut self.seen, &mut self.swept, &digest, now, |known| {
+            known.counts(now)
+        }) {
+            self.seen.insert(
+                digest,
+                Named {
+                    user: user.to_string(),
+                    at: now,
+                    has_run: false,
+                },
+            );
         }
     }
 
-    /// Whether the API accepted the credential `digest` within
-    /// [`ACCEPTED_FOR`] of `now`.
-    pub(crate) fn is_accepted(&self, digest: &str, now: Instant) -> bool {
+    /// The API refused the credential `digest` (401).
+    pub(crate) fn refused(&mut self, digest: &str) {
+        self.seen.remove(digest);
+    }
+
+    /// The user (a digest) the API said the credential `digest` belongs to,
+    /// while the credential is accepted at `now`.
+    pub(crate) fn user_of(&self, digest: &str, now: Instant) -> Option<&str> {
         self.seen
             .get(digest)
-            .is_some_and(|at| now.saturating_duration_since(*at) < ACCEPTED_FOR)
+            .filter(|known| known.counts(now))
+            .map(|known| known.user.as_str())
+    }
+
+    /// The API recorded a report under the credential `digest`, in a
+    /// workspace the gateway keeps alive. With a fresh word of the API on
+    /// whose it is, the credential now has a run, and stays accepted for as
+    /// long as that run can be signalled. Without one, whether to ask the
+    /// API for it now: at most every [`ASK_WHOSE_EVERY`] a credential.
+    pub(crate) fn reported(&mut self, digest: &str, now: Instant) -> bool {
+        if let Some(known) = self
+            .seen
+            .get_mut(digest)
+            .filter(|known| known.is_fresh(now))
+        {
+            known.has_run = true;
+            return false;
+        }
+        let lately = |at: &Instant| now.saturating_duration_since(*at) < ASK_WHOSE_EVERY;
+        if self.asked.get(digest).is_some_and(lately)
+            || !has_room(&mut self.asked, &mut self.asked_swept, digest, now, lately)
+        {
+            return false;
+        }
+        self.asked.insert(digest.to_string(), now);
+        true
     }
 
     /// How many credentials are remembered.
@@ -1815,16 +1941,82 @@ pub(crate) fn credential_digest(credential: mcp_client::SentCredential<'_>) -> S
     framed_digest("contextstream-run-progress-accepted-v1", &[kind, secret])
 }
 
-/// The API answered a request that carried a caller's own credential (the
+/// What stands for a user the API named, in [`Accepted`] and in the count of
+/// signs: a digest of the id.
+pub(crate) fn user_digest(user: Uuid) -> String {
+    let mut digest = framed_digest("contextstream-run-progress-user-v1", &[&user.to_string()]);
+    digest.truncate(32);
+    digest
+}
+
+/// An answer of the API said something about a caller's own credential (the
 /// client tells, once [`watch_for_signs_of_life`] asked it to).
-pub(crate) fn api_answered(credential: mcp_client::SentCredential<'_>, status: u16) {
-    if !matches!(status, 200..=299 | 401) {
-        return;
+pub(crate) fn api_answered(
+    credential: mcp_client::SentCredential<'_>,
+    answer: mcp_client::ApiAnswer,
+) {
+    let digest = credential_digest(credential);
+    let mut accepted = accepted()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match answer {
+        mcp_client::ApiAnswer::Names(user) => {
+            accepted.named(digest, &user_digest(user), Instant::now());
+        }
+        mcp_client::ApiAnswer::Refuses => accepted.refused(&digest),
     }
-    accepted()
+}
+
+/// The API recorded a report of the request's caller in `workspace_id`.
+/// Where the gateway keeps that workspace's runs alive (`workspaces`, the
+/// setting's), the credential the report went under now has a run to keep
+/// alive ([`Accepted::reported`]). When the API has not said of late whose
+/// that credential is, it is asked: `GET /auth/me` under the credential,
+/// once, detached and never waited on, at most every [`ASK_WHOSE_EVERY`] a
+/// credential, and only while a sign's place is free
+/// ([`MAX_SIGNS_IN_FLIGHT`]). This is how a credential the gateway's door
+/// never saw is accepted on the session-id contract. It is asked only of a
+/// credential the API has just recorded a report under, so one the API
+/// refuses is never asked about; for any other workspace nothing is asked
+/// and nothing is remembered.
+pub(crate) async fn caller_reported_for(
+    client: &ContextStreamClient,
+    workspace_id: Uuid,
+    workspaces: &[Uuid],
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !workspaces.contains(&workspace_id) {
+        return None;
+    }
+    let config = client.config().await;
+    if !config.is_http_transport {
+        return None;
+    }
+    let auth = mcp_client::get_task_auth_override()?;
+    let digest = credential_digest(mcp_client::sent_credential(&auth, &config)?);
+    let ask = accepted()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .answered(credential_digest(credential), status, Instant::now());
+        .reported(&digest, Instant::now());
+    if !ask {
+        return None;
+    }
+    let slot = SIGNS_IN_FLIGHT.take()?;
+    let client = client.clone();
+    Some(mcp_client::spawn_with_task_context(async move {
+        let _slot = slot;
+        match client.name_caller_quietly().await {
+            // Named now: the report it was asked for gives it its run.
+            Ok(()) => {
+                accepted()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .reported(&digest, Instant::now());
+            }
+            Err(error) => {
+                tracing::debug!("whose credential reported was not learned: {}", error);
+            }
+        }
+    }))
 }
 
 /// Signs out at once, against a cap: a sign takes a slot or is dropped.

@@ -14,12 +14,20 @@
 //! - A credential the API was never seen to accept causes no request of the
 //!   gateway's own: not one read of a run and not one sign, however many
 //!   such credentials call. What the called tool itself asks is all there is.
+//! - "Accept" is the API saying whose credential it is. An answer of a route
+//!   that checks no credential (the version) accepts nothing, so keys nobody
+//!   issued and tokens that name another's account cause no request, spend
+//!   nothing of that account's signs, and take no place of a real caller.
+//! - A refusal (401) ends it, whichever of the client's ways the request
+//!   went.
+//! - Another caller on one's session id cannot rename one's agent.
 //! - A request with no credential is refused and causes nothing.
 //!
 //! Every gateway gets its own HOME; the API is a listener on localhost.
 #![cfg(unix)]
 
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -47,12 +55,16 @@ struct Asked {
 }
 
 /// A stand-in for the ContextStream API. It refuses (401) every credential
-/// that starts with `refused-` and accepts any other, answers a report and a
-/// read of a run the way the API does, and keeps what it was asked.
+/// that starts with `refused-` or was revoked ([`FakeApi::revoke`]) and
+/// accepts any other, answers a report and a read of a run the way the API
+/// does, and keeps what it was asked. As the API does, it answers what needs
+/// no credential ([`VERSION`]) with success whatever credential came with
+/// it, and says who a credential belongs to only on [`ME`].
 #[derive(Clone)]
 struct FakeApi {
     port: u16,
     asked: Arc<Mutex<Vec<Asked>>>,
+    revoked: Arc<Mutex<HashSet<String>>>,
 }
 
 impl FakeApi {
@@ -61,15 +73,30 @@ impl FakeApi {
         let api = Self {
             port: listener.local_addr().unwrap().port(),
             asked: Arc::new(Mutex::new(Vec::new())),
+            revoked: Arc::new(Mutex::new(HashSet::new())),
         };
-        let asked = api.asked.clone();
+        let (asked, revoked) = (api.asked.clone(), api.revoked.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let asked = asked.clone();
-                std::thread::spawn(move || serve(stream, &asked));
+                let (asked, revoked) = (asked.clone(), revoked.clone());
+                std::thread::spawn(move || serve(stream, &asked, &revoked));
             }
         });
         api
+    }
+
+    /// From now on the API refuses `credential` (401), as it does a key that
+    /// was deleted or a token that was signed out.
+    fn revoke(&self, credential: &str) {
+        self.revoked.lock().unwrap().insert(credential.to_string());
+    }
+
+    /// The reads of one run the API received under `credential`.
+    fn run_reads_under(&self, credential: &str) -> usize {
+        self.run_reads()
+            .iter()
+            .filter(|asked| asked.credential == credential)
+            .count()
     }
 
     fn asked(&self) -> Vec<Asked> {
@@ -130,7 +157,45 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-fn serve(mut stream: TcpStream, asked: &Mutex<Vec<Asked>>) {
+/// The account a credential belongs to, as the fake API has it: the subject
+/// a token names; for a key, what stands before `~` in it (so one account
+/// can hold several keys), else the whole key.
+fn account_of(credential: &str) -> String {
+    let segments: Vec<&str> = credential.split('.').collect();
+    if let [_, claims, _] = segments[..] {
+        let named = base64url_decode(claims)
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|claims| claims["sub"].as_str().map(str::to_string));
+        if let Some(subject) = named {
+            return subject;
+        }
+    }
+    credential
+        .split('~')
+        .next()
+        .unwrap_or(credential)
+        .to_string()
+}
+
+/// The user id the fake API answers for an account: one id an account.
+fn user_id_of(account: &str) -> String {
+    let hash = |seed: u64| {
+        account.bytes().fold(seed, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    };
+    let (high, low) = (hash(0xcbf2_9ce4_8422_2325), hash(0x8422_2325_cbf2_9ce4));
+    format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        high >> 32,
+        (high >> 16) & 0xffff,
+        high & 0xfff,
+        low >> 52,
+        low & 0xffff_ffff_ffff
+    )
+}
+
+fn serve(mut stream: TcpStream, asked: &Mutex<Vec<Asked>>, revoked: &Mutex<HashSet<String>>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut request = Vec::new();
     let mut chunk = [0_u8; 4096];
@@ -168,7 +233,9 @@ fn serve(mut stream: TcpStream, asked: &Mutex<Vec<Asked>>) {
         })
         .unwrap_or_default();
     let body: Value = serde_json::from_slice(&request[head_end..]).unwrap_or(Value::Null);
-    let refused = credential.starts_with("refused-");
+    // The version is public: it is answered without a look at the credential.
+    let refused = !path.starts_with(VERSION)
+        && (credential.starts_with("refused-") || revoked.lock().unwrap().contains(&credential));
     let now = "2099-01-01T00:00:00Z";
     let answer = if refused {
         json!({"error": "unauthorized"})
@@ -196,7 +263,7 @@ fn serve(mut stream: TcpStream, asked: &Mutex<Vec<Asked>>) {
         }}})
     } else if path.starts_with(ME) {
         json!({"success": true, "data": {
-            "id": "99999999-9999-4999-8999-999999999999",
+            "id": user_id_of(&account_of(&credential)),
             "email": "qa@example.com",
             "created_at": "2026-01-01T00:00:00Z",
         }})
@@ -328,9 +395,20 @@ impl Gateway {
 
     /// One request to `/mcp`: the HTTP status of the answer.
     fn post(&self, credential: Credential, headers: &[(&str, &str)], body: &Value) -> u16 {
+        self.post_to("/mcp", credential, headers, body)
+    }
+
+    /// One request to the endpoint `endpoint`: the HTTP status of the answer.
+    fn post_to(
+        &self,
+        endpoint: &str,
+        credential: Credential,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> u16 {
         let text = body.to_string();
         let mut request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
+            "POST {endpoint} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
             self.port,
             text.len()
         );
@@ -430,8 +508,25 @@ impl Drop for Gateway {
     }
 }
 
+const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut bits, mut held) = (0_u32, 0_u32);
+    for byte in text.bytes() {
+        let value = ALPHABET.iter().position(|letter| *letter == byte)? as u32;
+        bits = bits << 6 | value;
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            out.push((bits >> held) as u8);
+            bits &= (1 << held) - 1;
+        }
+    }
+    Some(out)
+}
+
 fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
         let n = u32::from(chunk[0]) << 16
@@ -463,6 +558,18 @@ fn a_step(step: &str) -> Value {
 /// thing of its own ([`VERSION`]).
 fn version() -> Value {
     json!({"action": "version", "workspace_id": WORKSPACE})
+}
+
+/// A tool call in the workspace the gateway signs that asks the API nothing
+/// itself: whatever the API is asked then is the gateway's own doing.
+fn local() -> Value {
+    json!({"action": "tools", "workspace_id": WORKSPACE})
+}
+
+/// The version, asked with no workspace named: the API answers it without a
+/// look at the credential.
+fn public_version() -> Value {
+    json!({"action": "version"})
 }
 
 fn run_key(report: &Asked) -> String {
@@ -795,4 +902,256 @@ fn nothing_is_asked_for_a_workspace_the_setting_does_not_name() {
         let one_caller = [ME, OPEN_RUNS, REPORT, VERSION, VERSION, VERSION];
         assert_eq!(api.paths(), [one_caller, one_caller].concat(), "{env:?}");
     }
+}
+
+/// The delta reading's MUST 1, first part. The API answers what needs no
+/// credential with success whatever credential came with it. That answer
+/// says nothing about the credential: a key nobody issued and a token nobody
+/// issued stay unaccepted, and cause no request of the gateway's own.
+#[test]
+fn an_answer_that_checked_no_credential_accepts_none() {
+    let api = FakeApi::start();
+    let gateway = Gateway::start(&api);
+    let forged = format!("refused-{}", bearer(json!({"sub": "user-ann"}), "forged"));
+    for credential in [
+        Credential::ApiKey("refused-probe"),
+        Credential::Bearer(&forged),
+    ] {
+        assert_eq!(
+            gateway.call(credential, "s-probe", "help", public_version()),
+            200
+        );
+        for _ in 0..3 {
+            assert_eq!(gateway.call(credential, "s-probe", "help", local()), 200);
+        }
+    }
+    api.settle();
+    let paths = api.paths();
+    assert!(
+        !paths.is_empty() && paths.iter().all(|path| path == VERSION),
+        "a success of a route that checks no credential accepted one: {paths:?}"
+    );
+}
+
+/// The delta reading's MUST 1, second part. Sixty tokens nobody issued name
+/// Ann's account, one of them on Ann's own session id. None is accepted, so
+/// none reads a run, and none spends a sign of Ann's: her own session's next
+/// tool call is signalled.
+#[test]
+fn tokens_the_api_refuses_spend_no_sign_of_the_account_they_name() {
+    const FORGED: usize = 60;
+    let api = FakeApi::start();
+    let gateway = Gateway::start(&api);
+    let ann = bearer(json!({"sub": "user-ann", "jti": "real"}), "signature-a");
+    assert_eq!(gateway.initialize(Credential::Bearer(&ann)), 200);
+    gateway.call(Credential::Bearer(&ann), "ann-sid", "progress", a_step("A"));
+    api.settle();
+
+    for index in 0..FORGED {
+        let forged = format!(
+            "refused-{}",
+            bearer(json!({"sub": "user-ann", "n": index}), "forged")
+        );
+        let session = if index == 0 {
+            "ann-sid".to_string()
+        } else {
+            format!("forged-{index}")
+        };
+        gateway.call(
+            Credential::Bearer(&forged),
+            &session,
+            "help",
+            public_version(),
+        );
+        gateway.call(Credential::Bearer(&forged), &session, "help", local());
+    }
+    api.settle();
+    let forged_reads: Vec<Asked> = api
+        .run_reads()
+        .into_iter()
+        .filter(|asked| asked.credential != ann)
+        .collect();
+    assert!(
+        forged_reads.is_empty(),
+        "tokens the API refuses read a run: {} reads",
+        forged_reads.len()
+    );
+    assert_eq!(api.run_reads_under(&ann), 0);
+
+    gateway.call(Credential::Bearer(&ann), "ann-sid", "help", local());
+    api.wait_for_reports(2);
+    api.settle();
+    assert_eq!(
+        api.run_reads_under(&ann),
+        1,
+        "tokens the API refuses spent the signs of the account they name"
+    );
+    assert_eq!(api.reports().len(), 2, "Ann's report, and the sign");
+}
+
+/// The delta reading's MUST 1, third part. More keys nobody issued than the
+/// gateway remembers credentials call what needs no credential. None takes a
+/// place: a caller the API accepts afterwards is signalled.
+#[test]
+fn keys_nobody_issued_take_no_place_of_a_caller_the_api_accepts() {
+    const BOGUS: usize = 10_050;
+    const AT_ONCE: usize = 16;
+    let api = FakeApi::start();
+    let gateway = Gateway::start(&api);
+    std::thread::scope(|scope| {
+        for worker in 0..AT_ONCE {
+            let gateway = &gateway;
+            scope.spawn(move || {
+                for index in (worker..BOGUS).step_by(AT_ONCE) {
+                    gateway.call(
+                        Credential::ApiKey(&format!("refused-fill-{index}")),
+                        "fill",
+                        "help",
+                        public_version(),
+                    );
+                }
+            });
+        }
+    });
+    api.settle();
+    assert!(api.run_reads().is_empty());
+
+    assert_eq!(gateway.initialize(Credential::ApiKey("a-new-key")), 200);
+    gateway.call(Credential::ApiKey("a-new-key"), "new-sid", "help", local());
+    api.wait_for_reports(1);
+    api.settle();
+    assert_eq!(
+        api.run_reads_under("a-new-key"),
+        1,
+        "keys nobody issued took the place of a caller the API accepts"
+    );
+}
+
+/// The delta reading's MUST 2. The client asks the API in three ways (an
+/// answer it reads as JSON, one it reads as text, one it passes on as it
+/// is). A refusal seen on any of them ends the credential's acceptance: no
+/// further read of a run goes out under it.
+#[test]
+fn a_refusal_ends_the_acceptance_whichever_way_the_request_went() {
+    let capsule = "33333333-3333-4333-8333-333333333333";
+    let api = FakeApi::start();
+    let gateway = Gateway::start(&api);
+    let keys = ["key-json", "key-text", "key-raw"];
+    for key in keys {
+        assert_eq!(gateway.initialize(Credential::ApiKey(key)), 200);
+        // Accepted: a session of the key is signalled.
+        gateway.call(
+            Credential::ApiKey(key),
+            &format!("{key}-1"),
+            "help",
+            local(),
+        );
+    }
+    api.wait_for_reports(keys.len());
+    api.settle();
+    for key in keys {
+        assert_eq!(api.run_reads_under(key), 1, "{key}");
+        api.revoke(key);
+    }
+    let before = api.asked().len();
+
+    // Each key is refused once, on one of the three ways.
+    gateway.call(
+        Credential::ApiKey("key-json"),
+        "key-json-2",
+        "help",
+        json!({"action": "auth"}),
+    );
+    gateway.call(
+        Credential::ApiKey("key-text"),
+        "key-text-2",
+        "capsule",
+        json!({"action": "open", "capsule_id": capsule, "format": "markdown"}),
+    );
+    gateway.post_to(
+        "/coach",
+        Credential::ApiKey("key-raw"),
+        &[("Mcp-Session-Id", "key-raw-2")],
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "workflow", "arguments": {"action": "capabilities"}}}),
+    );
+    api.settle();
+    let refused: Vec<(String, String)> = api
+        .asked()
+        .into_iter()
+        .skip(before)
+        .map(|asked| (asked.credential, asked.path))
+        .collect();
+    let refused_on = |key: &str, path: &str| {
+        refused
+            .iter()
+            .any(|(credential, asked)| credential == key && asked.contains(path))
+    };
+    assert!(
+        refused_on("key-json", ME)
+            && refused_on("key-text", "/context.md")
+            && refused_on("key-raw", "/coach/capabilities"),
+        "each key was to be refused on its way: {refused:?}"
+    );
+
+    // No further read of a run, in any session of a refused key.
+    for key in keys {
+        gateway.call(
+            Credential::ApiKey(key),
+            &format!("{key}-3"),
+            "help",
+            local(),
+        );
+    }
+    api.settle();
+    let reads: Vec<(&str, usize)> = keys
+        .iter()
+        .map(|key| (*key, api.run_reads_under(key)))
+        .collect();
+    assert_eq!(
+        reads,
+        [("key-json", 1), ("key-text", 1), ("key-raw", 1)],
+        "a refused credential went on reading runs"
+    );
+}
+
+/// The delta reading's MUST 3. Two people who are signed in present the same
+/// session id. One names a folder for the session; the other's agent stays
+/// what it was: its own id and name, on its own run.
+#[test]
+fn another_caller_on_ones_session_id_cannot_rename_ones_agent() {
+    let api = FakeApi::start();
+    let gateway = Gateway::start(&api);
+    let ann = bearer(json!({"sub": "user-ann"}), "signature-a");
+    let bob = bearer(json!({"sub": "user-bob"}), "signature-b");
+    gateway.call(
+        Credential::Bearer(&ann),
+        "sid-42",
+        "progress",
+        a_step("Before"),
+    );
+    gateway.call(
+        Credential::Bearer(&bob),
+        "sid-42",
+        "init",
+        json!({"folder_path": "/work/agent-hijacked"}),
+    );
+    gateway.call(
+        Credential::Bearer(&ann),
+        "sid-42",
+        "progress",
+        a_step("After"),
+    );
+    let reports: Vec<Asked> = api
+        .reports()
+        .into_iter()
+        .filter(|report| report.credential == ann)
+        .collect();
+    assert_eq!(reports.len(), 2, "{reports:?}");
+    assert!(!agent_id(&reports[0]).is_empty(), "{reports:?}");
+    assert_eq!(
+        reports[0].body["agent"], reports[1].body["agent"],
+        "another caller renamed the agent"
+    );
+    assert_eq!(run_key(&reports[0]), run_key(&reports[1]));
 }

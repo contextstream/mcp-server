@@ -4400,6 +4400,8 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
     // A Slipstream auto-accept cap is a person's consent to be charged. The gateway serves
     // everyone, so its own environment never sets one: each caller sends theirs as a header.
     config.slipstream_auto_accept_max_credits = 0;
+    // The same for a spend ceiling: each connection sends its own (X-ContextStream-Max-Spend-Credits).
+    config.max_spend_credits = None;
 
     // Caller-supplied local filesystem paths must not drive reads/writes of the
     // gateway's own disk. Publish the policy process-wide so the filesystem

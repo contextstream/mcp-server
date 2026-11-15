@@ -125,6 +125,14 @@ pub struct Config {
     /// its own environment: it would spend every caller's credits.
     #[serde(default)]
     pub slipstream_auto_accept_max_credits: u32,
+
+    /// The most one call on this connection may spend, in credits, whatever the person or the
+    /// agent accepts (`CONTEXTSTREAM_MAX_SPEND_CREDITS` on stdio, the
+    /// `X-ContextStream-Max-Spend-Credits` header on a hosted connection; see
+    /// `mcp_tools::spend`). `None`, the default, sets no ceiling. The hosted gateway never
+    /// takes it from its own environment.
+    #[serde(default)]
+    pub max_spend_credits: Option<u32>,
 }
 
 fn default_true() -> bool {
@@ -177,6 +185,7 @@ impl Default for Config {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_default(),
             slipstream_auto_accept_max_credits: 0,
+            max_spend_credits: None,
         }
     }
 }
@@ -251,6 +260,9 @@ impl Config {
         if let Some(value) = override_config.slipstream_auto_accept_max_credits {
             next.slipstream_auto_accept_max_credits = value;
         }
+        if let Some(value) = override_config.max_spend_credits {
+            next.max_spend_credits = Some(value);
+        }
 
         next
     }
@@ -305,6 +317,11 @@ pub struct ConfigOverride {
     /// staging rehearsal of a film.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub studio_rehearsal: Option<bool>,
+    /// The most one call on this connection may spend (`X-ContextStream-Max-Spend-Credits`).
+    /// ContextStudio's recording machines send it so a recorded session can spend nothing above
+    /// what its film's accepted plan allows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_spend_credits: Option<u32>,
 }
 
 impl ConfigOverride {
@@ -329,6 +346,7 @@ impl ConfigOverride {
             && self.atlas_enabled.is_none()
             && self.slipstream_auto_accept_max_credits.is_none()
             && self.studio_rehearsal.is_none()
+            && self.max_spend_credits.is_none()
     }
 
     pub fn affects_tool_registry(&self) -> bool {

@@ -850,6 +850,20 @@ impl StudioTool {
             ));
         };
         let likely = quote.get("estimatedCredits").and_then(Value::as_i64);
+        // The connection's own ceiling (crate::spend): nothing priced above it is made, whatever
+        // the agent accepts, and the person is not asked a price this connection may not spend.
+        if let Some(most) = self.client.config().await.max_spend_credits {
+            if price > i64::from(most) {
+                return Ok(ToolResult::with_structured(
+                    format!(
+                        "Not made: this connection may spend at most {} credits on one making, and this plan costs up to {} credits. Nothing was spent.",
+                        credits(i64::from(most)),
+                        credits(price)
+                    ),
+                    json!({"made": false, "plan_id": quote_id, "price_credits": price, "max_spend_credits": most}),
+                ));
+            }
+        }
         let balance = self.create().balance().await;
         let titles = plan_titles(&quote);
 

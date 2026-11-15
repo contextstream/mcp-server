@@ -865,6 +865,88 @@ async fn the_auto_accept_cap_runs_without_a_quote_up_to_its_price() {
     assert_eq!(stub.task_posts().len(), 1);
 }
 
+/// A connection's spend ceiling (mcp_tools::spend) bounds every run on it: a priced run above it
+/// does not run whatever is accepted, the auto-accept cap included; a run metered per model
+/// call has no price to compare and does not run; an automatic run does not run.
+#[tokio::test]
+async fn a_spend_ceiling_bounds_every_run_on_the_connection() {
+    let stub = Stub::api(live_catalog(), |request| {
+        if request.method == "POST" {
+            Answer::ok(task_view("succeeded", true))
+        } else {
+            Answer::error(404, "no")
+        }
+    })
+    .await;
+    // review costs 1200 credits a run.
+    let mut config = stub.config("key-ceiling");
+    config.max_spend_credits = Some(1000);
+    config.slipstream_auto_accept_max_credits = 5000;
+    let (tool, _) = stub.tool(config);
+    for extra in [json!({"accepted_price_credits": 1200}), json!({})] {
+        let refused = tool.execute(run_input(extra.clone())).await.unwrap();
+        let text = text_of(&refused);
+        assert!(
+            text.starts_with("Not run: this connection may spend at most 1000 credits on one run"),
+            "{extra}: {text}"
+        );
+        assert!(text.contains("Nothing was charged"), "{text}");
+        let out = refused.structured_content.as_ref().unwrap();
+        assert_eq!(out["ran"], false);
+        assert_eq!(out["max_spend_credits"], 1000);
+    }
+    let automatic = tool
+        .execute(run_input(json!({"automatic": true})))
+        .await
+        .unwrap();
+    assert!(
+        text_of(&automatic).starts_with("Not run: this connection may spend at most 1000 credits"),
+        "{}",
+        text_of(&automatic)
+    );
+    assert!(stub.task_posts().is_empty());
+
+    // A run metered per model call: no price to hold it to.
+    let mut metered = live_catalog();
+    for entry in metered["data"]["agents"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        if entry["agent"]["id"] == "review" {
+            entry["agent"]
+                .as_object_mut()
+                .unwrap()
+                .remove("price_credits");
+        }
+    }
+    let metered_stub = Stub::api(metered, |_| Answer::ok(task_view("succeeded", true))).await;
+    let mut config = metered_stub.config("key-ceiling-metered");
+    config.max_spend_credits = Some(100_000);
+    let (tool, _) = metered_stub.tool(config);
+    let refused = tool.execute(run_input(json!({}))).await.unwrap();
+    assert!(
+        text_of(&refused).starts_with("Not run: this connection may spend at most 100000 credits"),
+        "{}",
+        text_of(&refused)
+    );
+    assert!(
+        text_of(&refused).contains("metered per model call"),
+        "{}",
+        text_of(&refused)
+    );
+    assert!(metered_stub.task_posts().is_empty());
+
+    // At the price: it runs, as on a connection with no ceiling.
+    let mut config = stub.config("key-ceiling-enough");
+    config.max_spend_credits = Some(1200);
+    let (tool, _) = stub.tool(config);
+    tool.execute(run_input(json!({"accepted_price_credits": 1200})))
+        .await
+        .unwrap();
+    assert_eq!(stub.task_posts().len(), 1);
+}
+
 #[tokio::test]
 async fn a_retried_run_carries_the_same_idempotency_key() {
     let stub = Stub::api(live_catalog(), |request| {

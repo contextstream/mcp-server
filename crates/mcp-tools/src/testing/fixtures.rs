@@ -276,6 +276,7 @@ impl TestFixtures {
             http_local_files: false,
             account_mode_preference: Default::default(),
             slipstream_auto_accept_max_credits: 0,
+            max_spend_credits: None,
         }
     }
 

@@ -5956,3 +5956,264 @@ mod tests {
         );
     }
 }
+
+// Written by lane review-studio-2 in its reading of 93d4920 (M1, and S2 in router mode), kept as the change's test.
+// Appended to crates/mcp-server/src/server.rs in a box and run with:
+//   cargo test --locked -p mcp-server --bin contextstream-mcp review_go_ahead -- --nocapture --test-threads=1
+// The thing to break: on a connection where only the person's own go-ahead counts, something is still deleted on
+// the agent's word.
+#[cfg(test)]
+mod review_go_ahead {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const WORKSPACE: &str = "11111111-1111-4111-8111-111111111111";
+    const DOC: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// A stand-in API that records every request line and answers each with a doc.
+    async fn api() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let record = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let header_end = loop {
+                        let Ok(read) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..read]);
+                        if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break position + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buffer.len() < header_end + length {
+                        let Ok(read) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        buffer.extend_from_slice(&chunk[..read]);
+                    }
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let path = parts
+                        .next()
+                        .unwrap_or_default()
+                        .split('?')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    record.lock().unwrap().push(format!("{method} {path}"));
+                    let body = json!({"success": true, "error": null, "metadata": {}, "data": {
+                        "id": DOC, "title": "The launch plan", "content": "words", "doc_type": "general",
+                        "workspace_id": WORKSPACE, "project_id": null, "is_personal": false, "deleted": true
+                    }})
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    async fn registry_on(url: &str) -> ToolRegistry {
+        registry_with(url, false).await
+    }
+
+    async fn registry_with(url: &str, router_mode: bool) -> ToolRegistry {
+        let config = Config {
+            api_key: Some("review-key".to_string()),
+            api_url: url.to_string(),
+            default_workspace_id: Some(WORKSPACE.parse().unwrap()),
+            router_mode,
+            ..Config::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config.clone()));
+        build_registry(&config, client, session)
+    }
+
+    fn asked_only() -> mcp_types::config::ConfigOverride {
+        mcp_types::config::ConfigOverride {
+            go_ahead_asked_only: Some(true),
+            ..Default::default()
+        }
+    }
+
+    fn said(
+        outcome: &std::result::Result<mcp_types::tool::ToolResult, mcp_types::Error>,
+    ) -> String {
+        match outcome {
+            Ok(result) => format!("is_error={} {:?}", result.is_error, result.content)
+                .chars()
+                .take(400)
+                .collect(),
+            Err(error) => format!("Err({error})").chars().take(400).collect(),
+        }
+    }
+
+    fn deletes(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("DELETE "))
+            .cloned()
+            .collect()
+    }
+
+    /// The control: the `delete` tool itself is refused and nothing reaches the API.
+    #[tokio::test]
+    async fn control_the_delete_tool_deletes_nothing_there() {
+        let (url, seen) = api().await;
+        let registry = registry_on(&url).await;
+        let outcome = mcp_client::run_with_config_override(asked_only(), || async {
+            registry
+                .execute(
+                    "delete",
+                    json!({"action": "memory.delete_doc", "doc_id": DOC}),
+                )
+                .await
+        })
+        .await;
+        println!("delete(memory.delete_doc), asked only: {}", said(&outcome));
+        assert!(said(&outcome).contains(
+            "Not deleted: on this connection a go-ahead counts only when the person is asked"
+        ));
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    /// The same delete under its other name: `memory_delete_doc` ("Same as delete(action=\"memory.delete_doc\")").
+    #[tokio::test]
+    async fn the_same_delete_under_its_narrow_tool_deletes_nothing_there_either() {
+        let (url, seen) = api().await;
+        let registry = registry_on(&url).await;
+        let listed: Vec<String> = registry
+            .list()
+            .iter()
+            .filter(|tool| tool.metadata.annotations.destructive)
+            .map(|tool| tool.metadata.name.clone())
+            .collect();
+        println!("tools this registry lists as destructive: {listed:?}");
+        assert!(
+            registry.get("memory_delete_doc").is_some(),
+            "the narrow tool is registered"
+        );
+        let outcome = mcp_client::run_with_config_override(asked_only(), || async {
+            registry
+                .execute("memory_delete_doc", json!({"doc_id": DOC}))
+                .await
+        })
+        .await;
+        println!("memory_delete_doc, asked only: {}", said(&outcome));
+        println!("requests that reached the API: {:?}", seen.lock().unwrap());
+        assert!(
+            deletes(&seen).is_empty(),
+            "a doc was deleted on the agent's word where only the person's go-ahead counts: {:?}",
+            deletes(&seen)
+        );
+    }
+
+    /// The router's catalog keeps every action (destructive.rs): the same delete as an operation.
+    #[tokio::test]
+    async fn the_same_delete_as_an_operation_deletes_nothing_there_either() {
+        let (url, seen) = api().await;
+        let registry = registry_on(&url).await;
+        let outcome = mcp_client::run_with_config_override(asked_only(), || async {
+            registry
+                .execute_operation("memory", json!({"action": "delete_doc", "doc_id": DOC}))
+                .await
+        })
+        .await;
+        println!(
+            "execute_operation(memory, delete_doc), asked only: {}",
+            said(&outcome)
+        );
+        println!("requests that reached the API: {:?}", seen.lock().unwrap());
+        assert!(
+            deletes(&seen).is_empty(),
+            "a doc was deleted through the operations catalog on the agent's word: {:?}",
+            deletes(&seen)
+        );
+    }
+
+    /// Off, nothing changes: the narrow tool deletes as before (what the stub shows when the setting is absent).
+    #[tokio::test]
+    async fn without_the_setting_the_narrow_tool_deletes_as_before() {
+        let (url, seen) = api().await;
+        let registry = registry_on(&url).await;
+        let outcome = registry
+            .execute("memory_delete_doc", json!({"doc_id": DOC}))
+            .await;
+        println!("memory_delete_doc, setting absent: {}", said(&outcome));
+        println!("requests that reached the API: {:?}", seen.lock().unwrap());
+        assert_eq!(deletes(&seen).len(), 1, "{:?}", seen.lock().unwrap());
+        let _: Option<Value> = None;
+    }
+
+    /// In router mode the operations catalog keeps every action (destructive.rs): the same delete as an operation is
+    /// refused there too, and nothing reaches the API (the reader's S2 on 93d4920).
+    #[tokio::test]
+    async fn in_router_mode_the_same_delete_as_an_operation_deletes_nothing_there() {
+        let (url, seen) = api().await;
+        let registry = registry_with(&url, true).await;
+        assert!(registry.is_router_mode());
+        assert!(
+            registry.get_operation("memory").is_some(),
+            "router mode keeps the memory operation"
+        );
+        let outcome = mcp_client::run_with_config_override(asked_only(), || async {
+            registry
+                .execute_operation("memory", json!({"action": "delete_doc", "doc_id": DOC}))
+                .await
+        })
+        .await;
+        println!(
+            "router mode, execute_operation(memory, delete_doc), asked only: {}",
+            said(&outcome)
+        );
+        assert!(said(&outcome).contains(
+            "Not deleted: on this connection a go-ahead counts only when the person is asked"
+        ));
+        assert!(deletes(&seen).is_empty(), "{:?}", seen.lock().unwrap());
+        // Off, the same operation deletes as before.
+        let outcome = registry
+            .execute_operation("memory", json!({"action": "delete_doc", "doc_id": DOC}))
+            .await;
+        println!("router mode, setting absent: {}", said(&outcome));
+        assert_eq!(deletes(&seen).len(), 1, "{:?}", seen.lock().unwrap());
+    }
+}

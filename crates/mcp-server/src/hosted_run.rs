@@ -374,7 +374,12 @@ mod tests {
             outcome(Ok(frame), true),
             Remote::Ran(101, "[ran remotely: 4.3 s]".to_string())
         );
-        assert_eq!(outcome(Ok(json!({"ran": false})), true), Remote::Broken);
+        assert_eq!(
+            outcome(Ok(json!({"ran": false})), true),
+            Remote::Here(Some(
+                "the output above does not count: the service did not finish it".to_string()
+            ))
+        );
         assert_eq!(
             outcome(Ok(json!({"ran": false})), false),
             Remote::Here(Some("the service declined to run it".to_string()))
@@ -383,6 +388,39 @@ mod tests {
         assert_eq!(
             outcome(Err("gone".to_string()), false),
             Remote::Here(Some("gone".to_string()))
+        );
+    }
+
+    /// Review of ee2f156 (review-lever8-mcp): with the output streamed, mcd's refusals after a run (a tool missing on
+    /// the host, a run that wrote the tree) come after the output, as `ran: false` and 75. On main such a command ran
+    /// here; it still does, and the last line says the output shown does not count, with the host's own reason.
+    #[test]
+    fn a_run_the_host_refuses_after_its_output_runs_here_and_the_output_does_not_count() {
+        let frame = json!({"type": "result", "ran": false, "exit": 75, "refused_code": "command_missing",
+            "refused": "command not found on the check host (exit 127); the session runs it itself"});
+        assert_eq!(
+            outcome(Ok(frame.clone()), true),
+            Remote::Here(Some(
+                "the output above does not count: command not found on the check host (exit 127); \
+                 the session runs it itself"
+                    .to_string()
+            ))
+        );
+        let frame =
+            json!({"type": "result", "ran": false, "exit": 75, "refused_code": "run_wrote_tree"});
+        assert_eq!(
+            outcome(Ok(frame), true),
+            Remote::Here(Some(
+                "the output above does not count: run_wrote_tree".to_string()
+            ))
+        );
+        // nothing shown yet: as before
+        assert_eq!(
+            outcome(
+                Ok(json!({"ran": false, "exit": 75, "refused": "busy"})),
+                false
+            ),
+            Remote::Here(Some("the service declined to run it".to_string()))
         );
     }
 

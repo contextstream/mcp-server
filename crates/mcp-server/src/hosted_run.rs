@@ -23,9 +23,10 @@ use mcp_tools::domains::hosted_tools::{
 use serde_json::Value;
 
 /// How a try at running the command on the service came out.
+#[derive(Debug, PartialEq)]
 enum Remote {
-    /// The service ran it: its exit status.
-    Ran(i32),
+    /// The service ran it: its exit status, and the line said after its output.
+    Ran(i32, String),
     /// It was not run there, so it is run here; the reason when a call was tried.
     Here(Option<String>),
     /// It started on the service and then the stream broke: its output was already written.
@@ -36,7 +37,10 @@ enum Remote {
 pub async fn run(tool: Option<String>, command: String) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     match try_remote(tool.as_deref(), &command, &cwd).await {
-        Remote::Ran(status) => status,
+        Remote::Ran(status, said) => {
+            eprintln!("{said}");
+            status
+        }
         Remote::Broken => {
             eprintln!("contextstream: the remote run ended without a result");
             1
@@ -135,6 +139,11 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
         let stdout = std::io::stdout();
         while let Some(event) = inbox.recv().await {
             if let Event::Output(bytes) = event {
+                if !wrote {
+                    if let Some(mark) = output_mark(DELIVERY) {
+                        eprintln!("{mark}");
+                    }
+                }
                 let mut out = stdout.lock();
                 // A reader that went away is no reason to stop the run.
                 let _ = out.write_all(&bytes).and_then(|_| out.flush());
@@ -143,14 +152,23 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
         }
         wrote
     };
-    let (outcome, wrote) = tokio::join!(
-        drive_stream(&call, &snapshot, Delivery::Buffered, events),
-        writer
-    );
-    match outcome {
+    let (result, wrote) = tokio::join!(drive_stream(&call, &snapshot, DELIVERY, events), writer);
+    outcome(result, wrote)
+}
+
+/// How this command takes the run's output from the service.
+const DELIVERY: Delivery = Delivery::Buffered;
+
+/// The line said on stderr before the first byte of the run's output, when it is shown as it prints.
+fn output_mark(_delivery: Delivery) -> Option<&'static str> {
+    None
+}
+
+/// What the service's `result` frame (or the reason there is none) comes to, and whether output was already written.
+fn outcome(result: Result<Value, String>, wrote: bool) -> Remote {
+    match result {
         Ok(frame) if frame.get("ran").and_then(Value::as_bool) == Some(true) => {
-            eprintln!("{}", ran_line(&frame));
-            Remote::Ran(exit_status(&frame))
+            Remote::Ran(exit_status(&frame), ran_line(&frame))
         }
         Ok(_) if wrote => Remote::Broken,
         Ok(_) => Remote::Here(Some("the service declined to run it".to_string())),
@@ -274,6 +292,58 @@ mod tests {
         assert_eq!(exit_status(&json!({"exit": 256})), 1);
         assert_eq!(exit_status(&json!({"exit": -1})), 1);
         assert_eq!(exit_status(&json!({})), 0);
+    }
+
+    /// Lever 8 (ruling of 2026-11-16): the output is shown as it prints, so a failure is seen when it happens
+    /// (1.6 to 2.1 s through the gateway on a check that fails at once, against 52 s when the output was held).
+    #[test]
+    fn the_output_comes_as_it_prints_under_a_mark_that_says_so() {
+        assert_eq!(DELIVERY, Delivery::Streamed);
+        let mark = output_mark(DELIVERY).expect("a streamed run's output is marked");
+        assert!(mark.starts_with("contextstream: "), "{mark}");
+        assert!(mark.contains("output so far"), "{mark}");
+        assert!(mark.contains("the verdict is the last line"), "{mark}");
+        assert_eq!(output_mark(Delivery::Buffered), None);
+    }
+
+    /// When the host says a failure was its own (mcd's `environment` on a streamed result), the last line says so and
+    /// the command runs here: the output already shown is not the verdict.
+    #[test]
+    fn a_failure_the_host_calls_its_own_is_said_to_be_the_hosts_and_runs_here() {
+        let frame = json!({"ran": true, "exit": 1, "seconds": 3.2, "environment": {
+            "refused_code": "host_oom", "detail": "the host ran out of memory during the run", "stage": "after the run"}});
+        match outcome(Ok(frame), true) {
+            Remote::Here(Some(said)) => {
+                assert!(said.starts_with("the host's fault, not your change"), "{said}");
+                assert!(said.contains("the host ran out of memory during the run"), "{said}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // with no detail, its code
+        let frame = json!({"ran": true, "exit": 1, "environment": {"refused_code": "host_disk"}});
+        assert_eq!(
+            outcome(Ok(frame), true),
+            Remote::Here(Some("the host's fault, not your change: host_disk".to_string()))
+        );
+        // and with nothing in it, the words alone
+        let frame = json!({"ran": true, "exit": 1, "environment": {}});
+        assert_eq!(
+            outcome(Ok(frame), false),
+            Remote::Here(Some("the host's fault, not your change".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_run_the_host_stands_by_is_its_exit_and_the_ran_line() {
+        let frame = json!({"ran": true, "exit": 101, "seconds": 4.26, "environment": null});
+        assert_eq!(outcome(Ok(frame), true), Remote::Ran(101, "[ran remotely: 4.3 s]".to_string()));
+        assert_eq!(outcome(Ok(json!({"ran": false})), true), Remote::Broken);
+        assert_eq!(
+            outcome(Ok(json!({"ran": false})), false),
+            Remote::Here(Some("the service declined to run it".to_string()))
+        );
+        assert_eq!(outcome(Err("gone".to_string()), true), Remote::Broken);
+        assert_eq!(outcome(Err("gone".to_string()), false), Remote::Here(Some("gone".to_string())));
     }
 
     #[test]

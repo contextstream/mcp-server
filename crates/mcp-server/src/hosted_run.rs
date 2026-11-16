@@ -345,8 +345,10 @@ mod tests {
         assert_eq!(DELIVERY, Delivery::Streamed);
         let mark = output_mark(DELIVERY).expect("a streamed run's output is marked");
         assert!(mark.starts_with("contextstream: "), "{mark}");
-        assert!(mark.contains("output so far"), "{mark}");
-        assert!(mark.contains("the verdict is the last line"), "{mark}");
+        assert!(mark.contains("as it prints"), "{mark}");
+        // the last line is not always the verdict: after a run the host does not stand by, the command runs here
+        assert!(!mark.contains("the verdict is the last line"), "{mark}");
+        assert!(mark.contains("if the host does not stand by it"), "{mark}");
         assert_eq!(output_mark(Delivery::Buffered), None);
     }
 
@@ -395,7 +397,8 @@ mod tests {
         assert_eq!(
             outcome(Ok(json!({"ran": false})), true),
             Remote::Here(Some(
-                "the output above does not count: the service did not finish it".to_string()
+                "the host did not stand by the output above: the service did not finish it"
+                    .to_string()
             ))
         );
         assert_eq!(
@@ -419,7 +422,7 @@ mod tests {
         assert_eq!(
             outcome(Ok(frame.clone()), true),
             Remote::Here(Some(
-                "the output above does not count: command not found on the check host (exit 127); \
+                "the host did not stand by the output above: command not found on the check host (exit 127); \
                  the session runs it itself"
                     .to_string()
             ))
@@ -429,7 +432,7 @@ mod tests {
         assert_eq!(
             outcome(Ok(frame), true),
             Remote::Here(Some(
-                "the output above does not count: run_wrote_tree".to_string()
+                "the host did not stand by the output above: run_wrote_tree".to_string()
             ))
         );
         // nothing shown yet: as before

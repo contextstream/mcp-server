@@ -8,8 +8,8 @@
 //! makes (the checkout is described to the API and sent on its stream), except
 //! that the output is written as it arrives (marked once on stderr as the
 //! run's output so far) and the process ends with the command's own exit
-//! status; a failure the host calls its own ends with a line that says so,
-//! and the command then runs here. Nothing here reaches the network when no tool
+//! status; a failure the host calls its own, or a run it refuses after its
+//! output, ends with a line that says so, and the command then runs here. Nothing here reaches the network when no tool
 //! takes the command.
 
 use std::io::Write;
@@ -171,6 +171,20 @@ fn output_mark(delivery: Delivery) -> Option<&'static str> {
     )
 }
 
+/// Why the service did not stand by a run: its `refused` words, else its `refused_code`.
+fn refusal_reason(frame: &Value) -> String {
+    let text = |key: &str| {
+        frame
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+    };
+    text("refused")
+        .or_else(|| text("refused_code"))
+        .unwrap_or("the service did not finish it")
+        .to_string()
+}
+
 /// What the host says when a run's failure was its own (mcd's `environment` on the result): its detail, else its code.
 fn host_fault(frame: &Value) -> Option<String> {
     let cause = frame.get("environment").filter(|cause| cause.is_object())?;
@@ -196,7 +210,11 @@ fn outcome(result: Result<Value, String>, wrote: bool) -> Remote {
                 None => Remote::Ran(exit_status(&frame), ran_line(&frame)),
             }
         }
-        Ok(_) if wrote => Remote::Broken,
+        // Refused after its output was shown (mcd's checks after the run): the output does not count; it runs here.
+        Ok(frame) if wrote => Remote::Here(Some(format!(
+            "the output above does not count: {}",
+            refusal_reason(&frame)
+        ))),
         Ok(_) => Remote::Here(Some("the service declined to run it".to_string())),
         Err(_) if wrote => Remote::Broken,
         Err(reason) => Remote::Here(Some(reason)),

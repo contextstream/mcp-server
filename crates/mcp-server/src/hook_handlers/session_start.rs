@@ -44,7 +44,8 @@ pub async fn handle() -> Result<()> {
         })
         .unwrap_or_default();
 
-    // Startup, resume, clear or compact: what the prompt hook showed earlier
+    // Startup, resume or compact (the installed matcher; /clear starts a new
+    // session id, which has no state): what the prompt hook showed earlier
     // is not in the model's view now, so its next prompt is delivered in full.
     super::mid_run_notices::reset_prompt_standing_window(&input, &cwd);
 

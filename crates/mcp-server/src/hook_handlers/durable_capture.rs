@@ -270,6 +270,30 @@ pub(crate) fn with_locked_json<S, T>(path: &Path, update: impl FnOnce(&mut S) ->
 where
     S: Default + Serialize + serde::de::DeserializeOwned,
 {
+    locked_json(path, None, update)
+}
+
+/// [`with_locked_json`] for a caller with a time limit: `None`, and nothing
+/// changed, when another process holds the lock for longer than `wait`.
+pub(crate) fn with_locked_json_within<S, T>(
+    path: &Path,
+    wait: Duration,
+    update: impl FnOnce(&mut S) -> T,
+) -> Option<T>
+where
+    S: Default + Serialize + serde::de::DeserializeOwned,
+{
+    locked_json(path, Some(wait), update)
+}
+
+fn locked_json<S, T>(
+    path: &Path,
+    wait: Option<Duration>,
+    update: impl FnOnce(&mut S) -> T,
+) -> Option<T>
+where
+    S: Default + Serialize + serde::de::DeserializeOwned,
+{
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
@@ -280,7 +304,18 @@ where
         .truncate(false)
         .open(path.with_extension("lock"))
         .ok()?;
-    fs2::FileExt::lock_exclusive(&lock).ok()?;
+    match wait {
+        None => fs2::FileExt::lock_exclusive(&lock).ok()?,
+        Some(wait) => {
+            let deadline = std::time::Instant::now() + wait;
+            while fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
     let mut state: S = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())

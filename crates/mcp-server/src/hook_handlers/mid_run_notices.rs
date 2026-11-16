@@ -40,7 +40,7 @@ use uuid::Uuid;
 use super::common::{self, ApiConfig};
 use super::durable_capture::{
     plain_session_id, session_api_session_id, session_primary_scope, sha256_hex, state_dir,
-    with_locked_json,
+    with_locked_json, with_locked_json_within,
 };
 
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 35;
@@ -63,6 +63,10 @@ const MAX_STANDING_LINE_HASHES: usize = 256;
 /// How long the prompt hook only counts a coordination notice it printed in
 /// full: a notice still unacknowledged after this is printed in full again.
 const DEFAULT_NOTICE_REPEAT_SECS: u64 = 30 * 60;
+/// How long the prompt hook waits for another hook's lock on the session
+/// state before it gives up and delivers the whole text: well inside the
+/// hook's 5 s limit.
+const STANDING_LOCK_WAIT: Duration = Duration::from_secs(1);
 /// Notice ids the prompt hook's one-line count spells out; the rest are counted.
 const MAX_LISTED_UNACKED_NOTICES: usize = 5;
 /// The background poll is off the hook's path, so it can wait for a slow API.
@@ -100,7 +104,8 @@ pub(crate) struct MidRunSessionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub standing_line_hashes: Vec<String>,
     /// When the prompt hook last printed each `[COORDINATION]` notice in full,
-    /// by notice id (`id:<id>`) and by item (`item:<uuid>`); at most
+    /// by notice id (`id:<id>`) and by its item together with its words
+    /// (`item:<uuid>:<hash of the words without notice ids>`); at most
     /// `MAX_DELIVERED_IDS`. Not tied to the standing window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub standing_notice_copies: Vec<NoticeCopy>,
@@ -967,13 +972,46 @@ fn is_per_prompt_block(header: &str) -> bool {
     header.starts_with("[INSTRUCT]") || header.starts_with("[CONTEXTSTREAM_NOTICE]")
 }
 
-/// The `item=<uuid>` a `[COORDINATION]` notice names: the same item can come
-/// back under a new notice id.
-fn extract_notice_item_from_line(line: &str) -> Option<String> {
-    let marker = "item=";
-    let start = line.find(marker)? + marker.len();
-    let candidate = line.get(start..start + 36)?;
+/// The item a `[COORDINATION]` notice is about, read only where the API
+/// writes it: `[COORDINATION] (<urgency>) from <origin>: item=<uuid> ...`.
+/// An `item=` anywhere else (quoted in a reason) is not this notice's item.
+fn notice_item_from_header(header: &str) -> Option<String> {
+    let rest = header
+        .trim_start()
+        .strip_prefix("[COORDINATION]")?
+        .trim_start();
+    let rest = match rest.strip_prefix('(') {
+        Some(after) => after.split_once(')')?.1.trim_start(),
+        None => rest,
+    };
+    let (origin, after) = rest.strip_prefix("from ")?.split_once(": item=")?;
+    if origin.contains(": ") {
+        return None;
+    }
+    let candidate = after.get(..36)?;
     Uuid::parse_str(candidate).ok().map(|item| item.to_string())
+}
+
+/// A short hash of a notice's words with every `notice_id="..."` value left
+/// out: the same notice re-addressed under a new id reads the same, and a
+/// reply or a new verdict on the same item reads new.
+fn notice_words_hash(joined: &str) -> String {
+    const MARKER: &str = "notice_id=\"";
+    let mut words = String::with_capacity(joined.len());
+    let mut rest = joined;
+    while let Some(start) = rest.find(MARKER) {
+        let value_start = start + MARKER.len();
+        words.push_str(&rest[..value_start]);
+        rest = &rest[value_start..];
+        match rest.find('"') {
+            Some(end) => rest = &rest[end..],
+            None => break,
+        }
+    }
+    words.push_str(rest);
+    let mut hash = sha256_hex(words.as_bytes());
+    hash.truncate(16);
+    hash
 }
 
 /// What a standing line is remembered by: the trimmed line and, for a line
@@ -1076,8 +1114,10 @@ fn coordination_tokens(block: &StandingBlock<'_>) -> (Vec<String>, Option<String
     if let Some(id) = notice_id.as_deref() {
         tokens.push(format!("id:{id}"));
     }
-    if let Some(item) = extract_notice_item_from_line(&joined) {
-        tokens.push(format!("item:{item}"));
+    // The item alone would hide a reply, which keeps the item of the notice it
+    // answers: an item stands for a notice only with the same words.
+    if let Some(item) = block.header.and_then(notice_item_from_header) {
+        tokens.push(format!("item:{item}:{}", notice_words_hash(&joined)));
     }
     if tokens.is_empty() {
         tokens.push(format!("text:{}", sha256_hex(joined.as_bytes())));
@@ -1130,7 +1170,8 @@ fn unacknowledged_notices_line(count: usize, ids: &[String]) -> String {
 ///   with its header, and a new header comes with its whole block. One line
 ///   says how much was left out and when it was shown.
 /// - A `[COORDINATION]` notice is printed in full once, by notice id or by
-///   the item it names; after that one line counts the notices still coming
+///   the item it names with the same words (a reply on the item is new
+///   words, so it is printed); after that one line counts the notices still coming
 ///   back and names their ids. Nothing is acknowledged here. This has its own
 ///   clock: a full delivery of the standing text does not bring a notice
 ///   back. A notice still pending `repeat.notice_ms` after its last full copy
@@ -1188,7 +1229,7 @@ pub(crate) fn filter_standing_text(
                 continue;
             }
             let (tokens, notice_id) = coordination_tokens(block);
-            // The last full copy of this notice, or of the item it names.
+            // The last full copy of this notice, or of the same words on its item.
             let shown_at = seen_copies
                 .iter()
                 .filter(|copy| tokens.contains(&copy.token) && now_ms >= copy.at_unix_ms)
@@ -1301,11 +1342,32 @@ pub(crate) fn throttle_prompt_standing_text(input: &Value, cwd: &str, text: Stri
         return text;
     }
     let key = session_state_key(input, cwd);
-    let now_ms = now_unix_ms();
-    let filtered = update_session_entry(&key, |entry| {
-        filter_standing_text(entry, &text, now_ms, repeat)
-    });
-    filtered.unwrap_or(text)
+    let Some(path) = session_path(&key) else {
+        return text;
+    };
+    // The clock is read under the lock: a prompt that waited for another
+    // one's lock must not see that prompt's window as starting in its future.
+    let filtered = with_locked_json_within(
+        &path,
+        STANDING_LOCK_WAIT,
+        |entry: &mut MidRunSessionState| {
+            let started = entry.standing_window_started_unix_ms;
+            let shown = filter_standing_text(entry, &text, now_unix_ms(), repeat);
+            entry.updated_at = Utc::now().to_rfc3339();
+            (shown, entry.standing_window_started_unix_ms != started)
+        },
+    );
+    match filtered {
+        Some((shown, new_window)) => {
+            // Old sessions' files are otherwise removed only by the mid-run
+            // poll, which `CONTEXTSTREAM_MID_RUN_NOTICES=0` turns off.
+            if new_window {
+                prune_stale_sessions();
+            }
+            shown
+        }
+        None => text,
+    }
 }
 
 /// Forget what the prompt hook showed this session, so its next prompt is
@@ -2648,6 +2710,120 @@ mod tests {
         assert_eq!(old.standing_window_started_unix_ms, 0);
     }
 
+    // The two tests below are the reader's (review-prompt-hook-standing-1);
+    // both failed on 5cb65cda.
+    #[test]
+    fn a_reply_on_an_item_already_shown_is_printed_in_full() {
+        let mut state = MidRunSessionState::default();
+        let mut text = HookText::new();
+        text.notices
+            .push(notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed."));
+        filter_standing_text(&mut state, &text.render(), T0, REPEAT);
+
+        // The API's reply notice keeps the item of the notice it answers and
+        // carries words this session has never seen.
+        let reply = notice(
+            ITEM_A,
+            NOTICE_A2,
+            "Reply from session lane-y: STOP, I am rewriting migration 12 now; do not push it",
+        );
+        text.notices.push(reply.clone());
+        let second = filter_standing_text(&mut state, &text.render(), T0 + 60_000, REPEAT);
+        assert!(
+            second.lines().any(|line| line == reply),
+            "the reply was never shown, yet it is counted as 'shown earlier':\n{second}"
+        );
+        assert!(second.ends_with(&format!(
+            "[COORDINATION] 1 notice shown earlier is still unacknowledged: ack via coordination(action=\"ack\", notice_id=\"{NOTICE_A1}\"), or read coordination(action=\"inbox\")."
+        )), "{second}");
+    }
+
+    #[test]
+    fn a_notice_that_quotes_an_item_in_its_words_is_printed_in_full() {
+        let mut state = MidRunSessionState::default();
+        let mut text = HookText::new();
+        text.notices
+            .push(notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed."));
+        filter_standing_text(&mut state, &text.render(), T0, REPEAT);
+
+        // A notice with no item of its own whose reason mentions an item.
+        let lease = format!(
+            "[COORDINATION] (important) from Acme/widgets: deploy is held by lane z (it follows item={ITEM_A}); wait for it — ack via coordination(action=\"ack\", notice_id=\"{NOTICE_B1}\")"
+        );
+        text.notices.push(lease.clone());
+        let second = filter_standing_text(&mut state, &text.render(), T0 + 60_000, REPEAT);
+        assert!(
+            second.lines().any(|line| line == lease),
+            "a notice never shown is counted as 'shown earlier':\n{second}"
+        );
+    }
+
+    #[test]
+    fn a_notice_item_is_read_only_where_the_api_writes_it() {
+        let api = notice(ITEM_A, NOTICE_A1, "Migration 12 is claimed.");
+        assert_eq!(notice_item_from_header(&api).as_deref(), Some(ITEM_A));
+        let blocking = format!(
+            "[COORDINATION] (blocking) from Acme/widgets: item={ITEM_B} READ BEFORE CONTINUING — x"
+        );
+        assert_eq!(notice_item_from_header(&blocking).as_deref(), Some(ITEM_B));
+        let no_urgency = format!("[COORDINATION] from another scope: item={ITEM_B} x");
+        assert_eq!(
+            notice_item_from_header(&no_urgency).as_deref(),
+            Some(ITEM_B)
+        );
+        for quoted in [
+            format!("[COORDINATION] (info) from Acme/widgets: see item={ITEM_A} first"),
+            format!("[COORDINATION] (info) from Acme/widgets: lease: item={ITEM_A}"),
+            format!("[COORDINATION] (info) item={ITEM_A}"),
+            format!("[PREFERENCE] from Acme/widgets: item={ITEM_A}"),
+            "[COORDINATION] (info) from Acme/widgets: item=not-a-uuid".to_string(),
+        ] {
+            assert_eq!(notice_item_from_header(&quoted), None, "{quoted}");
+        }
+
+        // The words are compared without the notice ids, and only without them.
+        let again = notice(ITEM_A, NOTICE_A2, "Migration 12 is claimed.");
+        let other = notice(ITEM_A, NOTICE_A1, "Migration 12 is free.");
+        assert_eq!(notice_words_hash(&api), notice_words_hash(&again));
+        assert_ne!(notice_words_hash(&api), notice_words_hash(&other));
+        assert_eq!(
+            notice_words_hash("a notice_id=\"x"),
+            notice_words_hash("a notice_id=\"x")
+        );
+    }
+
+    #[test]
+    fn a_held_session_lock_costs_at_most_the_wait_and_changes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.json");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))
+            .expect("lock file");
+        fs2::FileExt::lock_exclusive(&held).expect("hold the lock");
+        let started = std::time::Instant::now();
+        let result = with_locked_json_within(
+            &path,
+            Duration::from_millis(200),
+            |entry: &mut MidRunSessionState| entry.standing_window_started_unix_ms = 1,
+        );
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!path.exists(), "nothing is written without the lock");
+
+        fs2::FileExt::unlock(&held).expect("release the lock");
+        let result = with_locked_json_within(
+            &path,
+            Duration::from_millis(200),
+            |entry: &mut MidRunSessionState| entry.standing_window_started_unix_ms = 1,
+        );
+        assert!(result.is_some());
+        assert!(read_session_entry(&path).is_some_and(|e| e.standing_window_started_unix_ms == 1));
+    }
+
     #[test]
     fn block_headers_are_told_from_ordinary_lines() {
         for header in [
@@ -2669,13 +2845,18 @@ mod tests {
             assert!(!opens_standing_block(line), "{line}");
         }
         assert_eq!(
-            extract_notice_item_from_line(&notice(ITEM_A, NOTICE_A1, "x")).as_deref(),
+            notice_item_from_header(&notice(ITEM_A, NOTICE_A1, "x")).as_deref(),
             Some(ITEM_A)
         );
         assert_eq!(
-            extract_notice_item_from_line("item=not-a-uuid and more text here, long enough"),
+            notice_item_from_header(
+                "[COORDINATION] (info) from a/b: item=not-a-uuid and more text here, long enough"
+            ),
             None
         );
-        assert_eq!(extract_notice_item_from_line("item=é"), None);
+        assert_eq!(
+            notice_item_from_header("[COORDINATION] (info) from a/b: item=é"),
+            None
+        );
     }
 }

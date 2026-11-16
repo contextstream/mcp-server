@@ -6,8 +6,10 @@
 //! (`mcp_client::command_hints`): the command must be one a tool says it takes
 //! (or the tool is named with `--tool`). The call is the same a tool call
 //! makes (the checkout is described to the API and sent on its stream), except
-//! that the output is written as it arrives and the process ends with the
-//! command's own exit status. Nothing here reaches the network when no tool
+//! that the output is written as it arrives (marked once on stderr as the
+//! run's output so far) and the process ends with the command's own exit
+//! status; a failure the host calls its own ends with a line that says so,
+//! and the command then runs here. Nothing here reaches the network when no tool
 //! takes the command.
 
 use std::io::Write;
@@ -156,19 +158,43 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
     outcome(result, wrote)
 }
 
-/// How this command takes the run's output from the service.
-const DELIVERY: Delivery = Delivery::Buffered;
+/// How this command takes the run's output from the service: as it prints (lever 8, ruling of 2026-11-16), so a
+/// failure is seen when it happens and not when the whole check ends. Held (`Buffered`), the service kept it until it
+/// had decided its answer; streamed, a failure the host later calls its own has been shown already, and the last line
+/// says so (`outcome`).
+const DELIVERY: Delivery = Delivery::Streamed;
 
 /// The line said on stderr before the first byte of the run's output, when it is shown as it prints.
-fn output_mark(_delivery: Delivery) -> Option<&'static str> {
-    None
+fn output_mark(delivery: Delivery) -> Option<&'static str> {
+    (delivery == Delivery::Streamed).then_some(
+        "contextstream: the run's output so far, as it prints; the verdict is the last line",
+    )
+}
+
+/// What the host says when a run's failure was its own (mcd's `environment` on the result): its detail, else its code.
+fn host_fault(frame: &Value) -> Option<String> {
+    let cause = frame.get("environment").filter(|cause| cause.is_object())?;
+    let text = |key: &str| {
+        cause
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+    };
+    Some(match text("detail").or_else(|| text("refused_code")) {
+        Some(why) => format!("the host's fault, not your change: {why}"),
+        None => "the host's fault, not your change".to_string(),
+    })
 }
 
 /// What the service's `result` frame (or the reason there is none) comes to, and whether output was already written.
 fn outcome(result: Result<Value, String>, wrote: bool) -> Remote {
     match result {
         Ok(frame) if frame.get("ran").and_then(Value::as_bool) == Some(true) => {
-            Remote::Ran(exit_status(&frame), ran_line(&frame))
+            match host_fault(&frame) {
+                // The output shown is not the verdict: the command runs here, after a last line that says why.
+                Some(said) => Remote::Here(Some(said)),
+                None => Remote::Ran(exit_status(&frame), ran_line(&frame)),
+            }
         }
         Ok(_) if wrote => Remote::Broken,
         Ok(_) => Remote::Here(Some("the service declined to run it".to_string())),
@@ -314,8 +340,14 @@ mod tests {
             "refused_code": "host_oom", "detail": "the host ran out of memory during the run", "stage": "after the run"}});
         match outcome(Ok(frame), true) {
             Remote::Here(Some(said)) => {
-                assert!(said.starts_with("the host's fault, not your change"), "{said}");
-                assert!(said.contains("the host ran out of memory during the run"), "{said}");
+                assert!(
+                    said.starts_with("the host's fault, not your change"),
+                    "{said}"
+                );
+                assert!(
+                    said.contains("the host ran out of memory during the run"),
+                    "{said}"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -323,7 +355,9 @@ mod tests {
         let frame = json!({"ran": true, "exit": 1, "environment": {"refused_code": "host_disk"}});
         assert_eq!(
             outcome(Ok(frame), true),
-            Remote::Here(Some("the host's fault, not your change: host_disk".to_string()))
+            Remote::Here(Some(
+                "the host's fault, not your change: host_disk".to_string()
+            ))
         );
         // and with nothing in it, the words alone
         let frame = json!({"ran": true, "exit": 1, "environment": {}});
@@ -336,14 +370,20 @@ mod tests {
     #[test]
     fn a_run_the_host_stands_by_is_its_exit_and_the_ran_line() {
         let frame = json!({"ran": true, "exit": 101, "seconds": 4.26, "environment": null});
-        assert_eq!(outcome(Ok(frame), true), Remote::Ran(101, "[ran remotely: 4.3 s]".to_string()));
+        assert_eq!(
+            outcome(Ok(frame), true),
+            Remote::Ran(101, "[ran remotely: 4.3 s]".to_string())
+        );
         assert_eq!(outcome(Ok(json!({"ran": false})), true), Remote::Broken);
         assert_eq!(
             outcome(Ok(json!({"ran": false})), false),
             Remote::Here(Some("the service declined to run it".to_string()))
         );
         assert_eq!(outcome(Err("gone".to_string()), true), Remote::Broken);
-        assert_eq!(outcome(Err("gone".to_string()), false), Remote::Here(Some("gone".to_string())));
+        assert_eq!(
+            outcome(Err("gone".to_string()), false),
+            Remote::Here(Some("gone".to_string()))
+        );
     }
 
     #[test]

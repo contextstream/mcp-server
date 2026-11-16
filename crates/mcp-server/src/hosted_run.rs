@@ -167,7 +167,8 @@ const DELIVERY: Delivery = Delivery::Streamed;
 /// The line said on stderr before the first byte of the run's output, when it is shown as it prints.
 fn output_mark(delivery: Delivery) -> Option<&'static str> {
     (delivery == Delivery::Streamed).then_some(
-        "contextstream: the run's output so far, as it prints; the verdict is the last line",
+        "contextstream: the remote run's output, as it prints; if the host does not stand by it, \
+         a line from contextstream says so and the command runs here",
     )
 }
 
@@ -212,7 +213,7 @@ fn outcome(result: Result<Value, String>, wrote: bool) -> Remote {
         }
         // Refused after its output was shown (mcd's checks after the run): the output does not count; it runs here.
         Ok(frame) if wrote => Remote::Here(Some(format!(
-            "the output above does not count: {}",
+            "the host did not stand by the output above: {}",
             refusal_reason(&frame)
         ))),
         Ok(_) => Remote::Here(Some("the service declined to run it".to_string())),

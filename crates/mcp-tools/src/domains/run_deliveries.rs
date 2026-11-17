@@ -931,9 +931,7 @@ async fn end(
         workspace_id,
         run_id: Some(run_id),
     };
-    let claimed = client
-        .reclaim_delivery(id, &again, &expect, generation, attempt)
-        .await?;
+    let claimed = client.claim_delivery(id, &again, &expect).await?;
     if claimed.claim_attempt != Some(attempt)
         || claimed.previous_claims != generation
         || !owner.bind(run_id, Some(id), generation, Some(attempt))

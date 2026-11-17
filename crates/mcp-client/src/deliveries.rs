@@ -653,37 +653,11 @@ impl ContextStreamClient {
         who: &DeliveryActor,
         expect: &DeliveryReader,
     ) -> Result<Delivery> {
-        self.send_claim(id, who.body(), expect).await
-    }
-
-    /// Recover a token only if the server still holds the exact claim the
-    /// session was shown. The API must compare both fields before rotating
-    /// a token; a refused precondition is never retried unconditionally.
-    pub async fn reclaim_delivery(
-        &self,
-        id: Uuid,
-        who: &DeliveryActor,
-        expect: &DeliveryReader,
-        previous_claims: usize,
-        attempt: Uuid,
-    ) -> Result<Delivery> {
-        let mut body = who.body();
-        body.insert("expected_previous_claims".into(), json!(previous_claims));
-        body.insert("expected_claim_attempt".into(), json!(attempt));
-        self.send_claim(id, body, expect).await
-    }
-
-    async fn send_claim(
-        &self,
-        id: Uuid,
-        body: Map<String, Value>,
-        expect: &DeliveryReader,
-    ) -> Result<Delivery> {
         let answer = self
             .delivery_request(
                 "POST",
                 &format!("/decision-requests/deliveries/{id}/claim"),
-                Some(&Value::Object(body)),
+                Some(&Value::Object(who.body())),
             )
             .await
             .map_err(|e| e.error)?;

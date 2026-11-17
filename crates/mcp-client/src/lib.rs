@@ -22,6 +22,7 @@ pub mod client_session;
 pub mod coach;
 pub mod command_hints;
 pub mod credit_hold;
+pub mod deliveries;
 pub mod environment;
 pub mod frames;
 pub mod harness_readiness;
@@ -216,6 +217,7 @@ pub use client::{
     local_files_denied, runtime_self_update_disabled, set_local_files_denied,
     set_runtime_self_update_disabled,
 };
+pub use deliveries::{Delivery, DeliveryActor, DeliveryReader};
 pub use ingest_guard::{
     broad_ingest_opt_in_from_env, secret_path_rejection_reason, validate_ingest_root,
     IngestRootAssessment, IngestRootOptions, IngestRootRejection, IngestRootRejectionReason,

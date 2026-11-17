@@ -74,6 +74,17 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
 
 impl Api {
     pub(super) async fn start(answers: Vec<(&'static str, u16, Value)>) -> Self {
+        Self::start_with(answers, false).await
+    }
+
+    /// Like [`Api::start`], except that several answers given for one route
+    /// are given in turn: the first request gets the first, the next one the
+    /// next, and the last answer is given from then on.
+    pub(super) async fn start_in_turn(answers: Vec<(&'static str, u16, Value)>) -> Self {
+        Self::start_with(answers, true).await
+    }
+
+    async fn start_with(answers: Vec<(&'static str, u16, Value)>, in_turn: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock api");
@@ -81,6 +92,7 @@ impl Api {
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
         let log = seen.clone();
         let answers = Arc::new(answers);
+        let served: Arc<Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -88,6 +100,7 @@ impl Api {
                 };
                 let answers = answers.clone();
                 let log = log.clone();
+                let served = served.clone();
                 tokio::spawn(async move {
                     let request = read_request(&mut socket).await;
                     let (head, body) = request
@@ -104,13 +117,29 @@ impl Api {
                         head,
                         body: serde_json::from_str(&body).unwrap_or(Value::Null),
                     });
-                    let (status, answer) = answers
-                        .iter()
-                        .find(|(route, _, _)| {
-                            let (route_method, route_path) =
-                                route.split_once(' ').unwrap_or(("", *route));
-                            route_method == method && target.contains(route_path)
-                        })
+                    let fits = |route: &str| {
+                        let (route_method, route_path) =
+                            route.split_once(' ').unwrap_or(("", route));
+                        route_method == method && target.contains(route_path)
+                    };
+                    let first = answers.iter().find(|(route, _, _)| fits(route));
+                    let chosen = match first {
+                        Some((route, _, _)) if in_turn => {
+                            // The answers given for this very route, in the
+                            // order they were given; the last one stays.
+                            let turns: Vec<_> = answers
+                                .iter()
+                                .filter(|(other, _, _)| other == route)
+                                .collect();
+                            let mut served = served.lock().unwrap();
+                            let nth = served.entry((*route).to_string()).or_insert(0_usize);
+                            let turn = turns[(*nth).min(turns.len() - 1)];
+                            *nth += 1;
+                            Some(turn)
+                        }
+                        other => other,
+                    };
+                    let (status, answer) = chosen
                         .map(|(_, status, answer)| (*status, answer.to_string()))
                         .unwrap_or((404, json!({"error": "not found"}).to_string()));
                     let reason = match status {

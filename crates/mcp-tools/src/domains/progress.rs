@@ -2987,3 +2987,7 @@ fn run_text(view: &Value) -> String {
 #[cfg(test)]
 #[path = "progress_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "progress_deliveries_tests.rs"]
+mod deliveries_tests;

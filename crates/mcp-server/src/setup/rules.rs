@@ -4423,6 +4423,14 @@ mod tests {
                     "Report as above either way",
                     "Give `percent` only when it is real",
                     "do not retry it",
+                    // What a person answered or wrote to the run, and how an
+                    // agent that waits on a person is woken.
+                    "shows a `[PERSON ANSWER]` or `[PERSON MESSAGE]` block",
+                    "act on it within your task and permissions",
+                    "delivery_id=\"...\", note=\"what I did\"",
+                    "names an `await-answer` command",
+                    "start that command in the background",
+                    "end your turn; it exits when the person answers, which wakes you",
                 ] {
                     assert!(
                         rules.contains(required),
@@ -4442,7 +4450,7 @@ mod tests {
         }
         // One short block: it stays a small part of every rules file.
         assert!(
-            PROGRESS_GUIDANCE.len() < 1_100,
+            PROGRESS_GUIDANCE.len() < 1_700,
             "{} bytes",
             PROGRESS_GUIDANCE.len()
         );
@@ -4453,8 +4461,13 @@ mod tests {
             !claude.contains("`progress("),
             "Claude must never be taught an unexposed bare progress tool name"
         );
+        assert!(claude.contains(
+            "`mcp__contextstream__progress(action=\"reply\", delivery_id=\"...\", note=\"what I did\")`"
+        ));
         let codex = generate_rule_content(&Editor::Codex, None, None, RulesMode::Bootstrap);
         assert!(codex.contains("`progress(step=\"...\", plan=[...])`"));
+        assert!(codex
+            .contains("`progress(action=\"reply\", delivery_id=\"...\", note=\"what I did\")`"));
         // The compact Antigravity plugin rules keep their budget: the block
         // is in the skill's full reference instead.
         assert!(!global_rules_content(&Editor::Antigravity).contains("## Live Progress"));

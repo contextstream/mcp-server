@@ -391,10 +391,9 @@ impl ProgressTool {
                 let owner = self.delivery_owner(workspace_id, is_http).await;
                 let offered = match (reported_run, owner.as_ref()) {
                     (Some(run_id), Some(owner))
-                        if !report.is_terminal()
-                            && !run_has_ended(&answer)
-                            && owner.bind(run_id, None, 0, None) =>
+                        if !report.is_terminal() && !run_has_ended(&answer) =>
                     {
+                        self.deliveries.note_report(owner, run_id);
                         run_deliveries::poll(
                             &self.client,
                             &self.deliveries,
@@ -783,7 +782,7 @@ impl ProgressTool {
         let Some(owner) = self.delivery_owner(workspace_id, is_http).await else {
             return Offered::default();
         };
-        if !owner.reported(run_id) {
+        if !self.deliveries.saw_report(&owner, run_id) && !owner.reported(run_id) {
             return Offered::default();
         }
         run_deliveries::poll(

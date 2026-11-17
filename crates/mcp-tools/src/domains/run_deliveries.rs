@@ -297,6 +297,7 @@ struct Memory {
     shown: HashMap<String, Shown>,
     next: u64,
     polls: HashMap<(String, Uuid), Poll>,
+    reports: HashMap<(String, Uuid), Instant>,
     /// Workspaces whose API said it has no delivery routes, and until when
     /// that word stands.
     not_there: HashMap<String, Instant>,
@@ -319,6 +320,30 @@ impl Ledger {
             s.held_at.elapsed().as_secs() < super::delivery_bindings::CLAIM_SECONDS as u64
         });
         mem
+    }
+
+    // A get can follow its report before the first read has finished. Keep
+    // this evidence in memory until a successful read warrants a disk book.
+    pub(super) fn note_report(&self, owner: &Owner, run: Uuid) {
+        let mut mem = self.lock();
+        mem.reports.insert((owner.key.clone(), run), Instant::now());
+        if mem.reports.len() > MAX_REMEMBERED {
+            if let Some(oldest) = mem
+                .reports
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| key.clone())
+            {
+                mem.reports.remove(&oldest);
+            }
+        }
+    }
+
+    pub(super) fn saw_report(&self, owner: &Owner, run: Uuid) -> bool {
+        self.lock()
+            .reports
+            .get(&(owner.key.clone(), run))
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(7 * 86400))
     }
 
     fn key(session: &str, id: Uuid) -> String {
@@ -537,15 +562,14 @@ pub(super) async fn poll(
         }
         mem.polls.remove(&key);
     }
-    claim_offers(
-        client,
-        ledger,
-        owner,
-        run_id,
-        agent,
-        result.get().and_then(Option::as_deref),
-    )
-    .await
+    let Some(deliveries) = result.get().and_then(Option::as_deref) else {
+        return Offered::default();
+    };
+    if !owner.reported(run_id) && !owner.bind(run_id, None, 0, None) {
+        return Offered::default();
+    }
+    ledger.lock().reports.remove(&key);
+    claim_offers(client, ledger, owner, run_id, agent, deliveries).await
 }
 
 #[cfg(test)]
@@ -599,11 +623,8 @@ async fn claim_offers(
     owner: &Owner,
     run_id: Uuid,
     agent: &Value,
-    deliveries: Option<&[Delivery]>,
+    deliveries: &[Delivery],
 ) -> Offered {
-    let Some(deliveries) = deliveries else {
-        return Offered::default();
-    };
     let session = &owner.key;
     let workspace_id = owner.workspace;
     let reader = DeliveryReader {

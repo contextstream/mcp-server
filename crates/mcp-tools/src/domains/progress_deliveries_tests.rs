@@ -106,7 +106,9 @@ impl Fixture {
         ])
         .await;
         let tool = self.tool(&api);
-        tool.execute(json!({"step":"working"})).await.unwrap();
+        tool.report_then_collect(json!({"step":"working"}))
+            .await
+            .unwrap();
         (api, tool)
     }
 
@@ -275,7 +277,7 @@ async fn a_report_shows_a_persons_answer_once_and_claims_it() {
     let tool = fixture.tool(&api);
 
     let first = tool
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     let text = text_of(&first);
@@ -326,7 +328,7 @@ async fn a_report_shows_a_persons_answer_once_and_claims_it() {
     // The API offers it again (a mock that forgets the claim): the session
     // has seen it, so it is neither shown nor claimed a second time.
     let second = tool
-        .execute(json!({"step": "Still running the tests"}))
+        .report_then_collect(json!({"step": "Still running the tests"}))
         .await
         .expect("report");
     let text = text_of(&second);
@@ -353,7 +355,7 @@ async fn a_persons_message_is_shown_as_the_server_wrapped_it_and_not_wrapped_aga
     .await;
     let result = fixture
         .tool(&api)
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     let text = text_of(&result);
@@ -394,7 +396,7 @@ async fn a_message_that_is_not_in_the_servers_wrapper_is_framed_and_quoted_here(
         .await;
         let result = fixture
             .tool(&api)
-            .execute(json!({"step": "Running the tests"}))
+            .report_then_collect(json!({"step": "Running the tests"}))
             .await
             .expect("report");
         let shown = text_of(&result);
@@ -425,7 +427,7 @@ async fn what_a_person_wrote_stays_inside_the_frame() {
     .await;
     let result = fixture
         .tool(&api)
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     let text = text_of(&result);
@@ -457,7 +459,7 @@ async fn what_a_person_wrote_stays_inside_the_frame() {
         .iter()
         .map(|request| format!("{} {}", request.method, request.target))
         .collect();
-    assert_eq!(asked.len(), 3, "{asked:?}");
+    assert_eq!(asked.len(), 4, "{asked:?}");
 }
 
 #[tokio::test]
@@ -466,7 +468,7 @@ async fn nothing_is_printed_when_nothing_waits() {
     let api = Api::start(vec![fixture.recorded("working"), offered(vec![])]).await;
     let result = fixture
         .tool(&api)
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     let text = text_of(&result);
@@ -514,7 +516,7 @@ async fn quiet_without_deliveries(fixture: &Fixture, api: &Api) {
     let tool = fixture.tool(api);
     for step in ["Asking", "Still asking"] {
         let result = tool
-            .execute(json!({
+            .report_then_collect(json!({
                 "step": step,
                 "waiting": {"on": "person", "question": "Which cache stays warm?"},
             }))
@@ -538,7 +540,7 @@ async fn quiet_without_deliveries(fixture: &Fixture, api: &Api) {
     // Asked once; the second report does not ask a server that said it has
     // no such thing.
     assert_eq!(sent(api, "GET", "/decision-requests/deliveries").len(), 1);
-    assert_eq!(sent(api, "POST", "/run-progress/report").len(), 2);
+    assert_eq!(sent(api, "POST", "/run-progress/report").len(), 4);
 }
 
 #[tokio::test]
@@ -552,7 +554,7 @@ async fn a_read_that_fails_costs_the_report_nothing() {
     let tool = fixture.tool(&api);
     for _ in 0..2 {
         let result = tool
-            .execute(json!({"step": "Running the tests"}))
+            .report_then_collect(json!({"step": "Running the tests"}))
             .await
             .expect("report");
         assert_eq!(
@@ -584,7 +586,7 @@ async fn a_delivery_another_agent_holds_is_not_shown_until_it_is_this_agents() {
     .await;
     let tool = fixture.tool(&api);
     let first = tool
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     assert!(!text_of(&first).contains("[PERSON"), "{}", text_of(&first));
@@ -595,7 +597,7 @@ async fn a_delivery_another_agent_holds_is_not_shown_until_it_is_this_agents() {
         .is_none());
     // Offered again, and this time the claim is this agent's.
     let second = tool
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     assert!(
@@ -623,7 +625,7 @@ async fn a_claim_that_lapsed_and_is_offered_again_is_shown_again_once() {
     ])
     .await;
     let tool = fixture.tool(&api);
-    let report = || tool.execute(json!({"step": "Running the tests"}));
+    let report = || tool.report_then_collect(json!({"step": "Running the tests"}));
 
     let first = text_of(&report().await.expect("report"));
     assert!(
@@ -660,7 +662,7 @@ async fn the_hosted_gateway_shows_a_delivery_and_claims_it_too() {
     let tool = fixture.hosted_tool(&api);
     mcp_client::run_with_mcp_session_id("hosted-session".into(), || async {
         let first = tool
-            .execute(json!({"step": "Running the tests", "run_key": "warm-cache"}))
+            .report_then_collect(json!({"step": "Running the tests", "run_key": "warm-cache"}))
             .await
             .expect("report");
         assert!(
@@ -669,7 +671,7 @@ async fn the_hosted_gateway_shows_a_delivery_and_claims_it_too() {
             text_of(&first)
         );
         let second = tool
-            .execute(json!({"step": "Running the tests", "run_key": "warm-cache"}))
+            .report_then_collect(json!({"step": "Running the tests", "run_key": "warm-cache"}))
             .await
             .expect("report");
         assert!(!text_of(&second).contains("[PERSON"));
@@ -693,7 +695,7 @@ async fn a_report_that_waits_on_a_person_says_how_to_be_woken() {
         let api = Api::start(vec![fixture.recorded("waiting"), offered(vec![])]).await;
         let result = fixture
             .tool(&api)
-            .execute(json!({"waiting": waiting}))
+            .report_then_collect(json!({"waiting": waiting}))
             .await
             .expect("report");
         let text = text_of(&result);
@@ -735,7 +737,7 @@ async fn a_report_that_waits_on_no_person_or_works_names_no_command() {
         let api = Api::start(vec![fixture.recorded("working"), offered(vec![])]).await;
         let result = fixture
             .tool(&api)
-            .execute(arguments.clone())
+            .report_then_collect(arguments.clone())
             .await
             .expect("report");
         let text = text_of(&result);
@@ -760,7 +762,9 @@ async fn an_answer_that_is_already_there_is_shown_instead_of_the_way_to_wait() {
     .await;
     let result = fixture
         .tool(&api)
-        .execute(json!({"waiting": {"on": "person", "question": "Which cache stays warm?"}}))
+        .report_then_collect(
+            json!({"waiting": {"on": "person", "question": "Which cache stays warm?"}}),
+        )
         .await
         .expect("report");
     let text = text_of(&result);
@@ -784,7 +788,7 @@ async fn reply_confirms_the_delivery_with_the_note() {
     ])
     .await;
     let tool = fixture.tool(&api);
-    tool.execute(json!({"step": "Running the tests"}))
+    tool.report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
 
@@ -837,7 +841,7 @@ async fn reply_confirms_the_delivery_with_the_note() {
         applied[0].body
     );
     // A reply is not a report: nothing else was sent for it.
-    assert_eq!(sent(&api, "POST", "/run-progress/report").len(), 1);
+    assert_eq!(sent(&api, "POST", "/run-progress/report").len(), 2);
 }
 
 #[tokio::test]
@@ -944,7 +948,7 @@ async fn reply_and_decline_need_the_delivery_and_the_words() {
             "reason",
         ),
     ] {
-        match tool.execute(arguments.clone()).await {
+        match tool.report_then_collect(arguments.clone()).await {
             Err(Error::Validation(message)) => {
                 assert!(message.contains(says), "{arguments}: {message}")
             }
@@ -1032,6 +1036,8 @@ async fn get_reads_this_sessions_run_with_what_waits_for_it() {
         .await
         .expect("report");
 
+    assert!(run_deliveries::wait_for_poll(&tool.deliveries).await);
+
     // What the hooks' notice tells the agent to call.
     let result = tool
         .execute(json!({"action": "get", "run_id": fixture.run}))
@@ -1096,7 +1102,7 @@ async fn what_is_shown_is_what_the_claim_answered_not_what_the_read_offered() {
     .await;
     let result = fixture
         .tool(&api)
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     let text = text_of(&result);
@@ -1128,7 +1134,7 @@ async fn a_claim_whose_answer_is_not_that_delivery_claimed_shows_nothing() {
         .await;
         let result = fixture
             .tool(&api)
-            .execute(json!({"step": "Running the tests"}))
+            .report_then_collect(json!({"step": "Running the tests"}))
             .await
             .expect("report");
         assert_eq!(
@@ -1163,7 +1169,7 @@ async fn an_offer_that_is_not_addressed_to_this_run_is_never_claimed() {
     .await;
     let result = fixture
         .tool(&api)
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     assert!(
@@ -1190,7 +1196,7 @@ async fn a_confirmation_that_does_not_say_so_is_not_reported_as_one() {
         ])
         .await;
         let tool = fixture.tool(&api);
-        tool.execute(json!({"step": "Running the tests"}))
+        tool.report_then_collect(json!({"step": "Running the tests"}))
             .await
             .expect("report");
         let result = tool
@@ -1231,7 +1237,7 @@ async fn a_confirmation_says_the_delivery_and_its_state_and_nothing_else_of_it()
     ])
     .await;
     let tool = fixture.tool(&api);
-    tool.execute(json!({"step": "Running the tests"}))
+    tool.report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     let result = tool
@@ -1325,7 +1331,7 @@ async fn a_kind_this_tool_does_not_know_is_not_passed_on() {
     .await;
     let result = fixture
         .tool(&api)
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     let text = text_of(&result);
@@ -1361,7 +1367,7 @@ async fn the_claims_token_goes_back_with_the_reply_and_is_never_shown() {
     let tool = fixture.tool(&api);
     let mut shown = Vec::new();
     let report = tool
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     assert!(
@@ -1417,7 +1423,7 @@ async fn a_decline_is_the_claims_holders_too() {
     ])
     .await;
     let tool = fixture.tool(&api);
-    tool.execute(json!({"step": "Running the tests"}))
+    tool.report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     let result = tool
@@ -1464,12 +1470,12 @@ async fn of_two_sessions_offered_one_delivery_only_the_one_that_claims_it_shows_
     let second = fixture.hosted_tool(&api);
     mcp_client::run_with_mcp_session_id("other".into(), || async {
         let won = first
-            .execute(json!({"step": "Running the tests"}))
+            .report_then_collect(json!({"step": "Running the tests"}))
             .await
             .expect("report");
         assert!(text_of(&won).contains("[PERSON ANSWER]"));
         let lost = second
-            .execute(json!({"step": "Running the tests"}))
+            .report_then_collect(json!({"step": "Running the tests"}))
             .await
             .expect("a refused claim is not a failed report");
         assert_eq!(
@@ -1526,7 +1532,7 @@ async fn a_claim_refused_for_any_reason_shows_nothing_and_is_tried_at_the_next_r
     .await;
     let tool = fixture.tool(&api);
     let first = tool
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     assert!(!text_of(&first).contains("[PERSON"), "{}", text_of(&first));
@@ -1534,7 +1540,7 @@ async fn a_claim_refused_for_any_reason_shows_nothing_and_is_tried_at_the_next_r
     // Once per report: no second try inside the same call.
     assert_eq!(sent(&api, "POST", "/claim").len(), 1);
     let second = tool
-        .execute(json!({"step": "Running the tests"}))
+        .report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     assert!(text_of(&second).contains("[PERSON ANSWER]"));
@@ -1620,7 +1626,10 @@ async fn a_reply_whose_token_was_lost_claims_again_as_its_own_run_and_then_confi
     ])
     .await;
     let first = fixture.tool(&api);
-    first.execute(json!({"step":"working"})).await.unwrap();
+    first
+        .report_then_collect(json!({"step":"working"}))
+        .await
+        .unwrap();
     drop(first);
     let restored = fixture.tool(&api);
     let result = restored
@@ -1656,7 +1665,7 @@ async fn a_token_that_a_later_claim_replaced_is_replaced_here_too() {
     ])
     .await;
     let tool = fixture.tool(&api);
-    tool.execute(json!({"step": "Running the tests"}))
+    tool.report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     let result = tool
@@ -1689,7 +1698,7 @@ async fn a_server_that_refuses_the_claim_again_is_answered_calmly() {
     ])
     .await;
     let tool = fixture.tool(&api);
-    tool.execute(json!({"step": "Running the tests"}))
+    tool.report_then_collect(json!({"step": "Running the tests"}))
         .await
         .expect("report");
     let result = tool
@@ -1753,7 +1762,9 @@ async fn a_session_signed_in_with_oauth_is_never_told_to_wait_and_asks_for_nothi
     let api = Api::start(vec![fixture.recorded("waiting"), offered(vec![])]).await;
     let tool = fixture.signed_in_tool(&api);
     let result = tool
-        .execute(json!({"waiting": {"on": "person", "question": "Which cache stays warm?"}}))
+        .report_then_collect(
+            json!({"waiting": {"on": "person", "question": "Which cache stays warm?"}}),
+        )
         .await
         .expect("report");
     assert_eq!(
@@ -1818,7 +1829,9 @@ async fn a_key_limited_to_one_workspace_receives_nothing_either() {
     let session = Arc::new(SessionManager::new(client.clone(), config));
     let tool = ProgressTool::new(client, session).with_heartbeat(Heartbeat::None);
     let result = tool
-        .execute(json!({"waiting": {"on": "person", "question": "Which cache stays warm?"}}))
+        .report_then_collect(
+            json!({"waiting": {"on": "person", "question": "Which cache stays warm?"}}),
+        )
         .await
         .expect("report");
     assert_eq!(
@@ -1921,4 +1934,17 @@ async fn delivery_poll_respects_retry_after_from_the_api() {
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
     assert_eq!(sent(&api, "GET", "/deliveries").len(), 1);
+}
+
+impl ProgressTool {
+    /// Exercise both real reports: one starts the poll, the next picks up
+    /// its completed batch. Never use this helper in latency/concurrency tests.
+    async fn report_then_collect(&self, args: Value) -> Result<ToolResult> {
+        let first = self.execute(args.clone()).await?;
+        if run_deliveries::wait_for_poll(&self.deliveries).await {
+            self.execute(args).await
+        } else {
+            Ok(first)
+        }
+    }
 }

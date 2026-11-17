@@ -232,7 +232,7 @@ pub struct ProgressTool {
     heartbeat: Option<Heartbeat>,
     runs: Runs,
     /// What each session was shown of what people sent its runs.
-    deliveries: Ledger,
+    deliveries: Arc<Ledger>,
 }
 
 impl ProgressTool {
@@ -242,7 +242,7 @@ impl ProgressTool {
             session,
             heartbeat: None,
             runs: Arc::new(Mutex::new(HashMap::new())),
-            deliveries: Ledger::default(),
+            deliveries: Arc::default(),
         }
     }
 
@@ -385,12 +385,13 @@ impl ProgressTool {
                 let owner = self.delivery_owner(workspace_id, is_http).await;
                 let offered = match (reported_run, owner.as_ref()) {
                     (Some(run_id), Some(owner)) if owner.bind(run_id, None, 0) => {
-                        run_deliveries::offer(
+                        run_deliveries::poll(
                             &self.client,
                             &self.deliveries,
                             owner,
                             run_id,
                             &context.agent,
+                            false,
                         )
                         .await
                     }
@@ -758,12 +759,13 @@ impl ProgressTool {
         if !owner.reported(run_id) {
             return Offered::default();
         }
-        run_deliveries::offer(
+        run_deliveries::poll(
             &self.client,
             &self.deliveries,
             &owner,
             run_id,
             &self.agent(is_http).await,
+            true,
         )
         .await
     }

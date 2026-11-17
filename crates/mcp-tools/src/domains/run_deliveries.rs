@@ -60,7 +60,7 @@ use mcp_client::ContextStreamClient;
 use mcp_types::{tool::ToolResult, Error, Result};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -307,6 +307,7 @@ struct Shown {
 struct Memory {
     shown: HashMap<String, Shown>,
     next: u64,
+    polls: HashMap<(String, Uuid), Poll>,
     /// Workspaces whose API said it has no delivery routes, and until when
     /// that word stands.
     not_there: HashMap<Uuid, Instant>,
@@ -421,6 +422,9 @@ impl Ledger {
     }
 
     fn note_not_there(&self, workspace_id: Uuid) {
+        self.cool_down(workspace_id, NOT_THERE_FOR);
+    }
+    fn cool_down(&self, workspace_id: Uuid, duration: Duration) {
         let mut memory = self.lock();
         if memory.not_there.len() >= MAX_WORKSPACES_OFF {
             let now = Instant::now();
@@ -429,9 +433,10 @@ impl Ledger {
                 memory.not_there.clear();
             }
         }
-        memory
-            .not_there
-            .insert(workspace_id, Instant::now() + NOT_THERE_FOR);
+        memory.not_there.insert(
+            workspace_id,
+            Instant::now() + duration.min(Duration::from_secs(u32::MAX.into())),
+        );
     }
 }
 
@@ -460,6 +465,114 @@ impl Offered {
     }
 }
 
+#[derive(Debug)]
+struct Poll {
+    started: Instant,
+    finished: tokio::sync::watch::Receiver<bool>,
+    result: Arc<Mutex<Option<Offered>>>,
+}
+
+/// A report only consumes a finished poll or starts one. An explicit get
+/// may wait for the same worker. All consumers race for one take of its
+/// result; never hold a lock across an API call.
+pub(super) async fn poll(
+    client: &ContextStreamClient,
+    ledger: &Arc<Ledger>,
+    owner: &Owner,
+    run_id: Uuid,
+    agent: &Value,
+    wait: bool,
+) -> Offered {
+    let key = (owner.key.clone(), run_id);
+    let (mut finished, result) = {
+        let mut mem = ledger.lock();
+        mem.polls
+            .retain(|_, p| p.started.elapsed() < Duration::from_secs(3600));
+        // A hook or waiter can announce a new arrival after a previous poll
+        // finished empty. An explicit get must read that arrival now.
+        if wait
+            && mem.polls.get(&key).is_some_and(|p| {
+                *p.finished.borrow()
+                    && p.result
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|r| r.blocks.is_empty())
+            })
+        {
+            mem.polls.remove(&key);
+        }
+        if !mem.polls.contains_key(&key) {
+            if mem.polls.len() >= MAX_REMEMBERED {
+                let oldest = mem
+                    .polls
+                    .iter()
+                    .filter(|(_, p)| *p.finished.borrow())
+                    .min_by_key(|(_, p)| p.started)
+                    .map(|(k, _)| k.clone());
+                if let Some(oldest) = oldest {
+                    mem.polls.remove(&oldest);
+                } else {
+                    return Offered::default();
+                }
+            }
+            let (tx, finished) = tokio::sync::watch::channel(false);
+            let result = Arc::new(Mutex::new(None));
+            mem.polls.insert(
+                key.clone(),
+                Poll {
+                    started: Instant::now(),
+                    finished,
+                    result: result.clone(),
+                },
+            );
+            let (client, ledger, owner, agent) =
+                (client.clone(), ledger.clone(), owner.clone(), agent.clone());
+            mcp_client::spawn_with_task_context(async move {
+                let offered = offer(&client, &ledger, &owner, run_id, &agent).await;
+                *result.lock().unwrap() = Some(offered);
+                tx.send_replace(true);
+            });
+        }
+        let p = &mem.polls[&key];
+        (p.finished.clone(), p.result.clone())
+    };
+    if !*finished.borrow() {
+        if !wait {
+            return Offered::default();
+        }
+        // One bounded list and at most five bounded claims, including joins.
+        let _ = tokio::time::timeout(Duration::from_secs(32), finished.changed()).await;
+    }
+    let mut mem = ledger.lock();
+    if mem
+        .polls
+        .get(&key)
+        .is_some_and(|p| Arc::ptr_eq(&p.result, &result) && *p.finished.borrow())
+    {
+        mem.polls.remove(&key);
+        return result.lock().unwrap().take().unwrap_or_default();
+    }
+    Offered::default()
+}
+
+#[cfg(test)]
+pub(super) async fn wait_for_poll(ledger: &Ledger) -> bool {
+    let Some(mut done) = ledger
+        .lock()
+        .polls
+        .values()
+        .next()
+        .map(|p| p.finished.clone())
+    else {
+        return false;
+    };
+    if !*done.borrow() {
+        done.changed().await.unwrap();
+    }
+    true
+}
+
 /// Read what waits for `run_id`, claim each delivery `session` has not been
 /// shown, and render it. Never fails: whatever goes wrong, nothing is offered
 /// and nothing is said.
@@ -484,6 +597,8 @@ pub(super) async fn offer(
         Err(error) => {
             if is_not_there(&error) || is_not_ready(&error) {
                 ledger.note_not_there(workspace_id);
+            } else if let Error::RateLimited { retry_after, .. } = &error {
+                ledger.cool_down(workspace_id, Duration::from_secs(retry_after.unwrap_or(60)));
             }
             tracing::debug!("run deliveries not read: {}", error_tag(&error));
             return Offered::default();
@@ -514,6 +629,10 @@ pub(super) async fn offer(
                     delivery.id,
                     error_tag(&error)
                 );
+                if let Error::RateLimited { retry_after, .. } = error {
+                    ledger.cool_down(workspace_id, Duration::from_secs(retry_after.unwrap_or(60)));
+                    break;
+                }
                 continue;
             }
         };

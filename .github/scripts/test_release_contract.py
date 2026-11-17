@@ -8,6 +8,7 @@ from pathlib import Path
 import stat
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -90,6 +91,26 @@ class ReleaseContractTest(unittest.TestCase):
             env=env,
         )
         return result.stdout.strip()
+
+    def test_delivery_release_is_versioned_across_the_workspace(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        version = contract.verify_repository_metadata(root)
+        self.assertGreaterEqual(contract.canonical_stable_semver(version), (1, 0, 82))
+        workspace = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]
+        locked = tomllib.loads((root / "Cargo.lock").read_text())["package"]
+        for member in workspace["members"]:
+            crate = tomllib.loads((root / member / "Cargo.toml").read_text())["package"]["name"]
+            with self.subTest(crate=crate):
+                self.assertEqual([pkg["version"] for pkg in locked
+                                  if pkg["name"] == crate and "source" not in pkg], [version])
+        for dep in workspace["dependencies"].values():
+            if isinstance(dep, dict) and dep.get("path") in workspace["members"]:
+                self.assertEqual(dep["version"], f"={version}")
+        notes = (root / "CHANGELOG.md").read_text().split("## 1.0.82\n", 1)
+        self.assertEqual(len(notes), 2, "missing 1.0.82 upgrade notes")
+        section = notes[1].split("\n## ", 1)[0]
+        for topic in ("update-rules", "await-answer", "CONTEXTSTREAM_DELIVERY_STATE_DIR"):
+            self.assertIn(topic, section)
 
     def test_semver_and_ordering_are_strict(self) -> None:
         self.assertEqual(contract.canonical_stable_semver("1.2.3"), (1, 2, 3))

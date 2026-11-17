@@ -85,8 +85,8 @@ workspaces it is switched on for; for every other workspace the paths answer 404
 
 | When | What is sent |
 |---|---|
-| The `progress` tool recorded a report under an API key, or read a run this session reported | One `GET /api/v1/decision-requests/deliveries` with the workspace id and the run id. On a 404, or a 503 `deliveries_not_ready`, the workspace is not asked again for ten minutes |
-| Something waits for the run | `POST .../deliveries/<id>/claim` with the run id, the agent labels and a random attempt id as the claimant’s agent id. Only a response naming that attempt can be shown. Reports return independently; the next report or an explicit get can collect the result. The claim's answer carries a token the session keeps in memory |
+| The `progress` tool recorded a nonterminal report under a full API key, or read a run this session reported | One `GET /api/v1/decision-requests/deliveries` with the workspace id and the run id. On a 404, or a 503 `deliveries_not_ready`, the workspace is not asked again for ten minutes |
+| Something waits for the run | `POST .../deliveries/<id>/claim` with the run id, the agent labels and a random attempt id as the claimant’s agent id. Only a response naming that attempt can be shown. The background read cannot claim. A report or an explicit get takes the claim inline and returns the words. The claim's answer carries a token the session keeps in memory |
 | Your assistant confirms it (`progress(action="reply", ...)`) | `POST .../deliveries/<id>/applied` with the note your assistant wrote, which the person reads with the run, and the claim's token |
 | Your assistant declines it (`progress(action="decline", ...)`) | `POST .../deliveries/<id>/declined` with `moot` or `cannot_apply`, its note, and the claim's token |
 | Hooks are installed, the session reported a run, and it makes tool calls | The mid-run poll (at most every 35 s, a detached request) makes the same read for each run the session reported, at most eight. It claims nothing; it tells your assistant in one line that something waits and how to read it |
@@ -99,8 +99,8 @@ workspaces it is switched on for; for every other workspace the paths answer 404
 - **One claimer:** only the session's own `progress` call claims, under the credential that reported the run, and
   it confirms with the claim's token. The token is kept in the server process's memory and is never shown to your
   assistant, written to a file or logged. When a token is lost, recovery requires a private local record of the credential, session,
-  workspace, run, delivery and original claim attempt. The session claims again as the recorded run, verifies the
-  original attempt and sends the confirmation with its new token. A replica without that evidence sends nothing.
+  workspace, run, delivery and original claim attempt. The recovery request includes `expected_previous_claims` and `expected_claim_attempt`. The API must compare
+  both with the still-held claim before rotating its token. The client also checks the response before confirming. A replica without that evidence sends nothing.
 - **Only a person's full API key receives.** A session signed in with OAuth, any other token that is not an API
   key, and a key limited to one workspace (`cbiq_ws_`) ask for nothing: ContextStream raises no request for a run
   reported under them and takes no message for it, because no answer can come back to them. The `progress` tool
@@ -114,7 +114,7 @@ workspaces it is switched on for; for every other workspace the paths answer 404
   `~/.contextstream/mid-run-notices/<digest>.json`, removed a day after its last use. The `progress` tool remembers
   up to 512 tokens in memory for at most one hour. Its bounded local binding file stores ids, digests and
   timestamps, never tokens or words (in the platform state directory under `contextstream/deliveries`, or
-  `CONTEXTSTREAM_DELIVERY_STATE_DIR`). Replicas can use a private shared directory supporting file locks and atomic rename. `await-answer` keeps an empty per-run lock file in the user's state directory so only one local waiter polls; its lock is released on exit.
+  `CONTEXTSTREAM_DELIVERY_STATE_DIR`). The HTTP gateway requires this directory to be set explicitly. Replicas can use a private shared directory supporting file locks and atomic rename. `await-answer` keeps an empty per-run lock file under `contextstream/waiters` in the user's state directory so only one local waiter polls; its lock is released on exit.
 - **Controls:** `CONTEXTSTREAM_RUN_PROGRESS=off` (nothing is reported, so the tool asks for nothing),
   `CONTEXTSTREAM_MID_RUN_NOTICES=0` (the hooks do not ask). `await-answer` runs only when it is started.
 

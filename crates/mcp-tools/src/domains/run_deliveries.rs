@@ -429,7 +429,7 @@ impl Ledger {
 /// What a read of a run's deliveries came to.
 #[derive(Debug, Default)]
 pub(crate) struct Offered {
-    /// The read succeeded or is still in flight, and there is no known cooldown.
+    /// A recent read of this run succeeded.
     pub can_wait: bool,
     /// The deliveries claimed and to be shown, each as its block.
     pub blocks: Vec<String>,
@@ -469,7 +469,7 @@ pub(super) async fn poll(
     let (mut finished, result) = {
         let mut mem = ledger.lock();
         mem.polls
-            .retain(|_, p| p.started.elapsed() < Duration::from_secs(3600));
+            .retain(|_, p| p.started.elapsed() < NOT_THERE_FOR);
         // A hook or waiter can announce a new arrival after a previous poll
         // finished empty. An explicit get must read that arrival now.
         if wait
@@ -521,10 +521,7 @@ pub(super) async fn poll(
     };
     if !*finished.borrow() {
         if !wait {
-            return Offered {
-                can_wait: !ledger.is_not_there(owner.workspace),
-                ..Offered::default()
-            };
+            return Offered::default();
         }
         // One bounded list and at most five bounded claims, including joins.
         let _ = tokio::time::timeout(Duration::from_secs(32), finished.changed()).await;

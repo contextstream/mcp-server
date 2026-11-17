@@ -2707,3 +2707,57 @@ async fn round4_recovery_does_not_claim_a_newer_or_unproven_delivery() {
         check_recovery(case, false).await;
     }
 }
+
+#[tokio::test]
+async fn round4_terminal_report_returns_only_its_claimed_frames_and_can_reply() {
+    let f = Fixture::new();
+    let other = Fixture::new();
+    let first = f.message();
+    let mut second = f.answer(json!([]));
+    second["id"] = json!(Uuid::new_v4());
+    let api = Api::start_delaying(
+        vec![
+            f.recorded("working"),
+            f.recorded("working"),
+            other.recorded("finished"),
+            f.recorded("finished"),
+            offered(vec![first.clone(), second.clone()]),
+            (CLAIM, 200, held_with("claimed", &first, TOKEN)),
+            (CLAIM, 200, held_with("claimed", &second, SECOND_TOKEN)),
+            (APPLIED, 200, answers_with("applied", &first)),
+        ],
+        true,
+        Some((CLAIM, Duration::from_millis(250))),
+        Some(2),
+    )
+    .await;
+    let tool = f.tool(&api);
+    tool.execute(json!({"step":"starting"})).await.unwrap();
+    assert!(run_deliveries::wait_for_poll(&tool.deliveries, f.run).await);
+    // The first claim is saved. Cancel the report before either frame has been returned.
+    tokio::select! {
+        _ = tool.execute(json!({"step":"collect"})) => panic!("expected an outstanding claim"),
+        _ = async { while sent(&api, "POST", "/claim").len() < 2 { tokio::time::sleep(Duration::from_millis(2)).await; } } => {}
+    }
+    let end = json!({"status":"completed","summary":"done"});
+    assert!(!text_of(&tool.execute(end.clone()).await.unwrap()).contains("[PERSON"));
+    let result = tool.execute(end.clone()).await.unwrap();
+    assert!(text_of(&result).contains(&message_block(&f)));
+    assert!(text_of(&result).contains("Which cache stays warm?"));
+    assert_eq!(
+        result.structured_content.unwrap()["deliveries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(!text_of(&tool.execute(end).await.unwrap()).contains("[PERSON"));
+    assert_eq!(sent(&api, "GET", "/deliveries").len(), 1);
+    assert_eq!(sent(&api, "POST", "/claim").len(), 2);
+    let reply = tool
+        .execute(json!({"action":"reply","delivery_id":f.delivery,"note":"done"}))
+        .await
+        .unwrap();
+    assert_eq!(reply.structured_content.unwrap()["replied"], true);
+    assert_eq!(sent(&api, "POST", "/applied")[0].body["claim_token"], TOKEN);
+}

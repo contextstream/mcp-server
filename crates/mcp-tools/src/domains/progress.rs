@@ -382,20 +382,19 @@ impl ProgressTool {
                 // the report's answer. It can add to the answer, never fail it.
                 // Only under an API key: nothing is ever sent to a run reported
                 // under a sign-in or an app's token.
-                let receives = run_deliveries::receives_deliveries(&self.client).await;
-                let offered = match reported_run.filter(|_| receives) {
-                    Some(run_id) => {
+                let owner = self.delivery_owner(workspace_id, is_http).await;
+                let offered = match (reported_run, owner.as_ref()) {
+                    (Some(run_id), Some(owner)) if owner.bind(run_id, None, 0) => {
                         run_deliveries::offer(
                             &self.client,
                             &self.deliveries,
-                            &context.session,
-                            workspace_id,
+                            owner,
                             run_id,
                             &context.agent,
                         )
                         .await
                     }
-                    None => Offered::default(),
+                    _ => Offered::default(),
                 };
                 let mut text = recorded_text(&report, &answer);
                 // An agent that now waits on a person makes no more calls,
@@ -665,9 +664,7 @@ impl ProgressTool {
             return Ok(
                 match self.client.get_run_progress(workspace_id, run_id).await {
                     Ok(mut view) => {
-                        let offered = self
-                            .offered_to_own_run(workspace_id, run_id, &view, is_http)
-                            .await;
+                        let offered = self.offered_to_own_run(workspace_id, run_id, is_http).await;
                         let text = format!("{}{}", run_text(&view), offered.text());
                         if let (Some(fields), false) =
                             (view.as_object_mut(), offered.shown.is_empty())
@@ -706,113 +703,98 @@ impl ProgressTool {
         })
     }
 
-    /// What waits for a run that was just read, when the run is this
-    /// session's own: one this process reported, or one the API shows under
-    /// this session's agent ([`is_this_agents`]). An agent that looks at
-    /// another agent's run is offered nothing, so it cannot take that agent's
-    /// answer.
-    async fn offered_to_own_run(
+    async fn delivery_owner(
         &self,
-        workspace_id: Uuid,
-        run_id: Uuid,
-        view: &Value,
+        workspace: Uuid,
         is_http: bool,
-    ) -> Offered {
-        let agent = self.agent(is_http).await;
-        if !self.reported_here(run_id) && !is_this_agents(&agent, view.get("agent")) {
-            return Offered::default();
+    ) -> Option<super::delivery_bindings::Owner> {
+        let ns = self.client.delivery_namespace().await?;
+        let session = if is_http {
+            mcp_client::get_task_mcp_session_id().or_else(mcp_client::client_session::current)?
+        } else {
+            // A host-provided session survives a server restart. Without one,
+            // only this process can prove it was the reporting session.
+            [
+                "CODEX_THREAD_ID",
+                "CLAUDE_CODE_SESSION_ID",
+                "GEMINI_SESSION_ID",
+            ]
+            .iter()
+            .find_map(|k| {
+                std::env::var(k)
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| format!("{k}:{v}"))
+            })
+            .or(self.session.state().await.session_id)
+            .unwrap_or_else(|| session_part(false))
+        };
+        if session.trim().is_empty() {
+            return None;
         }
-        if !run_deliveries::receives_deliveries(&self.client).await {
+        let key = framed_digest(
+            "delivery-owner-v1",
+            &[
+                &ns,
+                &workspace.to_string(),
+                if is_http { "http" } else { "stdio" },
+                &session,
+            ],
+        );
+        let root = std::env::var_os("CONTEXTSTREAM_DELIVERY_STATE_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(super::delivery_bindings::default_root)?;
+        Some(super::delivery_bindings::Owner {
+            key,
+            workspace,
+            store: root.join(format!("{ns}-{workspace}")),
+        })
+    }
+
+    async fn offered_to_own_run(&self, workspace_id: Uuid, run_id: Uuid, is_http: bool) -> Offered {
+        let Some(owner) = self.delivery_owner(workspace_id, is_http).await else {
+            return Offered::default();
+        };
+        if !owner.reported(run_id) {
             return Offered::default();
         }
         run_deliveries::offer(
             &self.client,
             &self.deliveries,
-            &session_part(is_http),
-            workspace_id,
+            &owner,
             run_id,
-            &agent,
+            &self.agent(is_http).await,
         )
         .await
-    }
-
-    /// Whether this process reported the run (a local server remembers the
-    /// runs it reported; the hosted gateway remembers none).
-    fn reported_here(&self, run_id: Uuid) -> bool {
-        let id = run_id.to_string();
-        lock(&self.runs)
-            .values()
-            .any(|memo| memo.run_id.as_deref() == Some(id.as_str()))
-    }
-
-    /// Whether a run is this session's own: one this process reported, or
-    /// one the API shows under this session's agent ([`is_this_agents`]). It
-    /// is asked of a run a refusal named as holding a claim, before that
-    /// claim is made again in the run's name: never for another agent's run.
-    async fn is_own_run(&self, run_id: Uuid, workspace_id: Option<Uuid>, agent: &Value) -> bool {
-        if self.reported_here(run_id) {
-            return true;
-        }
-        let Some(workspace_id) = workspace_id else {
-            return false;
-        };
-        match self
-            .client
-            .get_run_progress_quietly(workspace_id, run_id)
-            .await
-        {
-            Ok(answer) => {
-                let view = answer
-                    .get("run")
-                    .filter(|run| run.is_object())
-                    .unwrap_or(&answer);
-                is_this_agents(agent, view.get("agent"))
-            }
-            Err(error) => {
-                tracing::debug!(
-                    "the run holding a delivery was not read: {}",
-                    mcp_client::deliveries::error_tag(&error)
-                );
-                false
-            }
-        }
     }
 
     /// `reply` and `decline`: confirm what a person sent a run.
     async fn answer_delivery(&self, input: ProgressInput, decline: bool) -> Result<ToolResult> {
         let is_http = self.client.config().await.is_http_transport;
-        let session = session_part(is_http);
         let agent = self.agent(is_http).await;
-        // The session's workspace, for the one read that tells whether a run
-        // a refusal names is this session's own. A workspace that cannot be
-        // read from the call is no workspace: the claim is then left alone.
-        let workspace_id = self.scope(&input).await.ok().and_then(|scope| scope.0);
-        let own_run = OwnRunsOf {
-            tool: self,
-            workspace_id,
-            agent: &agent,
+        let owner = match self.scope(&input).await?.0 {
+            Some(workspace) => self.delivery_owner(workspace, is_http).await,
+            None => None,
         };
         if decline {
             run_deliveries::decline(
                 &self.client,
                 &self.deliveries,
-                &session,
+                owner.as_ref(),
                 &agent,
                 input.delivery_id.as_deref(),
                 input.reason.as_deref(),
                 input.note.as_deref(),
-                &own_run,
             )
             .await
         } else {
             run_deliveries::reply(
                 &self.client,
                 &self.deliveries,
-                &session,
+                owner.as_ref(),
                 &agent,
                 input.delivery_id.as_deref(),
                 input.note.as_deref(),
-                &own_run,
             )
             .await
         }
@@ -1054,26 +1036,6 @@ impl ToolHandler for ProgressTool {
                 false,
             )
             .build()
-    }
-}
-
-/// The runs of one session of the tool, for a claim that is made again.
-struct OwnRunsOf<'a> {
-    tool: &'a ProgressTool,
-    workspace_id: Option<Uuid>,
-    agent: &'a Value,
-}
-
-#[async_trait]
-impl run_deliveries::OwnRuns for OwnRunsOf<'_> {
-    async fn is_own(&self, run_id: Uuid) -> bool {
-        self.tool
-            .is_own_run(run_id, self.workspace_id, self.agent)
-            .await
-    }
-
-    fn workspace_id(&self) -> Option<Uuid> {
-        self.workspace_id
     }
 }
 
@@ -1518,23 +1480,6 @@ pub(crate) fn run_id_of_key(workspace_id: Uuid, key: &str) -> Uuid {
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     uuid::Builder::from_sha1_bytes(bytes).into_uuid()
-}
-
-/// Whether a run the API shows under the agent `shown` is this session's,
-/// whose agent is `mine`: the same id, which a session of a client has and
-/// no other session shares; or, for an agent a person named (it has no id),
-/// the same name, which every session of that agent reports under.
-pub(crate) fn is_this_agents(mine: &Value, shown: Option<&Value>) -> bool {
-    let Some(shown) = shown else {
-        return false;
-    };
-    match (str_field(mine, "id"), str_field(shown, "id")) {
-        (Some(mine), Some(shown)) => mine == shown,
-        (None, None) => {
-            str_field(mine, "name").is_some() && str_field(mine, "name") == str_field(shown, "name")
-        }
-        _ => false,
-    }
 }
 
 fn run_memo_key(workspace_id: Uuid, run_key: &str) -> String {

@@ -32,22 +32,17 @@
 //!   in `previous_claims`, and is then shown once more, with a word about
 //!   what may already have been done. The token is never shown: not in the
 //!   words, not in a structured answer, not in a log.
-//! - A token that was lost is claimed again, never waited out. A `reply` or
-//!   a `decline` the API refuses because the delivery is claimed (the server
-//!   process restarted since the claim, the reply reached another replica of
-//!   the gateway, or a second claim of the run replaced the token) claims
-//!   once more as the session's own run, which the API answers with a new
-//!   token, and is then sent under it ([`end`]). Only a claim of the
-//!   session's own run is taken up: the run it claimed the delivery as, or
-//!   the run the refusal names when the caller can show it is its own. A
-//!   server that refuses the second claim is answered calmly, once.
+//! - To recover a lost token the session must first prove, from its private
+//!   ledger, which delivery it claimed and as which run. It can then claim
+//!   again and send the confirmation with the replacement token. No run id
+//!   or display name read from a refusal or a run view is proof.
 //! - Only the credential that reported the run claims what is sent to it.
 //!   ContextStream raises a question for a waiting run, and takes a message
 //!   for it, only where the run was reported under an API key: an answer
 //!   cannot come back to a sign-in or an app's token, which change with every
 //!   refresh, nor to a key limited to one workspace. So a session that
 //!   reports under anything but a person's full API key reads nothing and is
-//!   never told to wait for an answer ([`receives_deliveries`]).
+//!   never told to wait for an answer ([`ContextStreamClient::receives_deliveries`]).
 //! - A read is a side note to the agent's own call. An API without the
 //!   routes (they answer an unknown path's 404 where the feature is off), one
 //!   whose database cannot hold deliveries yet (503 `deliveries_not_ready`),
@@ -55,6 +50,7 @@
 //!   costs the call nothing; after a 404 or that 503 the API is not asked
 //!   again for a while.
 
+use super::delivery_bindings::Owner;
 use mcp_client::deliveries::{
     error_tag, is_malformed, is_no_way_back, is_not_ready, is_not_there, refusal_code, Answer,
     ClaimToken, Delivery, DeliveryActor, DeliveryReader, Refused, DECLINE_REASONS, KIND_ANSWER,
@@ -289,16 +285,6 @@ pub fn pointer(delivery: &Delivery, run_id: Uuid, tool: &str) -> String {
     )
 }
 
-/// Whether anything can come back to the credential a client's requests go
-/// under: a person's full API key. The rule itself is the client's
-/// (`ContextStreamClient::receives_deliveries`), the one place every delivery
-/// operation follows it: a sign-in, an app's token and a key limited to one
-/// workspace read nothing, claim nothing, confirm nothing, and are never told
-/// to wait for an answer.
-pub(crate) async fn receives_deliveries(client: &ContextStreamClient) -> bool {
-    client.receives_deliveries().await
-}
-
 // ============================================================================
 // What a session was shown
 // ============================================================================
@@ -307,8 +293,6 @@ pub(crate) async fn receives_deliveries(client: &ContextStreamClient) -> bool {
 struct Shown {
     /// How many claims had lapsed when it was shown.
     previous_claims: usize,
-    /// The workspace it was claimed in.
-    workspace_id: Uuid,
     /// The run it was claimed as.
     run_id: Uuid,
     /// The token of the claim, when the API gave one: what the session
@@ -359,7 +343,7 @@ impl Ledger {
         &self,
         session: &str,
         delivery: &Delivery,
-        workspace_id: Uuid,
+        _workspace_id: Uuid,
         run_id: Uuid,
         token: Option<ClaimToken>,
     ) {
@@ -370,7 +354,6 @@ impl Ledger {
             Self::key(session, delivery.id),
             Shown {
                 previous_claims: delivery.previous_claims,
-                workspace_id,
                 run_id,
                 token,
                 order,
@@ -394,7 +377,7 @@ impl Ledger {
         &self,
         session: &str,
         id: Uuid,
-        workspace_id: Uuid,
+        _workspace_id: Uuid,
         run_id: Uuid,
         token: Option<ClaimToken>,
     ) {
@@ -409,7 +392,6 @@ impl Ledger {
             Self::key(session, id),
             Shown {
                 previous_claims,
-                workspace_id,
                 run_id,
                 token,
                 order,
@@ -481,14 +463,15 @@ impl Offered {
 /// Read what waits for `run_id`, claim each delivery `session` has not been
 /// shown, and render it. Never fails: whatever goes wrong, nothing is offered
 /// and nothing is said.
-pub(crate) async fn offer(
+pub(super) async fn offer(
     client: &ContextStreamClient,
     ledger: &Ledger,
-    session: &str,
-    workspace_id: Uuid,
+    owner: &Owner,
     run_id: Uuid,
     agent: &Value,
 ) -> Offered {
+    let session = &owner.key;
+    let workspace_id = owner.workspace;
     if ledger.is_not_there(workspace_id) {
         return Offered::default();
     }
@@ -536,6 +519,9 @@ pub(crate) async fn offer(
         };
         // What is shown is what the claim answered: the API's statement that
         // this delivery, in this state, is this run's.
+        if !owner.bind(run_id, Some(claimed.id), claimed.previous_claims) {
+            continue;
+        }
         ledger.remember(
             session,
             &claimed,
@@ -583,6 +569,7 @@ fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolRes
     let error = &refused.error;
     let code = refusal_code(error);
     let (reason, status, why): (&str, Option<u16>, String) = match error {
+        Error::Validation(code) if code == NO_CLAIM => (NO_CLAIM, None, "this session has no owned claim for this delivery; read your run to pick up what is waiting".to_string()),
         // The API answered, and not with a confirmation of this delivery.
         error if is_malformed(error) => (
             "malformed_answer",
@@ -704,42 +691,6 @@ fn taken(said: &str, done: &str, delivery: &Delivery) -> ToolResult {
     ToolResult::with_structured(text, Value::Object(structured))
 }
 
-/// The actor of a `reply` or `decline`: the run the session claimed the
-/// delivery as and the claim's token, when this session claimed it. Without
-/// them the API takes the confirmation only for a delivery nobody holds (it
-/// claims and ends it at once); one that is held is refused, and [`end`]
-/// then sees whether the claim is this session's own.
-fn actor(ledger: &Ledger, session: &str, id: Uuid, agent: &Value) -> DeliveryActor {
-    let (run_id, claim_token) = match ledger.claimed_as(session, id) {
-        Some((run_id, token)) => (Some(run_id), token),
-        None => (None, None),
-    };
-    DeliveryActor {
-        run_id,
-        agent: Some(agent.clone()),
-        claim_token,
-    }
-}
-
-/// The workspace a session claimed a delivery in, when it remembers.
-fn claimed_in(ledger: &Ledger, session: &str, id: Uuid) -> Option<Uuid> {
-    ledger
-        .lock()
-        .shown
-        .get(&Ledger::key(session, id))
-        .map(|shown| shown.workspace_id)
-}
-
-/// Which runs are a session's own, for a claim that is made again ([`end`]).
-#[async_trait::async_trait]
-pub(crate) trait OwnRuns: Sync {
-    /// Whether `run_id` is a run of this session.
-    async fn is_own(&self, run_id: Uuid) -> bool;
-
-    /// The session's workspace.
-    fn workspace_id(&self) -> Option<Uuid>;
-}
-
 /// How a delivery is ended.
 enum Ending<'a> {
     Applied {
@@ -763,64 +714,49 @@ async fn send(
     }
 }
 
-/// End a delivery for `session`. Sent once; and once more when the API
-/// refuses it because the delivery is claimed and the claim turns out to be
-/// this session's own under a token it does not have: the session then
-/// claims again, as its own run, is given a new token, and ends the delivery
-/// under it. `own_run` says whether a run is this session's.
-///
-/// Which run is named in the second claim: the one this session claimed the
-/// delivery as, when it remembers the claim (its token was replaced); else
-/// the run the refusal says holds the claim, and only when `own_run` says it
-/// is this session's. A run is never named because a refusal named it: that
-/// would take another agent's claim. A server that refuses the second claim
-/// (one from before a claim could be made again) leaves the first refusal
-/// standing, and nothing more is tried.
+const NO_CLAIM: &str = "no_owned_claim";
+
 async fn end(
     client: &ContextStreamClient,
     ledger: &Ledger,
-    session: &str,
+    owner: Option<&Owner>,
     agent: &Value,
     id: Uuid,
     ending: &Ending<'_>,
-    own_run: &dyn OwnRuns,
 ) -> std::result::Result<Delivery, Refused> {
-    let who = actor(ledger, session, id, agent);
-    let refused = match send(client, id, ending, &who).await {
-        Ok(delivery) => return Ok(delivery),
-        Err(refused) => refused,
-    };
-    if refused.code() != Some("claimed_by_other") {
-        return Err(refused);
+    client.way_back().await?;
+    let no_claim = || Error::Validation(NO_CLAIM.to_string());
+    let owner = owner.ok_or_else(no_claim)?;
+    let (run_id, generation) = owner.claim(id).ok_or_else(no_claim)?;
+    let session = &owner.key;
+    let workspace_id = owner.workspace;
+    if let Some((held_run, Some(token))) = ledger.claimed_as(session, id) {
+        if held_run != run_id {
+            return Err(no_claim().into());
+        }
+        let who = DeliveryActor {
+            run_id: Some(run_id),
+            claim_token: Some(token),
+            agent: Some(agent.clone()),
+        };
+        match send(client, id, ending, &who).await {
+            Err(e) if e.code() == Some("claimed_by_other") => (),
+            result => return result,
+        }
     }
-    let run_id = match (who.run_id, refused.held_by_run) {
-        (Some(claimed_as), _) => claimed_as,
-        (None, Some(held_by)) if own_run.is_own(held_by).await => held_by,
-        _ => return Err(refused),
-    };
     let again = DeliveryActor {
         run_id: Some(run_id),
         agent: Some(agent.clone()),
         claim_token: None,
     };
-    let Some(workspace_id) = claimed_in(ledger, session, id).or(own_run.workspace_id()) else {
-        return Err(refused);
-    };
     let expect = DeliveryReader {
         workspace_id,
         run_id: Some(run_id),
     };
-    let claimed = match client.claim_delivery(id, &again, &expect).await {
-        Ok(claimed) => claimed,
-        Err(error) => {
-            tracing::debug!(
-                "run delivery {} not claimed again: {}",
-                id,
-                error_tag(&error)
-            );
-            return Err(refused);
-        }
-    };
+    let claimed = client.claim_delivery(id, &again, &expect).await?;
+    if !owner.bind(run_id, Some(id), generation) {
+        return Err(no_claim().into());
+    }
     ledger.hold(
         session,
         id,
@@ -838,14 +774,13 @@ async fn end(
 /// `progress(action="reply")`: the agent acted on a delivery, and `note` is
 /// its reply to the person. `own_run` says whether a run is this session's
 /// ([`end`]).
-pub(crate) async fn reply(
+pub(super) async fn reply(
     client: &ContextStreamClient,
     ledger: &Ledger,
-    session: &str,
+    owner: Option<&Owner>,
     agent: &Value,
     raw_id: Option<&str>,
     note: Option<&str>,
-    own_run: &dyn OwnRuns,
 ) -> Result<ToolResult> {
     let id = delivery_id(raw_id)?;
     let Some(note) = note_of(note) else {
@@ -855,23 +790,21 @@ pub(crate) async fn reply(
         ));
     };
     let ending = Ending::Applied { note: &note };
-    Ok(
-        match end(client, ledger, session, agent, id, &ending, own_run).await {
-            Ok(delivery) => taken(
-                "Reply recorded: the person sees it with the run.",
-                "replied",
-                &delivery,
-            ),
-            Err(refused) => {
-                tracing::debug!(
-                    "run delivery {} not confirmed: {}",
-                    id,
-                    error_tag(&refused.error)
-                );
-                not_taken("Reply not recorded", "replied", id, &refused)
-            }
-        },
-    )
+    Ok(match end(client, ledger, owner, agent, id, &ending).await {
+        Ok(delivery) => taken(
+            "Reply recorded: the person sees it with the run.",
+            "replied",
+            &delivery,
+        ),
+        Err(refused) => {
+            tracing::debug!(
+                "run delivery {} not confirmed: {}",
+                id,
+                error_tag(&refused.error)
+            );
+            not_taken("Reply not recorded", "replied", id, &refused)
+        }
+    })
 }
 
 /// `progress(action="decline")`: the agent cannot act on a delivery, or it no
@@ -879,15 +812,14 @@ pub(crate) async fn reply(
 /// or the agent's own words, which are then what the person is told.
 /// `own_run` says whether a run is this session's ([`end`]).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn decline(
+pub(super) async fn decline(
     client: &ContextStreamClient,
     ledger: &Ledger,
-    session: &str,
+    owner: Option<&Owner>,
     agent: &Value,
     raw_id: Option<&str>,
     reason: Option<&str>,
     note: Option<&str>,
-    own_run: &dyn OwnRuns,
 ) -> Result<ToolResult> {
     let id = delivery_id(raw_id)?;
     let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) else {
@@ -912,23 +844,21 @@ pub(crate) async fn decline(
         reason,
         note: note.as_deref(),
     };
-    Ok(
-        match end(client, ledger, session, agent, id, &ending, own_run).await {
-            Ok(delivery) => taken(
-                "Decline recorded: the person is told why.",
-                "declined",
-                &delivery,
-            ),
-            Err(refused) => {
-                tracing::debug!(
-                    "run delivery {} not declined: {}",
-                    id,
-                    error_tag(&refused.error)
-                );
-                not_taken("Decline not recorded", "declined", id, &refused)
-            }
-        },
-    )
+    Ok(match end(client, ledger, owner, agent, id, &ending).await {
+        Ok(delivery) => taken(
+            "Decline recorded: the person is told why.",
+            "declined",
+            &delivery,
+        ),
+        Err(refused) => {
+            tracing::debug!(
+                "run delivery {} not declined: {}",
+                id,
+                error_tag(&refused.error)
+            );
+            not_taken("Decline not recorded", "declined", id, &refused)
+        }
+    })
 }
 
 #[cfg(test)]

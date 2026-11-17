@@ -584,23 +584,28 @@ impl ContextStreamClient {
     /// the one rule every delivery operation follows: each call below makes
     /// no request when it does not hold ([`is_no_way_back`]).
     pub async fn receives_deliveries(&self) -> bool {
-        // The key a request carries is the caller's when it sent one, else
-        // this process's own (the rule `request` attaches `X-API-Key` by).
-        match crate::get_task_auth_override() {
-            Some(auth) if auth.api_key.as_deref().is_some_and(|key| !key.is_empty()) => {
-                auth.api_key.as_deref().is_some_and(is_full_api_key)
-            }
-            _ => self
-                .config()
-                .await
-                .api_key
-                .as_deref()
-                .is_some_and(is_full_api_key),
-        }
+        self.delivery_namespace().await.is_some()
+    }
+
+    /// Opaque namespace for local claim evidence, scoped to this API and
+    /// the full key actually used on this request.
+    pub async fn delivery_namespace(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let config = self.config().await;
+        let key = crate::get_task_auth_override()
+            .and_then(|a| a.api_key)
+            .filter(|k| !k.is_empty())
+            .or(config.api_key)
+            .filter(|k| is_full_api_key(k))?;
+        let mut hash = Sha256::new();
+        hash.update(config.api_url.as_bytes());
+        hash.update([0]);
+        hash.update(key.as_bytes());
+        Some(hex::encode(hash.finalize()))
     }
 
     /// Nothing is asked under a credential nothing can come back to.
-    async fn way_back(&self) -> Result<()> {
+    pub async fn way_back(&self) -> Result<()> {
         if self.receives_deliveries().await {
             Ok(())
         } else {

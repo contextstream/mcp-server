@@ -509,12 +509,13 @@ async fn quiet_without_deliveries(fixture: &Fixture, api: &Api) {
     let tool = fixture.tool(api);
     for step in ["Asking", "Still asking"] {
         let result = tool
-            .report_then_collect(json!({
+            .execute(json!({
                 "step": step,
                 "waiting": {"on": "person", "question": "Which cache stays warm?"},
             }))
             .await
             .expect("the report is the agent's, whatever the deliveries say");
+        run_deliveries::wait_for_poll(&tool.deliveries).await;
         assert!(!result.is_error);
         let text = text_of(&result);
         // The report, and not a word more: nothing about deliveries, nothing
@@ -533,7 +534,7 @@ async fn quiet_without_deliveries(fixture: &Fixture, api: &Api) {
     // Asked once; the second report does not ask a server that said it has
     // no such thing.
     assert_eq!(sent(api, "GET", "/decision-requests/deliveries").len(), 1);
-    assert_eq!(sent(api, "POST", "/run-progress/report").len(), 4);
+    assert_eq!(sent(api, "POST", "/run-progress/report").len(), 2);
 }
 
 #[tokio::test]
@@ -695,7 +696,7 @@ async fn review8_clients_without_background_wake_are_told_to_read_the_run() {
         let result = crate::client_identity::run_with_client_name(
             Some(client.into()),
             mcp_client::run_with_mcp_session_id("session".into(), || async {
-                tool.execute(json!({"waiting":{"on":"person","question":"Which cache?"}}))
+                tool.report_then_collect(json!({"waiting":{"on":"person","question":"Which cache?"}}))
                     .await
                     .unwrap()
             }),
@@ -726,7 +727,7 @@ async fn review8_local_claude_needs_an_installed_cli_to_wake() {
         let result = crate::client_identity::run_with_client_name(
             Some("claude-code".into()),
             f.tool(&api)
-                .execute(json!({"waiting":{"on":"person","question":"Which cache?"}})),
+                .report_then_collect(json!({"waiting":{"on":"person","question":"Which cache?"}})),
         )
         .await
         .unwrap();

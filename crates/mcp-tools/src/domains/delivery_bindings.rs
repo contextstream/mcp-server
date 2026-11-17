@@ -137,7 +137,20 @@ impl Owner {
         tokio::task::spawn_blocking(move || FileLock::acquire(path)).await?
     }
 
-    pub fn bind(
+    pub async fn bind(
+        &self,
+        run: Uuid,
+        delivery: Option<Uuid>,
+        generation: usize,
+        attempt: Option<Uuid>,
+    ) -> bool {
+        let owner = self.clone();
+        tokio::task::spawn_blocking(move || owner.bind_blocking(run, delivery, generation, attempt))
+            .await
+            .unwrap_or(false)
+    }
+
+    fn bind_blocking(
         &self,
         run: Uuid,
         delivery: Option<Uuid>,
@@ -219,7 +232,7 @@ mod tests {
         let (started, ready) = std::sync::mpsc::sync_channel(0);
         let writer = std::thread::spawn(move || {
             started.send(()).unwrap();
-            owner.bind(Uuid::new_v4(), None, 0, None)
+            owner.bind_blocking(Uuid::new_v4(), None, 0, None)
         });
         ready.recv().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -239,7 +252,7 @@ mod tests {
             store: dir.path().join("bindings"),
         };
         let id = Uuid::new_v4();
-        assert!(owner.bind(Uuid::new_v4(), None, 0, None));
+        assert!(owner.bind(Uuid::new_v4(), None, 0, None).await);
         let held = owner.reserve(id).await.unwrap();
         // A duplicate references the same open file description, just as a
         // concurrent child between fork and exec does.
@@ -264,7 +277,7 @@ mod tests {
             drop(held);
         });
         assert!(
-            owner.bind(Uuid::new_v4(), None, 0, None),
+            owner.bind(Uuid::new_v4(), None, 0, None).await,
             "timer must release the lock before the writer times out"
         );
         release.await.unwrap();

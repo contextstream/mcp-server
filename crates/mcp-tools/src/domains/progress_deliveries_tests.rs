@@ -2110,7 +2110,7 @@ async fn review7_racing_workers_reserve_before_sending_a_claim() {
     let tool = f.tool(&api);
     let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
     let agent = json!({"runtime":"mcp"});
-    assert!(owner.bind(f.run, None, 0, None));
+    assert!(owner.bind(f.run, None, 0, None).await);
     let first = Arc::default();
     let second = Arc::default();
     let (a, b) = tokio::join!(
@@ -2239,7 +2239,11 @@ async fn round2_contended_claim_bucket_reports_busy_without_writing() {
     let api = Api::start(vec![]).await;
     let tool = f.tool(&api);
     let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
-    assert!(owner.bind(f.run, Some(f.delivery), 0, Some(Uuid::new_v4())));
+    assert!(
+        owner
+            .bind(f.run, Some(f.delivery), 0, Some(Uuid::new_v4()))
+            .await
+    );
     let mut other = *f.delivery.as_bytes();
     other[15] ^= 1;
     let _held = owner.reserve(Uuid::from_bytes(other)).await.unwrap();

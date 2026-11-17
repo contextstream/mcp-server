@@ -653,7 +653,7 @@ pub(super) async fn poll(
     let Some(batch) = result.get().and_then(Option::as_ref) else {
         return Offered::default();
     };
-    if !owner.reported(run_id) && !owner.bind(run_id, None, 0, None) {
+    if !owner.reported(run_id) && !owner.bind(run_id, None, 0, None).await {
         return Offered::default();
     }
     ledger.with(&owner.key, |mem| mem.reports.remove(&run_id));
@@ -791,7 +791,10 @@ async fn claim_offers(
             let mut limited = false;
             match claim {
                 Ok(claimed) if claimed.claim_attempt == Some(attempt) => {
-                    if !owner.bind(run_id, Some(id), claimed.previous_claims, Some(attempt)) {
+                    if !owner
+                        .bind(run_id, Some(id), claimed.previous_claims, Some(attempt))
+                        .await
+                    {
                         tracing::warn!("could not save recovery evidence for a shown delivery");
                     }
                     ledger.remember(
@@ -1063,7 +1066,9 @@ async fn end(
     let claimed = client.claim_delivery(id, &again, &expect).await?;
     if claimed.claim_attempt != Some(attempt)
         || claimed.previous_claims != generation
-        || !owner.bind(run_id, Some(id), generation, Some(attempt))
+        || !owner
+            .bind(run_id, Some(id), generation, Some(attempt))
+            .await
     {
         return Err(no_claim().into());
     }

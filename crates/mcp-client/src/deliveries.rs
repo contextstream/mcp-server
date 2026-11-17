@@ -626,19 +626,84 @@ impl ContextStreamClient {
     /// What is deliverable to the reader's run. Endpoint:
     /// `GET /decision-requests/deliveries?workspace_id=&run_id=`.
     pub async fn read_deliveries(&self, reader: &DeliveryReader) -> Result<Vec<Delivery>> {
-        let answer = self
-            .delivery_request(
-                "GET",
-                &format!("/decision-requests/deliveries{}", reader.query()),
-                None,
-            )
-            .await
-            .map_err(|e| e.error)?;
+        let answer = self.delivery_views(reader).await?;
         // Only what is still to be delivered, in this workspace, to this run.
         Ok(deliveries_of(&answer)
             .into_iter()
             .filter(|delivery| delivery.is_in("pending") && delivery.is_for(reader))
             .collect())
+    }
+
+    async fn delivery_views(&self, reader: &DeliveryReader) -> Result<Value> {
+        self.delivery_request(
+            "GET",
+            &format!("/decision-requests/deliveries{}", reader.query()),
+            None,
+        )
+        .await
+        .map_err(|e| e.error)
+    }
+
+    /// Recover only a claim for which the scoped read corroborates the local
+    /// evidence. The offers endpoint can omit live holders: absence is not proof.
+    pub async fn recover_delivery(
+        &self,
+        reader: &DeliveryReader,
+        id: Uuid,
+        generation: usize,
+        attempt: Uuid,
+        agent: &Value,
+    ) -> Result<Option<Delivery>> {
+        let views = self.delivery_views(reader).await?;
+        let target = views
+            .get("deliveries")
+            .unwrap_or(&views)
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|row| {
+                let delivery = Delivery::from_value(row)?;
+                if delivery.id != id || !delivery.is_for(reader) {
+                    return None;
+                }
+                let history = row.get("previous_claims")?.as_array()?;
+                let count = history.len();
+                match delivery.state? {
+                    "claimed" if delivery.claim_attempt == Some(attempt) && count == generation => {
+                        Some((reader.run_id, count))
+                    }
+                    "pending"
+                        if row.get("claimed_by") == Some(&Value::Null)
+                            && (count == generation
+                                || (count.checked_sub(1) == Some(generation)
+                                    && history
+                                        .last()?
+                                        .get("agent")
+                                        .and_then(|a| uuid_field(a, "id"))
+                                        == Some(attempt))) =>
+                    // A tokenless claim naming the run can rotate a live holder's token.
+                    // Omit it for pending: if someone claims first, the API refuses us.
+                    {
+                        Some((None, count))
+                    }
+                    _ => None,
+                }
+            });
+        let Some((run_id, count)) = target else {
+            return Ok(None);
+        };
+        let mut labels = agent.clone();
+        labels["id"] = json!(attempt);
+        let who = DeliveryActor {
+            run_id,
+            agent: Some(labels),
+            claim_token: None,
+        };
+        let claimed = self.claim_delivery(id, &who, reader).await?;
+        Ok(
+            (claimed.claim_attempt == Some(attempt) && claimed.previous_claims == count)
+                .then_some(claimed),
+        )
     }
 
     /// Take a delivery for the length of a lease; with the actor's claim

@@ -99,8 +99,7 @@ workspaces it is switched on for; for every other workspace the paths answer 404
 - **One claimer:** only the session's own `progress` call claims, under the credential that reported the run, and
   it confirms with the claim's token. The token is kept in the server process's memory and is never shown to your
   assistant, written to a file or logged. When a token is lost, recovery requires a private local record of the credential, session,
-  workspace, run, delivery and original claim attempt. The recovery request includes `expected_previous_claims` and `expected_claim_attempt`. The API must compare
-  both with the still-held claim before rotating its token. The client also checks the response before confirming. A replica without that evidence sends nothing.
+  workspace, run, delivery and original claim attempt. Recovery first reads the run’s delivery list. A missing delivery or a newer claim is not reclaimed. When the list shows the same holder, recovery can request its token again; the current API omits active leases from this list. For a pending delivery with no intervening claim, recovery reuses the recorded attempt and omits the run id from the claim so it cannot rotate the token of an agent that took it after the read. The client checks the returned attempt and claim count before confirming. A replica without local evidence sends nothing.
 - **Only a person's full API key receives.** A session signed in with OAuth, any other token that is not an API
   key, and a key limited to one workspace (`cbiq_ws_`) ask for nothing: ContextStream raises no request for a run
   reported under them and takes no message for it, because no answer can come back to them. The `progress` tool

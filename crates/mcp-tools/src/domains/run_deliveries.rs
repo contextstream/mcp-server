@@ -1192,28 +1192,31 @@ async fn end(
         }
     }
     let (run_id, generation, attempt) = proof.ok_or_else(no_claim)?;
-    let again = DeliveryActor {
-        run_id: Some(run_id),
-        agent: Some(agent.clone()),
-        claim_token: None,
-    };
-    let expect = DeliveryReader {
+    let reader = DeliveryReader {
         workspace_id,
         run_id: Some(run_id),
     };
-    let claimed = client.claim_delivery(id, &again, &expect).await?;
-    if claimed.claim_attempt != Some(attempt)
-        || claimed.previous_claims != generation
-        || !owner
-            .bind(run_id, Some(id), generation, Some(attempt))
-            .await
+    let claimed = client
+        .recover_delivery(&reader, id, generation, attempt, agent)
+        .await?
+        .ok_or_else(no_claim)?;
+    if !owner
+        .bind(run_id, Some(id), claimed.previous_claims, Some(attempt))
+        .await
     {
         return Err(no_claim().into());
     }
-    ledger.keep(session, id, run_id, generation, claimed.claim_token.clone());
+    ledger.keep(
+        session,
+        id,
+        run_id,
+        claimed.previous_claims,
+        claimed.claim_token.clone(),
+    );
     let who = DeliveryActor {
+        run_id: Some(run_id),
+        agent: Some(agent.clone()),
         claim_token: claimed.claim_token,
-        ..again
     };
     send(client, id, ending, &who).await
 }

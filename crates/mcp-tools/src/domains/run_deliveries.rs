@@ -1384,6 +1384,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round5_all_pinned_owners_leave_a_new_report_without_delivery_work() {
+        let ledger = Arc::new(Ledger::default());
+        let run = Uuid::new_v4();
+        let message = delivery(json!({"id": Uuid::new_v4(), "text": "queued"}));
+        for slot in 0..OWNERS_PER_CREDENTIAL {
+            let owner = quota_owner(0, slot);
+            ledger.remember(&owner.key, &message, owner.workspace, run, None);
+        }
+        let newcomer = quota_owner(0, OWNERS_PER_CREDENTIAL);
+        let api = crate::domains::plan_loops_tests::Api::start(vec![]).await;
+        let (client, _) = crate::domains::parity_eval_tests::client_and_session(
+            &api.base_url,
+            newcomer.workspace,
+            None,
+        );
+        let offered = poll(&client, &ledger, &newcomer, run, &json!({}), false).await;
+        assert!(offered.text().is_empty() && offered.shown.is_empty());
+        assert!(
+            !wait_for_poll(&ledger, run).await,
+            "refusal must not start a read"
+        );
+        assert!(api.requests().is_empty());
+        assert!(!ledger.saw_report(&newcomer, run));
+
+        // Taking a tokenless frame releases just that owner's pin.
+        let released = quota_owner(0, OWNERS_PER_CREDENTIAL - 1);
+        assert_eq!(
+            ledger.take_frames(&released.key, run, TOOL, 1).shown.len(),
+            1
+        );
+        ledger.note_report(&newcomer, run);
+        assert!(ledger.saw_report(&newcomer, run));
+        assert_eq!(ledger.owner_count(), OWNERS_PER_CREDENTIAL);
+        for slot in 0..OWNERS_PER_CREDENTIAL - 1 {
+            assert_eq!(
+                ledger
+                    .take_frames(&quota_owner(0, slot).key, run, TOOL, 1)
+                    .shown
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn round5_pinned_owners_survive_while_an_expired_token_makes_room() {
+        let ledger = Ledger::default();
+        let run = Uuid::new_v4();
+        let message = delivery(json!({"id": Uuid::new_v4(), "text": "pending"}));
+        let frame = quota_owner(0, 0);
+        ledger.remember(&frame.key, &message, frame.workspace, run, None);
+        let claim = quota_owner(0, 1);
+        let (worker, done) = tokio::sync::watch::channel(());
+        ledger.with(&claim.key, |mem| {
+            mem.in_flight.insert(
+                message.id,
+                InFlight {
+                    attempt: Uuid::new_v4(),
+                    run,
+                    done,
+                },
+            );
+        });
+        let expired_slot = 3;
+        let token = ClaimToken::new("held").unwrap();
+        for slot in 2..OWNERS_PER_CREDENTIAL {
+            let owner = quota_owner(0, slot);
+            ledger.keep(&owner.key, message.id, run, 0, Some(token.clone()));
+            if slot == expired_slot {
+                ledger.with(&owner.key, |mem| {
+                    mem.shown.get_mut(&message.id).unwrap().held_at -=
+                        Duration::from_secs(super::super::delivery_bindings::CLAIM_SECONDS as u64);
+                });
+            }
+        }
+
+        let newcomer = quota_owner(0, OWNERS_PER_CREDENTIAL);
+        ledger.note_report(&newcomer, run);
+        assert!(ledger.saw_report(&newcomer, run));
+        assert_eq!(ledger.owner_count(), OWNERS_PER_CREDENTIAL);
+        assert_eq!(ledger.take_frames(&frame.key, run, TOOL, 1).shown.len(), 1);
+        assert_eq!(worker.receiver_count(), 1, "the live reservation was lost");
+        for slot in 2..OWNERS_PER_CREDENTIAL {
+            if slot != expired_slot {
+                assert_eq!(
+                    ledger.claimed_as(&quota_owner(0, slot).key, message.id),
+                    Some((run, Some(token.clone())))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn round2_abandoned_read_does_not_strand_the_next_get() {
         let workspace = Uuid::new_v4();
         let run = Uuid::new_v4();

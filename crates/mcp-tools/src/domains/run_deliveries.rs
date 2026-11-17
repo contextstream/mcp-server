@@ -515,7 +515,7 @@ impl Ledger {
     }
 
     // No await after this take: a cancelled batch leaves all its frames here.
-    fn take_frames(&self, owner: &OwnerKey, run: Uuid, tool: &str) -> Offered {
+    fn take_frames(&self, owner: &OwnerKey, run: Uuid, tool: &str, limit: usize) -> Offered {
         self.lookup(owner, |mem| {
             let mut ready: Vec<_> = mem
                 .shown
@@ -524,7 +524,7 @@ impl Ledger {
                 .collect();
             ready.sort_unstable_by_key(|(_, s)| s.order);
             let mut offered = Offered::default();
-            for (id, entry) in ready.into_iter().take(MAX_SHOWN_AT_ONCE) {
+            for (id, entry) in ready.into_iter().take(limit) {
                 if let Some((kind, text)) = entry.pending.take() {
                     offered
                         .blocks
@@ -534,6 +534,13 @@ impl Ledger {
             }
             offered
         })
+    }
+
+    /// A terminal report is the last opportunity to return these receipts.
+    /// Join only claims already sent for this owner and run. Do not read or claim.
+    pub(super) async fn terminal_frames(&self, owner: &Owner, run: Uuid, tool: &str) -> Offered {
+        let _ = tokio::time::timeout(OFFER_FRESH_FOR, self.finish_claims(&owner.key, run)).await;
+        self.take_frames(&owner.key, run, tool, usize::MAX)
     }
 
     async fn finish_claims(&self, owner: &OwnerKey, run: Uuid) {
@@ -643,7 +650,7 @@ pub(super) async fn poll(
     if wait {
         ledger.finish_claims(&owner.key, run_id).await;
     }
-    let ready = ledger.take_frames(&owner.key, run_id, tool);
+    let ready = ledger.take_frames(&owner.key, run_id, tool, MAX_SHOWN_AT_ONCE);
     if !ready.blocks.is_empty() {
         return ready;
     }
@@ -777,7 +784,7 @@ pub(super) async fn poll(
         collect.await;
         false
     };
-    let mut offered = ledger.take_frames(&owner.key, run_id, tool);
+    let mut offered = ledger.take_frames(&owner.key, run_id, tool, MAX_SHOWN_AT_ONCE);
     offered.notice = notice(late && batch.deliveries.len() > offered.shown.len());
     offered
 }

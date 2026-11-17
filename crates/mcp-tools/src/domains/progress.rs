@@ -389,6 +389,8 @@ impl ProgressTool {
                 // Only under an API key: nothing is ever sent to a run reported
                 // under a sign-in or an app's token.
                 let owner = self.delivery_owner(workspace_id, is_http).await;
+                let tool =
+                    run_deliveries::tool_for(context.agent.get("client").and_then(Value::as_str));
                 let offered = match (reported_run, owner.as_ref()) {
                     (Some(run_id), Some(owner))
                         if !report.is_terminal() && !run_has_ended(&answer) =>
@@ -402,6 +404,9 @@ impl ProgressTool {
                             false,
                         )
                         .await
+                    }
+                    (Some(run_id), Some(owner)) => {
+                        self.deliveries.terminal_frames(owner, run_id, tool).await
                     }
                     _ => Offered::default(),
                 };
@@ -418,8 +423,6 @@ impl ProgressTool {
                             .as_ref()
                             .is_some_and(|owner| self.deliveries.recently_read(owner))
                 });
-                let tool =
-                    run_deliveries::tool_for(context.agent.get("client").and_then(Value::as_str));
                 let background = wake.filter(|_| {
                     !is_http
                         && tool == run_deliveries::CLAUDE_TOOL

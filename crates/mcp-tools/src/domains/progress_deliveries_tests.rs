@@ -2177,3 +2177,22 @@ async fn round2_terminal_reports_do_not_start_a_delivery_read() {
     assert!(!run_deliveries::wait_for_poll(&tool.deliveries, f.run).await);
     assert!(sent(&api, "GET", "/deliveries").is_empty());
 }
+
+#[tokio::test]
+async fn round2_reply_with_unknown_ids_creates_no_files() {
+    let f = Fixture::new();
+    let api = Api::start(vec![]).await;
+    let tool = f.tool(&api);
+    let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
+    let result = tool.execute(json!({"action":"reply","delivery_id":f.delivery,"workspace_id":f.workspace,"note":"done"})).await.unwrap();
+    assert_eq!(
+        result.structured_content.unwrap()["reason"],
+        "no_owned_claim"
+    );
+    assert!(!owner.store.exists());
+    assert!(!owner.store.with_extension("lock").exists());
+    assert!(!owner
+        .store
+        .with_extension(format!("claim-{:02x}.lock", f.delivery.as_bytes()[0]))
+        .exists());
+}

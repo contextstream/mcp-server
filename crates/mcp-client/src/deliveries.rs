@@ -799,6 +799,45 @@ mod tests {
     use mcp_types::Config;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[tokio::test]
+    async fn round4_stalled_body_is_a_network_error_for_studio_and_a_timeout_for_deliveries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = Config {
+            api_url: format!("http://{}", listener.local_addr().unwrap()),
+            api_key: Some("cbiq_body_fixture".into()),
+            ..Default::default()
+        };
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: application/json\r\n\r\n{").await.unwrap();
+                sockets.push(socket);
+            }
+            // Keep both incomplete responses open until the clients have timed out.
+            hold.await.unwrap();
+        });
+        let client = ContextStreamClient::new(config);
+        let reader = DeliveryReader {
+            workspace_id: Uuid::new_v4(),
+            run_id: Some(Uuid::new_v4()),
+        };
+        let (studio, deliveries) = tokio::join!(
+            client.studio_output_bytes("/create/outputs/x/content", 1024, Duration::from_secs(1)),
+            client.read_deliveries(&reader)
+        );
+        release.send(()).unwrap();
+        server.await.unwrap();
+        assert!(matches!(studio, Err(Error::Network(_))), "{studio:?}");
+        assert!(
+            matches!(deliveries, Err(Error::Timeout(5))),
+            "{deliveries:?}"
+        );
+    }
+
     /// A client of an API that answers each request in turn with what is
     /// given, and the requests it was sent.
     async fn client_answered(

@@ -51,7 +51,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use crate::client::{parse_retry_after, ContextStreamClient, RawBody};
+use crate::client::{parse_retry_after, ContextStreamClient, RawBody, RawResponse};
 use mcp_types::{Error, Result};
 
 /// `kind` of a delivery that carries the answer to a question the agent asked.
@@ -557,15 +557,16 @@ impl ContextStreamClient {
     ) -> std::result::Result<Value, Refused> {
         self.way_back().await?;
         let response = self
-            .send_raw(
-                method,
-                path,
-                body.map(RawBody::Json),
-                &[],
-                DELIVERY_TIMEOUT,
-                512 * 1024,
-            )
+            .send_raw_request(method, path, body.map(RawBody::Json), &[], DELIVERY_TIMEOUT)
             .await?;
+        // A claim can have committed before its response body timed out.
+        let response = RawResponse::read(response, 512 * 1024).await.map_err(|e| {
+            if e.is_timeout() {
+                Error::Timeout(DELIVERY_TIMEOUT.as_secs())
+            } else {
+                Error::Network(e.to_string())
+            }
+        })?;
         if response.status == 429 {
             return Err(Error::RateLimited {
                 message: String::new(),

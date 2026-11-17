@@ -2092,6 +2092,40 @@ pub struct RawResponse {
 }
 
 impl RawResponse {
+    pub(crate) async fn read(mut response: Response, max_bytes: usize) -> reqwest::Result<Self> {
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Ok(RawResponse {
+                status,
+                headers,
+                bytes: Vec::new(),
+                truncated: true,
+            });
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len() + chunk.len() > max_bytes {
+                return Ok(RawResponse {
+                    status,
+                    headers,
+                    bytes: Vec::new(),
+                    truncated: true,
+                });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(RawResponse {
+            status,
+            headers,
+            bytes,
+            truncated: false,
+        })
+    }
+
     /// The body as JSON: `null` when empty, a string when it is not JSON.
     pub fn into_json(self) -> RawJsonResponse {
         let body = if self.bytes.iter().all(u8::is_ascii_whitespace) {
@@ -5192,6 +5226,23 @@ impl ContextStreamClient {
         timeout: Duration,
         max_bytes: usize,
     ) -> Result<RawResponse> {
+        let response = self
+            .send_raw_request(method, path, body, extra_headers, timeout)
+            .await?;
+        RawResponse::read(response, max_bytes)
+            .await
+            .map_err(|e| Error::Network(e.to_string()))
+    }
+
+    /// Send the request through the headers; callers interpret body-read failures.
+    pub(crate) async fn send_raw_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<RawBody<'_>>,
+        extra_headers: &[(&str, String)],
+        timeout: Duration,
+    ) -> Result<Response> {
         let config = self.config().await;
         let task_auth = get_task_auth_override();
         let auth: Option<&AuthOverride> = task_auth.as_ref();
@@ -5273,43 +5324,7 @@ impl ContextStreamClient {
         observe_tenant_home_header(response.headers());
         let status = response.status().as_u16();
         crate::run_progress::api_answered(auth, &config, status);
-        let headers = response.headers().clone();
-        if response
-            .content_length()
-            .is_some_and(|length| length > max_bytes as u64)
-        {
-            return Ok(RawResponse {
-                status,
-                headers,
-                bytes: Vec::new(),
-                truncated: true,
-            });
-        }
-        let mut bytes = Vec::new();
-        let mut response = response;
-        while let Some(chunk) = response.chunk().await.map_err(|e| {
-            if e.is_timeout() {
-                Error::Timeout(timeout.as_secs())
-            } else {
-                Error::Network(e.to_string())
-            }
-        })? {
-            if bytes.len() + chunk.len() > max_bytes {
-                return Ok(RawResponse {
-                    status,
-                    headers,
-                    bytes: Vec::new(),
-                    truncated: true,
-                });
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(RawResponse {
-            status,
-            headers,
-            bytes,
-            truncated: false,
-        })
+        Ok(response)
     }
 
     /// Parse a successful response.

@@ -1011,6 +1011,43 @@ mod tests {
         Delivery::from_value(&value).expect("a delivery")
     }
 
+    #[tokio::test]
+    async fn round2_abandoned_read_does_not_strand_the_next_get() {
+        let workspace = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Owner {
+            key: "owner".into(),
+            workspace,
+            store: dir.path().join("book"),
+        };
+        let api = crate::domains::plan_loops_tests::Api::start(vec![(
+            "GET /api/v1/decision-requests/deliveries",
+            200,
+            json!({"data":{"deliveries":[]}}),
+        )])
+        .await;
+        let (client, _) =
+            crate::domains::parity_eval_tests::client_and_session(&api.base_url, workspace, None);
+        let ledger = Arc::new(Ledger::default());
+        let (producer, finished) = tokio::sync::watch::channel(false);
+        ledger.lock().polls.insert(
+            (owner.key.clone(), run),
+            Poll {
+                started: Instant::now(),
+                finished,
+                result: Arc::default(),
+            },
+        );
+        drop(producer); // the worker unwound before publishing its result
+        assert!(
+            poll(&client, &ledger, &owner, run, &json!({}), true)
+                .await
+                .can_wait
+        );
+        assert_eq!(api.requests().len(), 1);
+    }
+
     #[test]
     fn a_kind_this_server_does_not_know_is_a_delivery_and_never_named() {
         let id = Uuid::new_v4();

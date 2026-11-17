@@ -1761,8 +1761,7 @@ async fn review10_only_the_restarted_owner_can_reclaim_and_confirm() {
             assert_eq!(writes[1].body["run_id"], json!(f.run));
             assert_eq!(writes[1].body["expected_previous_claims"], json!(0));
             assert_eq!(
-                writes[1].body["expected_claim_attempt"],
-                writes[0].body["agent"]["id"],
+                writes[1].body["expected_claim_attempt"], writes[0].body["agent"]["id"],
                 "token rotation must be conditional on the exact attempt shown"
             );
             assert!(writes[2].target.ends_with("/applied"));

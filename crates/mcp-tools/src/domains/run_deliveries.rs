@@ -625,6 +625,25 @@ struct Poll {
     result: Arc<OnceLock<std::result::Result<Batch, ReadFailure>>>,
 }
 
+impl Poll {
+    /// An old failure is stale too: the routes may have come online since
+    /// the probe. Only successful reads can supply evidence for a pointer.
+    fn stale_offers(&self) -> Option<bool> {
+        let (at, waiting) = match self.result.get()? {
+            Ok(batch) => (batch.read_at, !batch.deliveries.is_empty()),
+            Err(_) => (self.started, false),
+        };
+        (at.elapsed() >= OFFER_FRESH_FOR).then_some(waiting)
+    }
+
+    fn abandoned_or_empty_for_get(&self, get: bool) -> bool {
+        if !*self.finished.borrow() {
+            return self.finished.has_changed().is_err();
+        }
+        get && matches!(self.result.get(), Some(Ok(batch)) if batch.deliveries.is_empty())
+    }
+}
+
 /// Cold reports start a probe. A report with a stale probe refreshes and
 /// collects inline, sharing one deadline between the read and claims. All consumers race for one take of its
 /// result; never hold a lock across an API call.
@@ -658,24 +677,9 @@ pub(super) async fn poll(
         ledger.with(&owner.key, |mem| {
             // A hook or waiter can announce a new arrival after a previous poll
             // finished empty. An explicit get must read that arrival now.
-            let mut refreshing = spaced;
-            let mut stale_had_offers = false;
-            if mem.polls.get(&run_id).is_some_and(|p| {
-                if *p.finished.borrow() {
-                    p.result
-                        .get()
-                        .and_then(|b| b.as_ref().ok())
-                        .is_some_and(|batch| {
-                            let stale = batch.read_at.elapsed() >= OFFER_FRESH_FOR;
-                            refreshing |= stale;
-                            stale_had_offers = stale && !batch.deliveries.is_empty();
-                            stale || (wait && batch.deliveries.is_empty())
-                        })
-                } else {
-                    // A cancelled worker dropped its sender before publishing.
-                    p.finished.has_changed().is_err()
-                }
-            }) {
+            let previous = mem.polls.get(&run_id);
+            let stale = previous.and_then(Poll::stale_offers);
+            if stale.is_some() || previous.is_some_and(|p| p.abandoned_or_empty_for_get(wait)) {
                 mem.polls.remove(&run_id);
             }
             if !mem.polls.contains_key(&run_id) {
@@ -718,8 +722,8 @@ pub(super) async fn poll(
             Some((
                 p.finished.clone(),
                 p.result.clone(),
-                refreshing,
-                stale_had_offers,
+                spaced || stale.is_some(),
+                stale.unwrap_or(false),
             ))
         })
     else {

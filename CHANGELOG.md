@@ -2,7 +2,7 @@
 
 ## 1.0.82
 
-- Reports minutes apart refresh stale delivery offers and claim them within one five-second budget. If time runs out with a known offer, the report names the client’s `get` call. An unavailable deliveries route stays silent.
+- Reports minutes apart refresh stale delivery offers and claim them within one five-second budget. If time runs out with a known offer, the report names the client’s `get` call. A 404 stays silent; after the cooldown, the next spaced report can pick up deliveries if the routes have come online.
 
 - A terminal report returns any messages or answers this session already claimed for that run but has not shown. They can still be replied to or declined; finishing starts no delivery read or claim.
 - A nonterminal `progress` report or `progress(action="get")` on your own run can return a person's answer in a `[PERSON ANSWER]` block or a message in a `[PERSON MESSAGE]` block. The call that shows the words claims the delivery. After acting, use `progress(action="reply", delivery_id="...", note="what I did")`; the person sees the note. To decline, pass `action="decline"`, the `delivery_id`, a `reason` and an optional `note`. A delivery grants no new permissions.

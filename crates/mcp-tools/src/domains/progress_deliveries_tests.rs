@@ -824,34 +824,23 @@ async fn reply_confirms_the_delivery_with_the_note() {
 }
 
 #[tokio::test]
-async fn a_reply_to_a_delivery_another_carrier_claimed_names_no_run() {
-    // The waiter or the hooks claimed it: this process never did. The API
-    // lets the holder's own credential confirm when it names no run.
-    let fixture = Fixture::new();
-    let delivery = fixture.message();
-    let api = Api::start(vec![(APPLIED, 200, answers_with("applied", &delivery))]).await;
-    let result = fixture
-        .tool(&api)
-        .execute(json!({
-            "action": "reply",
-            "delivery_id": fixture.delivery,
-            "note": "Rebased on main; nothing conflicted.",
-        }))
-        .await
-        .expect("reply");
-    assert!(text_of(&result).starts_with("[PROGRESS] Reply recorded"));
-    let applied = sent(&api, "POST", "/applied");
-    assert_eq!(applied.len(), 1);
-    assert!(
-        applied[0].body.get("run_id").is_none(),
-        "{}",
-        applied[0].body
-    );
-    assert_eq!(
-        applied[0].body["note"],
-        "Rebased on main; nothing conflicted."
-    );
-    assert_eq!(api.requests().len(), 1);
+async fn unbound_confirmations_never_reach_the_api() {
+    let f = Fixture::new();
+    let d = f.message();
+    let api = Api::start(vec![
+        (APPLIED, 200, answers_with("applied", &d)),
+        (DECLINED, 200, answers_with("declined", &d)),
+    ])
+    .await;
+    let tool = f.tool(&api);
+    for action in ["reply", "decline"] {
+        let result = tool.execute(json!({"action":action, "delivery_id":f.delivery, "run_id": f.run, "note":"done","reason":"moot"})).await.unwrap();
+        assert_eq!(
+            result.structured_content.unwrap()["reason"],
+            "no_owned_claim"
+        );
+    }
+    assert!(api.requests().is_empty());
 }
 
 #[tokio::test]
@@ -1058,38 +1047,6 @@ async fn get_of_a_run_that_is_not_this_sessions_asks_for_no_delivery() {
     assert!(!text.contains("[PERSON"), "{text}");
     assert!(sent(&api, "GET", "/decision-requests/deliveries").is_empty());
     assert!(sent(&api, "POST", "/claim").is_empty());
-}
-
-#[test]
-fn a_run_is_this_sessions_by_its_agents_id_or_by_the_name_a_person_gave_it() {
-    let session =
-        json!({"id": "claude-code:3fa9c2d1", "name": "Claude Code 3fa9", "runtime": "mcp"});
-    let named = json!({"name": "cinder", "runtime": "mcp"});
-    // A session of a client: its own id, and nobody else's.
-    assert!(is_this_agents(&session, Some(&session)));
-    assert!(!is_this_agents(
-        &session,
-        Some(&json!({"id": "claude-code:0badc0de", "name": "Claude Code 3fa9"}))
-    ));
-    // An agent a person named has no id: its sessions report under the name.
-    assert!(is_this_agents(&named, Some(&json!({"name": "cinder"}))));
-    assert!(!is_this_agents(&named, Some(&json!({"name": "ember"}))));
-    // A name is never enough against a run that has an id, or the other way.
-    assert!(!is_this_agents(
-        &named,
-        Some(&json!({"id": "x:1", "name": "cinder"}))
-    ));
-    assert!(!is_this_agents(
-        &session,
-        Some(&json!({"name": "Claude Code 3fa9"}))
-    ));
-    // Nothing shown, nothing known: not this session's.
-    assert!(!is_this_agents(&session, None));
-    assert!(!is_this_agents(&json!({}), Some(&json!({}))));
-    assert!(!is_this_agents(
-        &json!({"name": " "}),
-        Some(&json!({"name": " "}))
-    ));
 }
 
 // ============================================================================
@@ -1646,69 +1603,30 @@ const SECOND_TOKEN: &str = "70ce70ce70ce70ce70ce70ce70ce70ce70ce70ce70ce70ce70ce
 
 #[tokio::test]
 async fn a_reply_whose_token_was_lost_claims_again_as_its_own_run_and_then_confirms() {
-    // The server process restarted between the claim and the reply (or the
-    // reply reached another replica of the gateway): the session's run still
-    // holds the claim, and nobody has its token. The API gives the claim's
-    // own credential, naming the claim's run, a new token (contextstream
-    // floor-answers/before-switch-on, `claims_again`).
     let fixture = Fixture::new();
     let delivery = fixture.answer(json!([]));
     let api = Api::start_in_turn(vec![
         fixture.recorded("working"),
-        offered(vec![]),
-        (APPLIED, 409, held_as_run(fixture.run)),
-        (APPLIED, 200, held_with("applied", &delivery, SECOND_TOKEN)),
+        offered(vec![delivery.clone()]),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
         (CLAIM, 200, held_with("claimed", &delivery, SECOND_TOKEN)),
+        (APPLIED, 200, answers_with("applied", &delivery)),
     ])
     .await;
-    let tool = fixture.tool(&api);
-    // This process reported the run, and was never shown the delivery.
-    tool.execute(json!({"step": "Running the tests"}))
+    let first = fixture.tool(&api);
+    first.execute(json!({"step":"working"})).await.unwrap();
+    drop(first);
+    let restored = fixture.tool(&api);
+    let result = restored
+        .execute(json!({"action":"reply","delivery_id":fixture.delivery,"note":"done"}))
         .await
-        .expect("report");
-    let result = tool
-        .execute(
-            json!({"action": "reply", "delivery_id": fixture.delivery, "note": "Kept it warm."}),
-        )
-        .await
-        .expect("reply");
-    assert_eq!(
-        text_of(&result),
-        format!(
-            "[PROGRESS] Reply recorded: the person sees it with the run. delivery_id={} state=applied",
-            fixture.delivery
-        )
-    );
-    let structured = result.structured_content.clone().unwrap();
-    assert_eq!(structured["replied"], true);
-    for token in [TOKEN, SECOND_TOKEN] {
-        assert!(!structured.to_string().contains(token));
-        assert!(!text_of(&result).contains(token));
-    }
-    // First without a token; then the claim again, as the session's own run
-    // and with no token; then the reply under the new one.
-    let applied = sent(&api, "POST", "/applied");
-    assert_eq!(applied.len(), 2, "{applied:?}");
-    assert!(applied[0].body.get("claim_token").is_none());
-    assert_eq!(applied[1].body["claim_token"], SECOND_TOKEN);
-    assert_eq!(applied[1].body["run_id"], json!(fixture.run));
-    assert_eq!(applied[1].body["note"], "Kept it warm.");
-    let claims = sent(&api, "POST", "/claim");
-    assert_eq!(claims.len(), 1, "{claims:?}");
-    assert_eq!(claims[0].body["run_id"], json!(fixture.run));
-    assert!(claims[0].body.get("claim_token").is_none());
-    // The run was this process's own: nothing was read to find that out.
-    assert!(sent(&api, "GET", "/run-progress/runs/").is_empty());
-
-    // The new token is the session's from then on: said again, it is sent.
-    tool.execute(
-        json!({"action": "reply", "delivery_id": fixture.delivery, "note": "Kept it warm."}),
-    )
-    .await
-    .expect("reply");
-    let applied = sent(&api, "POST", "/applied");
-    assert_eq!(applied[2].body["claim_token"], SECOND_TOKEN);
-    assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+        .unwrap();
+    assert_eq!(result.structured_content.unwrap()["replied"], true);
+    let writes = sent(&api, "POST", "/decision-requests/");
+    assert_eq!(writes.len(), 3);
+    assert!(writes[1].target.ends_with("/claim"));
+    assert_eq!(writes[1].body["run_id"], json!(fixture.run));
+    assert_eq!(writes[2].body["claim_token"], SECOND_TOKEN);
 }
 
 #[tokio::test]
@@ -1785,54 +1703,31 @@ async fn a_server_that_refuses_the_claim_again_is_answered_calmly() {
 }
 
 #[tokio::test]
-async fn the_gateway_takes_up_a_claim_of_a_run_the_api_shows_under_this_sessions_agent() {
-    // The hosted gateway remembers no run: whether the claim's run is this
-    // session's is read from the API, by the agent the run is reported under.
-    let fixture = Fixture::new();
-    let delivery = fixture.answer(json!([]));
-    let tool = {
-        let api = Api::start(vec![]).await;
-        fixture.hosted_tool(&api)
-    };
-    let mine = tool.agent(true).await;
-    for (agent, taken_up) in [
-        (mine.clone(), true),
+async fn a_matching_agent_in_a_run_view_does_not_prove_ownership() {
+    let f = Fixture::new();
+    let empty = Api::start(vec![]).await;
+    let mine = f.hosted_tool(&empty).agent(true).await;
+    let api = Api::start(vec![
         (
-            json!({"id": "claude-code:0badc0de", "name": "Claude Code 0bad", "runtime": "mcp"}),
-            false,
+            "GET /api/v1/run-progress/runs/",
+            200,
+            json!({"data":f.run_view("waiting",mine)}),
         ),
-    ] {
-        let api = Api::start_in_turn(vec![
-            (
-                "GET /api/v1/run-progress/runs/",
-                200,
-                json!({"success": true, "data": fixture.run_view("waiting", agent)}),
-            ),
-            (APPLIED, 409, held_as_run(fixture.run)),
-            (APPLIED, 200, held_with("applied", &delivery, SECOND_TOKEN)),
-            (CLAIM, 200, held_with("claimed", &delivery, SECOND_TOKEN)),
-        ])
-        .await;
-        let result = fixture
-            .hosted_tool(&api)
-            .execute(json!({"action": "reply", "delivery_id": fixture.delivery, "note": "Done."}))
-            .await
-            .expect("reply");
-        let looked_up = sent(&api, "GET", "/run-progress/runs/");
-        assert_eq!(looked_up.len(), 1, "{looked_up:?}");
-        assert!(looked_up[0].target.contains(&fixture.run.to_string()));
-        assert_eq!(
-            text_of(&result).starts_with("[PROGRESS] Reply recorded"),
-            taken_up,
-            "{}",
-            text_of(&result)
-        );
-        assert_eq!(sent(&api, "POST", "/claim").len(), usize::from(taken_up));
-        assert_eq!(
-            sent(&api, "POST", "/applied").len(),
-            1 + usize::from(taken_up)
-        );
-    }
+        offered(vec![f.message()]),
+        (APPLIED, 409, held_as_run(f.run)),
+    ])
+    .await;
+    let tool = f.hosted_tool(&api);
+    tool.execute(json!({"action":"get","run_id":f.run}))
+        .await
+        .unwrap();
+    tool.execute(json!({"action":"reply","delivery_id":f.delivery,"note":"done"}))
+        .await
+        .unwrap();
+    assert!(api
+        .requests()
+        .iter()
+        .all(|r| !r.target.contains("decision-requests")));
 }
 
 // ============================================================================

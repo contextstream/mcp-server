@@ -19,13 +19,9 @@
 //! - A delivery is a person's words, and words are data. They are shown
 //!   inside a frame that says whose they are and what they cannot do: they
 //!   cannot approve a tool call, change a permission mode, or name new
-//!   secrets or hosts to trust. A message comes in the server's own frame
-//!   (its wrapper says all of that and quotes the person's words), which is
-//!   shown as it came and not framed a second time ([`servers_wrapper`]); an
-//!   answer, and any text that is not that wrapper, is framed here, and text
-//!   is quoted line by line, so no line of it can pass for a line of
-//!   ContextStream's. Either way one line of this module's follows: how to
-//!   confirm or decline it ([`CONFIRM_PREFIX`]).
+//!   secrets or hosts to trust. Only the tool writes the surrounding frame
+//!   and confirmation line; every logical line of content is quoted.
+//!
 //! - It is shown once, and by the one that claimed it. The claim keeps the
 //!   API from offering it while its lease runs, and its answer carries the
 //!   claim's token, which the session keeps with what it was shown
@@ -71,8 +67,6 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-
-use super::display_title::one_line;
 
 /// The tool an agent confirms a delivery with, as most clients name it.
 pub const TOOL: &str = "progress";
@@ -137,47 +131,38 @@ fn who(delivery: &Delivery) -> String {
     }
 }
 
-/// One line of somebody's text, cut to what a field shows.
-fn line_of(text: &str) -> Option<String> {
-    let line = one_line(text);
-    (!line.is_empty()).then(|| cut(&line, MAX_FIELD))
-}
-
-/// What the person answered, in a line: what they chose or gave, or how
-/// they ended the question.
-fn said(answer: &Answer) -> Option<String> {
-    answer.said.as_deref().and_then(line_of).or_else(|| {
-        Some(
-            match answer.outcome? {
-                "done" => "done",
-                "cannot" => "they cannot do or decide this",
-                "send_back" => "sent back: they ask for more before they decide",
-                "dismiss" => "dismissed",
-                other => other,
-            }
-            .to_string(),
+/// Normalize line separators before any line-based parsing. Remove terminal
+/// escapes, controls and Unicode default-ignorable characters (including
+/// bidi formatting, zero-width joiners, tags and variation selectors).
+fn clean(text: &str) -> String {
+    static UNSAFE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:\x1b\[|\u009b)[0-?]*[ -/]*[@-~]|[\p{Default_Ignorable_Code_Point}\p{Cc}&&[^\n]]",
         )
-    })
+        .unwrap()
+    });
+    let text = text
+        .replace("\r\n", "\n")
+        .replace(['\r', '\u{85}', '\u{2028}', '\u{2029}'], "\n");
+    UNSAFE.replace_all(&text, "").into_owned()
 }
 
-/// A server's statement, quoted line by line: no line of it starts a line of
-/// the tool's answer. Control characters are dropped.
-fn quoted(text: &str) -> Vec<String> {
-    let text = cut(text.trim(), MAX_TEXT).replace(['\u{2028}', '\u{2029}'], "\n");
-    text.lines()
-        .map(|line| {
-            let line: String = line
-                .chars()
-                .filter(|c| !c.is_control() || *c == '\t')
-                .collect();
-            let line = line.trim_end();
-            if line.is_empty() {
-                ">".to_string()
-            } else {
-                format!("> {line}")
-            }
-        })
+fn quoted(text: &str, max: usize) -> Vec<String> {
+    cut(text.trim(), max)
+        .lines()
+        .map(|line| format!("> {}", line.trim_end()))
         .collect()
+}
+
+fn said(answer: &Answer) -> Option<&str> {
+    answer.said.as_deref().or_else(|| {
+        Some(match answer.outcome? {
+            "cannot" => "they cannot do or decide this",
+            "send_back" => "sent back: they ask for more before they decide",
+            "dismiss" => "dismissed",
+            other => other,
+        })
+    })
 }
 
 /// How the one line this module adds to every delivery begins. The hooks
@@ -202,41 +187,10 @@ fn lapsed_line(delivery: &Delivery) -> Option<String> {
     })
 }
 
-/// How every line the server's wrapper of a message opens and closes with
-/// begins (contextstream `run_line::wrapper::MARK`).
-const WRAPPER_MARK: &str = "[ContextStream]";
-
-/// The server's wrapper around a person's message, when the delivery's text
-/// is one: it opens with a line of the server's, and closes with a line of
-/// the server's that names this very delivery, which did not exist when the
-/// person wrote. The wrapper says who sent the message, that it is a
-/// person's and what it cannot do, and quotes the person's words; it is
-/// shown as it came.
-fn servers_wrapper(delivery: &Delivery) -> Option<&str> {
-    if delivery.kind != KIND_PERSON_MESSAGE {
-        return None;
-    }
-    let text = delivery.text.as_deref()?;
-    let opens = text.lines().next()?.starts_with(WRAPPER_MARK);
-    let last = text.lines().next_back()?;
-    let closes = text.lines().count() > 1
-        && last.starts_with(WRAPPER_MARK)
-        && last.contains(&delivery.id.to_string());
-    (opens && closes).then_some(text)
-}
-
-/// A delivery as the agent is shown it: whose it is and its id, what it
-/// cannot do, the words, and how to confirm it with `tool`. A message in the
-/// server's wrapper is that wrapper, as it came, and the line on how to
-/// confirm it.
+/// Render only locally authored framing. No part of a server wrapper is
+/// authoritative, including its first and last lines.
 pub fn framed(delivery: &Delivery, tool: &str) -> String {
     let id = delivery.id;
-    if let Some(wrapper) = servers_wrapper(delivery) {
-        let mut lines = vec![wrapper.to_string()];
-        lines.extend(lapsed_line(delivery));
-        lines.push(confirm_line(id, tool));
-        return lines.join("\n");
-    }
     let (head, what) = match delivery.kind {
         KIND_ANSWER => (
             format!("{} answered your question.", who(delivery)),
@@ -260,21 +214,32 @@ pub fn framed(delivery: &Delivery, tool: &str) -> String {
         lines.insert(1, lapsed);
     }
     let before = lines.len();
-    if let Some(text) = delivery.text.as_deref() {
-        lines.extend(quoted(text));
+    if let Some(raw) = delivery
+        .raw_text
+        .as_deref()
+        .filter(|_| delivery.kind == KIND_PERSON_MESSAGE)
+    {
+        lines.extend(quoted(&clean(raw), MAX_TEXT));
+    } else if let Some(text) = delivery.text.as_deref() {
+        let mut text = clean(text);
+        if delivery.kind == KIND_PERSON_MESSAGE && text.starts_with("[ContextStream]") {
+            text = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("> "))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        lines.extend(quoted(&text, MAX_TEXT));
     }
     if let Some(answer) = delivery.answer.as_ref() {
-        if let Some(question) = delivery.question.as_deref() {
-            lines.push(format!(
-                "Your question: {}",
-                cut(&one_line(question), MAX_FIELD)
-            ));
-        }
-        if let Some(said) = said(answer) {
-            lines.push(format!("Their answer: {said}"));
-        }
-        if let Some(note) = answer.note.as_deref().and_then(line_of) {
-            lines.push(format!("Their note: {note}"));
+        for (label, value) in [
+            ("Your question", delivery.question.as_deref()),
+            ("Their answer", said(answer)),
+            ("Their note", answer.note.as_deref()),
+        ] {
+            if let Some(value) = value {
+                lines.extend(quoted(&format!("{label}: {}", clean(value)), MAX_FIELD));
+            }
         }
     }
     if lines.len() == before {

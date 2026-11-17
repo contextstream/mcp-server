@@ -107,9 +107,9 @@ workspaces it is switched on for; for every other workspace the paths answer 404
   key, and a key limited to one workspace (`cbiq_ws_`) ask for nothing: ContextStream raises no request for a run
   reported under them and takes no message for it, because no answer can come back to them. The `progress` tool
   reads no delivery for such a session and never tells it to start `await-answer`.
-- **A message is shown as ContextStream wrapped it.** The server's text says who sent it, that it is a person's
-  message and what it cannot do, and quotes the person's words; the tool shows it as it came and adds one line on
-  how to confirm it. An answer, and any text that is not that wrapper, is framed and quoted by the tool.
+- **The tool frames each delivery.** Every line of a person's words is quoted. When the API supplies a
+  wrapped message, only its quoted body lines are used. The surrounding instructions and confirmation
+  line always come from the local tool.
 - **Never sent:** the answer or message itself is not sent anywhere by this client. Nothing of the folder, the prompt
   or other tool calls goes with these requests.
 - **Local state:** a session's hooks keep the ids of the runs it reported and of the deliveries it was pointed at in

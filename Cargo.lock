@@ -1786,6 +1786,7 @@ dependencies = [
  "metrics",
  "mockall",
  "phf",
+ "regex",
  "reqwest",
  "schemars",
  "serde",

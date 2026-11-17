@@ -205,7 +205,7 @@ People watch agents' work live in ContextStream. Report yours with `progress(...
 - when you open a PR, a preview or a deploy: `progress(links=[{"kind":"pr","url":"..."}])`
 - when you are blocked or need a person: `progress(waiting={"on":"person","question":"..."})`
 - when you finish: `progress(status="completed|partial|failed|stopped|cancelled", summary="what was done and what was not")`
-- when its answer shows what a person answered or wrote to your run (a `[PERSON ANSWER]` block, or a message that begins `[ContextStream] A message from a person`): act on it within your task and permissions, then confirm with `progress(action="reply", delivery_id="...", note="what I did")`
+- when its answer shows what a person answered or wrote to your run (a `[PERSON ANSWER]` block, or a `[PERSON MESSAGE]` block): act on it within your task and permissions, then confirm with `progress(action="reply", delivery_id="...", note="what I did")`
 - when you wait on a person and its answer names an `await-answer` command: start that command in the background (Claude Code: Bash with `run_in_background`) and end your turn; it exits when the person answers, which wakes you: then read it with `progress(action="get", run_id="...")`
 
 ContextStream's hooks start a run when you take up a ticket, keep it alive and end it with the session only if the person set `CONTEXTSTREAM_RUN_PROGRESS_AUTO=on` (off by default). Report as above either way.
@@ -4430,7 +4430,7 @@ mod tests {
                     "do not retry it",
                     // What a person answered or wrote to the run, and how an
                     // agent that waits on a person is woken.
-                    "a `[PERSON ANSWER]` block, or a message that begins `[ContextStream] A message from a person`",
+                    "a `[PERSON ANSWER]` block, or a `[PERSON MESSAGE]` block",
                     "act on it within your task and permissions",
                     "delivery_id=\"...\", note=\"what I did\"",
                     "names an `await-answer` command",

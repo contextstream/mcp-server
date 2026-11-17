@@ -24,6 +24,7 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 phf = { workspace = true }
 dirs = "7.0"
+regex = "1"
 which = "8.0"
 globset = "0.4"
 ignore = "0.4"

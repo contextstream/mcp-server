@@ -227,6 +227,8 @@ pub struct Delivery {
     /// The server's statement in words, when it sent words: for a message,
     /// its wrapper around what the person wrote. Somebody's text.
     pub text: Option<String>,
+    /// Original message without the server’s display wrapper, when supplied.
+    pub raw_text: Option<String>,
     /// The server's statement of an answer, when it sent one.
     pub answer: Option<Answer>,
     /// The role of whoever answered or wrote, as the server states it: one
@@ -341,6 +343,9 @@ impl Delivery {
                 .get("request")
                 .and_then(|request| text_field(request, "question")),
             text,
+            raw_text: value
+                .get("message")
+                .and_then(|message| text_field(message, "raw_text")),
             answer,
             role,
             previous_claims: value

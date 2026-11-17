@@ -882,6 +882,26 @@ fn a_request_without_a_credential_is_refused_and_asks_the_api_nothing() {
     assert_eq!(api.asked().len(), 0, "{:?}", api.asked());
 }
 
+fn quiet_workspace_paths(paths: &[&str], personal_key: bool) -> bool {
+    if personal_key {
+        paths == [ME, OPEN_RUNS, REPORT, DELIVERIES, VERSION, VERSION, VERSION]
+    } else {
+        paths == [ME, OPEN_RUNS, REPORT, VERSION, VERSION, VERSION]
+    }
+}
+
+#[test]
+fn quiet_workspace_allows_the_delivery_read_to_arrive_after_help() {
+    let delayed = [ME, OPEN_RUNS, REPORT, VERSION, VERSION, VERSION, DELIVERIES];
+    assert!(quiet_workspace_paths(&delayed, true));
+    assert!(!quiet_workspace_paths(&delayed, false));
+    assert!(!quiet_workspace_paths(&delayed[..6], true));
+    assert!(!quiet_workspace_paths(
+        &[&delayed[..], &[DELIVERIES]].concat(),
+        true
+    ));
+}
+
 /// As shipped (the setting unset), and for a workspace the setting does not
 /// name, a tool call causes no request of the gateway's own: only what the
 /// tool itself asks.
@@ -908,13 +928,21 @@ fn nothing_is_asked_for_a_workspace_the_setting_does_not_name() {
         // question. Nothing else: no read of a run, no sign. After a report
         // under an API key, what a person sent the run is read; a sign-in is
         // a credential no answer comes back to, so nothing is read for it.
-        let by_key = [ME, OPEN_RUNS, REPORT, DELIVERIES, VERSION, VERSION, VERSION];
-        let by_sign_in = [ME, OPEN_RUNS, REPORT, VERSION, VERSION, VERSION];
-        assert_eq!(
-            api.paths(),
-            [&by_key[..], &by_sign_in[..]].concat(),
-            "{env:?}"
-        );
+        let calls = api.asked();
+        assert!(calls
+            .iter()
+            .all(|c| c.credential == "cbiq_fixture" || c.credential == ann));
+        for (key, personal_key) in [("cbiq_fixture", true), (ann.as_str(), false)] {
+            let paths: Vec<_> = calls
+                .iter()
+                .filter(|c| c.credential == key)
+                .map(|c| c.path.as_str())
+                .collect();
+            assert!(
+                quiet_workspace_paths(&paths, personal_key),
+                "{env:?}: {paths:?}"
+            );
+        }
     }
 }
 

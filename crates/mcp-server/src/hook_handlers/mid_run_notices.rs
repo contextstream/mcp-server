@@ -18,6 +18,13 @@
 //!   repository its tool calls, prompt, or `brief.md` point at, never to a
 //!   project made for the scratch folder.
 //!
+//! - The same detached process asks what a person answered or wrote to the
+//!   runs the session reported with `progress`
+//!   (`GET /api/v1/decision-requests/deliveries`, see [`check_deliveries`]),
+//!   and leaves a pointer in `pending`: that something waits, for which run,
+//!   and the `progress` call that reads it. The words themselves are shown
+//!   where the delivery is claimed, by that call; the hooks claim nothing.
+//!
 //! `CONTEXTSTREAM_MID_RUN_NOTICES=0` turns delivery off.
 //!
 //! The same state file also holds what the prompt hook needs to show its
@@ -74,6 +81,11 @@ const POLL_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const ACK_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Hook name of the detached poll process.
 pub(crate) const BACKGROUND_POLL_HOOK: &str = "mid-run-poll";
+/// Runs of a session the poll asks about; the ones reported longest ago
+/// give way.
+const MAX_REPORTED_RUNS: usize = 8;
+/// How long an API that answered 404 for deliveries is not asked again.
+const DELIVERIES_NOT_THERE_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct MidRunSessionState {
@@ -121,8 +133,29 @@ pub(crate) struct MidRunSessionState {
     pub observed_project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    /// Runs the session reported with `progress` and has not finished: the
+    /// poll asks what a person sent each (at most `MAX_REPORTED_RUNS`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reported_runs: Vec<ReportedRun>,
+    /// Deliveries the session was pointed at, by id and how many claims on
+    /// it had lapsed (`<id>#<n>`), and deliveries a `progress` answer showed
+    /// (`<id>#tool`); at most `MAX_DELIVERED_IDS`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub noticed_deliveries: Vec<String>,
+    /// The API said it has no delivery routes: not asked again before this.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub deliveries_not_there_until_unix_ms: u64,
     #[serde(default)]
     pub updated_at: String,
+}
+
+/// A run the session reported with `progress`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReportedRun {
+    pub run_id: String,
+    /// The workspace the report named; the session's own when it named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 /// The last full copy of a coordination notice the prompt hook printed.
@@ -1462,6 +1495,257 @@ pub(crate) fn record_tool_result_delivery(input: &Value, cwd: &str, tool_respons
     });
 }
 
+/// What a `progress` answer means for the deliveries the poll asks about.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProgressFinding {
+    /// A run the session reported, and the workspace the call named.
+    reported: Option<ReportedRun>,
+    /// That run is over.
+    ended: bool,
+    /// Deliveries the answer showed the agent.
+    shown: Vec<String>,
+}
+
+/// The word after `mark` in a tool's text (`run_id=...`, `state=...`).
+fn word_after(text: &str, mark: &str) -> Option<String> {
+    let rest = text.get(text.find(mark)? + mark.len()..)?;
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    (!word.is_empty()).then_some(word)
+}
+
+fn uuid_text(raw: Option<&str>) -> Option<String> {
+    Uuid::parse_str(raw?.trim()).ok().map(|id| id.to_string())
+}
+
+/// Read a `progress` call and its answer: the hosted gateway answers with a
+/// structured part, a local server in words.
+fn progress_finding(
+    tool_input: &Value,
+    answer: &super::run_progress::Answer,
+    all_text: &str,
+) -> ProgressFinding {
+    let mut finding = ProgressFinding::default();
+    if !answer.succeeded {
+        return finding;
+    }
+    // Every delivery a `[PERSON ...]` block of the answer named.
+    for line in all_text.lines().filter(|line| line.starts_with("[PERSON ")) {
+        if let Some(id) = uuid_text(word_after(line, "delivery_id=").as_deref()) {
+            if !finding.shown.contains(&id) {
+                finding.shown.push(id);
+            }
+        }
+    }
+    let action = tool_input
+        .get("action")
+        .and_then(Value::as_str)
+        .map(|action| action.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !(action.is_empty() || action == "report") {
+        return finding;
+    }
+    let run = answer.json.and_then(|json| json.get("run"));
+    let text = answer
+        .text
+        .filter(|text| text.contains("[PROGRESS] Recorded"));
+    let run_id = uuid_text(
+        run.and_then(|run| run.get("run_id"))
+            .and_then(Value::as_str),
+    )
+    .or_else(|| {
+        uuid_text(
+            text.and_then(|text| word_after(text, " run_id="))
+                .as_deref(),
+        )
+    });
+    let Some(run_id) = run_id else {
+        return finding;
+    };
+    let state = run
+        .and_then(|run| run.get("state"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| text.and_then(|text| word_after(text, " state=")));
+    let said_finished = tool_input
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| {
+            matches!(
+                status.trim().to_ascii_lowercase().as_str(),
+                "completed" | "partial" | "stopped" | "failed" | "cancelled"
+            )
+        });
+    finding.ended = said_finished
+        || matches!(state.as_deref(), Some("finished" | "stopped" | "failed"))
+        || run
+            .and_then(|run| run.get("liveness"))
+            .and_then(Value::as_str)
+            == Some("ended");
+    finding.reported = Some(ReportedRun {
+        run_id,
+        workspace_id: uuid_text(tool_input.get("workspace_id").and_then(Value::as_str)).or_else(
+            || {
+                uuid_text(
+                    run.and_then(|run| run.get("workspace_id"))
+                        .and_then(Value::as_str),
+                )
+            },
+        ),
+    });
+    finding
+}
+
+fn apply_progress_finding(entry: &mut MidRunSessionState, finding: ProgressFinding) {
+    if let Some(run) = finding.reported {
+        entry
+            .reported_runs
+            .retain(|known| known.run_id != run.run_id);
+        if !finding.ended {
+            entry.reported_runs.push(run);
+            let excess = entry.reported_runs.len().saturating_sub(MAX_REPORTED_RUNS);
+            entry.reported_runs.drain(0..excess);
+        }
+    }
+    for id in finding.shown {
+        // The agent has read it: a pointer at it would only send it back.
+        let named = format!("delivery_id={id}");
+        entry.pending.retain(|notice| !notice.contains(&named));
+        push_bounded(
+            &mut entry.noticed_deliveries,
+            format!("{id}#tool"),
+            MAX_DELIVERED_IDS,
+        );
+    }
+}
+
+/// PostToolUse of ContextStream's `progress` tool: remember the run the
+/// session reported, so the poll can ask what a person sent it; forget a run
+/// the session finished; and note the deliveries the answer itself showed.
+/// Never touches the network.
+pub(crate) fn record_progress_answer(
+    input: &Value,
+    cwd: &str,
+    tool_input: &Value,
+    tool_response: &Value,
+    answer: &super::run_progress::Answer,
+) {
+    if !mid_run_notices_enabled() {
+        return;
+    }
+    let mut all_text = String::new();
+    tool_result_text(tool_response, &mut all_text);
+    let finding = progress_finding(tool_input, answer, &all_text);
+    if finding == ProgressFinding::default() {
+        return;
+    }
+    let key = session_state_key(input, cwd);
+    let _ = update_session_entry(&key, |entry| apply_progress_finding(entry, finding));
+}
+
+/// One delivery the poll found waiting.
+struct Waiting {
+    id: String,
+    previous_claims: usize,
+    pointer: String,
+}
+
+/// Queue a pointer for each delivery the session has not been pointed at.
+fn queue_delivery_pointers(entry: &mut MidRunSessionState, found: Vec<Waiting>) {
+    let mut lines = Vec::new();
+    for waiting in found {
+        let token = format!("{}#{}", waiting.id, waiting.previous_claims);
+        if entry.noticed_deliveries.contains(&token) {
+            continue;
+        }
+        push_bounded(&mut entry.noticed_deliveries, token, MAX_DELIVERED_IDS);
+        // A `progress` answer showed it while this read was on its way.
+        if waiting.previous_claims == 0
+            && entry
+                .noticed_deliveries
+                .contains(&format!("{}#tool", waiting.id))
+        {
+            continue;
+        }
+        lines.push(waiting.pointer);
+    }
+    if lines.is_empty() {
+        return;
+    }
+    entry.pending.push(lines.join("\n"));
+    let excess = entry.pending.len().saturating_sub(MAX_PENDING_NOTICES);
+    entry.pending.drain(0..excess);
+}
+
+/// Ask what a person answered or wrote to the runs the session reported, and
+/// leave a pointer for each delivery the session has not been pointed at.
+/// The read counts an offer and changes nothing else: the claim is made by
+/// the `progress` call the pointer names, where the words are shown. An API
+/// without the routes (404) is not asked again for ten minutes; any failure
+/// says nothing.
+async fn check_deliveries(key: &str, editor: &str, config: &ApiConfig) {
+    use mcp_client::deliveries::{is_not_there, DeliveryReader};
+    use mcp_tools::domains::run_deliveries::{pointer, CLAUDE_TOOL, TOOL};
+
+    let Some(entry) = read_session_entry_fast(key) else {
+        return;
+    };
+    if entry.reported_runs.is_empty() || now_unix_ms() < entry.deliveries_not_there_until_unix_ms {
+        return;
+    }
+    let client = mcp_client::ContextStreamClient::new(mcp_types::Config {
+        api_url: config.api_url.clone(),
+        api_key: Some(config.api_key.clone()),
+        ..Default::default()
+    });
+    let tool = if editor == "claude" {
+        CLAUDE_TOOL
+    } else {
+        TOOL
+    };
+    let mut found = Vec::new();
+    let mut not_there = false;
+    for run in &entry.reported_runs {
+        let ids = (
+            Uuid::parse_str(&run.run_id).ok(),
+            run.workspace_id
+                .as_deref()
+                .or(config.workspace_id.as_deref())
+                .and_then(|id| Uuid::parse_str(id.trim()).ok()),
+        );
+        let (Some(run_id), Some(workspace_id)) = ids else {
+            continue;
+        };
+        let reader = DeliveryReader {
+            workspace_id,
+            run_id: Some(run_id),
+        };
+        match client.read_deliveries(&reader).await {
+            Ok(deliveries) => found.extend(deliveries.iter().map(|delivery| Waiting {
+                id: delivery.id.to_string(),
+                previous_claims: delivery.previous_claims,
+                pointer: pointer(delivery, run_id, tool),
+            })),
+            Err(error) if is_not_there(&error) => {
+                not_there = true;
+                break;
+            }
+            Err(_) => {}
+        }
+    }
+    if found.is_empty() && !not_there {
+        return;
+    }
+    let _ = update_session_entry(key, |entry| {
+        if not_there {
+            entry.deliveries_not_there_until_unix_ms = now_unix_ms() + DELIVERIES_NOT_THERE_MS;
+        }
+        queue_delivery_pointers(entry, found);
+    });
+}
+
 /// Keep what a poll returned that this session has not seen: every new
 /// `[COORDINATION]` notice, and lessons or preferences that appeared after
 /// the first complete context. `complete` is false when the API answered
@@ -1816,6 +2100,7 @@ pub async fn run_background_poll() -> anyhow::Result<()> {
             .unwrap_or_default();
             ack_notices(&config, &ack_ids).await;
         }
+        check_deliveries(key, editor, &config).await;
     }
     prune_stale_sessions();
     Ok(())

@@ -896,22 +896,36 @@ pub async fn handle() -> Result<()> {
 
     // What the call means for this session's live runs (no network): who the
     // server says the session is, a run the model reported, a ticket taken up.
+    let answer_json = response_json(&tool_response);
+    let answer_text = response_text(&tool_response);
+    let answer = super::run_progress::Answer {
+        succeeded: tool_call_succeeded(&tool_response),
+        json: answer_json.as_ref(),
+        text: answer_text.as_deref(),
+    };
     super::run_progress::tool_finished(
         &input,
         &cwd,
         is_contextstream_server_call(&mcp_server_name, &tool_name)
             .then_some(normalized_tool_name.as_str()),
         &tool_input,
-        super::run_progress::Answer {
-            succeeded: tool_call_succeeded(&tool_response),
-            json: response_json(&tool_response).as_ref(),
-            text: response_text(&tool_response).as_deref(),
-        },
+        answer,
     );
 
     if is_contextstream_server_call(&mcp_server_name, &tool_name) {
         // Notices a `context`/`init` result showed are not shown again mid-run.
         super::mid_run_notices::record_tool_result_delivery(&input, &cwd, &tool_response);
+        // A run the session reported is one the mid-run poll asks about:
+        // what a person answered or wrote to it (no network here).
+        if normalized_tool_name == "progress" {
+            super::mid_run_notices::record_progress_answer(
+                &input,
+                &cwd,
+                &tool_input,
+                &tool_response,
+                &answer,
+            );
+        }
         // Record successful initialization before optional indexing/routing
         // work, whose early returns must not lose this session's receipt.
         if completes_session_init(&normalized_tool_name, &tool_response) {

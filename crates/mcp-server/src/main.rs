@@ -265,6 +265,28 @@ enum Commands {
         command: Vec<String>,
     },
 
+    /// Wait until a person answers or messages a run, then print it and exit
+    #[command(
+        long_about = "Wait until a person answers a question a run asked, or sends the run a message, in ContextStream; then print it and exit.\n\nAn agent that asked a person something and ended its turn makes no tool call, so nothing can be shown to it. It starts this command in the background before it ends its turn (the `progress` tool's answer to a report that waits on a person names the exact command), and the command's exit brings the agent back with what the person said. It asks every 20 seconds, claims what arrived, and prints it with how to confirm it (`progress(action=\"reply\", ...)`). While it waits it prints nothing.\n\nExit status: 0 when something arrived; 124 when nothing arrived within --timeout-min (one line says so); 1 when there are no credentials or no workspace to wait with. It uses the credentials the hooks use in this folder and prints none of them."
+    )]
+    AwaitAnswer {
+        /// The run to wait for (the `progress` tool's answer names it)
+        #[arg(long, value_name = "UUID")]
+        run_id: uuid::Uuid,
+
+        /// The run's workspace (default: the workspace this folder is linked to)
+        #[arg(long, value_name = "UUID")]
+        workspace_id: Option<uuid::Uuid>,
+
+        /// Minutes to wait before giving up
+        #[arg(long, value_name = "N", default_value_t = mcp_server::await_answer::DEFAULT_TIMEOUT_MIN)]
+        timeout_min: f64,
+
+        /// Seconds between two asks
+        #[arg(long, value_name = "N", hide = true, default_value_t = mcp_server::await_answer::DEFAULT_POLL_SECS)]
+        poll_secs: f64,
+    },
+
     /// Install or remove the managed git hooks for local VCS capture
     #[command(
         long_about = "Install (or with --uninstall, remove) the managed git hooks (post-commit, pre-push, post-checkout, post-merge) that capture local commits/pushes/branch-switches/merges into ContextStream. Idempotent; preserves and chains any existing user hooks. Honors the CONTEXTSTREAM_GIT_CAPTURE kill-switch and per-repo .contextstream/config.json git_capture policy."
@@ -804,6 +826,7 @@ Usage:
   contextstream-mcp update-rules [--scope=all] [--only-configured]
   contextstream-mcp exclude [list|add|remove|reset|info] [PATTERNS...]
   contextstream-mcp detect-editors [--format=json]
+  contextstream-mcp await-answer --run-id=<id> [--workspace-id=<id>] [--timeout-min=240]
   contextstream-mcp generate-configs [--transport=remote] [--editors=claude,cursor] [--preauth]
 
 Commands:
@@ -826,6 +849,7 @@ Commands:
   migrate-remote [--scope=..]  Convert existing local MCP configs to hosted remote transport
   update-rules [--scope=..]    Update AI rules for editors selected during setup (non-interactive)
   detect-editors               Detect installed editors and output as JSON
+  await-answer --run-id=..     Wait until a person answers or messages a run, then print it and exit
   generate-configs             Generate MCP config payloads as JSON (for scripted setup)
 
 Environment variables:
@@ -939,6 +963,27 @@ fn main() -> Result<()> {
                 .block_on(mcp_server::hosted_run::run(tool, command.join(" ")));
             std::process::exit(status);
         }
+        Some(Commands::AwaitAnswer {
+            run_id,
+            workspace_id,
+            timeout_min,
+            poll_secs,
+        }) => {
+            // A one-shot whose output and exit status are what its agent is woken with: one
+            // thread that sleeps between asks, and nothing else printed.
+            let status = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(mcp_server::await_answer::run(
+                    mcp_server::await_answer::Wait {
+                        run_id,
+                        workspace_id,
+                        timeout_min,
+                        poll_secs,
+                    },
+                ));
+            std::process::exit(status);
+        }
         command => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -1035,6 +1080,8 @@ fn silence_stdout_when_quiet(quiet: bool, command: &Option<Commands>) {
                 | Commands::Clients { .. }
                 | Commands::DetectEditors { .. }
                 | Commands::GenerateConfigs { .. }
+                // What arrived is what the command was asked for.
+                | Commands::AwaitAnswer { .. }
                 | Commands::ExportAntigravityPlugin { json: true, .. }
                 | Commands::Exclude {
                     action: ExcludeAction::List | ExcludeAction::Info,
@@ -1255,6 +1302,10 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
 
         Some(Commands::Run { .. }) => {
             unreachable!("`main` dispatches `run` on its own current-thread runtime")
+        }
+
+        Some(Commands::AwaitAnswer { .. }) => {
+            unreachable!("`main` dispatches `await-answer` on its own current-thread runtime")
         }
 
         Some(Commands::GitHooks { path, uninstall }) => {

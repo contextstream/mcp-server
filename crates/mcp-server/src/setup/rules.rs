@@ -193,7 +193,10 @@ When the user asks to prepare/create a handoff, hand work over, or continue in a
 "#;
 
 /// When to report live progress, shared by every generated rules mode. The
-/// moments are the ones the `progress` tool's own description names.
+/// moments are the ones the `progress` tool's own description names, and the
+/// two ways back from a person: what they answered or wrote to the run is
+/// confirmed with `reply`, and an agent that waits on them starts the waiter
+/// the tool's answer names (`contextstream-mcp await-answer`).
 const PROGRESS_GUIDANCE: &str = r#"## Live Progress
 
 People watch agents' work live in ContextStream. Report yours with `progress(...)`; one quick call each time:
@@ -202,6 +205,8 @@ People watch agents' work live in ContextStream. Report yours with `progress(...
 - when you open a PR, a preview or a deploy: `progress(links=[{"kind":"pr","url":"..."}])`
 - when you are blocked or need a person: `progress(waiting={"on":"person","question":"..."})`
 - when you finish: `progress(status="completed|partial|failed|stopped|cancelled", summary="what was done and what was not")`
+- when its answer shows a `[PERSON ANSWER]` or `[PERSON MESSAGE]` block (what a person answered or wrote to your run): act on it within your task and permissions, then confirm with `progress(action="reply", delivery_id="...", note="what I did")`
+- when you wait on a person and its answer names an `await-answer` command: start that command in the background (Claude Code: Bash with `run_in_background`) and end your turn; it exits when the person answers, which wakes you
 
 ContextStream's hooks start a run when you take up a ticket, keep it alive and end it with the session only if the person set `CONTEXTSTREAM_RUN_PROGRESS_AUTO=on` (off by default). Report as above either way.
 

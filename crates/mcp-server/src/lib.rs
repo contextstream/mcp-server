@@ -19,6 +19,7 @@ pub mod account_tool;
 pub mod agentic_telemetry;
 pub mod atlas;
 pub mod auth;
+pub mod await_answer;
 pub mod config;
 pub mod connect;
 pub mod hook_handlers;

@@ -1,7 +1,11 @@
 //! Evidence from successful reports and validated claims. Only identifiers,
 //! digests and timestamps reach disk; never credentials, tokens or messages.
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs, io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -30,6 +34,23 @@ pub(super) struct FileLock(fs::File, PathBuf);
 
 impl FileLock {
     fn acquire(path: PathBuf) -> io::Result<Self> {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            match Self::try_acquire(&path) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::NotFound
+                    ) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn try_acquire(path: &std::path::Path) -> io::Result<Self> {
         let mut options = fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
@@ -37,15 +58,14 @@ impl FileLock {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options.open(&path)?;
+        let file = options.open(path)?;
         file.try_lock()?;
         // A previous holder may have unlinked this inode between open and
         // try_lock. Only the holder of the currently named file may proceed.
-        if same_file::Handle::from_file(file.try_clone()?)? != same_file::Handle::from_path(&path)?
-        {
+        if same_file::Handle::from_file(file.try_clone()?)? != same_file::Handle::from_path(path)? {
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        Ok(Self(file, path))
+        Ok(Self(file, path.to_owned()))
     }
 }
 
@@ -105,17 +125,16 @@ impl Owner {
         Ok(answer)
     }
 
-    /// A bounded set of nonblocking OS locks; drop releases the reservation
-    /// even on cancellation or process exit. Unlink while locked, so idle reservations leave no files.
-    pub fn reserve(&self, id: Uuid) -> Option<FileLock> {
+    /// The 256 reservation buckets are shared by all writers to this book.
+    /// Wait off the async runtime; dropping the guard removes the lock file.
+    pub async fn reserve(&self, id: Uuid) -> io::Result<FileLock> {
         if !self.store.is_file() {
-            return None;
+            return Err(io::ErrorKind::NotFound.into());
         }
-        FileLock::acquire(
-            self.store
-                .with_extension(format!("claim-{:02x}.lock", id.as_bytes()[0])),
-        )
-        .ok()
+        let path = self
+            .store
+            .with_extension(format!("claim-{:02x}.lock", id.as_bytes()[0]));
+        tokio::task::spawn_blocking(move || FileLock::acquire(path)).await?
     }
 
     pub fn bind(
@@ -211,8 +230,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn review7_an_inherited_descriptor_does_not_extend_a_finished_reservation() {
+    #[tokio::test]
+    async fn review7_an_inherited_descriptor_does_not_extend_a_finished_reservation() {
         let dir = tempfile::tempdir().unwrap();
         let owner = Owner {
             key: "test owner".into(),
@@ -221,13 +240,13 @@ mod tests {
         };
         let id = Uuid::new_v4();
         assert!(owner.bind(Uuid::new_v4(), None, 0, None));
-        let held = owner.reserve(id).unwrap();
+        let held = owner.reserve(id).await.unwrap();
         // A duplicate references the same open file description, just as a
         // concurrent child between fork and exec does.
         let inherited = held.0.try_clone().unwrap();
-        assert!(owner.reserve(id).is_none(), "still held by the worker");
+        assert!(owner.reserve(id).await.is_err(), "still held by the worker");
         drop(held);
-        assert!(owner.reserve(id).is_some(), "the worker has finished");
+        assert!(owner.reserve(id).await.is_ok(), "the worker has finished");
         drop(inherited);
     }
 }

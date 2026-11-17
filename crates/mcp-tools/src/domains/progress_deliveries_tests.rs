@@ -2240,7 +2240,7 @@ async fn round2_contended_claim_bucket_reports_busy_without_writing() {
     assert!(owner.bind(f.run, Some(f.delivery), 0, Some(Uuid::new_v4())));
     let mut other = *f.delivery.as_bytes();
     other[15] ^= 1;
-    let _held = owner.reserve(Uuid::from_bytes(other)).unwrap();
+    let _held = owner.reserve(Uuid::from_bytes(other)).await.unwrap();
     let reply = tool
         .execute(json!({"action":"reply","delivery_id":f.delivery,"note":"done"}))
         .await

@@ -608,7 +608,7 @@ async fn claim_offers(
         // Shown only once it is this agent's: one another agent holds, or one
         // whose claim did not get through, is offered again later. One try
         // per read: the next report reads again.
-        let Some(_reservation) = owner.reserve(delivery.id) else {
+        let Ok(_reservation) = owner.reserve(delivery.id).await else {
             continue;
         };
         if owner.already_claimed(delivery.id, delivery.previous_claims) {
@@ -642,15 +642,18 @@ async fn claim_offers(
         };
         // What is shown is what the claim answered: the API's statement that
         // this delivery, in this state, is this run's.
-        if claimed.claim_attempt != Some(attempt)
-            || !owner.bind(
-                run_id,
-                Some(claimed.id),
-                claimed.previous_claims,
-                Some(attempt),
-            )
-        {
+        if claimed.claim_attempt != Some(attempt) {
             continue;
+        }
+        // A validated claim must reach the caller even if its recovery
+        // record cannot be saved. The scoped ledger still holds its token.
+        if !owner.bind(
+            run_id,
+            Some(claimed.id),
+            claimed.previous_claims,
+            Some(attempt),
+        ) {
+            tracing::warn!("could not save recovery evidence for a shown delivery");
         }
         ledger.remember(
             session,
@@ -699,6 +702,7 @@ fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolRes
     let error = &refused.error;
     let code = refusal_code(error);
     let (reason, status, why): (&str, Option<u16>, String) = match error {
+        Error::Validation(code) if code == BUSY => (BUSY, None, "this delivery is busy; retry in a moment".to_string()),
         Error::Validation(code) if code == NO_CLAIM => (NO_CLAIM, None, "this session has no owned claim for this delivery; read your run to pick up what is waiting".to_string()),
         // The API answered, and not with a confirmation of this delivery.
         error if is_malformed(error) => (
@@ -845,6 +849,7 @@ async fn send(
 }
 
 const NO_CLAIM: &str = "no_owned_claim";
+const BUSY: &str = "busy";
 
 async fn end(
     client: &ContextStreamClient,
@@ -857,13 +862,18 @@ async fn end(
     client.way_back().await?;
     let no_claim = || Error::Validation(NO_CLAIM.to_string());
     let owner = owner.ok_or_else(no_claim)?;
-    owner.claim(id).ok_or_else(no_claim)?;
-    let _reservation = owner.reserve(id).ok_or_else(no_claim)?;
-    let (run_id, generation, attempt) = owner.claim(id).ok_or_else(no_claim)?;
     let session = &owner.key;
+    if ledger.claimed_as(session, id).is_none() && owner.claim(id).is_none() {
+        return Err(no_claim().into());
+    }
+    let _reservation = owner.reserve(id).await.map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => no_claim(),
+        _ => Error::Validation(BUSY.to_string()),
+    })?;
+    let proof = owner.claim(id);
     let workspace_id = owner.workspace;
-    if let Some((held_run, Some(token))) = ledger.claimed_as(session, id) {
-        if held_run != run_id {
+    if let Some((run_id, Some(token))) = ledger.claimed_as(session, id) {
+        if proof.is_some_and(|(run, _, _)| run != run_id) {
             return Err(no_claim().into());
         }
         let who = DeliveryActor {
@@ -876,6 +886,7 @@ async fn end(
             result => return result,
         }
     }
+    let (run_id, generation, attempt) = proof.ok_or_else(no_claim)?;
     let again = DeliveryActor {
         run_id: Some(run_id),
         agent: Some(agent.clone()),

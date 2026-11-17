@@ -298,6 +298,7 @@ struct Memory {
     next: u64,
     polls: HashMap<(String, Uuid), Poll>,
     reports: HashMap<(String, Uuid), Instant>,
+    last_read: HashMap<String, Instant>,
     /// Workspaces whose API said it has no delivery routes, and until when
     /// that word stands.
     not_there: HashMap<String, Instant>,
@@ -344,6 +345,13 @@ impl Ledger {
             .reports
             .get(&(owner.key.clone(), run))
             .is_some_and(|at| at.elapsed() < Duration::from_secs(7 * 86400))
+    }
+
+    pub(super) fn recently_read(&self, owner: &Owner) -> bool {
+        self.lock()
+            .last_read
+            .get(&owner.key)
+            .is_some_and(|at| at.elapsed() < NOT_THERE_FOR)
     }
 
     fn key(session: &str, id: Uuid) -> String {
@@ -454,8 +462,6 @@ impl Ledger {
 /// What a read of a run's deliveries came to.
 #[derive(Debug, Default)]
 pub(crate) struct Offered {
-    /// A recent read of this run succeeded.
-    pub can_wait: bool,
     /// The deliveries claimed and to be shown, each as its block.
     pub blocks: Vec<String>,
     /// The same deliveries for a client that shows the structured answer.
@@ -604,9 +610,17 @@ async fn read(
         run_id: Some(run_id),
     };
     match client.read_deliveries(&reader).await {
-        Ok(deliveries) => Some(deliveries),
+        Ok(deliveries) => {
+            let mut memory = ledger.lock();
+            memory
+                .last_read
+                .retain(|_, at| at.elapsed() < NOT_THERE_FOR);
+            memory.last_read.insert(owner.key.clone(), Instant::now());
+            Some(deliveries)
+        }
         Err(error) => {
             if is_not_there(&error) || is_not_ready(&error) {
+                ledger.lock().last_read.remove(&owner.key);
                 ledger.note_not_there(&owner.key);
             } else if let Error::RateLimited { retry_after, .. } = &error {
                 ledger.cool_down(&owner.key, Duration::from_secs(retry_after.unwrap_or(60)));
@@ -631,10 +645,7 @@ async fn claim_offers(
         workspace_id,
         run_id: Some(run_id),
     };
-    let mut offered = Offered {
-        can_wait: true,
-        ..Offered::default()
-    };
+    let mut offered = Offered::default();
     for delivery in deliveries
         .iter()
         .filter(|delivery| ledger.is_new(session, delivery))
@@ -1073,11 +1084,8 @@ mod tests {
             },
         );
         drop(producer); // the worker unwound before publishing its result
-        assert!(
-            poll(&client, &ledger, &owner, run, &json!({}), true)
-                .await
-                .can_wait
-        );
+        poll(&client, &ledger, &owner, run, &json!({}), true).await;
+        assert!(ledger.recently_read(&owner));
         assert_eq!(api.requests().len(), 1);
     }
 

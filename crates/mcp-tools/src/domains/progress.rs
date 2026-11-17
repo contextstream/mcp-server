@@ -410,7 +410,13 @@ impl ProgressTool {
                 // Only local Claude Code wakes on command completion. All
                 // clients can collect a pending poll with an explicit get.
                 let wake = reported_run.filter(|_| {
-                    offered.can_wait && offered.blocks.is_empty() && report.asks_a_person()
+                    !report.is_terminal()
+                        && !run_has_ended(&answer)
+                        && offered.blocks.is_empty()
+                        && report.asks_a_person()
+                        && owner
+                            .as_ref()
+                            .is_some_and(|owner| self.deliveries.recently_read(owner))
                 });
                 let background = wake.filter(|_| {
                     !is_http

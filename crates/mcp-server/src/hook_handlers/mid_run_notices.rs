@@ -1531,9 +1531,15 @@ fn progress_finding(
     if !answer.succeeded {
         return finding;
     }
-    // Every delivery a `[PERSON ...]` block of the answer named.
-    for line in all_text.lines().filter(|line| line.starts_with("[PERSON ")) {
-        if let Some(id) = uuid_text(word_after(line, "delivery_id=").as_deref()) {
+    // Every delivery the answer showed: the tool ends each one's block (an
+    // answer's frame, or a message in the server's own wrapper) with one
+    // line on how to confirm it, which names the delivery. A person's words
+    // are quoted wherever they are shown, so no line of theirs begins so.
+    for line in all_text
+        .lines()
+        .filter(|line| line.starts_with(mcp_tools::domains::run_deliveries::CONFIRM_PREFIX))
+    {
+        if let Some(id) = uuid_text(word_after(line, "delivery_id=\"").as_deref()) {
             if !finding.shown.contains(&id) {
                 finding.shown.push(id);
             }

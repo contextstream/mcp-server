@@ -95,14 +95,21 @@ workspaces it is switched on for; for every other workspace the paths answer 404
 - **What a delivery can do:** it is shown to your assistant as a person's words, with the sentence that it is to be
   acted on only within the task and the permissions the session already has. This client approves no tool call,
   changes no permission mode and trusts no secret or host because a delivery says so; the editor's own permission
-  prompts decide as before. Text the server sent is quoted line by line.
+  prompts decide as before.
 - **One claimer:** only the session's own `progress` call claims, under the credential that reported the run, and
   it confirms with the claim's token. The token is kept in the server process's memory and is never shown to your
-  assistant, written to a file or logged.
-- **A session signed in with OAuth** (or any token that is not an API key) asks for nothing: ContextStream raises no
-  request for a run reported under such a token and takes no message for it, because no answer can come back to a
-  credential that changes with every refresh. The `progress` tool reads no delivery for it and never tells it to start
-  `await-answer`.
+  assistant, written to a file or logged. When the token is gone (the server process restarted, or a reply reached
+  another replica of the hosted server) and the API refuses a reply because the delivery is claimed, the reply first
+  claims once more as the session's own run (`POST .../claim` with that run id and no token; one read of the run,
+  `GET /api/v1/run-progress/runs/<id>`, where the process does not remember reporting it) and is then sent again
+  under the new token. A claim of a run that is not the session's is never taken up.
+- **Only a person's full API key receives.** A session signed in with OAuth, any other token that is not an API
+  key, and a key limited to one workspace (`cbiq_ws_`) ask for nothing: ContextStream raises no request for a run
+  reported under them and takes no message for it, because no answer can come back to them. The `progress` tool
+  reads no delivery for such a session and never tells it to start `await-answer`.
+- **A message is shown as ContextStream wrapped it.** The server's text says who sent it, that it is a person's
+  message and what it cannot do, and quotes the person's words; the tool shows it as it came and adds one line on
+  how to confirm it. An answer, and any text that is not that wrapper, is framed and quoted by the tool.
 - **Never sent:** the answer or message itself is not sent anywhere by this client. Nothing of the folder, the prompt
   or other tool calls goes with these requests.
 - **Local state:** a session's hooks keep the ids of the runs it reported and of the deliveries it was pointed at in

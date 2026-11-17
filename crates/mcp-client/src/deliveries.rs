@@ -35,9 +35,16 @@
 //!
 //! A delivery is read as the server sent it. Its `kind` says what it carries
 //! (`answer`, `person_message`, and whatever the API adds later); a delivery
-//! without one is an answer. The words a person wrote are never looked into
-//! here: they are data for the agent to read inside the frame its tool puts
-//! around them.
+//! without one is an answer. A message's words come inside the server's own
+//! wrapper (`message.text`: who sent it, what it is and cannot do, and the
+//! person's words quoted). The words a person wrote are never looked into
+//! here: they are data for the agent to read.
+//!
+//! **A token that was lost** (the process that claimed restarted) does not
+//! lock its holder out: the API gives the claim's own credential, naming the
+//! claim's run, a new token when it claims again, and the old one dies. A
+//! refused `applied` or `declined` says which run holds the claim
+//! ([`Refused::held_by_run`]), so a holder can tell that the claim is its own.
 
 use std::time::Duration;
 
@@ -201,8 +208,10 @@ impl Delivery {
             .as_object_mut()
             .and_then(|fields| fields.remove("claim_token"))
             .and_then(|token| token.as_str().and_then(ClaimToken::new));
-        // The statement in words: wherever the server put it.
-        let text = ["text", "statement", "message"].iter().find_map(|key| {
+        // The statement in words. A message's is `message.text`, the server's
+        // wrapper around what the person wrote; any other place the server
+        // may put words is read too.
+        let text = ["message", "text", "statement"].iter().find_map(|key| {
             let field = value.get(*key)?;
             match field {
                 Value::String(_) => text_field(value, key),
@@ -348,10 +357,14 @@ fn refused_ending(status: u16, body: &Value) -> Refused {
                 .collect::<String>()
         })
         .filter(|reason| !reason.is_empty());
+    let held_by_run = details
+        .and_then(|details| details.pointer("/claimed_by/run_id"))
+        .and_then(Value::as_str)
+        .and_then(|run_id| Uuid::parse_str(run_id.trim()).ok());
     Refused {
         error: Error::http(status, message),
         ended_as,
-        held_by_run: None,
+        held_by_run,
     }
 }
 

@@ -156,6 +156,9 @@ impl Api {
                             if target.ends_with("/claim") && answer.pointer("/data/state") == Some(&json!("claimed"))
                                 && answer["data"]["claimed_by"].is_null() {
                                 let actor: Value = serde_json::from_str(&body).unwrap();
+                                if actor.as_object().unwrap().keys().any(|k| !matches!(k.as_str(), "run_id" | "agent" | "claim_token")) {
+                                    return (422, json!({"error": "unknown claim field"}).to_string());
+                                }
                                 let key = (target.clone(), answer["data"]["previous_claims"].to_string());
                                 answer["data"]["claimed_by"] = claimants.lock().unwrap().entry(key)
                                     .or_insert_with(|| json!({"agent":actor["agent"], "run_id":actor["run_id"]})).clone();

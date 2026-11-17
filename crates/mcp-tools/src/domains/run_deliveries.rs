@@ -700,6 +700,19 @@ pub(super) async fn wait_for_poll(ledger: &Ledger, run: Uuid) -> bool {
     true
 }
 
+#[cfg(test)]
+pub(super) fn age_poll(ledger: &Ledger, owner: &Owner, run: Uuid, age: Duration) {
+    ledger.with(&owner.key, |mem| {
+        let poll = mem.polls.get_mut(&run).unwrap();
+        poll.started -= age;
+        let batch = poll.result.get().unwrap().as_ref().unwrap();
+        poll.result = Arc::new(OnceLock::from(Some(Batch {
+            read_at: batch.read_at - age,
+            deliveries: batch.deliveries.clone(),
+        })));
+    });
+}
+
 async fn read(
     client: &ContextStreamClient,
     ledger: &Ledger,

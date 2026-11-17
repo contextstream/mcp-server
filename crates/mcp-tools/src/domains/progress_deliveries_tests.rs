@@ -2477,3 +2477,69 @@ async fn round3_confirmation_names_the_connected_clients_tool() {
         );
     }
 }
+
+async fn spaced_reports(
+    stale_offer: bool,
+    fresh_status: u16,
+    delay: Option<&'static str>,
+) -> (String, Fixture, Api) {
+    let f = Fixture::new();
+    let d = f.message();
+    let api = Api::start_delaying(
+        vec![
+            f.recorded("working"),
+            offered(if stale_offer { vec![d.clone()] } else { vec![] }),
+            (READ, fresh_status, offered(vec![d.clone()]).2),
+            (CLAIM, 200, held_with("claimed", &d, TOKEN)),
+        ],
+        true,
+        delay.map(|route| (route, Duration::from_secs(7))),
+        Some(if delay == Some(READ) { 2 } else { 1 }),
+    )
+    .await;
+    let tool = f.tool(&api);
+    tool.execute(json!({"step":"start"})).await.unwrap();
+    assert!(run_deliveries::wait_for_poll(&tool.deliveries, f.run).await);
+    let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
+    run_deliveries::age_poll(&tool.deliveries, &owner, f.run, Duration::from_secs(180));
+    let report = tokio::time::timeout(
+        Duration::from_millis(5500),
+        tool.execute(json!({"step":"still working"})),
+    )
+    .await
+    .expect("one five-second budget")
+    .unwrap();
+    (text_of(&report), f, api)
+}
+
+#[tokio::test]
+async fn round4_spaced_reports_show_a_new_message() {
+    let (text, f, api) = spaced_reports(false, 200, None).await;
+    assert!(text.contains(&message_block(&f)), "{text}");
+    assert_eq!(sent(&api, "GET", "/deliveries").len(), 2);
+    assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+}
+
+#[tokio::test]
+async fn round4_stale_offer_points_to_get_if_the_read_times_out() {
+    let (text, f, _) = spaced_reports(true, 200, Some(READ)).await;
+    assert!(text.ends_with(&format!("A person's answer or message waits for this run: read it with progress(action=\"get\", run_id=\"{}\")", f.run)), "{text}");
+    assert!(!text.contains("[PERSON"));
+}
+
+#[tokio::test]
+async fn round4_refreshed_offer_points_to_get_if_claim_is_late() {
+    let (text, f, _) = spaced_reports(false, 200, Some(CLAIM)).await;
+    assert!(text.ends_with(&format!("A person's answer or message waits for this run: read it with progress(action=\"get\", run_id=\"{}\")", f.run)), "{text}");
+}
+
+#[tokio::test]
+async fn round4_stale_offer_is_silent_when_routes_are_off() {
+    let (text, _, api) = spaced_reports(true, 404, None).await;
+    assert!(
+        !text.contains("[PERSON") && !text.contains("action=\"get\""),
+        "{text}"
+    );
+    assert_eq!(sent(&api, "GET", "/deliveries").len(), 2);
+    assert!(sent(&api, "POST", "/claim").is_empty());
+}

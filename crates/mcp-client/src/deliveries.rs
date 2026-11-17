@@ -597,11 +597,14 @@ impl ContextStreamClient {
     pub async fn delivery_namespace(&self) -> Option<String> {
         use sha2::{Digest, Sha256};
         let config = self.config().await;
-        let key = crate::get_task_auth_override()
-            .and_then(|a| a.api_key)
-            .filter(|k| !k.is_empty())
-            .or(config.api_key)
-            .filter(|k| is_full_api_key(k))?;
+        // An explicit caller credential determines eligibility, even when
+        // the gateway also has a process key. Scope-only overrides do not
+        // select a different credential.
+        let key = match crate::get_task_auth_override() {
+            Some(auth) if auth.api_key.is_some() || auth.jwt.is_some() => auth.api_key,
+            _ => config.api_key,
+        }
+        .filter(|k| is_full_api_key(k))?;
         let mut hash = Sha256::new();
         hash.update(config.api_url.as_bytes());
         hash.update([0]);

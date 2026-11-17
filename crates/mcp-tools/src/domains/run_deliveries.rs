@@ -45,8 +45,8 @@
 //!   again for a while.
 
 use mcp_client::deliveries::{
-    ended_as, is_not_ready, is_not_there, refusal_code, ClaimToken, Delivery, DeliveryActor,
-    DeliveryReader, DECLINE_REASONS, KIND_ANSWER, KIND_PERSON_MESSAGE, NOTE_MAX, UNDELIVERABLE,
+    is_not_ready, is_not_there, refusal_code, ClaimToken, Delivery, DeliveryActor, DeliveryReader,
+    Refused, DECLINE_REASONS, KIND_ANSWER, KIND_PERSON_MESSAGE, NOTE_MAX, UNDELIVERABLE,
 };
 use mcp_client::ContextStreamClient;
 use mcp_types::{tool::ToolResult, Error, Result};
@@ -544,12 +544,13 @@ fn api_words(message: &str) -> String {
 /// A `reply` or `decline` the API did not take, as a calm result: what
 /// happened and whether sending it again can help. `done` is the structured
 /// key (`replied` or `declined`).
-fn not_taken(headline: &str, done: &str, id: Uuid, error: &Error) -> ToolResult {
+fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolResult {
+    let error = &refused.error;
     let (reason, status, why) = match error {
         // The server ended it after a week with nobody taking it.
         Error::Http { status: 409, .. }
             if refusal_code(error) == Some("delivery_closed")
-                && ended_as(error) == Some(UNDELIVERABLE) =>
+                && refused.ended_as.as_deref() == Some(UNDELIVERABLE) =>
         {
             (
                 UNDELIVERABLE,
@@ -667,9 +668,9 @@ pub(crate) async fn reply(
             "replied",
             &delivery,
         ),
-        Err(error) => {
-            tracing::debug!("run delivery {} not confirmed: {}", id, error);
-            not_taken("Reply not recorded", "replied", id, &error)
+        Err(refused) => {
+            tracing::debug!("run delivery {} not confirmed: {}", id, refused.error);
+            not_taken("Reply not recorded", "replied", id, &refused)
         }
     })
 }
@@ -716,9 +717,9 @@ pub(crate) async fn decline(
                 "declined",
                 &delivery,
             ),
-            Err(error) => {
-                tracing::debug!("run delivery {} not declined: {}", id, error);
-                not_taken("Decline not recorded", "declined", id, &error)
+            Err(refused) => {
+                tracing::debug!("run delivery {} not declined: {}", id, refused.error);
+                not_taken("Decline not recorded", "declined", id, &refused)
             }
         },
     )

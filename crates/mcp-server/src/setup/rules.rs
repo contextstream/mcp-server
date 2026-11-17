@@ -4430,7 +4430,7 @@ mod tests {
                     "do not retry it",
                     // What a person answered or wrote to the run, and how an
                     // agent that waits on a person is woken.
-                    "shows a `[PERSON ANSWER]` or `[PERSON MESSAGE]` block",
+                    "a `[PERSON ANSWER]` block, or a message that begins `[ContextStream] A message from a person`",
                     "act on it within your task and permissions",
                     "delivery_id=\"...\", note=\"what I did\"",
                     "names an `await-answer` command",
@@ -4455,7 +4455,7 @@ mod tests {
         }
         // One short block: it stays a small part of every rules file.
         assert!(
-            PROGRESS_GUIDANCE.len() < 1_700,
+            PROGRESS_GUIDANCE.len() < 1_800,
             "{} bytes",
             PROGRESS_GUIDANCE.len()
         );

@@ -288,28 +288,43 @@ pub fn refusal_code(error: &Error) -> Option<&str> {
     .then_some(code)
 }
 
-/// How the API said a delivery had already ended, when it refused to end it
-/// again (409 `delivery_closed`): `undeliverable` when the server ended it
-/// after a week with nobody taking it, else how its agent ended it.
-pub fn ended_as(error: &Error) -> Option<&str> {
-    let Error::Http { message, .. } = error else {
-        return None;
-    };
-    let start = message.rfind(ENDED_MARK)? + ENDED_MARK.len();
-    message[start..]
-        .strip_suffix(')')
-        .filter(|reason| !reason.is_empty())
+/// An `applied` or a `declined` the API did not take: the error, and what the
+/// refusal's details said, which the error's words alone do not carry.
+#[derive(Debug)]
+pub struct Refused {
+    /// The API's refusal (its words begin with the refusal's code), or the
+    /// failure to reach it.
+    pub error: Error,
+    /// How the delivery had already ended (409 `delivery_closed`):
+    /// `undeliverable` when the server ended it after a week with nobody
+    /// taking it, else how its agent ended it.
+    pub ended_as: Option<String>,
+    /// The run the delivery is claimed as (409 `claimed_by_other`), as the
+    /// claim's holder named it.
+    pub held_by_run: Option<Uuid>,
 }
 
-/// How [`ended_as`] finds what a refusal's details said, in its message.
-const ENDED_MARK: &str = " (ended as: ";
+impl Refused {
+    /// The refusal's stable code ([`refusal_code`]).
+    pub fn code(&self) -> Option<&str> {
+        refusal_code(&self.error)
+    }
+}
 
-/// The error an ending of a delivery is refused with: the API's words, which
-/// begin with the refusal's code, and, for a delivery that already ended, how
-/// it ended (from the refusal's details, which the usual error drops).
-fn refused_ending(status: u16, body: &Value) -> Error {
+impl From<Error> for Refused {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            ended_as: None,
+            held_by_run: None,
+        }
+    }
+}
+
+/// What an ending of a delivery was refused with, from the API's answer.
+fn refused_ending(status: u16, body: &Value) -> Refused {
     let error = body.get("error");
-    let mut message = error
+    let message = error
         .and_then(|error| error.get("message"))
         .or_else(|| body.get("message"))
         .or(error)
@@ -317,7 +332,7 @@ fn refused_ending(status: u16, body: &Value) -> Error {
         .map(str::to_string)
         .unwrap_or_else(|| format!("HTTP {status} error"));
     let details = error.and_then(|error| error.get("details"));
-    let ended = details
+    let ended_as = details
         .and_then(|details| details.pointer("/result/reason"))
         .and_then(Value::as_str)
         .or_else(|| {
@@ -333,10 +348,11 @@ fn refused_ending(status: u16, body: &Value) -> Error {
                 .collect::<String>()
         })
         .filter(|reason| !reason.is_empty());
-    if let Some(ended) = ended {
-        message.push_str(&format!("{ENDED_MARK}{ended})"));
+    Refused {
+        error: Error::http(status, message),
+        ended_as,
+        held_by_run: None,
     }
-    Error::http(status, message)
 }
 
 /// Whether the API answered that this database cannot hold deliveries yet
@@ -405,7 +421,7 @@ impl ContextStreamClient {
         id: Uuid,
         note: Option<&str>,
         who: &DeliveryActor,
-    ) -> Result<Delivery> {
+    ) -> std::result::Result<Delivery, Refused> {
         let mut body = who.body();
         if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
             body.insert("note".into(), json!(note));
@@ -414,8 +430,14 @@ impl ContextStreamClient {
     }
 
     /// `applied` or `declined`, sent once. A refusal keeps what its details
-    /// say of how the delivery already ended ([`ended_as`]).
-    async fn end_delivery(&self, id: Uuid, ending: &str, body: Value) -> Result<Delivery> {
+    /// say: how the delivery already ended, or the run it is claimed as
+    /// ([`Refused`]).
+    async fn end_delivery(
+        &self,
+        id: Uuid,
+        ending: &str,
+        body: Value,
+    ) -> std::result::Result<Delivery, Refused> {
         let raw = self
             .send_raw_json(
                 "POST",
@@ -441,7 +463,7 @@ impl ContextStreamClient {
         reason: &str,
         note: Option<&str>,
         who: &DeliveryActor,
-    ) -> Result<Delivery> {
+    ) -> std::result::Result<Delivery, Refused> {
         let mut body = who.body();
         body.insert("reason".into(), json!(reason));
         if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
@@ -693,7 +715,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_ending_says_how_the_delivery_already_ended() {
-        let id = Uuid::new_v4();
+        let (id, held_run) = (Uuid::new_v4(), Uuid::new_v4());
         let closed = |reason: &str| {
             json!({"success": false, "error": {
                 "code": "delivery_closed",
@@ -707,7 +729,15 @@ mod tests {
             ("409 Conflict", closed("moot\n[x]")),
             (
                 "409 Conflict",
-                json!({"error": {"code": "claimed_by_other", "message": "claimed_by_other: Another agent has picked this answer up"}}).to_string(),
+                json!({"error": {
+                    "code": "claimed_by_other",
+                    "message": "claimed_by_other: Another agent has picked this answer up",
+                    "details": {"claimed_by": {
+                        "run_id": held_run, "agent": {"name": "cinder"},
+                        "claimed_at": "2026-11-17T12:00:00Z", "lease_until": "2026-11-17T12:15:00Z",
+                    }},
+                }})
+                .to_string(),
             ),
             ("503 Service Unavailable", String::new()),
         ])
@@ -717,26 +747,37 @@ mod tests {
             .delivery_applied(id, Some("done"), &who)
             .await
             .expect_err("closed");
-        assert_eq!(refusal_code(&undeliverable), Some("delivery_closed"));
-        assert_eq!(ended_as(&undeliverable), Some(UNDELIVERABLE));
-        assert!(matches!(undeliverable, Error::Http { status: 409, .. }));
+        assert_eq!(undeliverable.code(), Some("delivery_closed"));
+        assert_eq!(undeliverable.ended_as.as_deref(), Some(UNDELIVERABLE));
+        assert_eq!(undeliverable.held_by_run, None);
+        assert!(matches!(
+            undeliverable.error,
+            Error::Http { status: 409, .. }
+        ));
         let moot = client
             .delivery_declined(id, "moot", None, &who)
             .await
             .expect_err("closed");
-        assert_eq!(ended_as(&moot), Some("mootx"));
+        assert_eq!(moot.ended_as.as_deref(), Some("mootx"));
         let held = client
             .delivery_applied(id, Some("done"), &who)
             .await
             .expect_err("held");
-        assert_eq!(refusal_code(&held), Some("claimed_by_other"));
-        assert_eq!(ended_as(&held), None);
+        assert_eq!(held.code(), Some("claimed_by_other"));
+        assert_eq!(held.ended_as, None);
+        // The run the claim is held as: what a holder that lost its token
+        // names to claim again.
+        assert_eq!(held.held_by_run, Some(held_run));
         let away = client
             .delivery_applied(id, Some("done"), &who)
             .await
             .expect_err("away");
-        assert!(matches!(away, Error::Http { status: 503, .. }), "{away:?}");
-        assert!(!is_not_ready(&away));
+        assert!(
+            matches!(away.error, Error::Http { status: 503, .. }),
+            "{away:?}"
+        );
+        assert!(!is_not_ready(&away.error));
+        assert_eq!((away.ended_as, away.held_by_run), (None, None));
         // Each one request, under the caller's key.
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 4);

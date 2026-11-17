@@ -2275,3 +2275,46 @@ async fn round3_consecutive_waiting_reports_use_the_last_successful_read() {
         }
     }
 }
+
+#[tokio::test]
+async fn round3_one_claim_budget_leaves_the_remaining_offers_for_next_time() {
+    let f = Fixture::new();
+    let mut routes = vec![f.recorded("working")];
+    let deliveries: Vec<_> = (0..5)
+        .map(|_| {
+            let mut d = f.message();
+            d["id"] = json!(Uuid::new_v4());
+            routes.push((CLAIM, 200, held_with("claimed", &d, TOKEN)));
+            d
+        })
+        .collect();
+    routes.push(offered(deliveries));
+    let api = Api::start_with(routes, true, Some((CLAIM, Duration::from_secs(2)))).await;
+    let tool = f.tool(&api);
+    let report = json!({"step":"working"});
+    let start = Instant::now();
+    let first = tool.report_then_collect(report.clone()).await.unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "claim batch took {elapsed:?}"
+    );
+    let count = sent(&api, "POST", "/claim").len();
+    assert!((1..5).contains(&count));
+    assert_eq!(
+        first.structured_content.unwrap()["deliveries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        count
+    );
+    let next = tool.report_then_collect(report).await.unwrap();
+    assert_eq!(
+        next.structured_content.unwrap()["deliveries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5 - count
+    );
+    assert_eq!(sent(&api, "POST", "/claim").len(), 5);
+}

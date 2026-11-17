@@ -39,21 +39,9 @@ const TIMED_OUT: i32 = 124;
 
 /// What the waiter prints when something waits for the run: what it is and
 /// how to read it, never the words.
-fn wake_lines(lines: &[(&str, &str)]) -> String {
-    let mut text: Vec<String> = lines
-        .iter()
-        .map(|(what, id)| {
-            format!(
-                "[CONTEXTSTREAM LIVE NOTICE] {what} (delivery_id={id}). Read it now with progress(action=\"get\", run_id=\"{RUN}\"): it comes with how to confirm it."
-            )
-        })
-        .collect();
-    text.push("In Claude Code the tool is mcp__contextstream__progress.".to_string());
-    format!("{}\n", text.join("\n"))
+fn wake_notice() -> String {
+    format!("[CONTEXTSTREAM LIVE NOTICE] Something from a person waits for this run. Read it with progress(action=\"get\", run_id=\"{RUN}\").\n")
 }
-
-const ANSWERED: &str = "A person answered a question this run asked";
-const WROTE: &str = "A person sent this run a message";
 
 /// An answer to a question the run asked, as the API's view gives it.
 fn answer_delivery(run: &str) -> Value {
@@ -518,7 +506,7 @@ fn the_waiter_wakes_the_agent_when_an_answer_arrives_and_claims_nothing() {
     answering.join().unwrap();
 
     assert_eq!(output.status.code(), Some(0), "{}", err(&output));
-    assert_eq!(out(&output), wake_lines(&[(ANSWERED, ANSWER)]));
+    assert_eq!(out(&output), wake_notice());
     assert_eq!(err(&output), "");
     assert!(started.elapsed() < Duration::from_secs(20));
 
@@ -554,23 +542,20 @@ fn the_waiter_prints_a_persons_message_under_its_own_label() {
     api.deliver(answer_delivery(OTHER_RUN));
     let output = sandbox.await_answer(&["--run-id", RUN, "--workspace-id", WORKSPACE]);
     assert_eq!(output.status.code(), Some(0), "{}", err(&output));
-    assert_eq!(out(&output), wake_lines(&[(WROTE, MESSAGE)]));
+    assert_eq!(out(&output), wake_notice());
     assert!(!out(&output).contains("Please rebase"));
     assert!(api.claims().is_empty(), "{:?}", api.claims());
 }
 
 #[test]
-fn the_waiter_names_everything_that_waits_for_the_run() {
+fn review8_one_notice_for_everything_that_waits_for_the_run() {
     let api = FakeApi::start();
     let sandbox = Sandbox::new(&api);
     api.deliver(answer_delivery(RUN));
     api.deliver(message_delivery(RUN));
     let output = sandbox.await_answer(&["--run-id", RUN, "--workspace-id", WORKSPACE]);
     assert_eq!(output.status.code(), Some(0), "{}", err(&output));
-    assert_eq!(
-        out(&output),
-        wake_lines(&[(ANSWERED, ANSWER), (WROTE, MESSAGE)])
-    );
+    assert_eq!(out(&output), wake_notice());
     assert!(api.claims().is_empty());
 }
 
@@ -587,7 +572,7 @@ fn the_waiter_takes_its_workspace_from_the_folder_when_none_is_given() {
     api.deliver(answer_delivery(RUN));
     let output = sandbox.await_answer(&["--run-id", RUN]);
     assert_eq!(output.status.code(), Some(0), "{}", err(&output));
-    assert_eq!(out(&output), wake_lines(&[(ANSWERED, ANSWER)]));
+    assert_eq!(out(&output), wake_notice());
 }
 
 #[test]
@@ -619,7 +604,7 @@ fn the_waiter_says_in_one_line_that_nothing_arrived_and_exits_with_its_own_code(
         "{waited:?}"
     );
     // It kept asking until then, and claimed nothing.
-    assert!(api.reads().len() >= 4, "{:?}", api.reads());
+    assert!(api.reads().len() <= 2, "{:?}", api.reads());
     assert!(api.claims().is_empty());
 }
 
@@ -672,7 +657,7 @@ fn the_waiter_keeps_waiting_through_failures() {
         "0.1",
     ]);
     assert_eq!(output.status.code(), Some(0), "{}", err(&output));
-    assert_eq!(out(&output), wake_lines(&[(ANSWERED, ANSWER)]));
+    assert_eq!(out(&output), wake_notice());
     assert_eq!(err(&output), "");
     let reads = api.reads();
     assert_eq!(reads.len(), 3, "{reads:?}");
@@ -847,4 +832,32 @@ fn a_run_the_session_finished_is_no_longer_asked_about() {
     std::thread::sleep(Duration::from_millis(2500));
     assert_eq!(sandbox.tool_call_starts(), "");
     assert!(api.reads().is_empty(), "{:?}", api.reads());
+}
+
+#[test]
+fn review8_second_waiter_exits_without_a_read_and_no_read_starts_at_the_deadline() {
+    let api = FakeApi::start();
+    let sandbox = Sandbox::new(&api);
+    let args = [
+        "--run-id",
+        RUN,
+        "--workspace-id",
+        WORKSPACE,
+        "--timeout-min",
+        "0.025",
+        "--poll-secs",
+        "30",
+    ];
+    let mut first = sandbox
+        .command()
+        .arg("await-answer")
+        .args(args)
+        .spawn()
+        .unwrap();
+    assert!(api.wait_for_reads(1, Duration::from_secs(5)));
+    let second = sandbox.await_answer(&args);
+    assert_eq!(second.status.code(), Some(1), "{}", out(&second));
+    assert!(out(&second).contains("already waiting"));
+    assert_eq!(first.wait().unwrap().code(), Some(TIMED_OUT));
+    assert_eq!(api.reads().len(), 1);
 }

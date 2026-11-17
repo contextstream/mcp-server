@@ -65,13 +65,6 @@ fn framed_message_block(id: Uuid, quoted: &str) -> String {
     )
 }
 
-/// What a waiting report says about being woken.
-fn wake(run: Uuid, workspace: Uuid) -> String {
-    format!(
-        "To be woken when the person answers, start this in the background now (in Claude Code: the Bash tool with run_in_background) and then end your turn: `contextstream-mcp await-answer --run-id {run} --workspace-id {workspace}`. It waits quietly and exits when a person answers or writes to this run; then read it with progress(action=\"get\", run_id=\"{run}\")."
-    )
-}
-
 struct Fixture {
     workspace: Uuid,
     project: Uuid,
@@ -685,37 +678,93 @@ async fn the_hosted_gateway_shows_a_delivery_and_claims_it_too() {
 // ============================================================================
 
 #[tokio::test]
-async fn a_report_that_waits_on_a_person_says_how_to_be_woken() {
-    let fixture = Fixture::new();
-    for waiting in [
-        json!({"on": "person", "question": "Which cache stays warm?"}),
-        json!({"on": "approval", "question": "May I push?"}),
-        json!({"on": "sign_in", "question": "Please sign in to Linear for me"}),
+async fn review8_clients_without_background_wake_are_told_to_read_the_run() {
+    let f = Fixture::new();
+    for (client, hosted) in [
+        ("codex-cli", false),
+        ("cursor", false),
+        ("gemini-cli", false),
+        ("claude-code", true),
     ] {
-        let api = Api::start(vec![fixture.recorded("waiting"), offered(vec![])]).await;
-        let result = fixture
-            .tool(&api)
-            .report_then_collect(json!({"waiting": waiting}))
-            .await
-            .expect("report");
+        let api = Api::start(vec![f.recorded("waiting"), offered(vec![])]).await;
+        let tool = if hosted {
+            f.hosted_tool(&api)
+        } else {
+            f.tool(&api)
+        };
+        let result = crate::client_identity::run_with_client_name(
+            Some(client.into()),
+            mcp_client::run_with_mcp_session_id("session".into(), || async {
+                tool.execute(json!({"waiting":{"on":"person","question":"Which cache?"}}))
+                    .await
+                    .unwrap()
+            }),
+        )
+        .await;
         let text = text_of(&result);
         assert!(
-            text.ends_with(&format!("\n{}", wake(fixture.run, fixture.workspace))),
-            "{waiting}: {text}"
+            text.contains(&format!("progress(action=\"get\", run_id=\"{}\")", f.run)),
+            "{text}"
         );
-        // One short paragraph, said once.
-        assert_eq!(text.matches("await-answer").count(), 1, "{text}");
+        assert!(!text.contains("end your turn") && !text.contains("await-answer"));
+        assert!(result
+            .structured_content
+            .unwrap()
+            .get("await_answer")
+            .is_none());
+    }
+}
+
+// Give each Claude Code case its own PATH without changing other tests' environment.
+#[cfg(unix)]
+#[tokio::test]
+async fn review8_local_claude_needs_an_installed_cli_to_wake() {
+    const CASE: &str = "MCP_TEST_REVIEW8_CLAUDE_CLI";
+    if let Ok(installed) = std::env::var(CASE) {
+        let f = Fixture::new();
+        let api = Api::start(vec![f.recorded("waiting"), offered(vec![])]).await;
+        let result = crate::client_identity::run_with_client_name(
+            Some("claude-code".into()),
+            f.tool(&api)
+                .execute(json!({"waiting":{"on":"person","question":"Which cache?"}})),
+        )
+        .await
+        .unwrap();
+        let text = text_of(&result);
+        assert_eq!(text.contains("end your turn"), installed == "yes", "{text}");
+        assert!(
+            text.contains(&format!("progress(action=\"get\", run_id=\"{}\")", f.run)),
+            "{text}"
+        );
         assert_eq!(
-            result.structured_content.unwrap()["await_answer"],
-            json!({
-                "command": format!(
-                    "contextstream-mcp await-answer --run-id {} --workspace-id {}",
-                    fixture.run, fixture.workspace
-                ),
-            })
+            result
+                .structured_content
+                .unwrap()
+                .get("await_answer")
+                .is_some(),
+            installed == "yes"
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    for installed in ["no", "yes"] {
+        if installed == "yes" {
+            std::os::unix::fs::symlink(
+                std::env::current_exe().unwrap(),
+                dir.path().join("contextstream-mcp"),
+            )
+            .unwrap();
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "domains::progress::deliveries_tests::review8_local_claude_needs_an_installed_cli_to_wake"])
+            .env(CASE, installed).env("PATH", dir.path())
+            .output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
         );
     }
-    assert!(wake(fixture.run, fixture.workspace).len() < 460);
 }
 
 #[tokio::test]

@@ -60,7 +60,7 @@ use mcp_client::ContextStreamClient;
 use mcp_types::{tool::ToolResult, Error, Result};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -451,7 +451,7 @@ impl Offered {
 struct Poll {
     started: Instant,
     finished: tokio::sync::watch::Receiver<bool>,
-    result: Arc<Mutex<Option<Vec<Delivery>>>>,
+    result: Arc<OnceLock<Option<Vec<Delivery>>>>,
 }
 
 /// A report only consumes a finished poll or starts one. An explicit get
@@ -471,11 +471,18 @@ pub(super) async fn poll(
         mem.polls.retain(|_, p| p.started.elapsed() < NOT_THERE_FOR);
         // A hook or waiter can announce a new arrival after a previous poll
         // finished empty. An explicit get must read that arrival now.
-        if wait
-            && mem.polls.get(&key).is_some_and(|p| {
-                *p.finished.borrow() && p.result.lock().unwrap().as_ref().is_some_and(Vec::is_empty)
-            })
-        {
+        if mem.polls.get(&key).is_some_and(|p| {
+            if *p.finished.borrow() {
+                wait && p
+                    .result
+                    .get()
+                    .and_then(Option::as_ref)
+                    .is_some_and(Vec::is_empty)
+            } else {
+                // A cancelled worker dropped its sender before publishing.
+                p.finished.has_changed().is_err()
+            }
+        }) {
             mem.polls.remove(&key);
         }
         if !mem.polls.contains_key(&key) {
@@ -493,7 +500,7 @@ pub(super) async fn poll(
                 }
             }
             let (tx, finished) = tokio::sync::watch::channel(false);
-            let result = Arc::new(Mutex::new(None));
+            let result = Arc::new(OnceLock::new());
             mem.polls.insert(
                 key.clone(),
                 Poll {
@@ -505,7 +512,7 @@ pub(super) async fn poll(
             let (client, ledger, owner) = (client.clone(), ledger.clone(), owner.clone());
             mcp_client::spawn_with_task_context(async move {
                 let offered = read(&client, &ledger, &owner, run_id).await;
-                *result.lock().unwrap() = offered;
+                let _ = result.set(offered);
                 tx.send_replace(true);
             });
         }
@@ -519,7 +526,7 @@ pub(super) async fn poll(
         // Only the list runs in the worker.
         let _ = tokio::time::timeout(Duration::from_secs(6), finished.changed()).await;
     }
-    let deliveries = {
+    {
         let mut mem = ledger.lock();
         if !mem
             .polls
@@ -529,9 +536,16 @@ pub(super) async fn poll(
             return Offered::default();
         }
         mem.polls.remove(&key);
-        result.lock().unwrap().take()
-    };
-    claim_offers(client, ledger, owner, run_id, agent, deliveries).await
+    }
+    claim_offers(
+        client,
+        ledger,
+        owner,
+        run_id,
+        agent,
+        result.get().and_then(Option::as_deref),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -585,7 +599,7 @@ async fn claim_offers(
     owner: &Owner,
     run_id: Uuid,
     agent: &Value,
-    deliveries: Option<Vec<Delivery>>,
+    deliveries: Option<&[Delivery]>,
 ) -> Offered {
     let Some(deliveries) = deliveries else {
         return Offered::default();

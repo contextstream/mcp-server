@@ -646,6 +646,7 @@ async fn claim_offers(
         run_id: Some(run_id),
     };
     let mut offered = Offered::default();
+    let deadline = Instant::now() + Duration::from_secs(5);
     for delivery in deliveries
         .iter()
         .filter(|delivery| ledger.is_new(session, delivery))
@@ -654,6 +655,9 @@ async fn claim_offers(
         // Shown only once it is this agent's: one another agent holds, or one
         // whose claim did not get through, is offered again later. One try
         // per read: the next report reads again.
+        if Instant::now() >= deadline {
+            break;
+        }
         let Ok(_reservation) = owner.reserve(delivery.id).await else {
             continue;
         };
@@ -671,6 +675,10 @@ async fn claim_offers(
             agent: Some(labels),
             claim_token: None,
         };
+        // Reservation and evidence checks also consume this call's budget.
+        if Instant::now() >= deadline {
+            break;
+        }
         let claimed = match client.claim_delivery(delivery.id, &who, &reader).await {
             Ok(claimed) => claimed,
             Err(error) => {

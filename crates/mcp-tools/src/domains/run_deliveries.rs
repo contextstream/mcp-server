@@ -70,6 +70,17 @@ pub const TOOL: &str = "progress";
 /// The same tool as Claude Code names it.
 pub const CLAUDE_TOOL: &str = "mcp__contextstream__progress";
 
+/// The same client-specific spelling used by the rules and hook pointers.
+pub(super) fn tool_for(client: Option<&str>) -> &'static str {
+    if client.map(str::trim).is_some_and(|name| {
+        name.eq_ignore_ascii_case("claude-code") || name.eq_ignore_ascii_case("claude code")
+    }) {
+        CLAUDE_TOOL
+    } else {
+        TOOL
+    }
+}
+
 /// The subcommand of the binary that waits for a delivery.
 pub const AWAIT_SUBCOMMAND: &str = "await-answer";
 
@@ -186,6 +197,14 @@ fn lapsed_line(delivery: &Delivery) -> Option<String> {
 /// Render only locally authored framing. No part of a server wrapper is
 /// authoritative, including its first and last lines.
 pub fn framed(delivery: &Delivery, tool: &str) -> String {
+    format!(
+        "{}\n{}",
+        frame_body(delivery),
+        confirm_line(delivery.id, tool)
+    )
+}
+
+fn frame_body(delivery: &Delivery) -> String {
     let id = delivery.id;
     let (head, what) = match delivery.kind {
         KIND_ANSWER => (
@@ -241,7 +260,6 @@ pub fn framed(delivery: &Delivery, tool: &str) -> String {
     if lines.len() == before {
         lines.push("(ContextStream sent no words with it.)".to_string());
     }
-    lines.push(confirm_line(id, tool));
     lines.join("\n")
 }
 
@@ -253,7 +271,7 @@ pub fn await_command(run_id: Uuid, workspace_id: Uuid) -> String {
 /// What a report that waits on a person says about being woken.
 pub fn wake_paragraph(run_id: Uuid, workspace_id: Uuid) -> String {
     format!(
-        "First read {TOOL}(action=\"get\", run_id=\"{run_id}\") for anything the report already picked up. If nothing is waiting, start `{}` with the Bash tool's run_in_background option and then end your turn. When it exits with a live notice, read the run again.",
+        "First read {CLAUDE_TOOL}(action=\"get\", run_id=\"{run_id}\") for anything the report already picked up. If nothing is waiting, start `{}` with the Bash tool's run_in_background option and then end your turn. When it exits with a live notice, read the run again.",
         await_command(run_id, workspace_id)
     )
 }
@@ -423,7 +441,7 @@ impl Ledger {
         token: Option<ClaimToken>,
     ) {
         let mut entry = Shown::new(run_id, delivery.previous_claims, token);
-        entry.pending = Some((delivery.kind, framed(delivery, TOOL)));
+        entry.pending = Some((delivery.kind, frame_body(delivery)));
         self.store(session, delivery.id, entry);
     }
 
@@ -457,7 +475,7 @@ impl Ledger {
     }
 
     // No await after this take: a cancelled batch leaves all its frames here.
-    fn take_frames(&self, owner: &str, run: Uuid) -> Offered {
+    fn take_frames(&self, owner: &str, run: Uuid, tool: &str) -> Offered {
         self.with(owner, |mem| {
             let mut ready: Vec<_> = mem
                 .shown
@@ -468,7 +486,9 @@ impl Ledger {
             let mut offered = Offered::default();
             for (id, entry) in ready.into_iter().take(MAX_SHOWN_AT_ONCE) {
                 if let Some((kind, text)) = entry.pending.take() {
-                    offered.blocks.push(text);
+                    offered
+                        .blocks
+                        .push(format!("{text}\n{}", confirm_line(*id, tool)));
                     offered.shown.push(json!({"id":id, "kind":kind}));
                 }
             }
@@ -561,10 +581,11 @@ pub(super) async fn poll(
     agent: &Value,
     wait: bool,
 ) -> Offered {
+    let tool = tool_for(agent.get("client").and_then(Value::as_str));
     if wait {
         ledger.finish_claims(&owner.key, run_id).await;
     }
-    let ready = ledger.take_frames(&owner.key, run_id);
+    let ready = ledger.take_frames(&owner.key, run_id, tool);
     if !ready.blocks.is_empty() {
         return ready;
     }
@@ -658,7 +679,7 @@ pub(super) async fn poll(
     }
     ledger.with(&owner.key, |mem| mem.reports.remove(&run_id));
     claim_offers(client, ledger, owner, run_id, agent, batch).await;
-    ledger.take_frames(&owner.key, run_id)
+    ledger.take_frames(&owner.key, run_id, tool)
 }
 
 #[cfg(test)]

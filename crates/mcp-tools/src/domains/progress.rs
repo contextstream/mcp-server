@@ -418,21 +418,18 @@ impl ProgressTool {
                             .as_ref()
                             .is_some_and(|owner| self.deliveries.recently_read(owner))
                 });
+                let tool =
+                    run_deliveries::tool_for(context.agent.get("client").and_then(Value::as_str));
                 let background = wake.filter(|_| {
                     !is_http
-                        && crate::client_identity::current_client_name().is_some_and(|name| {
-                            matches!(
-                                name.trim().to_ascii_lowercase().as_str(),
-                                "claude-code" | "claude code"
-                            )
-                        })
+                        && tool == run_deliveries::CLAUDE_TOOL
                         && which::which("contextstream-mcp").is_ok()
                 });
                 if let Some(run_id) = background {
                     text.push('\n');
                     text.push_str(&run_deliveries::wake_paragraph(run_id, workspace_id));
                 } else if let Some(run_id) = wake {
-                    text.push_str(&format!("\nTo check for the person's answer, read progress(action=\"get\", run_id=\"{run_id}\")."));
+                    text.push_str(&format!("\nTo check for the person's answer, read {tool}(action=\"get\", run_id=\"{run_id}\")."));
                 }
                 text.push_str(&offered.text());
                 if let Some(fields) = answer.as_object_mut() {

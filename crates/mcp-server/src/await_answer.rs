@@ -46,7 +46,7 @@ use uuid::Uuid;
 /// Something arrived, and was printed.
 pub const EXIT_ARRIVED: i32 = 0;
 
-/// The wait could not start: no credentials, or no workspace.
+/// The wait could not start: missing or ineligible credentials, no workspace, or no reservation.
 pub const EXIT_NOT_STARTED: i32 = 1;
 
 /// Nothing arrived in time: the code `timeout(1)` ends with.

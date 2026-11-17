@@ -60,7 +60,7 @@ use mcp_client::ContextStreamClient;
 use mcp_types::{tool::ToolResult, Error, Result};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -76,14 +76,11 @@ pub const AWAIT_SUBCOMMAND: &str = "await-answer";
 /// Most deliveries one call shows; the rest wait for the next.
 const MAX_SHOWN_AT_ONCE: usize = 5;
 
-/// Most deliveries a process remembers having shown.
+/// Maximum entries of each kind retained per delivery owner.
 const MAX_REMEMBERED: usize = 512;
 
 /// A cached offer and a batch of claim starts share this short validity window.
 const OFFER_FRESH_FOR: Duration = Duration::from_secs(5);
-
-/// Most workspaces a process remembers as having no delivery routes.
-const MAX_WORKSPACES_OFF: usize = 1024;
 
 /// How long an API that answered 404 is not asked again.
 const NOT_THERE_FOR: Duration = Duration::from_secs(10 * 60);
@@ -320,78 +317,101 @@ struct InFlight {
 
 #[derive(Debug, Default)]
 struct Memory {
-    shown: HashMap<(String, Uuid), Shown>,
-    in_flight: HashMap<(String, Uuid), InFlight>,
+    shown: HashMap<Uuid, Shown>,
+    in_flight: HashMap<Uuid, InFlight>,
     next: u64,
-    polls: HashMap<(String, Uuid), Poll>,
-    reports: HashMap<(String, Uuid), Instant>,
-    last_read: HashMap<String, Instant>,
-    /// Workspaces whose API said it has no delivery routes, and until when
-    /// that word stands.
-    not_there: HashMap<String, Instant>,
+    polls: HashMap<Uuid, Poll>,
+    reports: HashMap<Uuid, Instant>,
+    last_read: Option<Instant>,
+    not_there: Option<Instant>,
 }
 
-/// What this process remembers of deliveries: which ones each session was
-/// shown, and where the API has no routes for them.
+impl Memory {
+    fn prune(&mut self) {
+        self.shown.retain(|_, s| {
+            s.held_at.elapsed().as_secs() < super::delivery_bindings::CLAIM_SECONDS as u64
+        });
+        self.reports
+            .retain(|_, at| at.elapsed() < Duration::from_secs(7 * 86400));
+        self.polls
+            .retain(|_, p| p.started.elapsed() < NOT_THERE_FOR);
+        self.in_flight.retain(|_, f| f.done.has_changed().is_ok());
+        self.last_read = self.last_read.filter(|at| at.elapsed() < NOT_THERE_FOR);
+        self.not_there = self.not_there.filter(|until| *until > Instant::now());
+    }
+    fn is_empty(&self) -> bool {
+        self.shown.is_empty()
+            && self.in_flight.is_empty()
+            && self.polls.is_empty()
+            && self.reports.is_empty()
+            && self.last_read.is_none()
+            && self.not_there.is_none()
+    }
+}
+
+#[derive(Debug, Default)]
+struct Owners {
+    by_key: HashMap<String, Memory>,
+    last_sweep: Option<Instant>,
+}
+
+/// The gateway shares this directory, but each credential/workspace/session
+/// owner has its own capacity for claims, reports and reads.
 #[derive(Debug, Default)]
 pub(crate) struct Ledger {
-    memory: Mutex<Memory>,
+    owners: Mutex<Owners>,
 }
 
 impl Ledger {
-    fn lock(&self) -> MutexGuard<'_, Memory> {
-        let mut mem = self
-            .memory
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        mem.shown.retain(|_, s| {
-            s.held_at.elapsed().as_secs() < super::delivery_bindings::CLAIM_SECONDS as u64
-        });
-        mem
+    fn with<T>(&self, owner: &str, f: impl FnOnce(&mut Memory) -> T) -> T {
+        let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+        if owners
+            .last_sweep
+            .is_none_or(|at| at.elapsed() >= NOT_THERE_FOR)
+        {
+            owners.by_key.retain(|_, mem| {
+                mem.prune();
+                !mem.is_empty()
+            });
+            owners.last_sweep = Some(Instant::now());
+        }
+        let mem = owners.by_key.entry(owner.to_owned()).or_default();
+        mem.prune();
+        f(mem)
     }
 
     // A get can follow its report before the first read has finished. Keep
     // this evidence in memory until a successful read warrants a disk book.
     pub(super) fn note_report(&self, owner: &Owner, run: Uuid) {
-        let mut mem = self.lock();
-        mem.reports.insert((owner.key.clone(), run), Instant::now());
-        if mem.reports.len() > MAX_REMEMBERED {
-            if let Some(oldest) = mem
-                .reports
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(key, _)| key.clone())
-            {
-                mem.reports.remove(&oldest);
+        self.with(&owner.key, |mem| {
+            mem.reports.insert(run, Instant::now());
+            if mem.reports.len() > MAX_REMEMBERED {
+                if let Some(oldest) = mem
+                    .reports
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(id, _)| *id)
+                {
+                    mem.reports.remove(&oldest);
+                }
             }
-        }
+        });
     }
 
     pub(super) fn saw_report(&self, owner: &Owner, run: Uuid) -> bool {
-        self.lock()
-            .reports
-            .get(&(owner.key.clone(), run))
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(7 * 86400))
+        self.with(&owner.key, |mem| mem.reports.contains_key(&run))
     }
 
     pub(super) fn recently_read(&self, owner: &Owner) -> bool {
-        self.lock()
-            .last_read
-            .get(&owner.key)
-            .is_some_and(|at| at.elapsed() < NOT_THERE_FOR)
+        self.with(&owner.key, |mem| mem.last_read.is_some())
     }
 
-    fn key(session: &str, id: Uuid) -> (String, Uuid) {
-        (session.to_owned(), id)
-    }
-
-    /// Whether the session has not been shown this offer of the delivery: it
-    /// never saw it, or a claim on it lapsed since.
     fn is_new(&self, session: &str, delivery: &Delivery) -> bool {
-        self.lock()
-            .shown
-            .get(&Self::key(session, delivery.id))
-            .is_none_or(|shown| delivery.previous_claims > shown.previous_claims)
+        self.with(session, |mem| {
+            mem.shown
+                .get(&delivery.id)
+                .is_none_or(|shown| delivery.previous_claims > shown.previous_claims)
+        })
     }
 
     fn remember(
@@ -419,89 +439,78 @@ impl Ledger {
     }
 
     fn store(&self, session: &str, id: Uuid, mut entry: Shown) {
-        let mut memory = self.lock();
-        memory.next += 1;
-        entry.order = memory.next;
-        memory.shown.insert(Self::key(session, id), entry);
-        if memory.shown.len() > MAX_REMEMBERED {
-            if let Some(oldest) = memory
-                .shown
-                .iter()
-                .min_by_key(|(_, s)| s.order)
-                .map(|(k, _)| k.clone())
-            {
-                memory.shown.remove(&oldest);
+        self.with(session, |mem| {
+            mem.next += 1;
+            entry.order = mem.next;
+            mem.shown.insert(id, entry);
+            if mem.shown.len() > MAX_REMEMBERED {
+                if let Some(oldest) = mem
+                    .shown
+                    .iter()
+                    .min_by_key(|(_, s)| s.order)
+                    .map(|(id, _)| *id)
+                {
+                    mem.shown.remove(&oldest);
+                }
             }
-        }
+        });
     }
 
     // No await after this take: a cancelled batch leaves all its frames here.
     fn take_frames(&self, owner: &str, run: Uuid) -> Offered {
-        let mut mem = self.lock();
-        let mut ready: Vec<_> = mem
-            .shown
-            .iter_mut()
-            .filter(|((session, _), s)| session == owner && s.run_id == run && s.pending.is_some())
-            .collect();
-        ready.sort_unstable_by_key(|(_, s)| s.order);
-        let mut offered = Offered::default();
-        for ((_, id), entry) in ready.into_iter().take(MAX_SHOWN_AT_ONCE) {
-            if let Some((kind, text)) = entry.pending.take() {
-                offered.blocks.push(text);
-                offered.shown.push(json!({"id":id, "kind":kind}));
+        self.with(owner, |mem| {
+            let mut ready: Vec<_> = mem
+                .shown
+                .iter_mut()
+                .filter(|(_, s)| s.run_id == run && s.pending.is_some())
+                .collect();
+            ready.sort_unstable_by_key(|(_, s)| s.order);
+            let mut offered = Offered::default();
+            for (id, entry) in ready.into_iter().take(MAX_SHOWN_AT_ONCE) {
+                if let Some((kind, text)) = entry.pending.take() {
+                    offered.blocks.push(text);
+                    offered.shown.push(json!({"id":id, "kind":kind}));
+                }
             }
-        }
-        offered
+            offered
+        })
     }
 
     async fn finish_claims(&self, owner: &str, run: Uuid) {
-        let already_sent: Vec<_> = self
-            .lock()
-            .in_flight
-            .iter()
-            .filter(|((session, _), flight)| session == owner && flight.run == run)
-            .map(|(_, flight)| flight.done.clone())
-            .collect();
+        let already_sent: Vec<_> = self.with(owner, |mem| {
+            mem.in_flight
+                .values()
+                .filter(|flight| flight.run == run)
+                .map(|flight| flight.done.clone())
+                .collect()
+        });
         for mut done in already_sent {
             let _ = done.changed().await;
         }
     }
 
     fn claimed_as(&self, session: &str, id: Uuid) -> Option<(Uuid, Option<ClaimToken>)> {
-        self.lock()
-            .shown
-            .get(&Self::key(session, id))
-            .map(|s| (s.run_id, s.token.clone()))
+        self.with(session, |mem| {
+            mem.shown.get(&id).map(|s| (s.run_id, s.token.clone()))
+        })
     }
 
-    fn is_not_there(&self, workspace_id: &str) -> bool {
-        let mut memory = self.lock();
-        match memory.not_there.get(workspace_id) {
-            Some(until) if *until > Instant::now() => true,
-            Some(_) => {
-                memory.not_there.remove(workspace_id);
-                false
-            }
-            None => false,
-        }
+    fn is_not_there(&self, owner: &str) -> bool {
+        self.with(owner, |mem| mem.not_there.is_some())
     }
 
-    fn note_not_there(&self, workspace_id: &str) {
-        self.cool_down(workspace_id, NOT_THERE_FOR);
+    fn note_not_there(&self, owner: &str) {
+        self.with(owner, |mem| {
+            mem.last_read = None;
+            mem.not_there = Some(Instant::now() + NOT_THERE_FOR);
+        });
     }
-    fn cool_down(&self, workspace_id: &str, duration: Duration) {
-        let mut memory = self.lock();
-        if memory.not_there.len() >= MAX_WORKSPACES_OFF {
-            let now = Instant::now();
-            memory.not_there.retain(|_, until| *until > now);
-            if memory.not_there.len() >= MAX_WORKSPACES_OFF {
-                memory.not_there.clear();
-            }
-        }
-        memory.not_there.insert(
-            workspace_id.to_owned(),
-            Instant::now() + duration.min(Duration::from_secs(u32::MAX.into())),
-        );
+
+    fn cool_down(&self, owner: &str, duration: Duration) {
+        self.with(owner, |mem| {
+            mem.not_there =
+                Some(Instant::now() + duration.min(Duration::from_secs(u32::MAX.into())))
+        });
     }
 }
 
@@ -559,13 +568,10 @@ pub(super) async fn poll(
     if !ready.blocks.is_empty() {
         return ready;
     }
-    let key = (owner.key.clone(), run_id);
-    let (mut finished, result) = {
-        let mut mem = ledger.lock();
-        mem.polls.retain(|_, p| p.started.elapsed() < NOT_THERE_FOR);
+    let Some((mut finished, result)) = ledger.with(&owner.key, |mem| {
         // A hook or waiter can announce a new arrival after a previous poll
         // finished empty. An explicit get must read that arrival now.
-        if mem.polls.get(&key).is_some_and(|p| {
+        if mem.polls.get(&run_id).is_some_and(|p| {
             if *p.finished.borrow() {
                 p.result
                     .get()
@@ -579,26 +585,26 @@ pub(super) async fn poll(
                 p.finished.has_changed().is_err()
             }
         }) {
-            mem.polls.remove(&key);
+            mem.polls.remove(&run_id);
         }
-        if !mem.polls.contains_key(&key) {
+        if !mem.polls.contains_key(&run_id) {
             if mem.polls.len() >= MAX_REMEMBERED {
                 let oldest = mem
                     .polls
                     .iter()
                     .filter(|(_, p)| *p.finished.borrow())
                     .min_by_key(|(_, p)| p.started)
-                    .map(|(k, _)| k.clone());
+                    .map(|(k, _)| *k);
                 if let Some(oldest) = oldest {
                     mem.polls.remove(&oldest);
                 } else {
-                    return Offered::default();
+                    return None;
                 }
             }
             let (tx, finished) = tokio::sync::watch::channel(false);
             let result = Arc::new(OnceLock::new());
             mem.polls.insert(
-                key.clone(),
+                run_id,
                 Poll {
                     started: Instant::now(),
                     finished,
@@ -617,8 +623,10 @@ pub(super) async fn poll(
                 tx.send_replace(true);
             });
         }
-        let p = &mem.polls[&key];
-        (p.finished.clone(), p.result.clone())
+        let p = &mem.polls[&run_id];
+        Some((p.finished.clone(), p.result.clone()))
+    }) else {
+        return Offered::default();
     };
     if !*finished.borrow() {
         if !wait {
@@ -627,16 +635,20 @@ pub(super) async fn poll(
         // Only the list runs in the worker.
         let _ = tokio::time::timeout(Duration::from_secs(6), finished.changed()).await;
     }
-    {
-        let mut mem = ledger.lock();
-        if !mem
+    let collected = ledger.with(&owner.key, |mem| {
+        if mem
             .polls
-            .get(&key)
+            .get(&run_id)
             .is_some_and(|p| Arc::ptr_eq(&p.result, &result) && *p.finished.borrow())
         {
-            return Offered::default();
+            mem.polls.remove(&run_id);
+            true
+        } else {
+            false
         }
-        mem.polls.remove(&key);
+    });
+    if !collected {
+        return Offered::default();
     }
     let Some(batch) = result.get().and_then(Option::as_ref) else {
         return Offered::default();
@@ -644,7 +656,7 @@ pub(super) async fn poll(
     if !owner.reported(run_id) && !owner.bind(run_id, None, 0, None) {
         return Offered::default();
     }
-    ledger.lock().reports.remove(&key);
+    ledger.with(&owner.key, |mem| mem.reports.remove(&run_id));
     claim_offers(client, ledger, owner, run_id, agent, batch).await;
     ledger.take_frames(&owner.key, run_id)
 }
@@ -652,11 +664,12 @@ pub(super) async fn poll(
 #[cfg(test)]
 pub(super) async fn wait_for_poll(ledger: &Ledger, run: Uuid) -> bool {
     let Some(mut done) = ledger
+        .owners
         .lock()
-        .polls
-        .iter()
-        .find(|((_, id), _)| *id == run)
-        .map(|(_, p)| p.finished.clone())
+        .unwrap()
+        .by_key
+        .values()
+        .find_map(|mem| mem.polls.get(&run).map(|p| p.finished.clone()))
     else {
         return false;
     };
@@ -682,16 +695,11 @@ async fn read(
     };
     match client.read_deliveries(&reader).await {
         Ok(deliveries) => {
-            let mut memory = ledger.lock();
-            memory
-                .last_read
-                .retain(|_, at| at.elapsed() < NOT_THERE_FOR);
-            memory.last_read.insert(owner.key.clone(), Instant::now());
+            ledger.with(&owner.key, |mem| mem.last_read = Some(Instant::now()));
             Some(deliveries)
         }
         Err(error) => {
             if is_not_there(&error) || is_not_ready(&error) {
-                ledger.lock().last_read.remove(&owner.key);
                 ledger.note_not_there(&owner.key);
             } else if let Error::RateLimited { retry_after, .. } = &error {
                 ledger.cool_down(&owner.key, Duration::from_secs(retry_after.unwrap_or(60)));
@@ -745,16 +753,24 @@ async fn claim_offers(
         if Instant::now() >= deadline {
             break;
         }
-        let key = Ledger::key(session, delivery.id);
         let (finished, done) = tokio::sync::watch::channel(());
-        ledger.lock().in_flight.insert(
-            key.clone(),
-            InFlight {
-                attempt,
-                run: run_id,
-                done,
-            },
-        );
+        let registered = ledger.with(session, |mem| {
+            if mem.in_flight.len() >= MAX_REMEMBERED || mem.in_flight.contains_key(&delivery.id) {
+                return false;
+            }
+            mem.in_flight.insert(
+                delivery.id,
+                InFlight {
+                    attempt,
+                    run: run_id,
+                    done,
+                },
+            );
+            true
+        });
+        if !registered {
+            continue;
+        }
         let (client, ledger, owner, id) =
             (client.clone(), ledger.clone(), owner.clone(), delivery.id);
         // Only start a claim selected by this call. Once sent, its receipt
@@ -796,16 +812,15 @@ async fn claim_offers(
                 }
                 _ => {}
             }
-            {
-                let mut mem = ledger.lock();
+            ledger.with(&owner.key, |mem| {
                 if mem
                     .in_flight
-                    .get(&key)
+                    .get(&id)
                     .is_some_and(|flight| flight.attempt == attempt)
                 {
-                    mem.in_flight.remove(&key);
+                    mem.in_flight.remove(&id);
                 }
-            }
+            });
             drop(reservation);
             drop(finished);
             limited
@@ -1178,14 +1193,16 @@ mod tests {
             crate::domains::parity_eval_tests::client_and_session(&api.base_url, workspace, None);
         let ledger = Arc::new(Ledger::default());
         let (producer, finished) = tokio::sync::watch::channel(false);
-        ledger.lock().polls.insert(
-            (owner.key.clone(), run),
-            Poll {
-                started: Instant::now(),
-                finished,
-                result: Arc::default(),
-            },
-        );
+        ledger.with(&owner.key, |mem| {
+            mem.polls.insert(
+                run,
+                Poll {
+                    started: Instant::now(),
+                    finished,
+                    result: Arc::default(),
+                },
+            )
+        });
         drop(producer); // the worker unwound before publishing its result
         poll(&client, &ledger, &owner, run, &json!({}), true).await;
         assert!(ledger.recently_read(&owner));
@@ -1387,7 +1404,7 @@ mod tests {
                 None,
             );
         }
-        assert_eq!(ledger.lock().shown.len(), MAX_REMEMBERED);
+        assert_eq!(ledger.with("a", |mem| mem.shown.len()), MAX_REMEMBERED);
         // The oldest made way.
         assert!(ledger.is_new("a", &first));
     }
@@ -1404,12 +1421,9 @@ mod tests {
         assert!(ledger.claimed_as("session", first).is_none());
         let expired = Uuid::new_v4();
         ledger.keep("session", expired, run, 0, ClaimToken::new("expired"));
-        ledger
-            .lock()
-            .shown
-            .get_mut(&Ledger::key("session", expired))
-            .unwrap()
-            .held_at -= Duration::from_secs(3600);
+        ledger.with("session", |mem| {
+            mem.shown.get_mut(&expired).unwrap().held_at -= Duration::from_secs(3600)
+        });
         assert!(ledger.claimed_as("session", expired).is_none());
     }
 
@@ -1422,10 +1436,9 @@ mod tests {
         assert!(ledger.is_not_there(here));
         assert!(!ledger.is_not_there(there));
         // The word stands for a while, not for ever.
-        ledger
-            .lock()
-            .not_there
-            .insert(here.to_owned(), Instant::now() - Duration::from_secs(1));
+        ledger.with(here, |mem| {
+            mem.not_there = Some(Instant::now() - Duration::from_secs(1))
+        });
         assert!(!ledger.is_not_there(here));
     }
 
@@ -1466,14 +1479,16 @@ mod tests {
             let other = Uuid::new_v4();
             ledger.note_report(&busy, other);
             ledger.keep(&busy.key, other, other, 0, None);
-            ledger.lock().polls.insert(
-                (busy.key.clone(), other),
-                Poll {
-                    started: Instant::now(),
-                    finished: finished.clone(),
-                    result: Arc::default(),
-                },
-            );
+            ledger.with(&busy.key, |mem| {
+                mem.polls.insert(
+                    other,
+                    Poll {
+                        started: Instant::now(),
+                        finished: finished.clone(),
+                        result: Arc::default(),
+                    },
+                )
+            });
         }
         assert!(ledger.saw_report(&owner, run));
         assert_eq!(

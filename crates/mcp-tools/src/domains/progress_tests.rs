@@ -109,6 +109,23 @@ fn progress_requests(api: &Api) -> Vec<Seen> {
         .collect()
 }
 
+// Prove the request checker cannot silently discard an unexpected mutation.
+#[tokio::test]
+#[should_panic(expected = "unexpected delivery write")]
+async fn review10_progress_request_checks_reject_delivery_writes() {
+    let api = Api::start(vec![]).await;
+    reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/decision-requests/deliveries/{}/claim",
+            api.base_url,
+            Uuid::new_v4()
+        ))
+        .send()
+        .await
+        .unwrap();
+    progress_requests(&api);
+}
+
 fn input(arguments: Value) -> ProgressInput {
     serde_json::from_value(arguments).expect("progress arguments")
 }

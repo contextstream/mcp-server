@@ -1662,35 +1662,89 @@ fn held_as_run(run: Uuid) -> Value {
 /// The token a claim made again is given: another one.
 const SECOND_TOKEN: &str = "70ce70ce70ce70ce70ce70ce70ce70ce70ce70ce70ce70ce70ce70ce70ce70ce";
 
+// Each phase runs in a separate OS process. Only the mock API and the
+// selected on-disk state directory survive the claiming process's exit.
 #[tokio::test]
-async fn a_reply_whose_token_was_lost_claims_again_as_its_own_run_and_then_confirms() {
-    let fixture = Fixture::new();
-    let delivery = fixture.answer(json!([]));
+async fn review10_only_the_restarted_owner_can_reclaim_and_confirm() {
+    const CASE: &str = "MCP_TEST_RESTART_PHASE";
+    if let Ok(phase) = std::env::var(CASE) {
+        let (url, workspace, project, delivery): (String, Uuid, Uuid, Uuid) =
+            serde_json::from_str(&std::env::var("MCP_TEST_RESTART_FIXTURE").unwrap()).unwrap();
+        let (client, session) = client_and_session(&url, workspace, Some(project));
+        let tool = ProgressTool::new(client, session).with_heartbeat(Heartbeat::None);
+        if phase == "claim" {
+            let shown = tool
+                .report_then_collect(json!({"step":"working"}))
+                .await
+                .unwrap();
+            assert!(text_of(&shown).contains("[PERSON ANSWER]"));
+        } else {
+            let result = tool
+                .execute(json!({"action":"reply","delivery_id":delivery,"note":"done"}))
+                .await
+                .unwrap();
+            let fields = result.structured_content.unwrap();
+            assert_eq!(fields["replied"], phase == "recover", "{fields}");
+            if phase != "recover" {
+                assert_eq!(fields["reason"], "no_owned_claim");
+            }
+        }
+        return;
+    }
+
+    let f = Fixture::new();
+    let delivery = f.answer(json!([]));
     let api = Api::start_in_turn(vec![
-        fixture.recorded("working"),
+        f.recorded("working"),
         offered(vec![delivery.clone()]),
         (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
         (CLAIM, 200, held_with("claimed", &delivery, SECOND_TOKEN)),
         (APPLIED, 200, answers_with("applied", &delivery)),
     ])
     .await;
-    let first = fixture.tool(&api);
-    first
-        .report_then_collect(json!({"step":"working"}))
-        .await
-        .unwrap();
-    drop(first);
-    let restored = fixture.tool(&api);
-    let result = restored
-        .execute(json!({"action":"reply","delivery_id":fixture.delivery,"note":"done"}))
-        .await
-        .unwrap();
-    assert_eq!(result.structured_content.unwrap()["replied"], true);
-    let writes = sent(&api, "POST", "/decision-requests/");
-    assert_eq!(writes.len(), 3);
-    assert!(writes[1].target.ends_with("/claim"));
-    assert_eq!(writes[1].body["run_id"], json!(fixture.run));
-    assert_eq!(writes[2].body["claim_token"], SECOND_TOKEN);
+    let home = tempfile::tempdir().unwrap();
+    let fixture =
+        serde_json::to_string(&(&api.base_url, f.workspace, f.project, f.delivery)).unwrap();
+    let test_name = std::thread::current().name().unwrap().to_owned();
+    for (phase, session, dir) in [
+        ("claim", "session-a", "owned"),
+        ("wrong-session", "session-b", "owned"),
+        ("empty-state", "session-a", "empty"),
+        ("recover", "session-a", "owned"),
+    ] {
+        let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name])
+            .env_clear()
+            .env("HOME", home.path())
+            .env(CASE, phase)
+            .env("MCP_TEST_RESTART_FIXTURE", &fixture)
+            .env("CODEX_THREAD_ID", session)
+            .env("CONTEXTSTREAM_DELIVERY_STATE_DIR", home.path().join(dir))
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{phase}: {}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let writes = sent(&api, "POST", "/decision-requests/");
+        if phase == "recover" {
+            assert_eq!(writes.len(), 3);
+            assert!(writes[1].target.ends_with("/claim"));
+            assert_eq!(writes[1].body["run_id"], json!(f.run));
+            assert!(writes[2].target.ends_with("/applied"));
+            assert_eq!(writes[2].body["claim_token"], SECOND_TOKEN);
+        } else {
+            assert_eq!(
+                writes.len(),
+                1,
+                "{phase} must leave only the original claim"
+            );
+            assert!(writes[0].target.ends_with("/claim"));
+        }
+    }
 }
 
 #[tokio::test]

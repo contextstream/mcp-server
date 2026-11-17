@@ -8,9 +8,25 @@ use std::{
 };
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub(super) struct OwnerKey {
+    pub namespace: String, // API and credential digest; shared quota across sessions and workspaces
+    pub digest: String,    // unchanged on-disk owner identity
+}
+
+#[cfg(test)]
+impl From<&str> for OwnerKey {
+    fn from(s: &str) -> Self {
+        Self {
+            namespace: "test".into(),
+            digest: s.into(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Owner {
-    pub key: String,
+    pub key: OwnerKey,
     pub workspace: Uuid,
     pub store: PathBuf,
 }
@@ -160,10 +176,10 @@ impl Owner {
         self.book(|entries| {
             entries.retain(|e| {
                 !(e.delivery == delivery
-                    && (delivery.is_some() || (e.run == run && e.owner == self.key)))
+                    && (delivery.is_some() || (e.run == run && e.owner == self.key.digest)))
             });
             entries.push(Binding {
-                owner: self.key.clone(),
+                owner: self.key.digest.clone(),
                 run,
                 delivery,
                 generation,
@@ -179,7 +195,7 @@ impl Owner {
         self.entries().is_ok_and(|entries| {
             entries
                 .iter()
-                .any(|e| e.run == run && e.delivery.is_none() && e.owner == self.key)
+                .any(|e| e.run == run && e.delivery.is_none() && e.owner == self.key.digest)
         })
     }
 
@@ -198,7 +214,7 @@ impl Owner {
             .ok()?
             .into_iter()
             .rev()
-            .find(|e| e.delivery == Some(id) && e.owner == self.key)
+            .find(|e| e.delivery == Some(id) && e.owner == self.key.digest)
             .and_then(|e| Some((e.run, e.generation, e.attempt?)))
     }
 }

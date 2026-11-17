@@ -778,9 +778,12 @@ impl ProgressTool {
             }
         })?;
         Some(super::delivery_bindings::Owner {
-            key,
-            workspace,
             store: root.join(format!("{ns}-{workspace}")),
+            key: super::delivery_bindings::OwnerKey {
+                namespace: ns,
+                digest: key,
+            },
+            workspace,
         })
     }
 

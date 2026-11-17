@@ -50,7 +50,7 @@
 //!   costs the call nothing; after a 404 or that 503 the API is not asked
 //!   again for a while.
 
-use super::delivery_bindings::Owner;
+use super::delivery_bindings::{Owner, OwnerKey};
 use mcp_client::deliveries::{
     error_tag, is_malformed, is_no_way_back, is_not_ready, is_not_there, refusal_code, Answer,
     ClaimToken, Delivery, DeliveryActor, DeliveryReader, Refused, DECLINE_REASONS, KIND_ANSWER,
@@ -89,6 +89,9 @@ const MAX_SHOWN_AT_ONCE: usize = 5;
 
 /// Maximum entries of each kind retained per delivery owner.
 const MAX_REMEMBERED: usize = 512;
+const MAX_OWNERS: usize = 256;
+const OWNERS_PER_CREDENTIAL: usize = 32;
+const REPORT_TTL: Duration = Duration::from_secs(2 * 3600);
 
 /// A cached offer and a batch of claim starts share this short validity window.
 const OFFER_FRESH_FOR: Duration = Duration::from_secs(5);
@@ -335,6 +338,7 @@ struct InFlight {
 
 #[derive(Debug, Default)]
 struct Memory {
+    last_used: Option<Instant>,
     shown: HashMap<Uuid, Shown>,
     in_flight: HashMap<Uuid, InFlight>,
     next: u64,
@@ -349,10 +353,8 @@ impl Memory {
         self.shown.retain(|_, s| {
             s.held_at.elapsed().as_secs() < super::delivery_bindings::CLAIM_SECONDS as u64
         });
-        self.reports
-            .retain(|_, at| at.elapsed() < Duration::from_secs(7 * 86400));
-        self.polls
-            .retain(|_, p| p.started.elapsed() < NOT_THERE_FOR);
+        self.reports.retain(|_, at| at.elapsed() < REPORT_TTL);
+        self.polls.retain(|_, p| p.started.elapsed() < REPORT_TTL);
         self.in_flight.retain(|_, f| f.done.has_changed().is_ok());
         self.last_read = self.last_read.filter(|at| at.elapsed() < NOT_THERE_FOR);
         self.not_there = self.not_there.filter(|until| *until > Instant::now());
@@ -369,7 +371,7 @@ impl Memory {
 
 #[derive(Debug, Default)]
 struct Owners {
-    by_key: HashMap<String, Memory>,
+    by_key: HashMap<OwnerKey, Memory>,
     last_sweep: Option<Instant>,
 }
 
@@ -386,7 +388,7 @@ impl Ledger {
         self.owners.lock().unwrap().by_key.len()
     }
 
-    fn with<T>(&self, owner: &str, f: impl FnOnce(&mut Memory) -> T) -> T {
+    fn directory(&self) -> std::sync::MutexGuard<'_, Owners> {
         let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
         if owners
             .last_sweep
@@ -398,7 +400,39 @@ impl Ledger {
             });
             owners.last_sweep = Some(Instant::now());
         }
-        let mem = owners.by_key.entry(owner.to_owned()).or_default();
+        owners
+    }
+
+    fn lookup<T: Default>(&self, owner: &OwnerKey, f: impl FnOnce(&mut Memory) -> T) -> T {
+        let mut owners = self.directory();
+        let Some(mem) = owners.by_key.get_mut(owner) else {
+            return T::default();
+        };
+        mem.prune();
+        mem.last_used = Some(Instant::now());
+        f(mem)
+    }
+
+    fn with<T>(&self, owner: &OwnerKey, f: impl FnOnce(&mut Memory) -> T) -> T {
+        let mut owners = self.directory();
+        if !owners.by_key.contains_key(owner) {
+            let same_key = owners
+                .by_key
+                .iter()
+                .filter(|(k, _)| k.namespace == owner.namespace);
+            let victim = if same_key.clone().count() >= OWNERS_PER_CREDENTIAL {
+                same_key.min_by_key(|(_, mem)| mem.last_used)
+            } else if owners.by_key.len() >= MAX_OWNERS {
+                owners.by_key.iter().min_by_key(|(_, mem)| mem.last_used)
+            } else {
+                None
+            };
+            if let Some(key) = victim.map(|(k, _)| k.clone()) {
+                owners.by_key.remove(&key);
+            }
+        }
+        let mem = owners.by_key.entry(owner.clone()).or_default();
+        mem.last_used = Some(Instant::now());
         mem.prune();
         f(mem)
     }
@@ -423,24 +457,24 @@ impl Ledger {
     }
 
     pub(super) fn saw_report(&self, owner: &Owner, run: Uuid) -> bool {
-        self.with(&owner.key, |mem| mem.reports.contains_key(&run))
+        self.lookup(&owner.key, |mem| mem.reports.contains_key(&run))
     }
 
     pub(super) fn recently_read(&self, owner: &Owner) -> bool {
-        self.with(&owner.key, |mem| mem.last_read.is_some())
+        self.lookup(&owner.key, |mem| mem.last_read.is_some())
     }
 
-    fn is_new(&self, session: &str, delivery: &Delivery) -> bool {
-        self.with(session, |mem| {
+    fn is_new(&self, session: &OwnerKey, delivery: &Delivery) -> bool {
+        !self.lookup(session, |mem| {
             mem.shown
                 .get(&delivery.id)
-                .is_none_or(|shown| delivery.previous_claims > shown.previous_claims)
+                .is_some_and(|shown| delivery.previous_claims <= shown.previous_claims)
         })
     }
 
     fn remember(
         &self,
-        session: &str,
+        session: &OwnerKey,
         delivery: &Delivery,
         _workspace_id: Uuid,
         run_id: Uuid,
@@ -453,7 +487,7 @@ impl Ledger {
 
     fn keep(
         &self,
-        session: &str,
+        session: &OwnerKey,
         id: Uuid,
         run_id: Uuid,
         generation: usize,
@@ -462,7 +496,7 @@ impl Ledger {
         self.store(session, id, Shown::new(run_id, generation, token));
     }
 
-    fn store(&self, session: &str, id: Uuid, mut entry: Shown) {
+    fn store(&self, session: &OwnerKey, id: Uuid, mut entry: Shown) {
         self.with(session, |mem| {
             mem.next += 1;
             entry.order = mem.next;
@@ -481,8 +515,8 @@ impl Ledger {
     }
 
     // No await after this take: a cancelled batch leaves all its frames here.
-    fn take_frames(&self, owner: &str, run: Uuid, tool: &str) -> Offered {
-        self.with(owner, |mem| {
+    fn take_frames(&self, owner: &OwnerKey, run: Uuid, tool: &str) -> Offered {
+        self.lookup(owner, |mem| {
             let mut ready: Vec<_> = mem
                 .shown
                 .iter_mut()
@@ -502,8 +536,8 @@ impl Ledger {
         })
     }
 
-    async fn finish_claims(&self, owner: &str, run: Uuid) {
-        let already_sent: Vec<_> = self.with(owner, |mem| {
+    async fn finish_claims(&self, owner: &OwnerKey, run: Uuid) {
+        let already_sent: Vec<_> = self.lookup(owner, |mem| {
             mem.in_flight
                 .values()
                 .filter(|flight| flight.run == run)
@@ -515,24 +549,24 @@ impl Ledger {
         }
     }
 
-    fn claimed_as(&self, session: &str, id: Uuid) -> Option<(Uuid, Option<ClaimToken>)> {
-        self.with(session, |mem| {
+    fn claimed_as(&self, session: &OwnerKey, id: Uuid) -> Option<(Uuid, Option<ClaimToken>)> {
+        self.lookup(session, |mem| {
             mem.shown.get(&id).map(|s| (s.run_id, s.token.clone()))
         })
     }
 
-    fn is_not_there(&self, owner: &str) -> bool {
-        self.with(owner, |mem| mem.not_there.is_some())
+    fn is_not_there(&self, owner: &OwnerKey) -> bool {
+        self.lookup(owner, |mem| mem.not_there.is_some())
     }
 
-    fn note_not_there(&self, owner: &str) {
+    fn note_not_there(&self, owner: &OwnerKey) {
         self.with(owner, |mem| {
             mem.last_read = None;
             mem.not_there = Some(Instant::now() + NOT_THERE_FOR);
         });
     }
 
-    fn cool_down(&self, owner: &str, duration: Duration) {
+    fn cool_down(&self, owner: &OwnerKey, duration: Duration) {
         self.with(owner, |mem| {
             mem.not_there =
                 Some(Instant::now() + duration.min(Duration::from_secs(u32::MAX.into())))
@@ -704,7 +738,7 @@ pub(super) async fn poll(
             };
         }
     }
-    let collected = ledger.with(&owner.key, |mem| {
+    let collected = ledger.lookup(&owner.key, |mem| {
         if mem
             .polls
             .get(&run_id)
@@ -919,7 +953,7 @@ async fn claim_offers(
                 }
                 _ => {}
             }
-            ledger.with(&owner.key, |mem| {
+            ledger.lookup(&owner.key, |mem| {
                 if mem
                     .in_flight
                     .get(&id)
@@ -1482,20 +1516,20 @@ mod tests {
         let (id, run) = (Uuid::new_v4(), Uuid::new_v4());
         let fresh = delivery(json!({"id": id, "previous_claims": []}));
         let lapsed = delivery(json!({"id": id, "previous_claims": [{"ended": "lapsed"}]}));
-        assert!(ledger.is_new("a", &fresh));
-        assert_eq!(ledger.claimed_as("a", id), None);
+        assert!(ledger.is_new(&"a".into(), &fresh));
+        assert_eq!(ledger.claimed_as(&"a".into(), id), None);
         let token = ClaimToken::new("5e1f").unwrap();
-        ledger.remember("a", &fresh, Uuid::nil(), run, Some(token.clone()));
-        assert!(!ledger.is_new("a", &fresh));
-        assert_eq!(ledger.claimed_as("a", id), Some((run, Some(token))));
+        ledger.remember(&"a".into(), &fresh, Uuid::nil(), run, Some(token.clone()));
+        assert!(!ledger.is_new(&"a".into(), &fresh));
+        assert_eq!(ledger.claimed_as(&"a".into(), id), Some((run, Some(token))));
         // Another session of the same process has not seen it.
-        assert!(ledger.is_new("b", &fresh));
-        assert_eq!(ledger.claimed_as("b", id), None);
+        assert!(ledger.is_new(&"b".into(), &fresh));
+        assert_eq!(ledger.claimed_as(&"b".into(), id), None);
         // Offered again after the lease ran out: once more, and then not.
-        assert!(ledger.is_new("a", &lapsed));
-        ledger.remember("a", &lapsed, Uuid::nil(), run, None);
-        assert!(!ledger.is_new("a", &lapsed));
-        assert!(!ledger.is_new("a", &fresh));
+        assert!(ledger.is_new(&"a".into(), &lapsed));
+        ledger.remember(&"a".into(), &lapsed, Uuid::nil(), run, None);
+        assert!(!ledger.is_new(&"a".into(), &lapsed));
+        assert!(!ledger.is_new(&"a".into(), &fresh));
     }
 
     #[test]
@@ -1519,19 +1553,22 @@ mod tests {
         let ledger = Ledger::default();
         let run = Uuid::new_v4();
         let first = delivery(json!({"id": Uuid::new_v4()}));
-        ledger.remember("a", &first, Uuid::nil(), run, None);
+        ledger.remember(&"a".into(), &first, Uuid::nil(), run, None);
         for _ in 0..MAX_REMEMBERED {
             ledger.remember(
-                "a",
+                &"a".into(),
                 &delivery(json!({"id": Uuid::new_v4()})),
                 Uuid::nil(),
                 run,
                 None,
             );
         }
-        assert_eq!(ledger.with("a", |mem| mem.shown.len()), MAX_REMEMBERED);
+        assert_eq!(
+            ledger.with(&"a".into(), |mem| mem.shown.len()),
+            MAX_REMEMBERED
+        );
         // The oldest made way.
-        assert!(ledger.is_new("a", &first));
+        assert!(ledger.is_new(&"a".into(), &first));
     }
 
     #[test]
@@ -1539,23 +1576,35 @@ mod tests {
         let ledger = Ledger::default();
         let run = Uuid::new_v4();
         let first = Uuid::new_v4();
-        ledger.keep("session", first, run, 0, ClaimToken::new("first"));
+        ledger.keep(&"session".into(), first, run, 0, ClaimToken::new("first"));
         for _ in 0..MAX_REMEMBERED {
-            ledger.keep("session", Uuid::new_v4(), run, 0, ClaimToken::new("later"));
+            ledger.keep(
+                &"session".into(),
+                Uuid::new_v4(),
+                run,
+                0,
+                ClaimToken::new("later"),
+            );
         }
-        assert!(ledger.claimed_as("session", first).is_none());
+        assert!(ledger.claimed_as(&"session".into(), first).is_none());
         let expired = Uuid::new_v4();
-        ledger.keep("session", expired, run, 0, ClaimToken::new("expired"));
-        ledger.with("session", |mem| {
+        ledger.keep(
+            &"session".into(),
+            expired,
+            run,
+            0,
+            ClaimToken::new("expired"),
+        );
+        ledger.with(&"session".into(), |mem| {
             mem.shown.get_mut(&expired).unwrap().held_at -= Duration::from_secs(3600)
         });
-        assert!(ledger.claimed_as("session", expired).is_none());
+        assert!(ledger.claimed_as(&"session".into(), expired).is_none());
     }
 
     #[test]
     fn an_api_without_the_routes_is_remembered_for_its_workspace_only() {
         let ledger = Ledger::default();
-        let (here, there) = ("owner A", "owner B");
+        let (here, there) = (&"owner A".into(), &"owner B".into());
         assert!(!ledger.is_not_there(here));
         ledger.note_not_there(here);
         assert!(ledger.is_not_there(here));

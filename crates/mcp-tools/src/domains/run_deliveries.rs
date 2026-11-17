@@ -1189,6 +1189,24 @@ mod tests {
     }
 
     #[test]
+    fn review7_recovered_tokens_make_room_for_newer_claims() {
+        let ledger = Ledger::default();
+        let run = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        ledger.hold("session", first, Uuid::nil(), run, ClaimToken::new("first"));
+        for _ in 0..MAX_REMEMBERED {
+            ledger.hold(
+                "session",
+                Uuid::new_v4(),
+                Uuid::nil(),
+                run,
+                ClaimToken::new("later"),
+            );
+        }
+        assert!(ledger.claimed_as("session", first).is_none());
+    }
+
+    #[test]
     fn an_api_without_the_routes_is_remembered_for_its_workspace_only() {
         let ledger = Ledger::default();
         let (here, there) = (Uuid::new_v4(), Uuid::new_v4());

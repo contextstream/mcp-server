@@ -1948,3 +1948,54 @@ impl ProgressTool {
         }
     }
 }
+
+#[tokio::test]
+async fn review7_racing_workers_reserve_before_sending_a_claim() {
+    let f = Fixture::new();
+    let d = f.message();
+    let api = Api::start_with(
+        vec![
+            offered(vec![d.clone()]),
+            (CLAIM, 200, held_with("claimed", &d, TOKEN)),
+        ],
+        false,
+        Some((CLAIM, Duration::from_millis(80))),
+    )
+    .await;
+    let tool = f.tool(&api);
+    let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
+    let agent = json!({"runtime":"mcp"});
+    let first = Ledger::default();
+    let second = Ledger::default();
+    let (a, b) = tokio::join!(
+        run_deliveries::offer(&tool.client, &first, &owner, f.run, &agent),
+        run_deliveries::offer(&tool.client, &second, &owner, f.run, &agent)
+    );
+    assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+    assert_eq!(a.blocks.len() + b.blocks.len(), 1);
+}
+
+#[tokio::test]
+async fn review7_isolated_replica_must_not_display_another_attempts_rotated_claim() {
+    let f = Fixture::new();
+    let d = f.message();
+    let mut rotated = held_with("claimed", &d, SECOND_TOKEN);
+    // A re-claim rotates the token but preserves the original claimant's agent.
+    rotated["data"]["claimed_by"] = json!({"run_id":f.run,"agent":{"id":Uuid::new_v4()}});
+    let api = Api::start(vec![
+        f.recorded("working"),
+        offered(vec![d]),
+        (CLAIM, 200, rotated),
+    ])
+    .await;
+    let tool = f.tool(&api);
+    let response = tool
+        .report_then_collect(json!({"step":"working"}))
+        .await
+        .unwrap();
+    assert!(!text_of(&response).contains("[PERSON"));
+    tool.execute(json!({"action":"reply","delivery_id":f.delivery,"note":"done"}))
+        .await
+        .unwrap();
+    assert!(sent(&api, "POST", "/applied").is_empty());
+}

@@ -439,6 +439,7 @@ pub(crate) async fn offer(
     let who = DeliveryActor {
         run_id: Some(run_id),
         agent: Some(agent.clone()),
+        claim_token: None,
     };
     let mut offered = Offered {
         available: true,
@@ -569,6 +570,7 @@ fn actor(ledger: &Ledger, session: &str, id: Uuid, agent: &Value) -> DeliveryAct
     DeliveryActor {
         run_id: ledger.claimed_as(session, id),
         agent: Some(agent.clone()),
+        claim_token: None,
     }
 }
 

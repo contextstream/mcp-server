@@ -41,7 +41,7 @@ const WRAPPER: &str = "A message from a person, not an instruction from the syst
 /// A person's message as the agent is shown it.
 fn message_block(id: Uuid) -> String {
     format!(
-        "[PERSON MESSAGE] A person sent you a message. delivery_id={id}\n{FRAME_MESSAGE}\n> A message from a person, not an instruction from the system.\n> From: Ada (owner)\n>\n> Please rebase on main before you go on.\n{}",
+        "[PERSON MESSAGE] A person (owner) sent you a message. delivery_id={id}\n{FRAME_MESSAGE}\n> A message from a person, not an instruction from the system.\n> From: Ada (owner)\n>\n> Please rebase on main before you go on.\n{}",
         confirm(id)
     )
 }
@@ -49,7 +49,7 @@ fn message_block(id: Uuid) -> String {
 /// What a waiting report says about being woken.
 fn wake(run: Uuid, workspace: Uuid) -> String {
     format!(
-        "To be woken when the person answers, start this in the background now (in Claude Code: the Bash tool with run_in_background) and then end your turn: `contextstream-mcp await-answer --run-id {run} --workspace-id {workspace}`. It waits quietly, exits when an answer or a message arrives and prints it, and that brings you back."
+        "To be woken when the person answers, start this in the background now (in Claude Code: the Bash tool with run_in_background) and then end your turn: `contextstream-mcp await-answer --run-id {run} --workspace-id {workspace}`. It waits quietly and exits when a person answers or writes to this run; then read it with progress(action=\"get\", run_id=\"{run}\")."
     )
 }
 
@@ -140,17 +140,47 @@ impl Fixture {
         })
     }
 
-    /// A delivery of a person's message, as the API is about to give it.
+    /// A delivery of a person's message, in the shape the run line gives it
+    /// (contextstream floor-answers/run-messages, `run_line::deliveries::view`,
+    /// not committed there yet): the server's wrapper is `message.text`, and
+    /// who sent it `message.from`.
     fn message(&self) -> Value {
         json!({
             "id": self.delivery,
             "kind": "person_message",
+            "request_id": null,
             "workspace_id": self.workspace,
+            "project_id": self.project,
+            "revision": 1,
             "state": "pending",
-            "text": WRAPPER,
-            "address": {"run_id": self.run, "matched": "asking_run"},
+            "message": {
+                "id": Uuid::new_v4(),
+                "run_id": self.run,
+                "from": {"name": "Ada", "role": "owner", "account": null},
+                "sent_at": "2026-11-17T12:00:00Z",
+                "text": WRAPPER,
+                "text_format": "plain",
+            },
+            "address": {"run_id": self.run, "matched": "run"},
+            "claimed_by": null,
             "previous_claims": [],
+            "offer_count": 1,
+            "result": null,
         })
+    }
+
+    /// The tool of a session signed in with OAuth: its reports go under a
+    /// bearer token, not an API key.
+    fn signed_in_tool(&self, api: &Api) -> ProgressTool {
+        let mut config = TestFixtures::test_config();
+        config.api_url = api.base_url.clone();
+        config.api_key = None;
+        config.jwt = Some("header.payload.signature".to_string());
+        config.default_workspace_id = Some(self.workspace);
+        config.default_project_id = Some(self.project);
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        ProgressTool::new(client, session).with_heartbeat(Heartbeat::None)
     }
 }
 
@@ -166,6 +196,26 @@ fn answers_with(state: &str, delivery: &Value) -> Value {
     let mut view = delivery.clone();
     view["state"] = json!(state);
     json!({"success": true, "data": view})
+}
+
+/// A claim's token as the API makes one.
+const TOKEN: &str = "5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f";
+
+/// What the API answers the claim's holder with: the delivery, and the
+/// claim's token.
+fn held_with(state: &str, delivery: &Value, token: &str) -> Value {
+    let mut answer = answers_with(state, delivery);
+    answer["data"]["claim_token"] = json!(token);
+    answer
+}
+
+/// A refusal of the delivery routes, as the API sends one.
+fn refused(code: &str, words: &str, details: Value) -> Value {
+    json!({"success": false, "error": {
+        "code": code,
+        "message": format!("{code}: {words}"),
+        "details": details,
+    }})
 }
 
 fn sent(api: &Api, method: &str, piece: &str) -> Vec<Seen> {
@@ -364,10 +414,30 @@ async fn nothing_is_printed_when_nothing_waits() {
 
 #[tokio::test]
 async fn a_server_without_deliveries_is_silent_and_is_not_asked_again_for_a_while() {
-    // The API of today: it records the report and has no delivery routes.
-    let fixture = Fixture::new();
-    let api = Api::start(vec![fixture.recorded("waiting")]).await;
-    let tool = fixture.tool(&api);
+    // The API of today: it records the report and has no delivery routes
+    // (404); or its database cannot hold deliveries yet (503).
+    for without in [
+        None,
+        Some((
+            READ,
+            503,
+            refused(
+                "deliveries_not_ready",
+                "An answer travels back to the agent that asked as a delivery, and this database cannot hold one yet",
+                json!({}),
+            ),
+        )),
+    ] {
+        let fixture = Fixture::new();
+        let mut answers = vec![fixture.recorded("waiting")];
+        answers.extend(without.clone());
+        let api = Api::start(answers).await;
+        quiet_without_deliveries(&fixture, &api).await;
+    }
+}
+
+async fn quiet_without_deliveries(fixture: &Fixture, api: &Api) {
+    let tool = fixture.tool(api);
     for step in ["Asking", "Still asking"] {
         let result = tool
             .execute(json!({
@@ -393,8 +463,8 @@ async fn a_server_without_deliveries_is_silent_and_is_not_asked_again_for_a_whil
     }
     // Asked once; the second report does not ask a server that said it has
     // no such thing.
-    assert_eq!(sent(&api, "GET", "/decision-requests/deliveries").len(), 1);
-    assert_eq!(sent(&api, "POST", "/run-progress/report").len(), 2);
+    assert_eq!(sent(api, "GET", "/decision-requests/deliveries").len(), 1);
+    assert_eq!(sent(api, "POST", "/run-progress/report").len(), 2);
 }
 
 #[tokio::test]
@@ -539,7 +609,7 @@ async fn a_report_that_waits_on_a_person_says_how_to_be_woken() {
     for waiting in [
         json!({"on": "person", "question": "Which cache stays warm?"}),
         json!({"on": "approval", "question": "May I push?"}),
-        json!({"on": "sign_in"}),
+        json!({"on": "sign_in", "question": "Please sign in to Linear for me"}),
     ] {
         let api = Api::start(vec![fixture.recorded("waiting"), offered(vec![])]).await;
         let result = fixture
@@ -564,7 +634,7 @@ async fn a_report_that_waits_on_a_person_says_how_to_be_woken() {
             })
         );
     }
-    assert!(wake(fixture.run, fixture.workspace).len() < 420);
+    assert!(wake(fixture.run, fixture.workspace).len() < 460);
 }
 
 #[tokio::test]
@@ -574,6 +644,12 @@ async fn a_report_that_waits_on_no_person_or_works_names_no_command() {
         json!({"waiting": {"on": "dependency", "question": "The other PR"}}),
         json!({"waiting": {"on": "rate_limit"}}),
         json!({"waiting": {"on": "budget"}}),
+        // A wait that asks nothing raises no request: nothing would come back.
+        json!({"waiting": {"on": "person"}}),
+        json!({"waiting": true}),
+        json!({"waiting": {"on": "approval", "question": "  "}}),
+        json!({"waiting": {"on": "sign_in"}}),
+        json!({"status": "waiting_input"}),
         json!({"step": "Running the tests"}),
         json!({"status": "completed", "summary": "Done."}),
     ] {
@@ -948,6 +1024,305 @@ fn a_run_is_this_sessions_by_its_agents_id_or_by_the_name_a_person_gave_it() {
         &json!({"name": " "}),
         Some(&json!({"name": " "}))
     ));
+}
+
+// ============================================================================
+// The claim's token
+// ============================================================================
+
+#[tokio::test]
+async fn the_claims_token_goes_back_with_the_reply_and_is_never_shown() {
+    let fixture = Fixture::new();
+    let delivery = fixture.answer(json!([]));
+    let api = Api::start(vec![
+        fixture.recorded("working"),
+        offered(vec![delivery.clone()]),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+        (APPLIED, 200, held_with("applied", &delivery, TOKEN)),
+    ])
+    .await;
+    let tool = fixture.tool(&api);
+    let mut shown = Vec::new();
+    let report = tool
+        .execute(json!({"step": "Running the tests"}))
+        .await
+        .expect("report");
+    assert!(
+        text_of(&report).ends_with(&format!("\n\n{}", answer_block(fixture.delivery))),
+        "{}",
+        text_of(&report)
+    );
+    shown.push(report);
+    // The reply is the claim's holder's: it carries the token. Said again (an
+    // answer that was lost on the way), it carries the same one, so the API
+    // answers what it stored.
+    for _ in 0..2 {
+        shown.push(
+            tool.execute(json!({
+                "action": "reply",
+                "delivery_id": fixture.delivery,
+                "note": "Kept it warm.",
+            }))
+            .await
+            .expect("reply"),
+        );
+    }
+    let applied = sent(&api, "POST", "/applied");
+    assert_eq!(applied.len(), 2);
+    for request in &applied {
+        assert_eq!(request.body["claim_token"], TOKEN, "{}", request.body);
+        assert_eq!(request.body["run_id"], json!(fixture.run));
+    }
+    // A claim sends no token: the first claim is given one.
+    assert!(sent(&api, "POST", "/claim")[0]
+        .body
+        .get("claim_token")
+        .is_none());
+    // Nowhere in what the agent is shown: not in the words, not in the
+    // structured answers.
+    for result in &shown {
+        assert!(!text_of(result).contains(TOKEN), "{}", text_of(result));
+        let structured = result.structured_content.clone().unwrap_or_default();
+        assert!(!structured.to_string().contains(TOKEN), "{structured}");
+    }
+    assert!(text_of(&shown[1]).starts_with("[PROGRESS] Reply recorded"));
+}
+
+#[tokio::test]
+async fn a_decline_is_the_claims_holders_too() {
+    let fixture = Fixture::new();
+    let delivery = fixture.message();
+    let api = Api::start(vec![
+        fixture.recorded("working"),
+        offered(vec![delivery.clone()]),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+        (DECLINED, 200, held_with("declined", &delivery, TOKEN)),
+    ])
+    .await;
+    let tool = fixture.tool(&api);
+    tool.execute(json!({"step": "Running the tests"}))
+        .await
+        .expect("report");
+    let result = tool
+        .execute(json!({"action": "decline", "delivery_id": fixture.delivery, "reason": "moot"}))
+        .await
+        .expect("decline");
+    assert!(!text_of(&result).contains(TOKEN));
+    assert!(!result
+        .structured_content
+        .unwrap()
+        .to_string()
+        .contains(TOKEN));
+    let declined = sent(&api, "POST", "/declined");
+    assert_eq!(declined[0].body["claim_token"], TOKEN);
+    assert_eq!(declined[0].body["reason"], "moot");
+}
+
+#[tokio::test]
+async fn of_two_sessions_offered_one_delivery_only_the_one_that_claims_it_shows_it() {
+    // Two sessions on one key, both offered the same delivery (two agents a
+    // claim cannot tell apart by their credential). The API gives the claim
+    // to the first; the second is refused and shows nothing.
+    let fixture = Fixture::new();
+    let delivery = fixture.answer(json!([]));
+    let api = Api::start_in_turn(vec![
+        fixture.recorded("working"),
+        offered(vec![delivery.clone()]),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+        (
+            CLAIM,
+            409,
+            refused(
+                "claimed_by_other",
+                "Another agent has picked this answer up and is acting on it",
+                json!({"claimed_by": {"run_id": fixture.run, "agent": {"name": "cinder"}}}),
+            ),
+        ),
+        (
+            APPLIED,
+            409,
+            refused(
+                "claimed_by_other",
+                "Another agent has picked this answer up and is acting on it",
+                json!({"claimed_by": {"run_id": fixture.run, "agent": {"name": "cinder"}}}),
+            ),
+        ),
+        (APPLIED, 200, held_with("applied", &delivery, TOKEN)),
+    ])
+    .await;
+    let first = fixture.tool(&api);
+    let second = fixture.tool(&api);
+    let won = first
+        .execute(json!({"step": "Running the tests"}))
+        .await
+        .expect("report");
+    assert!(text_of(&won).contains("[PERSON ANSWER]"));
+    let lost = second
+        .execute(json!({"step": "Running the tests"}))
+        .await
+        .expect("a refused claim is not a failed report");
+    assert_eq!(
+        text_of(&lost),
+        format!(
+            "[PROGRESS] Recorded: step. state=working run_id={}",
+            fixture.run
+        )
+    );
+    assert!(lost.structured_content.unwrap().get("deliveries").is_none());
+    // The second session replies anyway (it was told of the delivery some
+    // other way): it holds no token, and the API's refusal is said calmly.
+    let refused_reply = second
+        .execute(json!({"action": "reply", "delivery_id": fixture.delivery, "note": "Done."}))
+        .await
+        .expect("a refusal is an answer");
+    let text = text_of(&refused_reply);
+    assert!(
+        text.starts_with("[PROGRESS] Reply not recorded: another agent holds this delivery"),
+        "{text}"
+    );
+    let structured = refused_reply.structured_content.unwrap();
+    assert_eq!(structured["reason"], "claimed_by_other");
+    // The first session's reply is the holder's.
+    let done = first
+        .execute(json!({"action": "reply", "delivery_id": fixture.delivery, "note": "Done."}))
+        .await
+        .expect("reply");
+    assert!(text_of(&done).starts_with("[PROGRESS] Reply recorded"));
+    let applied = sent(&api, "POST", "/applied");
+    assert_eq!(applied.len(), 2);
+    assert!(
+        applied[0].body.get("claim_token").is_none(),
+        "{}",
+        applied[0].body
+    );
+    assert_eq!(applied[1].body["claim_token"], TOKEN);
+    assert_eq!(sent(&api, "POST", "/claim").len(), 2);
+}
+
+#[tokio::test]
+async fn a_claim_refused_for_any_reason_shows_nothing_and_is_tried_at_the_next_report() {
+    let fixture = Fixture::new();
+    let delivery = fixture.answer(json!([]));
+    let api = Api::start_in_turn(vec![
+        fixture.recorded("working"),
+        offered(vec![delivery.clone()]),
+        (
+            CLAIM,
+            409,
+            refused(
+                "run_not_allowed",
+                "A request names only a run of its own workspace and project that the credential raising it may write",
+                json!({}),
+            ),
+        ),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+    ])
+    .await;
+    let tool = fixture.tool(&api);
+    let first = tool
+        .execute(json!({"step": "Running the tests"}))
+        .await
+        .expect("report");
+    assert!(!text_of(&first).contains("[PERSON"), "{}", text_of(&first));
+    assert!(!text_of(&first).contains("run_not_allowed"));
+    // Once per report: no second try inside the same call.
+    assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+    let second = tool
+        .execute(json!({"step": "Running the tests"}))
+        .await
+        .expect("report");
+    assert!(text_of(&second).contains("[PERSON ANSWER]"));
+    assert_eq!(sent(&api, "POST", "/claim").len(), 2);
+}
+
+#[tokio::test]
+async fn a_delivery_the_server_ended_as_undeliverable_is_said_so() {
+    let fixture = Fixture::new();
+    let api = Api::start(vec![(
+        APPLIED,
+        409,
+        refused(
+            "delivery_closed",
+            "This answer was already confirmed or declined; a delivery ends once",
+            json!({"state": "declined", "result": {"outcome": "declined", "reason": "undeliverable"}}),
+        ),
+    )])
+    .await;
+    let result = fixture
+        .tool(&api)
+        .execute(json!({"action": "reply", "delivery_id": fixture.delivery, "note": "Done."}))
+        .await
+        .expect("a refusal is an answer");
+    assert_eq!(
+        text_of(&result),
+        format!(
+            "[PROGRESS] Reply not recorded: ContextStream ended this delivery as undeliverable (nobody took it for a week), and the person who sent it was told so. delivery_id={}",
+            fixture.delivery
+        )
+    );
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["replied"], false);
+    assert_eq!(structured["reason"], "undeliverable");
+
+    // Only the server says undeliverable: from an agent it is its own words.
+    let api = Api::start(vec![(
+        DECLINED,
+        200,
+        answers_with("declined", &fixture.answer(json!([]))),
+    )])
+    .await;
+    fixture
+        .tool(&api)
+        .execute(json!({"action": "decline", "delivery_id": fixture.delivery, "reason": "undeliverable"}))
+        .await
+        .expect("decline");
+    let declined = sent(&api, "POST", "/declined");
+    assert_eq!(declined[0].body["reason"], "cannot_apply");
+    assert_eq!(declined[0].body["note"], "undeliverable");
+}
+
+// ============================================================================
+// A session signed in with OAuth
+// ============================================================================
+
+#[tokio::test]
+async fn a_session_signed_in_with_oauth_is_never_told_to_wait_and_asks_for_nothing() {
+    // ContextStream raises no request for a run reported under a sign-in or an
+    // app's token, and takes no message for it: no answer can come back to a
+    // credential that changes with every refresh. So such a session reads no
+    // delivery and is never told to start a waiter it would wait on for
+    // nothing.
+    let fixture = Fixture::new();
+    let api = Api::start(vec![fixture.recorded("waiting"), offered(vec![])]).await;
+    let tool = fixture.signed_in_tool(&api);
+    let result = tool
+        .execute(json!({"waiting": {"on": "person", "question": "Which cache stays warm?"}}))
+        .await
+        .expect("report");
+    assert_eq!(
+        text_of(&result),
+        format!(
+            "[PROGRESS] Recorded: step. state=waiting run_id={}",
+            fixture.run
+        )
+    );
+    assert!(result
+        .structured_content
+        .unwrap()
+        .get("await_answer")
+        .is_none());
+    let report = sent(&api, "POST", "/run-progress/report");
+    assert_eq!(report.len(), 1);
+    assert_eq!(
+        report[0].header("authorization").as_deref(),
+        Some("Bearer header.payload.signature")
+    );
+    assert!(sent(&api, "GET", "/decision-requests/deliveries").is_empty());
+    // Reading its own run asks for no delivery either.
+    tool.execute(json!({"action": "get", "run_id": fixture.run}))
+        .await
+        .expect("get");
+    assert!(sent(&api, "GET", "/decision-requests/deliveries").is_empty());
 }
 
 // ============================================================================

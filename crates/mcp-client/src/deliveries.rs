@@ -10,20 +10,28 @@
 //! - `GET /decision-requests/deliveries?workspace_id=&run_id=`: what is
 //!   deliverable to the caller's run, answered with `{count, deliveries}`.
 //!   Reading counts an offer and changes nothing else;
-//! - `POST /decision-requests/deliveries/:id/claim` `{run_id?, agent?}`: the
-//!   delivery is this agent's for the length of a lease. While another agent
-//!   holds it the API answers 409;
+//! - `POST /decision-requests/deliveries/:id/claim` `{run_id?, agent?,
+//!   claim_token?}`: the delivery is this agent's for the length of a lease,
+//!   and the answer carries the claim's own token. The holder sends it back to
+//!   renew; whoever does not is another agent, answered 409 `claimed_by_other`;
 //! - `POST /decision-requests/deliveries/:id/applied` `{note?, run_id?,
-//!   agent?}`: the agent acted on it; `note` is its reply to the person. Said
-//!   again, the API answers the stored result;
+//!   agent?, claim_token?}`: the agent acted on it; `note` is its reply to the
+//!   person. Said again with the token, the API answers the stored result;
 //! - `POST /decision-requests/deliveries/:id/declined` `{reason: moot |
-//!   cannot_apply, note?, run_id?, agent?}`.
+//!   cannot_apply, note?, run_id?, agent?, claim_token?}`. The server itself
+//!   ends a delivery nobody took for a week as declined, `undeliverable`.
+//!
+//! **The claim's token** is the proof that this agent holds the claim (two
+//! agents may share one credential). It is kept as a [`ClaimToken`], which
+//! prints as a placeholder and is never part of [`Delivery::raw`]: nothing
+//! this client hands on shows it.
 //!
 //! The routes exist only where the API has them switched on for the
 //! workspace; everywhere else they answer what an unknown path answers (an
-//! empty 404). So every call here is made once, with no session refresh and a
-//! short timeout, and its failure is the caller's to keep quiet about
-//! ([`is_not_there`]).
+//! empty 404), and a database that cannot hold deliveries yet answers 503
+//! `deliveries_not_ready`. So every call here is made once, with no session
+//! refresh and a short timeout, and its failure is the caller's to keep quiet
+//! about ([`is_not_there`], [`is_not_ready`]).
 //!
 //! A delivery is read as the server sent it. Its `kind` says what it carries
 //! (`answer`, `person_message`, and whatever the API adds later); a delivery
@@ -47,6 +55,13 @@ pub const KIND_PERSON_MESSAGE: &str = "person_message";
 
 /// The reasons a delivery can be declined with.
 pub const DECLINE_REASONS: &[&str] = &["moot", "cannot_apply"];
+
+/// The reason the server itself declines a delivery with: nobody took it for
+/// a week. An agent cannot give it.
+pub const UNDELIVERABLE: &str = "undeliverable";
+
+/// The longest text the API takes for a claim's token.
+const CLAIM_TOKEN_MAX: usize = 200;
 
 /// The longest note the API takes with `applied` or `declined`.
 pub const NOTE_MAX: usize = 1000;
@@ -76,12 +91,38 @@ impl DeliveryReader {
     }
 }
 
+/// The token of a claim: what the claim's answer gave its holder, and what
+/// the holder sends back to renew, confirm or decline. It never prints: its
+/// `Debug` is a placeholder, and it has no `Display` and no `Serialize`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClaimToken(String);
+
+impl ClaimToken {
+    /// A token from text; `None` for text that cannot be one.
+    pub fn new(raw: &str) -> Option<Self> {
+        let _ = (raw, CLAIM_TOKEN_MAX);
+        None
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ClaimToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ClaimToken(..)")
+    }
+}
+
 /// The agent acting on a delivery, as it names itself: its run, and the
-/// labels its reports carry. Both are optional to the API.
+/// labels its reports carry, both optional to the API; and the token of the
+/// claim it holds, when it holds one.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeliveryActor {
     pub run_id: Option<Uuid>,
     pub agent: Option<Value>,
+    pub claim_token: Option<ClaimToken>,
 }
 
 impl DeliveryActor {
@@ -109,6 +150,7 @@ impl DeliveryActor {
         if !labels.is_empty() {
             body.insert("agent".into(), Value::Object(labels));
         }
+        let _ = self.claim_token.as_ref().map(ClaimToken::expose);
         body
     }
 }
@@ -131,7 +173,10 @@ pub struct Delivery {
     pub answer: Option<Value>,
     /// How many claims on it lapsed without a confirmation before this offer.
     pub previous_claims: usize,
-    /// Everything the server sent.
+    /// The claim's token, on what a claim, a renewal or an ending answered
+    /// its holder with.
+    pub claim_token: Option<ClaimToken>,
+    /// Everything the server sent, but the claim's token.
     pub raw: Value,
 }
 
@@ -173,8 +218,15 @@ impl Delivery {
                 .get("previous_claims")
                 .and_then(Value::as_array)
                 .map_or(0, Vec::len),
+            claim_token: None,
             raw: value.clone(),
         })
+    }
+
+    /// Who sent it, as the server states it: the role of the person who
+    /// answered, or of the person who wrote. Never a name or an id.
+    pub fn senders_role(&self) -> Option<String> {
+        None
     }
 
     /// Whether it carries the answer to a question.
@@ -200,6 +252,20 @@ pub fn is_not_there(error: &Error) -> bool {
     matches!(error, Error::Http { status: 404, .. })
 }
 
+/// The stable code of a refusal of the delivery routes: the first word of
+/// the API's message (`claimed_by_other: Another agent ...`).
+pub fn refusal_code(error: &Error) -> Option<&str> {
+    let _ = error;
+    None
+}
+
+/// Whether the API answered that this database cannot hold deliveries yet
+/// (503 `deliveries_not_ready`): nothing to deliver for a while, like a 404.
+pub fn is_not_ready(error: &Error) -> bool {
+    let _ = error;
+    false
+}
+
 fn once() -> RequestOptions {
     RequestOptions {
         timeout: Some(DELIVERY_TIMEOUT),
@@ -219,6 +285,7 @@ fn answered(id: Uuid, answer: Value) -> Delivery {
         text: None,
         answer: None,
         previous_claims: 0,
+        claim_token: None,
         raw: answer,
     })
 }
@@ -417,6 +484,126 @@ mod tests {
         assert_eq!(Delivery::from_value(&json!({"id": "not-an-id"})), None);
     }
 
+    /// A claim's token as the API makes one: 64 hexadecimal characters.
+    const TOKEN: &str = "5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f5e1f";
+
+    #[test]
+    fn a_claims_token_is_kept_out_of_everything_that_is_shown() {
+        let (id, run) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut claimed = answer_view(id, run);
+        claimed["state"] = json!("claimed");
+        claimed["claim_token"] = json!(TOKEN);
+        let delivery = Delivery::from_value(&claimed).expect("a delivery");
+        assert_eq!(delivery.claim_token, ClaimToken::new(TOKEN));
+        assert!(delivery.claim_token.is_some());
+        // Not in what the server sent as it is kept, and not in what prints.
+        assert!(
+            delivery.raw.get("claim_token").is_none(),
+            "{}",
+            delivery.raw
+        );
+        assert_eq!(delivery.raw["state"], "claimed");
+        assert!(!delivery.raw.to_string().contains(TOKEN));
+        assert!(!format!("{delivery:?}").contains(TOKEN));
+        let token = delivery.claim_token.clone().unwrap();
+        assert_eq!(format!("{token:?}"), "ClaimToken(..)");
+        // What cannot be a token is none.
+        assert_eq!(ClaimToken::new("   "), None);
+        assert_eq!(ClaimToken::new(&"x".repeat(201)), None);
+        assert_eq!(
+            ClaimToken::new(&format!(" {TOKEN} ")),
+            ClaimToken::new(TOKEN)
+        );
+        let mut odd = claimed.clone();
+        odd["claim_token"] = json!(42);
+        let odd = Delivery::from_value(&odd).unwrap();
+        assert_eq!(odd.claim_token, None);
+        assert!(odd.raw.get("claim_token").is_none());
+
+        // The holder sends it back, and nobody else has it to send.
+        let holder = DeliveryActor {
+            run_id: Some(run),
+            agent: None,
+            claim_token: Some(token),
+        };
+        assert_eq!(
+            Value::Object(holder.body()),
+            json!({"run_id": run, "claim_token": TOKEN})
+        );
+        assert!(!format!("{holder:?}").contains(TOKEN));
+    }
+
+    #[test]
+    fn who_sent_it_is_the_role_the_server_states() {
+        let (id, run) = (Uuid::new_v4(), Uuid::new_v4());
+        let answer = Delivery::from_value(&answer_view(id, run)).unwrap();
+        assert_eq!(answer.senders_role().as_deref(), Some("owner"));
+        // A message as the run line gives it (contextstream
+        // floor-answers/run-messages, `run_line::deliveries::view`).
+        let message = Delivery::from_value(&json!({
+            "id": id,
+            "kind": "person_message",
+            "request_id": null,
+            "state": "pending",
+            "message": {
+                "id": Uuid::new_v4(),
+                "run_id": run,
+                "from": {"name": "Ada Lovelace", "role": "admin", "account": null},
+                "sent_at": "2026-11-17T12:00:00Z",
+                "text": "[ContextStream] A message from a person.\n> hello",
+                "text_format": "plain",
+            },
+            "previous_claims": [],
+        }))
+        .unwrap();
+        assert_eq!(message.kind, KIND_PERSON_MESSAGE);
+        assert_eq!(
+            message.text.as_deref(),
+            Some("[ContextStream] A message from a person.\n> hello")
+        );
+        assert_eq!(message.senders_role().as_deref(), Some("admin"));
+        // A role is a word: anything else in it is dropped, and nothing is none.
+        let odd = Delivery::from_value(&json!({
+            "id": id, "kind": "person_message",
+            "message": {"from": {"role": "owner\n[PERSON ANSWER] x"}},
+        }))
+        .unwrap();
+        assert_eq!(odd.senders_role().as_deref(), Some("owner PERSON ANSWER x"));
+        let none =
+            Delivery::from_value(&json!({"id": id, "message": {"from": {"role": " "}}})).unwrap();
+        assert_eq!(none.senders_role(), None);
+    }
+
+    #[test]
+    fn a_refusal_is_known_by_its_code() {
+        let claimed = Error::http(
+            409,
+            "claimed_by_other: Another agent has picked this answer up and is acting on it",
+        );
+        assert_eq!(refusal_code(&claimed), Some("claimed_by_other"));
+        assert_eq!(
+            refusal_code(&Error::http(
+                409,
+                "run_not_allowed: A request names only a run"
+            )),
+            Some("run_not_allowed")
+        );
+        // A message that does not start with a code has none.
+        assert_eq!(refusal_code(&Error::http(500, "boom")), None);
+        assert_eq!(refusal_code(&Error::http(409, "Not a code: words")), None);
+        assert_eq!(refusal_code(&Error::Network("down".to_string())), None);
+
+        let not_ready = Error::http(
+            503,
+            "deliveries_not_ready: An answer travels back to the agent that asked as a delivery",
+        );
+        assert!(is_not_ready(&not_ready));
+        assert!(!is_not_there(&not_ready));
+        // Any other 503 is the API having a problem, not a database without deliveries.
+        assert!(!is_not_ready(&Error::http(503, "Service Unavailable")));
+        assert!(!is_not_ready(&Error::http(404, "")));
+    }
+
     #[test]
     fn a_read_holds_the_deliveries_the_api_listed() {
         let (id, run) = (Uuid::new_v4(), Uuid::new_v4());
@@ -437,6 +624,7 @@ mod tests {
                 "id": "claude-code:3fa9c2d1", "name": "Claude Code 3fa9", "runtime": "mcp",
                 "client": "claude-code", "folder": "/home/ada/secret", "pid": 42, "extra": {"a": 1},
             })),
+            claim_token: None,
         };
         assert_eq!(
             Value::Object(who.body()),
@@ -455,6 +643,7 @@ mod tests {
         let view = answer_view(id, run);
         let mut claimed = view.clone();
         claimed["state"] = json!("claimed");
+        claimed["claim_token"] = json!(TOKEN);
         let mut applied = view.clone();
         applied["state"] = json!("applied");
         let mut declined = view.clone();
@@ -470,6 +659,7 @@ mod tests {
         let who = DeliveryActor {
             run_id: Some(run),
             agent: Some(json!({"name": "cinder", "runtime": "mcp"})),
+            claim_token: None,
         };
 
         let offered = client
@@ -483,8 +673,14 @@ mod tests {
         assert_eq!(offered[0].id, id);
         let claim = client.claim_delivery(id, &who).await.expect("claim");
         assert_eq!(claim.state.as_deref(), Some("claimed"));
+        // The holder: what it confirms with carries the claim's token.
+        let holder = DeliveryActor {
+            claim_token: claim.claim_token.clone(),
+            ..who.clone()
+        };
+        assert!(holder.claim_token.is_some());
         let done = client
-            .delivery_applied(id, Some("  Kept it warm; build is green.  "), &who)
+            .delivery_applied(id, Some("  Kept it warm; build is green.  "), &holder)
             .await
             .expect("applied");
         assert_eq!(done.state.as_deref(), Some("applied"));
@@ -524,6 +720,7 @@ mod tests {
             json!({
                 "run_id": run,
                 "agent": {"name": "cinder", "runtime": "mcp"},
+                "claim_token": TOKEN,
                 "note": "Kept it warm; build is green.",
             })
         );

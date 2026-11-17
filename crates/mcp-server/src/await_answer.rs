@@ -140,6 +140,7 @@ pub async fn run(wait: Wait) -> i32 {
     let who = DeliveryActor {
         run_id: Some(wait.run_id),
         agent: None,
+        claim_token: None,
     };
     let mut failures = 0_u32;
     loop {

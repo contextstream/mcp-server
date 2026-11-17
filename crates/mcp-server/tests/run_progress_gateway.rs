@@ -900,11 +900,17 @@ fn nothing_is_asked_for_a_workspace_the_setting_does_not_name() {
         }
         api.settle();
         // For each caller: the check of the credential at `initialize`, the
-        // report (with the read of open runs before it, and of what a person
-        // sent the run after it), and each call's own question. Nothing
-        // else: no read of a run, no sign.
-        let one_caller = [ME, OPEN_RUNS, REPORT, DELIVERIES, VERSION, VERSION, VERSION];
-        assert_eq!(api.paths(), [one_caller, one_caller].concat(), "{env:?}");
+        // report (with the read of open runs before it), and each call's own
+        // question. Nothing else: no read of a run, no sign. After a report
+        // under an API key, what a person sent the run is read; a sign-in is
+        // a credential no answer comes back to, so nothing is read for it.
+        let by_key = [ME, OPEN_RUNS, REPORT, DELIVERIES, VERSION, VERSION, VERSION];
+        let by_sign_in = [ME, OPEN_RUNS, REPORT, VERSION, VERSION, VERSION];
+        assert_eq!(
+            api.paths(),
+            [&by_key[..], &by_sign_in[..]].concat(),
+            "{env:?}"
+        );
     }
 }
 

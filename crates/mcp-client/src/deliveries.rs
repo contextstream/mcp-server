@@ -602,6 +602,7 @@ impl ContextStreamClient {
         // select a different credential.
         let key = match crate::get_task_auth_override() {
             Some(auth) if auth.api_key.is_some() || auth.jwt.is_some() => auth.api_key,
+            _ if config.is_http_transport => None,
             _ => config.api_key,
         }
         .filter(|k| is_full_api_key(k))?;

@@ -65,6 +65,15 @@ fn framed_message_block(id: Uuid, quoted: &str) -> String {
     )
 }
 
+// Model the per-request credential scope installed by the HTTP transport.
+async fn with_caller<F: std::future::Future>(call: F) -> F::Output {
+    let auth = mcp_types::AuthOverride {
+        api_key: Some("cbiq_gateway_fixture".into()),
+        ..Default::default()
+    };
+    mcp_client::run_with_auth_override(auth, || call).await
+}
+
 struct Fixture {
     workspace: Uuid,
     project: Uuid,
@@ -647,31 +656,34 @@ async fn a_claim_that_lapsed_and_is_offered_again_is_shown_again_once() {
 
 #[tokio::test]
 async fn the_hosted_gateway_shows_a_delivery_and_claims_it_too() {
-    let fixture = Fixture::new();
-    let delivery = fixture.answer(json!([]));
-    let api = Api::start(vec![
-        fixture.recorded("working"),
-        offered(vec![delivery.clone()]),
-        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
-    ])
-    .await;
-    let tool = fixture.hosted_tool(&api);
-    mcp_client::run_with_mcp_session_id("hosted-session".into(), || async {
-        let first = tool
-            .report_then_collect(json!({"step": "Running the tests", "run_key": "warm-cache"}))
-            .await
-            .expect("report");
-        assert!(
-            text_of(&first).ends_with(&format!("\n\n{}", answer_block(fixture.delivery))),
-            "{}",
-            text_of(&first)
-        );
-        let second = tool
-            .report_then_collect(json!({"step": "Running the tests", "run_key": "warm-cache"}))
-            .await
-            .expect("report");
-        assert!(!text_of(&second).contains("[PERSON"));
-        assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+    with_caller(async {
+        let fixture = Fixture::new();
+        let delivery = fixture.answer(json!([]));
+        let api = Api::start(vec![
+            fixture.recorded("working"),
+            offered(vec![delivery.clone()]),
+            (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+        ])
+        .await;
+        let tool = fixture.hosted_tool(&api);
+        mcp_client::run_with_mcp_session_id("hosted-session".into(), || async {
+            let first = tool
+                .report_then_collect(json!({"step": "Running the tests", "run_key": "warm-cache"}))
+                .await
+                .expect("report");
+            assert!(
+                text_of(&first).ends_with(&format!("\n\n{}", answer_block(fixture.delivery))),
+                "{}",
+                text_of(&first)
+            );
+            let second = tool
+                .report_then_collect(json!({"step": "Running the tests", "run_key": "warm-cache"}))
+                .await
+                .expect("report");
+            assert!(!text_of(&second).contains("[PERSON"));
+            assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+        })
+        .await;
     })
     .await;
 }
@@ -682,42 +694,45 @@ async fn the_hosted_gateway_shows_a_delivery_and_claims_it_too() {
 
 #[tokio::test]
 async fn review8_clients_without_background_wake_are_told_to_read_the_run() {
-    let f = Fixture::new();
-    for (client, hosted) in [
-        ("codex-cli", false),
-        ("cursor", false),
-        ("gemini-cli", false),
-        ("claude-code", true),
-    ] {
-        let api = Api::start(vec![f.recorded("waiting"), offered(vec![])]).await;
-        let tool = if hosted {
-            f.hosted_tool(&api)
-        } else {
-            f.tool(&api)
-        };
-        let result = crate::client_identity::run_with_client_name(
-            Some(client.into()),
-            mcp_client::run_with_mcp_session_id("session".into(), || async {
-                tool.report_then_collect(
-                    json!({"waiting":{"on":"person","question":"Which cache?"}}),
-                )
-                .await
+    with_caller(async {
+        let f = Fixture::new();
+        for (client, hosted) in [
+            ("codex-cli", false),
+            ("cursor", false),
+            ("gemini-cli", false),
+            ("claude-code", true),
+        ] {
+            let api = Api::start(vec![f.recorded("waiting"), offered(vec![])]).await;
+            let tool = if hosted {
+                f.hosted_tool(&api)
+            } else {
+                f.tool(&api)
+            };
+            let result = crate::client_identity::run_with_client_name(
+                Some(client.into()),
+                mcp_client::run_with_mcp_session_id("session".into(), || async {
+                    tool.report_then_collect(
+                        json!({"waiting":{"on":"person","question":"Which cache?"}}),
+                    )
+                    .await
+                    .unwrap()
+                }),
+            )
+            .await;
+            let text = text_of(&result);
+            assert!(
+                text.contains(&format!("progress(action=\"get\", run_id=\"{}\")", f.run)),
+                "{text}"
+            );
+            assert!(!text.contains("end your turn") && !text.contains("await-answer"));
+            assert!(result
+                .structured_content
                 .unwrap()
-            }),
-        )
-        .await;
-        let text = text_of(&result);
-        assert!(
-            text.contains(&format!("progress(action=\"get\", run_id=\"{}\")", f.run)),
-            "{text}"
-        );
-        assert!(!text.contains("end your turn") && !text.contains("await-answer"));
-        assert!(result
-            .structured_content
-            .unwrap()
-            .get("await_answer")
-            .is_none());
-    }
+                .get("await_answer")
+                .is_none());
+        }
+    })
+    .await;
 }
 
 // Give each Claude Code case its own PATH without changing other tests' environment.
@@ -1497,70 +1512,75 @@ async fn a_decline_is_the_claims_holders_too() {
 
 #[tokio::test]
 async fn of_two_sessions_offered_one_delivery_only_the_one_that_claims_it_shows_it() {
-    // Two sessions on one key, both offered the same delivery (two agents a
-    // claim cannot tell apart by their credential). The API gives the claim
-    // to the first; the second is refused and shows nothing.
-    let fixture = Fixture::new();
-    let delivery = fixture.answer(json!([]));
-    // The run the first session claimed it as: not one of the second's.
-    let holders_run = Uuid::new_v4();
-    let api = Api::start_in_turn(vec![
-        fixture.recorded("working"),
-        offered(vec![delivery.clone()]),
-        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
-        (
-            CLAIM,
-            409,
-            refused(
-                "claimed_by_other",
-                "Another agent has picked this answer up and is acting on it",
-                json!({"claimed_by": {"run_id": holders_run, "agent": {"name": "cinder"}}}),
+    with_caller(async {
+        // Two sessions on one key, both offered the same delivery (two agents a
+        // claim cannot tell apart by their credential). The API gives the claim
+        // to the first; the second is refused and shows nothing.
+        let fixture = Fixture::new();
+        let delivery = fixture.answer(json!([]));
+        // The run the first session claimed it as: not one of the second's.
+        let holders_run = Uuid::new_v4();
+        let api = Api::start_in_turn(vec![
+            fixture.recorded("working"),
+            offered(vec![delivery.clone()]),
+            (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+            (
+                CLAIM,
+                409,
+                refused(
+                    "claimed_by_other",
+                    "Another agent has picked this answer up and is acting on it",
+                    json!({"claimed_by": {"run_id": holders_run, "agent": {"name": "cinder"}}}),
+                ),
             ),
-        ),
-        (APPLIED, 200, held_with("applied", &delivery, TOKEN)),
-    ])
-    .await;
-    let first = fixture.tool(&api);
-    let second = fixture.hosted_tool(&api);
-    mcp_client::run_with_mcp_session_id("other".into(), || async {
-        let won = first
-            .report_then_collect(json!({"step": "Running the tests"}))
-            .await
-            .expect("report");
-        assert!(text_of(&won).contains("[PERSON ANSWER]"));
-        let lost = second
-            .report_then_collect(json!({"step": "Running the tests"}))
-            .await
-            .expect("a refused claim is not a failed report");
-        assert_eq!(
-            text_of(&lost),
-            format!(
-                "[PROGRESS] Recorded: step. state=working run_id={}",
-                fixture.run
-            )
-        );
-        assert!(lost.structured_content.unwrap().get("deliveries").is_none());
-        // The second session replies anyway (it was told of the delivery some
-        // other way): it holds no token, and the API's refusal is said calmly.
-        // The claim is held as a run that is not this session's, so it does not
-        // claim it again in that run's name.
-        let refused_reply = second
-            .execute(json!({"action": "reply", "delivery_id": fixture.delivery, "note": "Done."}))
-            .await
-            .expect("a refusal is an answer");
-        assert_eq!(
-            refused_reply.structured_content.unwrap()["reason"],
-            "no_owned_claim"
-        );
-        let done = first
-            .execute(json!({"action":"reply","delivery_id":fixture.delivery,"note":"Done."}))
-            .await
-            .unwrap();
-        assert!(text_of(&done).starts_with("[PROGRESS] Reply recorded"));
-        let applied = sent(&api, "POST", "/applied");
-        assert_eq!(applied.len(), 1);
-        assert_eq!(applied[0].body["claim_token"], TOKEN);
-        assert!(sent(&api, "GET", "/run-progress/runs/").is_empty());
+            (APPLIED, 200, held_with("applied", &delivery, TOKEN)),
+        ])
+        .await;
+        let first = fixture.tool(&api);
+        let second = fixture.hosted_tool(&api);
+        mcp_client::run_with_mcp_session_id("other".into(), || async {
+            let won = first
+                .report_then_collect(json!({"step": "Running the tests"}))
+                .await
+                .expect("report");
+            assert!(text_of(&won).contains("[PERSON ANSWER]"));
+            let lost = second
+                .report_then_collect(json!({"step": "Running the tests"}))
+                .await
+                .expect("a refused claim is not a failed report");
+            assert_eq!(
+                text_of(&lost),
+                format!(
+                    "[PROGRESS] Recorded: step. state=working run_id={}",
+                    fixture.run
+                )
+            );
+            assert!(lost.structured_content.unwrap().get("deliveries").is_none());
+            // The second session replies anyway (it was told of the delivery some
+            // other way): it holds no token, and the API's refusal is said calmly.
+            // The claim is held as a run that is not this session's, so it does not
+            // claim it again in that run's name.
+            let refused_reply = second
+                .execute(
+                    json!({"action": "reply", "delivery_id": fixture.delivery, "note": "Done."}),
+                )
+                .await
+                .expect("a refusal is an answer");
+            assert_eq!(
+                refused_reply.structured_content.unwrap()["reason"],
+                "no_owned_claim"
+            );
+            let done = first
+                .execute(json!({"action":"reply","delivery_id":fixture.delivery,"note":"Done."}))
+                .await
+                .unwrap();
+            assert!(text_of(&done).starts_with("[PROGRESS] Reply recorded"));
+            let applied = sent(&api, "POST", "/applied");
+            assert_eq!(applied.len(), 1);
+            assert_eq!(applied[0].body["claim_token"], TOKEN);
+            assert!(sent(&api, "GET", "/run-progress/runs/").is_empty());
+        })
+        .await;
     })
     .await;
 }
@@ -1829,30 +1849,33 @@ async fn a_server_that_refuses_the_claim_again_is_answered_calmly() {
 
 #[tokio::test]
 async fn a_matching_agent_in_a_run_view_does_not_prove_ownership() {
-    let f = Fixture::new();
-    let empty = Api::start(vec![]).await;
-    let mine = f.hosted_tool(&empty).agent(true).await;
-    let api = Api::start(vec![
-        (
-            "GET /api/v1/run-progress/runs/",
-            200,
-            json!({"data":f.run_view("waiting",mine)}),
-        ),
-        offered(vec![f.message()]),
-        (APPLIED, 409, held_as_run(f.run)),
-    ])
+    with_caller(async {
+        let f = Fixture::new();
+        let empty = Api::start(vec![]).await;
+        let mine = f.hosted_tool(&empty).agent(true).await;
+        let api = Api::start(vec![
+            (
+                "GET /api/v1/run-progress/runs/",
+                200,
+                json!({"data":f.run_view("waiting",mine)}),
+            ),
+            offered(vec![f.message()]),
+            (APPLIED, 409, held_as_run(f.run)),
+        ])
+        .await;
+        let tool = f.hosted_tool(&api);
+        tool.execute(json!({"action":"get","run_id":f.run}))
+            .await
+            .unwrap();
+        tool.execute(json!({"action":"reply","delivery_id":f.delivery,"note":"done"}))
+            .await
+            .unwrap();
+        assert!(api
+            .requests()
+            .iter()
+            .all(|r| !r.target.contains("decision-requests")));
+    })
     .await;
-    let tool = f.hosted_tool(&api);
-    tool.execute(json!({"action":"get","run_id":f.run}))
-        .await
-        .unwrap();
-    tool.execute(json!({"action":"reply","delivery_id":f.delivery,"note":"done"}))
-        .await
-        .unwrap();
-    assert!(api
-        .requests()
-        .iter()
-        .all(|r| !r.target.contains("decision-requests")));
 }
 
 // ============================================================================
@@ -2118,53 +2141,56 @@ async fn review7_isolated_replica_must_not_display_another_attempts_rotated_clai
 
 #[tokio::test]
 async fn round2_new_gateway_tool_per_call_claims_only_when_returning_the_frame() {
-    let f = Fixture::new();
-    let delivery = f.message();
-    let api = Api::start(vec![
-        f.recorded("working"),
-        offered(vec![delivery.clone()]),
-        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
-        (
-            "GET /api/v1/run-progress/runs/",
-            200,
-            json!({"data":f.run_view("working",json!({}))}),
-        ),
-        (APPLIED, 200, answers_with("applied", &delivery)),
-    ])
-    .await;
-    mcp_client::run_with_mcp_session_id("fresh-registry".into(), || async {
-        let first = f.hosted_tool(&api);
-        let answer = first
-            .execute(json!({"step":"working","run_key":"own"}))
-            .await
-            .unwrap();
-        assert!(!text_of(&answer).contains("[PERSON"));
-        assert!(run_deliveries::wait_for_poll(&first.deliveries, f.run).await);
-        drop(first);
-        assert!(
-            sent(&api, "POST", "/claim").is_empty(),
-            "a read cannot pick up a delivery"
-        );
-        for expected in [true, false] {
-            let get = f
-                .hosted_tool(&api)
-                .execute(json!({"action":"get","run_id":f.run}))
+    with_caller(async {
+        let f = Fixture::new();
+        let delivery = f.message();
+        let api = Api::start(vec![
+            f.recorded("working"),
+            offered(vec![delivery.clone()]),
+            (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+            (
+                "GET /api/v1/run-progress/runs/",
+                200,
+                json!({"data":f.run_view("working",json!({}))}),
+            ),
+            (APPLIED, 200, answers_with("applied", &delivery)),
+        ])
+        .await;
+        mcp_client::run_with_mcp_session_id("fresh-registry".into(), || async {
+            let first = f.hosted_tool(&api);
+            let answer = first
+                .execute(json!({"step":"working","run_key":"own"}))
                 .await
                 .unwrap();
-            assert_eq!(text_of(&get).contains(&message_block(&f)), expected);
-            assert_eq!(sent(&api, "POST", "/claim").len(), 1);
-        }
-        let reply = f
-            .hosted_tool(&api)
-            .execute(json!({"action":"reply","delivery_id":f.delivery,"note":"done"}))
-            .await
-            .unwrap();
-        assert_eq!(reply.structured_content.unwrap()["replied"], true);
-        assert_eq!(
-            sent(&api, "POST", "/claim").len(),
-            1,
-            "the gateway retained the token"
-        );
+            assert!(!text_of(&answer).contains("[PERSON"));
+            assert!(run_deliveries::wait_for_poll(&first.deliveries, f.run).await);
+            drop(first);
+            assert!(
+                sent(&api, "POST", "/claim").is_empty(),
+                "a read cannot pick up a delivery"
+            );
+            for expected in [true, false] {
+                let get = f
+                    .hosted_tool(&api)
+                    .execute(json!({"action":"get","run_id":f.run}))
+                    .await
+                    .unwrap();
+                assert_eq!(text_of(&get).contains(&message_block(&f)), expected);
+                assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+            }
+            let reply = f
+                .hosted_tool(&api)
+                .execute(json!({"action":"reply","delivery_id":f.delivery,"note":"done"}))
+                .await
+                .unwrap();
+            assert_eq!(reply.structured_content.unwrap()["replied"], true);
+            assert_eq!(
+                sent(&api, "POST", "/claim").len(),
+                1,
+                "the gateway retained the token"
+            );
+        })
+        .await;
     })
     .await;
 }

@@ -708,7 +708,10 @@ fn the_waiter_does_not_start_under_a_credential_nothing_comes_back_to() {
     // A key limited to one workspace.
     let mut command = sandbox.command();
     command
-        .env("CONTEXTSTREAM_API_KEY", format!("cbiq_ws_{}", "0".repeat(16)))
+        .env(
+            "CONTEXTSTREAM_API_KEY",
+            format!("cbiq_ws_{}", "0".repeat(16)),
+        )
         .args(["await-answer", "--run-id", RUN, "--workspace-id", WORKSPACE]);
     let output = finish(command, None, Duration::from_secs(30));
     assert_eq!(output.status.code(), Some(1), "{}", err(&output));

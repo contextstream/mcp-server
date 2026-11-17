@@ -4435,7 +4435,9 @@ mod tests {
                     "delivery_id=\"...\", note=\"what I did\"",
                     "names an `await-answer` command",
                     "start that command in the background",
-                    "end your turn; it exits when the person answers, which wakes you",
+                    "exit 0",
+                    "4 hours (exit 124)",
+                    "another waiter already holds this run (exit 1)",
                 ] {
                     assert!(
                         rules.contains(required),

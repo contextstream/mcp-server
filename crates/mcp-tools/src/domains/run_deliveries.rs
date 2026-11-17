@@ -79,6 +79,9 @@ const MAX_SHOWN_AT_ONCE: usize = 5;
 /// Most deliveries a process remembers having shown.
 const MAX_REMEMBERED: usize = 512;
 
+/// A cached offer and a batch of claim starts share this short validity window.
+const OFFER_FRESH_FOR: Duration = Duration::from_secs(5);
+
 /// Most workspaces a process remembers as having no delivery routes.
 const MAX_WORKSPACES_OFF: usize = 1024;
 
@@ -526,10 +529,16 @@ impl Offered {
 }
 
 #[derive(Debug)]
+struct Batch {
+    read_at: Instant,
+    deliveries: Vec<Delivery>,
+}
+
+#[derive(Debug)]
 struct Poll {
     started: Instant,
     finished: tokio::sync::watch::Receiver<bool>,
-    result: Arc<OnceLock<Option<Vec<Delivery>>>>,
+    result: Arc<OnceLock<Option<Batch>>>,
 }
 
 /// A report only consumes a finished poll or starts one. An explicit get
@@ -558,11 +567,13 @@ pub(super) async fn poll(
         // finished empty. An explicit get must read that arrival now.
         if mem.polls.get(&key).is_some_and(|p| {
             if *p.finished.borrow() {
-                wait && p
-                    .result
+                p.result
                     .get()
                     .and_then(Option::as_ref)
-                    .is_some_and(Vec::is_empty)
+                    .is_some_and(|batch| {
+                        batch.read_at.elapsed() >= OFFER_FRESH_FOR
+                            || (wait && batch.deliveries.is_empty())
+                    })
             } else {
                 // A cancelled worker dropped its sender before publishing.
                 p.finished.has_changed().is_err()
@@ -596,7 +607,12 @@ pub(super) async fn poll(
             );
             let (client, ledger, owner) = (client.clone(), ledger.clone(), owner.clone());
             mcp_client::spawn_with_task_context(async move {
-                let offered = read(&client, &ledger, &owner, run_id).await;
+                let offered = read(&client, &ledger, &owner, run_id)
+                    .await
+                    .map(|deliveries| Batch {
+                        read_at: Instant::now(),
+                        deliveries,
+                    });
                 let _ = result.set(offered);
                 tx.send_replace(true);
             });
@@ -622,14 +638,14 @@ pub(super) async fn poll(
         }
         mem.polls.remove(&key);
     }
-    let Some(deliveries) = result.get().and_then(Option::as_deref) else {
+    let Some(batch) = result.get().and_then(Option::as_ref) else {
         return Offered::default();
     };
     if !owner.reported(run_id) && !owner.bind(run_id, None, 0, None) {
         return Offered::default();
     }
     ledger.lock().reports.remove(&key);
-    claim_offers(client, ledger, owner, run_id, agent, deliveries).await;
+    claim_offers(client, ledger, owner, run_id, agent, batch).await;
     ledger.take_frames(&owner.key, run_id)
 }
 
@@ -692,11 +708,12 @@ async fn claim_offers(
     owner: &Owner,
     run_id: Uuid,
     agent: &Value,
-    deliveries: &[Delivery],
+    batch: &Batch,
 ) {
     let session = &owner.key;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    for delivery in deliveries
+    let deadline = batch.read_at + OFFER_FRESH_FOR;
+    for delivery in batch
+        .deliveries
         .iter()
         .filter(|delivery| ledger.is_new(session, delivery))
         .take(MAX_SHOWN_AT_ONCE)

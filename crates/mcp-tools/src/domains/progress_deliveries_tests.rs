@@ -588,7 +588,7 @@ async fn a_delivery_another_agent_holds_is_not_shown_until_it_is_this_agents() {
         (
             CLAIM,
             409,
-            json!({"error": {"code": "claimed_by_other", "message": "claimed_by_other: Another agent has picked this answer up and is acting on it"}}),
+            json!({"error": {"code": "claimed_by_other", "message": "another agent holds this delivery"}}),
         ),
         (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
     ])
@@ -813,7 +813,8 @@ async fn reply_confirms_the_delivery_with_the_note() {
     );
     let structured = result.structured_content.unwrap();
     assert_eq!(structured["replied"], true);
-    assert_eq!(structured["delivery"]["state"], "applied");
+    assert_eq!(structured["state"], "applied");
+    assert!(structured.get("delivery").is_none(), "{structured}");
 
     let applied = sent(&api, "POST", "/applied");
     assert_eq!(applied.len(), 1, "{applied:?}");

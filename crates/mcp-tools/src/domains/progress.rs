@@ -769,7 +769,10 @@ impl ProgressTool {
                 is_this_agents(agent, view.get("agent"))
             }
             Err(error) => {
-                tracing::debug!("the run holding a delivery was not read: {}", error);
+                tracing::debug!(
+                    "the run holding a delivery was not read: {}",
+                    mcp_client::deliveries::error_tag(&error)
+                );
                 false
             }
         }

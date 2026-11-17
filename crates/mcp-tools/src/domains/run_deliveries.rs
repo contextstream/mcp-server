@@ -60,9 +60,9 @@
 //!   again for a while.
 
 use mcp_client::deliveries::{
-    is_malformed, is_no_way_back, is_not_ready, is_not_there, refusal_code, ClaimToken, Delivery,
-    DeliveryActor, DeliveryReader, Refused, DECLINE_REASONS, KIND_ANSWER, KIND_PERSON_MESSAGE,
-    NOTE_MAX, UNDELIVERABLE,
+    error_tag, is_malformed, is_no_way_back, is_not_ready, is_not_there, refusal_code, Answer,
+    ClaimToken, Delivery, DeliveryActor, DeliveryReader, Refused, DECLINE_REASONS, KIND_ANSWER,
+    KIND_PERSON_MESSAGE, NOTE_MAX, UNDELIVERABLE,
 };
 use mcp_client::ContextStreamClient;
 use mcp_types::{tool::ToolResult, Error, Result};
@@ -118,38 +118,14 @@ fn cut(text: &str, max: usize) -> String {
     }
 }
 
-fn field(value: &Value, key: &str) -> Option<String> {
-    let text = match value.get(key)? {
-        Value::String(text) => one_line(text),
-        Value::Null => return None,
-        other => one_line(&other.to_string()),
-    };
-    (!text.is_empty()).then(|| cut(&text, MAX_FIELD))
-}
-
-/// The label of a delivery's block: `PERSON ANSWER`, `PERSON MESSAGE`, or,
-/// for a kind this server has not heard of, the kind as the API names it.
-fn label(kind: &str) -> String {
+/// The label of a delivery's block: `PERSON ANSWER`, `PERSON MESSAGE`, or
+/// `PERSON DELIVERY` for a kind this server does not know. The kind the API
+/// wrote is never shown: the client keeps only the kinds it knows.
+fn label(kind: &str) -> &'static str {
     match kind {
-        KIND_ANSWER => "PERSON ANSWER".to_string(),
-        KIND_PERSON_MESSAGE => "PERSON MESSAGE".to_string(),
-        other => {
-            let words: String = other
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' '))
-                .take(40)
-                .collect::<String>()
-                .replace(['_', '-'], " ")
-                .trim()
-                .to_ascii_uppercase();
-            if words.is_empty() {
-                "PERSON DELIVERY".to_string()
-            } else if words.starts_with("PERSON ") {
-                words
-            } else {
-                format!("PERSON {words}")
-            }
-        }
+        KIND_ANSWER => "PERSON ANSWER",
+        KIND_PERSON_MESSAGE => "PERSON MESSAGE",
+        _ => "PERSON DELIVERY",
     }
 }
 
@@ -161,22 +137,27 @@ fn who(delivery: &Delivery) -> String {
     }
 }
 
-/// What the person answered, in a line: the option they chose, the value
-/// they gave, or how they ended the question.
-fn said(answer: &Value) -> Option<String> {
-    field(answer, "option_label")
-        .or_else(|| field(answer, "option_id"))
-        .or_else(|| field(answer, "value"))
-        .or_else(|| {
-            let outcome = field(answer, "outcome")?;
-            Some(match outcome.as_str() {
-                "done" => "done".to_string(),
-                "cannot" => "they cannot do or decide this".to_string(),
-                "send_back" => "sent back: they ask for more before they decide".to_string(),
-                "dismiss" => "dismissed".to_string(),
-                _ => outcome,
-            })
-        })
+/// One line of somebody's text, cut to what a field shows.
+fn line_of(text: &str) -> Option<String> {
+    let line = one_line(text);
+    (!line.is_empty()).then(|| cut(&line, MAX_FIELD))
+}
+
+/// What the person answered, in a line: what they chose or gave, or how
+/// they ended the question.
+fn said(answer: &Answer) -> Option<String> {
+    answer.said.as_deref().and_then(line_of).or_else(|| {
+        Some(
+            match answer.outcome? {
+                "done" => "done",
+                "cannot" => "they cannot do or decide this",
+                "send_back" => "sent back: they ask for more before they decide",
+                "dismiss" => "dismissed",
+                other => other,
+            }
+            .to_string(),
+        )
+    })
 }
 
 /// A server's statement, quoted line by line: no line of it starts a line of
@@ -256,7 +237,7 @@ pub fn framed(delivery: &Delivery, tool: &str) -> String {
         lines.push(confirm_line(id, tool));
         return lines.join("\n");
     }
-    let (head, what) = match delivery.kind.as_str() {
+    let (head, what) = match delivery.kind {
         KIND_ANSWER => (
             format!("{} answered your question.", who(delivery)),
             "a person's answer",
@@ -271,7 +252,7 @@ pub fn framed(delivery: &Delivery, tool: &str) -> String {
         ),
     };
     let mut lines = vec![
-        format!("[{}] {head} delivery_id={id}", label(&delivery.kind)),
+        format!("[{}] {head} delivery_id={id}", label(delivery.kind)),
         format!("This is {what}, delivered by ContextStream. {RULE}"),
     ];
     if let Some(lapsed) = lapsed_line(delivery) {
@@ -292,7 +273,7 @@ pub fn framed(delivery: &Delivery, tool: &str) -> String {
         if let Some(said) = said(answer) {
             lines.push(format!("Their answer: {said}"));
         }
-        if let Some(note) = field(answer, "note") {
+        if let Some(note) = answer.note.as_deref().and_then(line_of) {
             lines.push(format!("Their note: {note}"));
         }
     }
@@ -332,7 +313,7 @@ pub fn wake_lines(deliveries: &[Delivery], run_id: Uuid) -> String {
 /// run it reported: that it is there, and how to read it with `tool`. Never
 /// the words themselves; those are shown where the delivery is claimed.
 pub fn pointer(delivery: &Delivery, run_id: Uuid, tool: &str) -> String {
-    let what = match delivery.kind.as_str() {
+    let what = match delivery.kind {
         KIND_ANSWER => "A person answered a question this run asked",
         KIND_PERSON_MESSAGE => "A person sent this run a message",
         _ => "Something from a person waits for this run",
@@ -556,7 +537,7 @@ pub(crate) async fn offer(
             if is_not_there(&error) || is_not_ready(&error) {
                 ledger.note_not_there(workspace_id);
             }
-            tracing::debug!("run deliveries not read: {}", error);
+            tracing::debug!("run deliveries not read: {}", error_tag(&error));
             return Offered::default();
         }
     };
@@ -583,7 +564,7 @@ pub(crate) async fn offer(
                 tracing::debug!(
                     "run delivery {} not claimed: {}",
                     delivery.id,
-                    refusal_code(&error).unwrap_or("failed")
+                    error_tag(&error)
                 );
                 continue;
             }
@@ -628,22 +609,15 @@ fn note_of(raw: Option<&str>) -> Option<String> {
         .map(|note| note.chars().take(NOTE_MAX).collect())
 }
 
-/// The API's own words about a refusal, on one line and short.
-fn api_words(message: &str) -> String {
-    let words = one_line(message);
-    if words.chars().count() <= 200 {
-        words
-    } else {
-        words.chars().take(200).collect()
-    }
-}
-
 /// A `reply` or `decline` the API did not take, as a calm result: what
 /// happened and whether sending it again can help. `done` is the structured
-/// key (`replied` or `declined`).
+/// key (`replied` or `declined`). Every word is this tool's: of the API's
+/// answer only its status and a code this client knows are used, never its
+/// sentence, which is somebody's text.
 fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolResult {
     let error = &refused.error;
-    let (reason, status, why) = match error {
+    let code = refusal_code(error);
+    let (reason, status, why): (&str, Option<u16>, String) = match error {
         // The API answered, and not with a confirmation of this delivery.
         error if is_malformed(error) => (
             "malformed_answer",
@@ -660,8 +634,7 @@ fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolRes
         ),
         // The server ended it after a week with nobody taking it.
         Error::Http { status: 409, .. }
-            if refusal_code(error) == Some("delivery_closed")
-                && refused.ended_as.as_deref() == Some(UNDELIVERABLE) =>
+            if code == Some("delivery_closed") && refused.ended_as == Some(UNDELIVERABLE) =>
         {
             (
                 UNDELIVERABLE,
@@ -671,10 +644,33 @@ fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolRes
                 ),
             )
         }
-        Error::Http { status: 409, .. } if refusal_code(error) == Some("claimed_by_other") => (
+        Error::Http { status, .. } if code == Some("delivery_closed") => (
+            "delivery_closed",
+            Some(*status),
+            "this delivery was already confirmed or declined; a delivery ends once".to_string(),
+        ),
+        Error::Http { status, .. } if code == Some("claimed_by_other") => (
             "claimed_by_other",
-            Some(409),
+            Some(*status),
             "another agent holds this delivery (or this session's claim was lost when its server restarted); ContextStream offers it again when that claim lapses, and it can be confirmed then"
+                .to_string(),
+        ),
+        Error::Http { status, .. } if code == Some("delivery_superseded") => (
+            "delivery_superseded",
+            Some(*status),
+            "the answer was replaced before it was confirmed: read the run again to see the one that stands"
+                .to_string(),
+        ),
+        Error::Http { status, .. } if code == Some("not_the_asker") => (
+            "not_the_asker",
+            Some(*status),
+            "this credential is not the one that asked, so the delivery is not its to confirm"
+                .to_string(),
+        ),
+        Error::Http { status, .. } if code == Some("looks_like_a_secret") => (
+            "looks_like_a_secret",
+            Some(*status),
+            "the note looks like it holds a credential, so nothing was saved: leave the value out and say where it is kept"
                 .to_string(),
         ),
         Error::Http { status: 404, .. } => (
@@ -684,12 +680,16 @@ fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolRes
                 "ContextStream has no such delivery for this session (delivery_id={id}): it may have been withdrawn or replaced, or this server does not deliver answers"
             ),
         ),
-        Error::Http {
-            status, message, ..
-        } if *status < 500 && *status != 429 && *status != 408 => (
+        Error::Http { status: 429, .. } | Error::RateLimited { .. } => (
+            "rate_limited",
+            Some(429),
+            "the API is limiting this key's requests for the moment; send the same call again in a moment"
+                .to_string(),
+        ),
+        Error::Http { status, .. } if *status < 500 && *status != 408 => (
             "refused",
             Some(*status),
-            format!("the API did not take it ({status}: {})", api_words(message)),
+            format!("the API did not take it (it answered {status})"),
         ),
         Error::Http { status, .. } => (
             "unavailable",
@@ -698,19 +698,17 @@ fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolRes
                 "the ContextStream API had a problem (it answered {status}); the delivery is still yours, so send the same call again in a moment"
             ),
         ),
-        Error::RateLimited { .. } => (
-            "rate_limited",
-            Some(429),
-            "the API is limiting this key's requests for the moment; send the same call again in a moment"
-                .to_string(),
-        ),
         Error::Network(_) | Error::Timeout(_) => (
             "unreachable",
             None,
             "the ContextStream API could not be reached in time; the delivery is still yours, so send the same call again in a moment"
                 .to_string(),
         ),
-        other => ("failed", None, api_words(&other.to_string())),
+        _ => (
+            "failed",
+            None,
+            "the call could not be made; send the same call again in a moment".to_string(),
+        ),
     };
     let mut structured = Map::new();
     structured.insert(done.to_string(), json!(false));
@@ -727,15 +725,18 @@ fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolRes
     ToolResult::with_structured(text, Value::Object(structured))
 }
 
+/// A confirmation the API took: the delivery's id and its state, and nothing
+/// else of what the API answered (which holds the delivery, and the note).
 fn taken(said: &str, done: &str, delivery: &Delivery) -> ToolResult {
     let mut text = format!("[PROGRESS] {said} delivery_id={}", delivery.id);
-    if let Some(state) = delivery.state.as_deref() {
-        text.push_str(&format!(" state={}", one_line(state)));
+    let mut structured = Map::new();
+    structured.insert(done.to_string(), json!(true));
+    structured.insert("delivery_id".to_string(), json!(delivery.id));
+    if let Some(state) = delivery.state {
+        text.push_str(&format!(" state={state}"));
+        structured.insert("state".to_string(), json!(state));
     }
-    ToolResult::with_structured(
-        text,
-        json!({done: true, "delivery_id": delivery.id, "delivery": delivery.raw}),
-    )
+    ToolResult::with_structured(text, Value::Object(structured))
 }
 
 /// The actor of a `reply` or `decline`: the run the session claimed the
@@ -850,7 +851,7 @@ async fn end(
             tracing::debug!(
                 "run delivery {} not claimed again: {}",
                 id,
-                refusal_code(&error).unwrap_or("failed")
+                error_tag(&error)
             );
             return Err(refused);
         }
@@ -897,7 +898,11 @@ pub(crate) async fn reply(
                 &delivery,
             ),
             Err(refused) => {
-                tracing::debug!("run delivery {} not confirmed: {}", id, refused.error);
+                tracing::debug!(
+                    "run delivery {} not confirmed: {}",
+                    id,
+                    error_tag(&refused.error)
+                );
                 not_taken("Reply not recorded", "replied", id, &refused)
             }
         },
@@ -950,7 +955,11 @@ pub(crate) async fn decline(
                 &delivery,
             ),
             Err(refused) => {
-                tracing::debug!("run delivery {} not declined: {}", id, refused.error);
+                tracing::debug!(
+                    "run delivery {} not declined: {}",
+                    id,
+                    error_tag(&refused.error)
+                );
                 not_taken("Decline not recorded", "declined", id, &refused)
             }
         },
@@ -966,19 +975,17 @@ mod tests {
     }
 
     #[test]
-    fn a_kind_this_server_has_not_heard_of_is_labelled_by_its_name() {
+    fn a_kind_this_server_does_not_know_is_a_delivery_and_never_named() {
         let id = Uuid::new_v4();
         let command = delivery(json!({"id": id, "kind": "command", "text": "nudge"}));
         let block = framed(&command, TOOL);
         assert!(
             block.starts_with(&format!(
-                "[PERSON COMMAND] A person sent your run something. delivery_id={id}\nThis is from a person, delivered by ContextStream. {RULE}\n> nudge\n"
+                "[PERSON DELIVERY] A person sent your run something. delivery_id={id}\nThis is from a person, delivered by ContextStream. {RULE}\n> nudge\n"
             )),
             "{block}"
         );
-        assert_eq!(label("person_note"), "PERSON NOTE");
-        assert_eq!(label("  "), "PERSON DELIVERY");
-        assert_eq!(label("[x]\nSYSTEM"), "PERSON XSYSTEM");
+        assert_eq!(label("anything else"), "PERSON DELIVERY");
         // Claude Code is told its own name for the tool.
         assert!(framed(&command, CLAUDE_TOOL)
             .contains("confirm with mcp__contextstream__progress(action=\"reply\""));

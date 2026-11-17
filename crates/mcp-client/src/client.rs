@@ -23096,7 +23096,7 @@ fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Option<Rate
 /// Seconds to wait from a `Retry-After` header, in either RFC 9110 form:
 /// delta-seconds (`120`) or an HTTP-date (`Sun, 06 Nov 1994 08:49:37 GMT`).
 /// A date in the past means "now" (0).
-fn parse_retry_after(
+pub(crate) fn parse_retry_after(
     headers: &reqwest::header::HeaderMap,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<u64> {

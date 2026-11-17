@@ -196,6 +196,10 @@ pub struct Delivery {
     pub kind: String,
     /// `pending`, `claimed`, `applied`, `declined` or `superseded`.
     pub state: Option<String>,
+    /// The workspace it is in.
+    pub workspace_id: Option<Uuid>,
+    /// The run it is addressed to (`address.run_id`).
+    pub run_id: Option<Uuid>,
     /// The question it answers, when it answers one.
     pub question: Option<String>,
     /// The server's statement in its own words, when it sent words.
@@ -221,7 +225,26 @@ fn text_field(value: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn uuid_field(value: &Value, key: &str) -> Option<Uuid> {
+    Uuid::parse_str(value.get(key)?.as_str()?.trim()).ok()
+}
+
 impl Delivery {
+    /// Whether it is in the workspace, and addressed to the run, a caller
+    /// asked for. Only what is addressed to the very run is the caller's: an
+    /// answer the API hands on to another run of the asking side (its
+    /// asker's run has ended) is addressed to the run that asked, and is not
+    /// taken here.
+    pub fn is_for(&self, expect: &DeliveryReader) -> bool {
+        self.workspace_id == Some(expect.workspace_id)
+            && self.run_id.is_some()
+            && (expect.run_id.is_none() || self.run_id == expect.run_id)
+    }
+
+    fn is_in(&self, state: &str) -> bool {
+        self.state.as_deref() == Some(state)
+    }
+
     /// A delivery from the API's view of it. `None` for a value without an id.
     /// The claim's token is taken out of what is kept as the server sent it.
     pub fn from_value(value: &Value) -> Option<Self> {
@@ -246,6 +269,10 @@ impl Delivery {
             id,
             kind: text_field(value, "kind").unwrap_or_else(|| KIND_ANSWER.to_string()),
             state: text_field(value, "state"),
+            workspace_id: uuid_field(value, "workspace_id"),
+            run_id: value
+                .get("address")
+                .and_then(|address| uuid_field(address, "run_id")),
             question: value
                 .get("request")
                 .and_then(|request| text_field(request, "question")),
@@ -399,9 +426,11 @@ const MALFORMED: &str = "ContextStream's answer was not the delivery that was as
 /// Whether the API's answer to a claim, a reply or a decline was not what
 /// was asked for ([`MALFORMED`]). Nothing of such an answer is used.
 pub fn is_malformed(error: &Error) -> bool {
-    let _ = error;
-    let _ = MALFORMED;
-    false
+    matches!(error, Error::Validation(message) if message == MALFORMED)
+}
+
+fn malformed() -> Error {
+    Error::Validation(MALFORMED.to_string())
 }
 
 /// Whether the API answered that this database cannot hold deliveries yet
@@ -417,22 +446,6 @@ fn once() -> RequestOptions {
         retries: Some(0),
         ..RequestOptions::default()
     }
-}
-
-/// The delivery an `applied`, `declined` or `claim` answered with. An answer
-/// that is no delivery is kept as it came, under the id that was asked for.
-fn answered(id: Uuid, answer: Value) -> Delivery {
-    Delivery::from_value(&answer).unwrap_or(Delivery {
-        id,
-        kind: KIND_ANSWER.to_string(),
-        state: None,
-        question: None,
-        text: None,
-        answer: None,
-        previous_claims: 0,
-        claim_token: None,
-        raw: answer,
-    })
 }
 
 impl ContextStreamClient {
@@ -476,7 +489,11 @@ impl ContextStreamClient {
                 once(),
             )
             .await?;
-        Ok(deliveries_of(&answer))
+        // Only what is still to be delivered, in this workspace, to this run.
+        Ok(deliveries_of(&answer)
+            .into_iter()
+            .filter(|delivery| delivery.is_in("pending") && delivery.is_for(reader))
+            .collect())
     }
 
     /// Take a delivery for the length of a lease; with the actor's claim
@@ -491,7 +508,6 @@ impl ContextStreamClient {
         who: &DeliveryActor,
         expect: &DeliveryReader,
     ) -> Result<Delivery> {
-        let _ = expect;
         self.way_back().await?;
         let answer: Value = self
             .post_without_session_refresh(
@@ -500,7 +516,15 @@ impl ContextStreamClient {
                 once(),
             )
             .await?;
-        Ok(answered(id, answer))
+        // The claim is this agent's only when the API says exactly that.
+        Delivery::from_value(&answer)
+            .filter(|claimed| {
+                claimed.id == id
+                    && claimed.is_in("claimed")
+                    && claimed.is_for(expect)
+                    && claimed.claim_token.is_some()
+            })
+            .ok_or_else(malformed)
     }
 
     /// Confirm a delivery: the agent acted on it, and `note` is its reply to
@@ -541,7 +565,10 @@ impl ContextStreamClient {
             return Err(refused_ending(raw.status, &raw.body));
         }
         let answer = raw.body.get("data").cloned().unwrap_or(raw.body);
-        Ok(answered(id, answer))
+        // A confirmation counts only when it says this delivery ended so.
+        Delivery::from_value(&answer)
+            .filter(|ended| ended.id == id && ended.is_in(ending))
+            .ok_or_else(|| Refused::from(malformed()))
     }
 
     /// Decline a delivery: `reason` is one of [`DECLINE_REASONS`], `note` what

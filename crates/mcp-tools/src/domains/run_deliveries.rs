@@ -60,9 +60,9 @@
 //!   again for a while.
 
 use mcp_client::deliveries::{
-    is_no_way_back, is_not_ready, is_not_there, refusal_code, ClaimToken, Delivery, DeliveryActor,
-    DeliveryReader, Refused, DECLINE_REASONS, KIND_ANSWER, KIND_PERSON_MESSAGE, NOTE_MAX,
-    UNDELIVERABLE,
+    is_malformed, is_no_way_back, is_not_ready, is_not_there, refusal_code, ClaimToken, Delivery,
+    DeliveryActor, DeliveryReader, Refused, DECLINE_REASONS, KIND_ANSWER, KIND_PERSON_MESSAGE,
+    NOTE_MAX, UNDELIVERABLE,
 };
 use mcp_client::ContextStreamClient;
 use mcp_types::{tool::ToolResult, Error, Result};
@@ -361,6 +361,8 @@ pub(crate) async fn receives_deliveries(client: &ContextStreamClient) -> bool {
 struct Shown {
     /// How many claims had lapsed when it was shown.
     previous_claims: usize,
+    /// The workspace it was claimed in.
+    workspace_id: Uuid,
     /// The run it was claimed as.
     run_id: Uuid,
     /// The token of the claim, when the API gave one: what the session
@@ -411,6 +413,7 @@ impl Ledger {
         &self,
         session: &str,
         delivery: &Delivery,
+        workspace_id: Uuid,
         run_id: Uuid,
         token: Option<ClaimToken>,
     ) {
@@ -421,6 +424,7 @@ impl Ledger {
             Self::key(session, delivery.id),
             Shown {
                 previous_claims: delivery.previous_claims,
+                workspace_id,
                 run_id,
                 token,
                 order,
@@ -440,7 +444,14 @@ impl Ledger {
 
     /// A claim made again: the delivery is this session's as `run_id`, under
     /// `token`. What the session was shown of it stays as it was.
-    fn hold(&self, session: &str, id: Uuid, run_id: Uuid, token: Option<ClaimToken>) {
+    fn hold(
+        &self,
+        session: &str,
+        id: Uuid,
+        workspace_id: Uuid,
+        run_id: Uuid,
+        token: Option<ClaimToken>,
+    ) {
         let mut memory = self.lock();
         memory.next += 1;
         let order = memory.next;
@@ -452,6 +463,7 @@ impl Ledger {
             Self::key(session, id),
             Shown {
                 previous_claims,
+                workspace_id,
                 run_id,
                 token,
                 order,
@@ -576,11 +588,19 @@ pub(crate) async fn offer(
                 continue;
             }
         };
-        ledger.remember(session, delivery, run_id, claimed.claim_token);
-        offered.blocks.push(framed(delivery, TOOL));
+        // What is shown is what the claim answered: the API's statement that
+        // this delivery, in this state, is this run's.
+        ledger.remember(
+            session,
+            &claimed,
+            workspace_id,
+            run_id,
+            claimed.claim_token.clone(),
+        );
+        offered.blocks.push(framed(&claimed, TOOL));
         offered
             .shown
-            .push(json!({"id": delivery.id, "kind": delivery.kind}));
+            .push(json!({"id": claimed.id, "kind": claimed.kind}));
     }
     offered
 }
@@ -624,6 +644,13 @@ fn api_words(message: &str) -> String {
 fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolResult {
     let error = &refused.error;
     let (reason, status, why) = match error {
+        // The API answered, and not with a confirmation of this delivery.
+        error if is_malformed(error) => (
+            "malformed_answer",
+            None,
+            "ContextStream's answer did not say the delivery was confirmed; send the same call again in a moment"
+                .to_string(),
+        ),
         // Nothing was sent: nothing comes back to this credential.
         error if is_no_way_back(error) => (
             "no_way_back",
@@ -730,8 +757,11 @@ fn actor(ledger: &Ledger, session: &str, id: Uuid, agent: &Value) -> DeliveryAct
 
 /// The workspace a session claimed a delivery in, when it remembers.
 fn claimed_in(ledger: &Ledger, session: &str, id: Uuid) -> Option<Uuid> {
-    let _ = (ledger, session, id);
-    None
+    ledger
+        .lock()
+        .shown
+        .get(&Ledger::key(session, id))
+        .map(|shown| shown.workspace_id)
 }
 
 /// Which runs are a session's own, for a claim that is made again ([`end`]).
@@ -739,6 +769,9 @@ fn claimed_in(ledger: &Ledger, session: &str, id: Uuid) -> Option<Uuid> {
 pub(crate) trait OwnRuns: Sync {
     /// Whether `run_id` is a run of this session.
     async fn is_own(&self, run_id: Uuid) -> bool;
+
+    /// The session's workspace.
+    fn workspace_id(&self) -> Option<Uuid>;
 }
 
 /// How a delivery is ended.
@@ -804,8 +837,11 @@ async fn end(
         agent: Some(agent.clone()),
         claim_token: None,
     };
+    let Some(workspace_id) = claimed_in(ledger, session, id).or(own_run.workspace_id()) else {
+        return Err(refused);
+    };
     let expect = DeliveryReader {
-        workspace_id: claimed_in(ledger, session, id).unwrap_or_default(),
+        workspace_id,
         run_id: Some(run_id),
     };
     let claimed = match client.claim_delivery(id, &again, &expect).await {
@@ -819,7 +855,13 @@ async fn end(
             return Err(refused);
         }
     };
-    ledger.hold(session, id, run_id, claimed.claim_token.clone());
+    ledger.hold(
+        session,
+        id,
+        workspace_id,
+        run_id,
+        claimed.claim_token.clone(),
+    );
     let who = DeliveryActor {
         claim_token: claimed.claim_token,
         ..again
@@ -1083,7 +1125,7 @@ mod tests {
         assert!(ledger.is_new("a", &fresh));
         assert_eq!(ledger.claimed_as("a", id), None);
         let token = ClaimToken::new("5e1f").unwrap();
-        ledger.remember("a", &fresh, run, Some(token.clone()));
+        ledger.remember("a", &fresh, Uuid::nil(), run, Some(token.clone()));
         assert!(!ledger.is_new("a", &fresh));
         assert_eq!(ledger.claimed_as("a", id), Some((run, Some(token))));
         // Another session of the same process has not seen it.
@@ -1091,7 +1133,7 @@ mod tests {
         assert_eq!(ledger.claimed_as("b", id), None);
         // Offered again after the lease ran out: once more, and then not.
         assert!(ledger.is_new("a", &lapsed));
-        ledger.remember("a", &lapsed, run, None);
+        ledger.remember("a", &lapsed, Uuid::nil(), run, None);
         assert!(!ledger.is_new("a", &lapsed));
         assert!(!ledger.is_new("a", &fresh));
     }
@@ -1101,9 +1143,15 @@ mod tests {
         let ledger = Ledger::default();
         let run = Uuid::new_v4();
         let first = delivery(json!({"id": Uuid::new_v4()}));
-        ledger.remember("a", &first, run, None);
+        ledger.remember("a", &first, Uuid::nil(), run, None);
         for _ in 0..MAX_REMEMBERED {
-            ledger.remember("a", &delivery(json!({"id": Uuid::new_v4()})), run, None);
+            ledger.remember(
+                "a",
+                &delivery(json!({"id": Uuid::new_v4()})),
+                Uuid::nil(),
+                run,
+                None,
+            );
         }
         assert_eq!(ledger.lock().shown.len(), MAX_REMEMBERED);
         // The oldest made way.

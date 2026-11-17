@@ -629,6 +629,8 @@ async fn a_claim_that_lapsed_and_is_offered_again_is_shown_again_once() {
         offered(vec![fresh.clone()]),
         offered(vec![lapsed.clone()]),
         (CLAIM, 200, held_with("claimed", &fresh, TOKEN)),
+        // The second claim's answer says, as the offer did, what lapsed.
+        (CLAIM, 200, held_with("claimed", &lapsed, TOKEN)),
     ])
     .await;
     let tool = fixture.tool(&api);

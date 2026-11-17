@@ -1068,6 +1068,10 @@ impl run_deliveries::OwnRuns for OwnRunsOf<'_> {
             .is_own_run(run_id, self.workspace_id, self.agent)
             .await
     }
+
+    fn workspace_id(&self) -> Option<Uuid> {
+        self.workspace_id
+    }
 }
 
 /// Register the `progress` tool.

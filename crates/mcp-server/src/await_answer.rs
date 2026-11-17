@@ -11,16 +11,24 @@
 //!
 //! - every [`DEFAULT_POLL_SECS`] it asks the API what is deliverable to the
 //!   run (`GET /decision-requests/deliveries?workspace_id=&run_id=`);
-//! - when something is, it claims it, prints it inside the frame the
-//!   `progress` tool uses (with how to confirm it), and exits 0. Confirming
-//!   stays the agent's: `progress(action="reply", ...)`;
+//! - when something is, it prints a line for each (what it is, and the
+//!   `progress(action="get", run_id=...)` that reads it) and exits 0;
 //! - when nothing arrived within `--timeout-min` it says so in one line and
 //!   exits [`EXIT_TIMED_OUT`].
 //!
+//! **It claims nothing, and prints no word a person wrote.** A delivery is
+//! confirmed with its claim's token, which only the claim's answer carries,
+//! and its lease is renewed only by the claiming credential. So the one that
+//! claims must be the one that replies: the session's own `progress` call,
+//! under the credential that reported the run (`mcp_tools::domains::
+//! run_deliveries`). This process may hold another credential (the folder's
+//! key, where the session is signed in another way); it only wakes.
+//!
 //! It is quiet while it waits. An API that fails is asked again after twice
 //! the wait, up to [`MAX_BACKOFF`] times the poll; an API without the routes
-//! (they answer an unknown path's 404 where the feature is off) is asked at a
-//! [`NOT_THERE_SLOWER`]th of the pace, and nothing is said about either.
+//! (they answer an unknown path's 404 where the feature is off) or whose
+//! database cannot hold deliveries yet (503 `deliveries_not_ready`) is asked
+//! at a [`NOT_THERE_SLOWER`]th of the pace, and nothing is said about either.
 //!
 //! The credentials are the ones the hooks and `contextstream-mcp run` use in
 //! this folder (`hook_handlers::common::load_config`), else what the server
@@ -30,9 +38,9 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use mcp_client::deliveries::{is_not_there, DeliveryActor, DeliveryReader};
+use mcp_client::deliveries::{is_not_ready, is_not_there, DeliveryReader};
 use mcp_client::ContextStreamClient;
-use mcp_tools::domains::run_deliveries::{framed, TOOL};
+use mcp_tools::domains::run_deliveries::wake_lines;
 use uuid::Uuid;
 
 /// Something arrived, and was printed.
@@ -59,7 +67,7 @@ const MAX_BACKOFF: u32 = 15;
 /// The longest a wait may be asked to last: a week.
 const MAX_TIMEOUT_MIN: f64 = 7.0 * 24.0 * 60.0;
 
-/// Most deliveries one wait prints; the rest are offered to the next read.
+/// Most deliveries one wait names; the session's read shows them all.
 const MAX_PRINTED: usize = 5;
 
 /// What to wait for, and for how long.
@@ -137,34 +145,24 @@ pub async fn run(wait: Wait) -> i32 {
         workspace_id,
         run_id: Some(wait.run_id),
     };
-    let who = DeliveryActor {
-        run_id: Some(wait.run_id),
-        agent: None,
-        claim_token: None,
-    };
     let mut failures = 0_u32;
     loop {
         let next = match client.read_deliveries(&reader).await {
-            Ok(deliveries) => {
+            Ok(deliveries) if !deliveries.is_empty() => {
+                // A read changes nothing but a count: what it found is still
+                // there for the session, which claims it when it reads it.
+                let named = &deliveries[..deliveries.len().min(MAX_PRINTED)];
+                say(&wake_lines(named, wait.run_id));
+                return EXIT_ARRIVED;
+            }
+            Ok(_) => {
                 failures = 0;
-                let mut blocks = Vec::new();
-                for delivery in deliveries.iter().take(MAX_PRINTED) {
-                    // Printed only once it is this run's: one another agent
-                    // holds, or one whose claim did not get through, is
-                    // offered again.
-                    if client.claim_delivery(delivery.id, &who).await.is_ok() {
-                        blocks.push(framed(delivery, TOOL));
-                    }
-                }
-                if !blocks.is_empty() {
-                    say(&blocks.join("\n\n"));
-                    return EXIT_ARRIVED;
-                }
                 poll
             }
-            // The feature is off for this workspace, or on this server: it
-            // may be switched on while the agent waits, so keep asking, rarely.
-            Err(error) if is_not_there(&error) => {
+            // The feature is off for this workspace, or on this server, or its
+            // database cannot hold deliveries yet: that may change while the
+            // agent waits, so keep asking, rarely.
+            Err(error) if is_not_there(&error) || is_not_ready(&error) => {
                 failures = 0;
                 poll.saturating_mul(NOT_THERE_SLOWER)
             }

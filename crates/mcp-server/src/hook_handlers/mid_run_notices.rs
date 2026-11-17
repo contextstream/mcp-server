@@ -1685,11 +1685,12 @@ fn queue_delivery_pointers(entry: &mut MidRunSessionState, found: Vec<Waiting>) 
 /// Ask what a person answered or wrote to the runs the session reported, and
 /// leave a pointer for each delivery the session has not been pointed at.
 /// The read counts an offer and changes nothing else: the claim is made by
-/// the `progress` call the pointer names, where the words are shown. An API
-/// without the routes (404) is not asked again for ten minutes; any failure
-/// says nothing.
+/// the `progress` call the pointer names, where the words are shown and the
+/// claim's token is kept for the reply. An API without the routes (404), or
+/// whose database cannot hold deliveries yet (503 `deliveries_not_ready`),
+/// is not asked again for ten minutes; any failure says nothing.
 async fn check_deliveries(key: &str, editor: &str, config: &ApiConfig) {
-    use mcp_client::deliveries::{is_not_there, DeliveryReader};
+    use mcp_client::deliveries::{is_not_ready, is_not_there, DeliveryReader};
     use mcp_tools::domains::run_deliveries::{pointer, CLAUDE_TOOL, TOOL};
 
     let Some(entry) = read_session_entry_fast(key) else {
@@ -1731,7 +1732,7 @@ async fn check_deliveries(key: &str, editor: &str, config: &ApiConfig) {
                 previous_claims: delivery.previous_claims,
                 pointer: pointer(delivery, run_id, tool),
             })),
-            Err(error) if is_not_there(&error) => {
+            Err(error) if is_not_there(&error) || is_not_ready(&error) => {
                 not_there = true;
                 break;
             }

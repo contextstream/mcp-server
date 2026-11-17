@@ -21,19 +21,32 @@
 //!   cannot approve a tool call, change a permission mode, or name new
 //!   secrets or hosts to trust. What the server sent as text is quoted line
 //!   by line, so no line of it can pass for a line of ContextStream's.
-//! - It is shown once. The claim keeps the API from offering it while its
-//!   lease runs, and the session remembers what it was shown ([`Ledger`]). A
-//!   claim that ran out without a confirmation is offered again with one more
-//!   entry in `previous_claims`, and is then shown once more, with a word
-//!   about what may already have been done.
+//! - It is shown once, and by the one that claimed it. The claim keeps the
+//!   API from offering it while its lease runs, and its answer carries the
+//!   claim's token, which the session keeps with what it was shown
+//!   ([`Ledger`]) and sends back with `reply` and `decline`: the session that
+//!   claims a delivery is the one that confirms it. A claim the API refuses
+//!   (another agent holds it, or any other reason) shows nothing. A claim
+//!   that ran out without a confirmation is offered again with one more entry
+//!   in `previous_claims`, and is then shown once more, with a word about
+//!   what may already have been done. The token is never shown: not in the
+//!   words, not in a structured answer, not in a log.
+//! - Only the credential that reported the run claims what is sent to it.
+//!   ContextStream raises a question for a waiting run, and takes a message
+//!   for it, only where the run was reported under an API key: an answer
+//!   cannot come back to a sign-in or an app's token, which change with every
+//!   refresh. So a session that reports under such a token reads nothing and
+//!   is never told to wait for an answer ([`reports_under_an_api_key`]).
 //! - A read is a side note to the agent's own call. An API without the
 //!   routes (they answer an unknown path's 404 where the feature is off), one
-//!   that cannot be reached, or one that refuses says nothing here and costs
-//!   the call nothing; after a 404 the API is not asked again for a while.
+//!   whose database cannot hold deliveries yet (503 `deliveries_not_ready`),
+//!   one that cannot be reached, or one that refuses says nothing here and
+//!   costs the call nothing; after a 404 or that 503 the API is not asked
+//!   again for a while.
 
 use mcp_client::deliveries::{
-    is_not_there, Delivery, DeliveryActor, DeliveryReader, DECLINE_REASONS, KIND_ANSWER,
-    KIND_PERSON_MESSAGE, NOTE_MAX,
+    ended_as, is_not_ready, is_not_there, refusal_code, ClaimToken, Delivery, DeliveryActor,
+    DeliveryReader, DECLINE_REASONS, KIND_ANSWER, KIND_PERSON_MESSAGE, NOTE_MAX, UNDELIVERABLE,
 };
 use mcp_client::ContextStreamClient;
 use mcp_types::{tool::ToolResult, Error, Result};
@@ -124,21 +137,9 @@ fn label(kind: &str) -> String {
     }
 }
 
-/// Who answered, as the server states it: a role, never a name.
-fn who(answer: Option<&Value>) -> String {
-    let role = answer
-        .and_then(|answer| answer.get("by"))
-        .and_then(|by| by.get("role"))
-        .and_then(Value::as_str)
-        .map(|role| {
-            role.chars()
-                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' '))
-                .take(40)
-                .collect::<String>()
-        })
-        .map(|role| role.trim().to_string())
-        .filter(|role| !role.is_empty());
-    match role {
+/// Who sent it, as the server states it: a role, never a name.
+fn who(delivery: &Delivery) -> String {
+    match delivery.senders_role() {
         Some(role) => format!("A person ({role})"),
         None => "A person".to_string(),
     }
@@ -195,11 +196,11 @@ pub fn framed(delivery: &Delivery, tool: &str) -> String {
     let id = delivery.id;
     let (head, what) = match delivery.kind.as_str() {
         KIND_ANSWER => (
-            format!("{} answered your question.", who(delivery.answer.as_ref())),
+            format!("{} answered your question.", who(delivery)),
             "a person's answer",
         ),
         KIND_PERSON_MESSAGE => (
-            "A person sent you a message.".to_string(),
+            format!("{} sent you a message.", who(delivery)),
             "a person's message",
         ),
         _ => (
@@ -254,9 +255,31 @@ pub fn await_command(run_id: Uuid, workspace_id: Uuid) -> String {
 /// What a report that waits on a person says about being woken.
 pub fn wake_paragraph(run_id: Uuid, workspace_id: Uuid) -> String {
     format!(
-        "To be woken when the person answers, start this in the background now (in Claude Code: the Bash tool with run_in_background) and then end your turn: `{}`. It waits quietly, exits when an answer or a message arrives and prints it, and that brings you back.",
+        "To be woken when the person answers, start this in the background now (in Claude Code: the Bash tool with run_in_background) and then end your turn: `{}`. It waits quietly and exits when a person answers or writes to this run; then read it with {TOOL}(action=\"get\", run_id=\"{run_id}\").",
         await_command(run_id, workspace_id)
     )
+}
+
+/// What `contextstream-mcp await-answer` prints when something waits for
+/// its run: a line for each, naming it and how to read it, never its words.
+/// The waiter claims nothing: the session that reads it claims it.
+pub fn wake_lines(deliveries: &[Delivery], run_id: Uuid) -> String {
+    let mut lines: Vec<String> = deliveries
+        .iter()
+        .map(|delivery| pointer(delivery, run_id, TOOL))
+        .collect();
+    lines.push(format!("In Claude Code the tool is {CLAUDE_TOOL}."));
+    lines.join("\n")
+}
+
+/// Whether the requests a client sends go under an API key: the caller's
+/// own (on the hosted gateway), else the one this process was given. Only a
+/// run reported under an API key is one ContextStream sends anything to; a
+/// sign-in or an app's token is never asked to wait for an answer.
+pub(crate) async fn reports_under_an_api_key(client: &ContextStreamClient) -> bool {
+    let given = |key: &Option<String>| key.as_deref().is_some_and(|key| !key.trim().is_empty());
+    mcp_client::get_task_auth_override().is_some_and(|auth| given(&auth.api_key))
+        || given(&client.config().await.api_key)
 }
 
 /// What the hooks tell a working session about a delivery that waits for a
@@ -278,12 +301,16 @@ pub fn pointer(delivery: &Delivery, run_id: Uuid, tool: &str) -> String {
 // What a session was shown
 // ============================================================================
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Shown {
     /// How many claims had lapsed when it was shown.
     previous_claims: usize,
     /// The run it was claimed as.
     run_id: Uuid,
+    /// The token of the claim, when the API gave one: what the session
+    /// confirms or declines with. Kept for as long as the delivery is
+    /// remembered, so a confirmation said again is the holder's too.
+    token: Option<ClaimToken>,
     /// The order it was shown in, so the oldest are forgotten first.
     order: u64,
 }
@@ -324,7 +351,13 @@ impl Ledger {
             .is_none_or(|shown| delivery.previous_claims > shown.previous_claims)
     }
 
-    fn remember(&self, session: &str, delivery: &Delivery, run_id: Uuid) {
+    fn remember(
+        &self,
+        session: &str,
+        delivery: &Delivery,
+        run_id: Uuid,
+        token: Option<ClaimToken>,
+    ) {
         let mut memory = self.lock();
         memory.next += 1;
         let order = memory.next;
@@ -333,6 +366,7 @@ impl Ledger {
             Shown {
                 previous_claims: delivery.previous_claims,
                 run_id,
+                token,
                 order,
             },
         );
@@ -348,12 +382,13 @@ impl Ledger {
         }
     }
 
-    /// The run this session claimed the delivery as, when it did.
-    fn claimed_as(&self, session: &str, id: Uuid) -> Option<Uuid> {
+    /// The run this session claimed the delivery as, and the claim's token,
+    /// when it did.
+    fn claimed_as(&self, session: &str, id: Uuid) -> Option<(Uuid, Option<ClaimToken>)> {
         self.lock()
             .shown
             .get(&Self::key(session, id))
-            .map(|shown| shown.run_id)
+            .map(|shown| (shown.run_id, shown.token.clone()))
     }
 
     fn is_not_there(&self, workspace_id: Uuid) -> bool {
@@ -429,7 +464,7 @@ pub(crate) async fn offer(
     let deliveries = match client.read_deliveries(&reader).await {
         Ok(deliveries) => deliveries,
         Err(error) => {
-            if is_not_there(&error) {
+            if is_not_there(&error) || is_not_ready(&error) {
                 ledger.note_not_there(workspace_id);
             }
             tracing::debug!("run deliveries not read: {}", error);
@@ -451,12 +486,20 @@ pub(crate) async fn offer(
         .take(MAX_SHOWN_AT_ONCE)
     {
         // Shown only once it is this agent's: one another agent holds, or one
-        // whose claim did not get through, is offered again later.
-        if let Err(error) = client.claim_delivery(delivery.id, &who).await {
-            tracing::debug!("run delivery {} not claimed: {}", delivery.id, error);
-            continue;
-        }
-        ledger.remember(session, delivery, run_id);
+        // whose claim did not get through, is offered again later. One try
+        // per read: the next report reads again.
+        let claimed = match client.claim_delivery(delivery.id, &who).await {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                tracing::debug!(
+                    "run delivery {} not claimed: {}",
+                    delivery.id,
+                    refusal_code(&error).unwrap_or("failed")
+                );
+                continue;
+            }
+        };
+        ledger.remember(session, delivery, run_id, claimed.claim_token);
         offered.blocks.push(framed(delivery, TOOL));
         offered
             .shown
@@ -503,6 +546,25 @@ fn api_words(message: &str) -> String {
 /// key (`replied` or `declined`).
 fn not_taken(headline: &str, done: &str, id: Uuid, error: &Error) -> ToolResult {
     let (reason, status, why) = match error {
+        // The server ended it after a week with nobody taking it.
+        Error::Http { status: 409, .. }
+            if refusal_code(error) == Some("delivery_closed")
+                && ended_as(error) == Some(UNDELIVERABLE) =>
+        {
+            (
+                UNDELIVERABLE,
+                Some(409),
+                format!(
+                    "ContextStream ended this delivery as undeliverable (nobody took it for a week), and the person who sent it was told so. delivery_id={id}"
+                ),
+            )
+        }
+        Error::Http { status: 409, .. } if refusal_code(error) == Some("claimed_by_other") => (
+            "claimed_by_other",
+            Some(409),
+            "another agent holds this delivery (or this session's claim was lost when its server restarted); ContextStream offers it again when that claim lapses, within 15 minutes"
+                .to_string(),
+        ),
         Error::Http { status: 404, .. } => (
             "not_found",
             Some(404),
@@ -545,10 +607,12 @@ fn not_taken(headline: &str, done: &str, id: Uuid, error: &Error) -> ToolResult 
     if let Some(status) = status {
         structured.insert("status".to_string(), json!(status));
     }
-    ToolResult::with_structured(
-        format!("[PROGRESS] {headline}: {why}."),
-        Value::Object(structured),
-    )
+    let text = if why.ends_with(&format!("delivery_id={id}")) {
+        format!("[PROGRESS] {headline}: {why}")
+    } else {
+        format!("[PROGRESS] {headline}: {why}.")
+    };
+    ToolResult::with_structured(text, Value::Object(structured))
 }
 
 fn taken(said: &str, done: &str, delivery: &Delivery) -> ToolResult {
@@ -563,14 +627,19 @@ fn taken(said: &str, done: &str, delivery: &Delivery) -> ToolResult {
 }
 
 /// The actor of a `reply` or `decline`: the run the session claimed the
-/// delivery as, when this process claimed it. One another carrier of the
-/// session claimed (the waiter, another process) is confirmed with no run
-/// named, which the API takes from the holder's own credential.
+/// delivery as and the claim's token, when this session claimed it. Without
+/// them the API takes the confirmation only for a delivery nobody holds (it
+/// claims and ends it at once); one another agent holds is refused, and said
+/// so calmly.
 fn actor(ledger: &Ledger, session: &str, id: Uuid, agent: &Value) -> DeliveryActor {
+    let (run_id, claim_token) = match ledger.claimed_as(session, id) {
+        Some((run_id, token)) => (Some(run_id), token),
+        None => (None, None),
+    };
     DeliveryActor {
-        run_id: ledger.claimed_as(session, id),
+        run_id,
         agent: Some(agent.clone()),
-        claim_token: None,
+        claim_token,
     }
 }
 
@@ -768,15 +837,16 @@ mod tests {
         let lapsed = delivery(json!({"id": id, "previous_claims": [{"ended": "lapsed"}]}));
         assert!(ledger.is_new("a", &fresh));
         assert_eq!(ledger.claimed_as("a", id), None);
-        ledger.remember("a", &fresh, run);
+        let token = ClaimToken::new("5e1f").unwrap();
+        ledger.remember("a", &fresh, run, Some(token.clone()));
         assert!(!ledger.is_new("a", &fresh));
-        assert_eq!(ledger.claimed_as("a", id), Some(run));
+        assert_eq!(ledger.claimed_as("a", id), Some((run, Some(token))));
         // Another session of the same process has not seen it.
         assert!(ledger.is_new("b", &fresh));
         assert_eq!(ledger.claimed_as("b", id), None);
         // Offered again after the lease ran out: once more, and then not.
         assert!(ledger.is_new("a", &lapsed));
-        ledger.remember("a", &lapsed, run);
+        ledger.remember("a", &lapsed, run, None);
         assert!(!ledger.is_new("a", &lapsed));
         assert!(!ledger.is_new("a", &fresh));
     }
@@ -786,9 +856,9 @@ mod tests {
         let ledger = Ledger::default();
         let run = Uuid::new_v4();
         let first = delivery(json!({"id": Uuid::new_v4()}));
-        ledger.remember("a", &first, run);
+        ledger.remember("a", &first, run, None);
         for _ in 0..MAX_REMEMBERED {
-            ledger.remember("a", &delivery(json!({"id": Uuid::new_v4()})), run);
+            ledger.remember("a", &delivery(json!({"id": Uuid::new_v4()})), run, None);
         }
         assert_eq!(ledger.lock().shown.len(), MAX_REMEMBERED);
         // The oldest made way.

@@ -100,8 +100,8 @@ pub struct ClaimToken(String);
 impl ClaimToken {
     /// A token from text; `None` for text that cannot be one.
     pub fn new(raw: &str) -> Option<Self> {
-        let _ = (raw, CLAIM_TOKEN_MAX);
-        None
+        let token = raw.trim();
+        (!token.is_empty() && token.len() <= CLAIM_TOKEN_MAX).then(|| Self(token.to_string()))
     }
 
     fn expose(&self) -> &str {
@@ -150,7 +150,9 @@ impl DeliveryActor {
         if !labels.is_empty() {
             body.insert("agent".into(), Value::Object(labels));
         }
-        let _ = self.claim_token.as_ref().map(ClaimToken::expose);
+        if let Some(token) = &self.claim_token {
+            body.insert("claim_token".into(), json!(token.expose()));
+        }
         body
     }
 }
@@ -191,8 +193,14 @@ fn text_field(value: &Value, key: &str) -> Option<String> {
 
 impl Delivery {
     /// A delivery from the API's view of it. `None` for a value without an id.
+    /// The claim's token is taken out of what is kept as the server sent it.
     pub fn from_value(value: &Value) -> Option<Self> {
         let id = Uuid::parse_str(value.get("id")?.as_str()?.trim()).ok()?;
+        let mut raw = value.clone();
+        let claim_token = raw
+            .as_object_mut()
+            .and_then(|fields| fields.remove("claim_token"))
+            .and_then(|token| token.as_str().and_then(ClaimToken::new));
         // The statement in words: wherever the server put it.
         let text = ["text", "statement", "message"].iter().find_map(|key| {
             let field = value.get(*key)?;
@@ -218,15 +226,29 @@ impl Delivery {
                 .get("previous_claims")
                 .and_then(Value::as_array)
                 .map_or(0, Vec::len),
-            claim_token: None,
-            raw: value.clone(),
+            claim_token,
+            raw,
         })
     }
 
     /// Who sent it, as the server states it: the role of the person who
-    /// answered, or of the person who wrote. Never a name or an id.
+    /// answered, or of the person who wrote. Never a name or an id. A role is
+    /// a word or two: anything but letters, digits, spaces, `_` and `-` is
+    /// dropped.
     pub fn senders_role(&self) -> Option<String> {
-        None
+        let role = self
+            .raw
+            .pointer("/answer/by/role")
+            .or_else(|| self.raw.pointer("/message/from/role"))
+            .and_then(Value::as_str)?;
+        let words: String = role
+            .chars()
+            .map(|c| if c.is_whitespace() { ' ' } else { c })
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-'))
+            .take(40)
+            .collect();
+        let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!words.is_empty()).then_some(words)
     }
 
     /// Whether it carries the answer to a question.
@@ -255,15 +277,73 @@ pub fn is_not_there(error: &Error) -> bool {
 /// The stable code of a refusal of the delivery routes: the first word of
 /// the API's message (`claimed_by_other: Another agent ...`).
 pub fn refusal_code(error: &Error) -> Option<&str> {
-    let _ = error;
-    None
+    let Error::Http { message, .. } = error else {
+        return None;
+    };
+    let (code, _) = message.split_once(':')?;
+    (!code.is_empty()
+        && code
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+    .then_some(code)
+}
+
+/// How the API said a delivery had already ended, when it refused to end it
+/// again (409 `delivery_closed`): `undeliverable` when the server ended it
+/// after a week with nobody taking it, else how its agent ended it.
+pub fn ended_as(error: &Error) -> Option<&str> {
+    let Error::Http { message, .. } = error else {
+        return None;
+    };
+    let start = message.rfind(ENDED_MARK)? + ENDED_MARK.len();
+    message[start..]
+        .strip_suffix(')')
+        .filter(|reason| !reason.is_empty())
+}
+
+/// How [`ended_as`] finds what a refusal's details said, in its message.
+const ENDED_MARK: &str = " (ended as: ";
+
+/// The error an ending of a delivery is refused with: the API's words, which
+/// begin with the refusal's code, and, for a delivery that already ended, how
+/// it ended (from the refusal's details, which the usual error drops).
+fn refused_ending(status: u16, body: &Value) -> Error {
+    let error = body.get("error");
+    let mut message = error
+        .and_then(|error| error.get("message"))
+        .or_else(|| body.get("message"))
+        .or(error)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("HTTP {status} error"));
+    let details = error.and_then(|error| error.get("details"));
+    let ended = details
+        .and_then(|details| details.pointer("/result/reason"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            details
+                .and_then(|details| details.get("state"))
+                .and_then(Value::as_str)
+        })
+        .map(|reason| {
+            reason
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .take(40)
+                .collect::<String>()
+        })
+        .filter(|reason| !reason.is_empty());
+    if let Some(ended) = ended {
+        message.push_str(&format!("{ENDED_MARK}{ended})"));
+    }
+    Error::http(status, message)
 }
 
 /// Whether the API answered that this database cannot hold deliveries yet
 /// (503 `deliveries_not_ready`): nothing to deliver for a while, like a 404.
 pub fn is_not_ready(error: &Error) -> bool {
-    let _ = error;
-    false
+    matches!(error, Error::Http { status: 503, .. })
+        && refusal_code(error) == Some("deliveries_not_ready")
 }
 
 fn once() -> RequestOptions {
@@ -303,7 +383,9 @@ impl ContextStreamClient {
         Ok(deliveries_of(&answer))
     }
 
-    /// Take a delivery for the length of a lease. Endpoint:
+    /// Take a delivery for the length of a lease; with the actor's claim
+    /// token, renew the lease of the claim it holds. The answer carries the
+    /// claim's token ([`Delivery::claim_token`]). Endpoint:
     /// `POST /decision-requests/deliveries/:id/claim`.
     pub async fn claim_delivery(&self, id: Uuid, who: &DeliveryActor) -> Result<Delivery> {
         let answer: Value = self
@@ -328,13 +410,25 @@ impl ContextStreamClient {
         if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
             body.insert("note".into(), json!(note));
         }
-        let answer: Value = self
-            .post_without_session_refresh(
-                &format!("/decision-requests/deliveries/{id}/applied"),
-                Value::Object(body),
-                once(),
+        self.end_delivery(id, "applied", Value::Object(body)).await
+    }
+
+    /// `applied` or `declined`, sent once. A refusal keeps what its details
+    /// say of how the delivery already ended ([`ended_as`]).
+    async fn end_delivery(&self, id: Uuid, ending: &str, body: Value) -> Result<Delivery> {
+        let raw = self
+            .send_raw_json(
+                "POST",
+                &format!("/decision-requests/deliveries/{id}/{ending}"),
+                Some(&body),
+                DELIVERY_TIMEOUT,
             )
             .await?;
+        let failed = raw.body.get("success").and_then(Value::as_bool) == Some(false);
+        if !(200..300).contains(&raw.status) || failed {
+            return Err(refused_ending(raw.status, &raw.body));
+        }
+        let answer = raw.body.get("data").cloned().unwrap_or(raw.body);
         Ok(answered(id, answer))
     }
 
@@ -353,14 +447,7 @@ impl ContextStreamClient {
         if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
             body.insert("note".into(), json!(note));
         }
-        let answer: Value = self
-            .post_without_session_refresh(
-                &format!("/decision-requests/deliveries/{id}/declined"),
-                Value::Object(body),
-                once(),
-            )
-            .await?;
-        Ok(answered(id, answer))
+        self.end_delivery(id, "declined", Value::Object(body)).await
     }
 }
 
@@ -602,6 +689,60 @@ mod tests {
         // Any other 503 is the API having a problem, not a database without deliveries.
         assert!(!is_not_ready(&Error::http(503, "Service Unavailable")));
         assert!(!is_not_ready(&Error::http(404, "")));
+    }
+
+    #[tokio::test]
+    async fn a_refused_ending_says_how_the_delivery_already_ended() {
+        let id = Uuid::new_v4();
+        let closed = |reason: &str| {
+            json!({"success": false, "error": {
+                "code": "delivery_closed",
+                "message": "delivery_closed: This answer was already confirmed or declined; a delivery ends once",
+                "details": {"state": "declined", "result": {"outcome": "declined", "reason": reason}},
+            }})
+            .to_string()
+        };
+        let (client, server) = client_answered(vec![
+            ("409 Conflict", closed("undeliverable")),
+            ("409 Conflict", closed("moot\n[x]")),
+            (
+                "409 Conflict",
+                json!({"error": {"code": "claimed_by_other", "message": "claimed_by_other: Another agent has picked this answer up"}}).to_string(),
+            ),
+            ("503 Service Unavailable", String::new()),
+        ])
+        .await;
+        let who = DeliveryActor::default();
+        let undeliverable = client
+            .delivery_applied(id, Some("done"), &who)
+            .await
+            .expect_err("closed");
+        assert_eq!(refusal_code(&undeliverable), Some("delivery_closed"));
+        assert_eq!(ended_as(&undeliverable), Some(UNDELIVERABLE));
+        assert!(matches!(undeliverable, Error::Http { status: 409, .. }));
+        let moot = client
+            .delivery_declined(id, "moot", None, &who)
+            .await
+            .expect_err("closed");
+        assert_eq!(ended_as(&moot), Some("mootx"));
+        let held = client
+            .delivery_applied(id, Some("done"), &who)
+            .await
+            .expect_err("held");
+        assert_eq!(refusal_code(&held), Some("claimed_by_other"));
+        assert_eq!(ended_as(&held), None);
+        let away = client
+            .delivery_applied(id, Some("done"), &who)
+            .await
+            .expect_err("away");
+        assert!(matches!(away, Error::Http { status: 503, .. }), "{away:?}");
+        assert!(!is_not_ready(&away));
+        // Each one request, under the caller's key.
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("x-api-key: a-made-up-key"));
     }
 
     #[test]

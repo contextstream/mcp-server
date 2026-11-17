@@ -40,6 +40,9 @@ const REPORT: &str = "/api/v1/run-progress/report";
 const RUNS: &str = "/api/v1/run-progress/runs/";
 /// What a report that names no run asks first: the workspace's open runs.
 const OPEN_RUNS: &str = "/api/v1/run-progress/runs?workspace_id=11111111-1111-4111-8111-111111111111&active=true&limit=100";
+/// What a recorded report asks next: what a person answered or wrote to the
+/// run (`progress` shows it in its answer). This API has nothing to deliver.
+const DELIVERIES: &str = "/api/v1/decision-requests/deliveries?workspace_id=11111111-1111-4111-8111-111111111111&run_id=44444444-4444-4444-8444-444444444444";
 /// What `help(action="version")` itself asks the API.
 const VERSION: &str = "/api/v1/mcp/version";
 const ME: &str = "/api/v1/auth/me";
@@ -897,9 +900,10 @@ fn nothing_is_asked_for_a_workspace_the_setting_does_not_name() {
         }
         api.settle();
         // For each caller: the check of the credential at `initialize`, the
-        // report (and the read of open runs before it), and each call's own
-        // question. Nothing else: no read of a run, no sign.
-        let one_caller = [ME, OPEN_RUNS, REPORT, VERSION, VERSION, VERSION];
+        // report (with the read of open runs before it, and of what a person
+        // sent the run after it), and each call's own question. Nothing
+        // else: no read of a run, no sign.
+        let one_caller = [ME, OPEN_RUNS, REPORT, DELIVERIES, VERSION, VERSION, VERSION];
         assert_eq!(api.paths(), [one_caller, one_caller].concat(), "{env:?}");
     }
 }

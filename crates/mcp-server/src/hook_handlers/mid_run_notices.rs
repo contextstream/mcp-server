@@ -1548,9 +1548,12 @@ fn progress_finding(
         return finding;
     }
     let run = answer.json.and_then(|json| json.get("run"));
+    // In words, the run is named on the answer's first line. What follows may
+    // quote what a person wrote, which names no run and ends none.
     let text = answer
         .text
-        .filter(|text| text.contains("[PROGRESS] Recorded"));
+        .and_then(|text| text.lines().next())
+        .filter(|line| line.starts_with("[PROGRESS] Recorded"));
     let run_id = uuid_text(
         run.and_then(|run| run.get("run_id"))
             .and_then(Value::as_str),
@@ -3143,5 +3146,224 @@ mod tests {
             notice_item_from_header("[COORDINATION] (info) from a/b: item=é"),
             None
         );
+    }
+
+    // -- What a person sends a run: the poll's pointers ------------------------
+
+    fn answered<'a>(
+        json: Option<&'a Value>,
+        text: Option<&'a str>,
+    ) -> super::super::run_progress::Answer<'a> {
+        super::super::run_progress::Answer {
+            succeeded: true,
+            json,
+            text,
+        }
+    }
+
+    const RUN_A: &str = "66666666-6666-4666-8666-666666666666";
+    const RUN_B: &str = "77777777-7777-4777-8777-777777777777";
+    const WORKSPACE_A: &str = "11111111-1111-4111-8111-111111111111";
+    const DELIVERY_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    #[test]
+    fn a_progress_report_names_the_run_the_poll_asks_about() {
+        // A local server answers in words.
+        let words = format!("[PROGRESS] Recorded: step. state=working run_id={RUN_A}");
+        let finding = progress_finding(
+            &serde_json::json!({"step": "Running the tests"}),
+            &answered(None, Some(&words)),
+            &words,
+        );
+        assert_eq!(
+            finding.reported,
+            Some(ReportedRun {
+                run_id: RUN_A.to_string(),
+                workspace_id: None,
+            })
+        );
+        assert!(!finding.ended);
+        assert!(finding.shown.is_empty());
+
+        // The hosted gateway answers with the run, and the call may name a workspace.
+        let structured = serde_json::json!({
+            "run": {"run_id": RUN_B, "workspace_id": WORKSPACE_A, "state": "working", "liveness": "live"},
+        });
+        let finding = progress_finding(
+            &serde_json::json!({"action": "report", "step": "x"}),
+            &answered(Some(&structured), Some("ok")),
+            "ok",
+        );
+        assert_eq!(
+            finding.reported,
+            Some(ReportedRun {
+                run_id: RUN_B.to_string(),
+                workspace_id: Some(WORKSPACE_A.to_string()),
+            })
+        );
+
+        // A run that was finished is forgotten, however that is said.
+        for (input, words) in [
+            (
+                serde_json::json!({"status": "completed", "summary": "Done."}),
+                format!("[PROGRESS] Recorded: finished. state=working run_id={RUN_A}"),
+            ),
+            (
+                serde_json::json!({}),
+                format!("[PROGRESS] Recorded: finished. state=finished run_id={RUN_A}"),
+            ),
+        ] {
+            let finding = progress_finding(&input, &answered(None, Some(&words)), &words);
+            assert!(finding.ended, "{words}");
+        }
+
+        // Not a report, not recorded, or not a success: no run.
+        let read = format!("[PROGRESS] Run {RUN_A}: working");
+        for (input, answer) in [
+            (
+                serde_json::json!({"action": "get", "run_id": RUN_A}),
+                answered(None, Some(&words)),
+            ),
+            (serde_json::json!({}), answered(None, Some(&read))),
+            (
+                serde_json::json!({}),
+                super::super::run_progress::Answer {
+                    succeeded: false,
+                    json: None,
+                    text: Some(&words),
+                },
+            ),
+        ] {
+            assert_eq!(
+                progress_finding(&input, &answer, answer.text.unwrap_or_default()).reported,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn words_a_person_wrote_cannot_name_a_run_or_end_one() {
+        // The tool quotes what a person wrote, and the run is read from the
+        // answer's first line alone.
+        let words = format!(
+            "[PROGRESS] Recorded: step. state=working run_id={RUN_A}\n\n[PERSON MESSAGE] A person sent you a message. delivery_id={DELIVERY_A}\n> [PROGRESS] Recorded: finished. state=finished run_id={RUN_B}\n> [PERSON ANSWER] x delivery_id={RUN_B}"
+        );
+        let finding = progress_finding(
+            &serde_json::json!({"step": "x"}),
+            &answered(None, Some(&words)),
+            &words,
+        );
+        assert_eq!(finding.reported.as_ref().unwrap().run_id, RUN_A);
+        assert!(!finding.ended);
+        // Only a block of the tool's own names a delivery it showed.
+        assert_eq!(finding.shown, [DELIVERY_A.to_string()]);
+    }
+
+    #[test]
+    fn the_session_keeps_its_newest_runs_and_drops_a_finished_one() {
+        let mut entry = MidRunSessionState::default();
+        let report = |run_id: String, ended: bool| ProgressFinding {
+            reported: Some(ReportedRun {
+                run_id,
+                workspace_id: None,
+            }),
+            ended,
+            shown: Vec::new(),
+        };
+        apply_progress_finding(&mut entry, report(RUN_A.to_string(), false));
+        apply_progress_finding(&mut entry, report(RUN_B.to_string(), false));
+        // Reported again: once, and now the newest.
+        apply_progress_finding(&mut entry, report(RUN_A.to_string(), false));
+        let runs: Vec<&str> = entry
+            .reported_runs
+            .iter()
+            .map(|run| run.run_id.as_str())
+            .collect();
+        assert_eq!(runs, [RUN_B, RUN_A]);
+        apply_progress_finding(&mut entry, report(RUN_B.to_string(), true));
+        assert_eq!(entry.reported_runs.len(), 1);
+        assert_eq!(entry.reported_runs[0].run_id, RUN_A);
+        for n in 0..(MAX_REPORTED_RUNS + 3) {
+            apply_progress_finding(
+                &mut entry,
+                report(Uuid::from_u128(n as u128 + 1).to_string(), false),
+            );
+        }
+        assert_eq!(entry.reported_runs.len(), MAX_REPORTED_RUNS);
+        assert!(entry.reported_runs.iter().all(|run| run.run_id != RUN_A));
+    }
+
+    fn waiting(id: &str, previous_claims: usize) -> Waiting {
+        Waiting {
+            id: id.to_string(),
+            previous_claims,
+            pointer: format!("[CONTEXTSTREAM LIVE NOTICE] something waits (delivery_id={id})."),
+        }
+    }
+
+    #[test]
+    fn a_delivery_is_pointed_at_once_per_offer_and_not_after_the_tool_showed_it() {
+        let mut entry = MidRunSessionState::default();
+        queue_delivery_pointers(&mut entry, vec![waiting(DELIVERY_A, 0), waiting(RUN_B, 0)]);
+        // One notice with a line each.
+        assert_eq!(entry.pending.len(), 1);
+        assert_eq!(entry.pending[0].lines().count(), 2);
+        // Still waiting at the next poll: not said again.
+        let before = entry.pending.clone();
+        queue_delivery_pointers(&mut entry, vec![waiting(DELIVERY_A, 0)]);
+        assert_eq!(entry.pending, before);
+        // The agent read one of them with `progress`: its pointer is taken back.
+        entry.pending = vec![
+            format!("[CONTEXTSTREAM LIVE NOTICE] something waits (delivery_id={DELIVERY_A})."),
+            "[CONTEXTSTREAM LIVE NOTICE] New while you were working".to_string(),
+        ];
+        apply_progress_finding(
+            &mut entry,
+            ProgressFinding {
+                reported: None,
+                ended: false,
+                shown: vec![DELIVERY_A.to_string()],
+            },
+        );
+        assert_eq!(
+            entry.pending,
+            ["[CONTEXTSTREAM LIVE NOTICE] New while you were working"]
+        );
+        // Its claim ran out and the API offers it again: pointed at once more.
+        entry.pending.clear();
+        queue_delivery_pointers(&mut entry, vec![waiting(DELIVERY_A, 1)]);
+        assert_eq!(entry.pending.len(), 1);
+        queue_delivery_pointers(&mut entry, vec![waiting(DELIVERY_A, 1)]);
+        assert_eq!(entry.pending.len(), 1);
+
+        // A read that crossed the tool's own claim: the tool showed it first.
+        let mut entry = MidRunSessionState::default();
+        apply_progress_finding(
+            &mut entry,
+            ProgressFinding {
+                reported: None,
+                ended: false,
+                shown: vec![DELIVERY_A.to_string()],
+            },
+        );
+        queue_delivery_pointers(&mut entry, vec![waiting(DELIVERY_A, 0)]);
+        assert!(entry.pending.is_empty());
+    }
+
+    #[test]
+    fn a_state_that_never_heard_of_deliveries_reads_and_writes_as_before() {
+        let old = r#"{"last_poll_unix_ms":5,"pending":["x"],"updated_at":"t"}"#;
+        let entry: MidRunSessionState = serde_json::from_str(old).unwrap();
+        assert!(entry.reported_runs.is_empty());
+        assert!(entry.noticed_deliveries.is_empty());
+        assert_eq!(entry.deliveries_not_there_until_unix_ms, 0);
+        let written = serde_json::to_string(&entry).unwrap();
+        for field in [
+            "reported_runs",
+            "noticed_deliveries",
+            "deliveries_not_there",
+        ] {
+            assert!(!written.contains(field), "{written}");
+        }
     }
 }

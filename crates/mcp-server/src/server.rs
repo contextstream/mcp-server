@@ -3514,7 +3514,7 @@ mod tests {
             // New row for plan loops contract v1.3: the live progress tool
             // (report, get, list). No argument is required.
             "progress",
-            "69c1b73f6eb4c40a97d45f84da1fc29cdafcd198a131765024902e84042a74a1",
+            "859c47a825f5cff316f204bc6ca79db541137f5169c5a25df66a46a976c10769",
         ),
         (
             // Additive: action=working_set with `add`, `remove` and `clear`
@@ -3995,6 +3995,33 @@ mod tests {
     }
 
     #[test]
+    fn delivery_inputs_only_add_to_the_progress_schema() {
+        // The way back from a person (what they answered or wrote to a run)
+        // added two actions, `reply` and `decline`, and their three
+        // parameters to `progress`. Without them the schema is exactly the
+        // contract v1.3 gave it, so a report, a read and every other
+        // parameter are unchanged, and still nothing is required.
+        let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        assert_eq!(
+            schema_contract_without(
+                &tools,
+                "progress",
+                &["reply", "decline"],
+                &["delivery_id", "note", "reason"],
+            ),
+            "69c1b73f6eb4c40a97d45f84da1fc29cdafcd198a131765024902e84042a74a1"
+        );
+        let progress = tool_by_name(&tools, "progress");
+        assert!(progress["inputSchema"].get("required").is_none());
+        for param in ["delivery_id", "note", "reason"] {
+            assert_eq!(
+                progress["inputSchema"]["properties"][param]["type"], "string",
+                "{param}"
+            );
+        }
+    }
+
+    #[test]
     fn the_progress_tool_is_listed_for_every_client_and_asks_for_nothing() {
         // A new tool of contract v1.3. It is on the default surface, so a
         // client lists it without asking; no argument is required (a call
@@ -4005,7 +4032,7 @@ mod tests {
         assert!(progress["inputSchema"].get("required").is_none());
         assert_eq!(
             progress["inputSchema"]["properties"]["action"]["enum"],
-            serde_json::json!(["report", "get", "list"])
+            serde_json::json!(["report", "get", "list", "reply", "decline"])
         );
         assert_eq!(progress["annotations"]["readOnlyHint"], false);
         assert_eq!(progress["annotations"]["destructiveHint"], false);

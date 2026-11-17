@@ -703,8 +703,9 @@ impl ProgressTool {
 
     /// What waits for a run that was just read, when the run is this
     /// session's own: one this process reported, or one the API shows under
-    /// this session's agent. An agent that looks at another agent's run is
-    /// offered nothing, so it cannot take that agent's answer.
+    /// this session's agent ([`is_this_agents`]). An agent that looks at
+    /// another agent's run is offered nothing, so it cannot take that agent's
+    /// answer.
     async fn offered_to_own_run(
         &self,
         workspace_id: Uuid,
@@ -720,14 +721,7 @@ impl ProgressTool {
                 key.starts_with(&prefix) && memo.run_id.as_deref() == Some(id.as_str())
             })
         };
-        let under_this_agent = match (
-            agent.get("id").and_then(Value::as_str),
-            view.pointer("/agent/id").and_then(Value::as_str),
-        ) {
-            (Some(mine), Some(shown)) => mine == shown,
-            _ => false,
-        };
-        if !reported_here && !under_this_agent {
+        if !reported_here && !is_this_agents(&agent, view.get("agent")) {
             return Offered::default();
         }
         run_deliveries::offer(
@@ -1443,6 +1437,23 @@ pub(crate) fn run_id_of_key(workspace_id: Uuid, key: &str) -> Uuid {
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     uuid::Builder::from_sha1_bytes(bytes).into_uuid()
+}
+
+/// Whether a run the API shows under the agent `shown` is this session's,
+/// whose agent is `mine`: the same id, which a session of a client has and
+/// no other session shares; or, for an agent a person named (it has no id),
+/// the same name, which every session of that agent reports under.
+pub(crate) fn is_this_agents(mine: &Value, shown: Option<&Value>) -> bool {
+    let Some(shown) = shown else {
+        return false;
+    };
+    match (str_field(mine, "id"), str_field(shown, "id")) {
+        (Some(mine), Some(shown)) => mine == shown,
+        (None, None) => {
+            str_field(mine, "name").is_some() && str_field(mine, "name") == str_field(shown, "name")
+        }
+        _ => false,
+    }
 }
 
 fn run_memo_key(workspace_id: Uuid, run_key: &str) -> String {

@@ -1443,4 +1443,55 @@ mod tests {
         assert!(delivery_id(Some("the one above")).is_err());
         assert!(delivery_id(None).is_err());
     }
+
+    #[tokio::test]
+    async fn round3_one_owner_cannot_displace_anothers_tokens_reports_or_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Owner {
+            key: "quiet".into(),
+            workspace: Uuid::new_v4(),
+            store: dir.path().join("book"),
+        };
+        let busy = Owner {
+            key: "busy".into(),
+            ..owner.clone()
+        };
+        let ledger = Arc::new(Ledger::default());
+        let run = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        ledger.note_report(&owner, run);
+        ledger.keep(&owner.key, id, run, 0, ClaimToken::new("held"));
+        let (_sender, finished) = tokio::sync::watch::channel(false);
+        for _ in 0..MAX_REMEMBERED {
+            let other = Uuid::new_v4();
+            ledger.note_report(&busy, other);
+            ledger.keep(&busy.key, other, other, 0, None);
+            ledger.lock().polls.insert(
+                (busy.key.clone(), other),
+                Poll {
+                    started: Instant::now(),
+                    finished: finished.clone(),
+                    result: Arc::default(),
+                },
+            );
+        }
+        assert!(ledger.saw_report(&owner, run));
+        assert_eq!(
+            ledger.claimed_as(&owner.key, id),
+            Some((run, ClaimToken::new("held")))
+        );
+        let api = crate::domains::plan_loops_tests::Api::start(vec![(
+            "GET /api/v1/decision-requests/deliveries",
+            200,
+            json!({"data":{"deliveries":[]}}),
+        )])
+        .await;
+        let (client, _) = crate::domains::parity_eval_tests::client_and_session(
+            &api.base_url,
+            owner.workspace,
+            None,
+        );
+        poll(&client, &ledger, &owner, run, &json!({}), true).await;
+        assert_eq!(api.requests().len(), 1);
+    }
 }

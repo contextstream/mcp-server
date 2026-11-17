@@ -290,11 +290,35 @@ struct Shown {
     token: Option<ClaimToken>,
     /// The order it was shown in, so the oldest are forgotten first.
     order: u64,
+    // Retain the validated, size-limited frame until a tool response takes it.
+    pending: Option<(&'static str, String)>,
+}
+
+impl Shown {
+    fn new(run_id: Uuid, previous_claims: usize, token: Option<ClaimToken>) -> Self {
+        Self {
+            run_id,
+            previous_claims,
+            token,
+            order: 0,
+            held_at: Instant::now(),
+            pending: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InFlight {
+    attempt: Uuid,
+    run: Uuid,
+    // Closed after the worker publishes its result and drops the reservation.
+    done: tokio::sync::watch::Receiver<()>,
 }
 
 #[derive(Debug, Default)]
 struct Memory {
-    shown: HashMap<String, Shown>,
+    shown: HashMap<(String, Uuid), Shown>,
+    in_flight: HashMap<(String, Uuid), InFlight>,
     next: u64,
     polls: HashMap<(String, Uuid), Poll>,
     reports: HashMap<(String, Uuid), Instant>,
@@ -354,8 +378,8 @@ impl Ledger {
             .is_some_and(|at| at.elapsed() < NOT_THERE_FOR)
     }
 
-    fn key(session: &str, id: Uuid) -> String {
-        format!("{session}\n{id}")
+    fn key(session: &str, id: Uuid) -> (String, Uuid) {
+        (session.to_owned(), id)
     }
 
     /// Whether the session has not been shown this offer of the delivery: it
@@ -375,13 +399,9 @@ impl Ledger {
         run_id: Uuid,
         token: Option<ClaimToken>,
     ) {
-        self.keep(
-            session,
-            delivery.id,
-            run_id,
-            delivery.previous_claims,
-            token,
-        );
+        let mut entry = Shown::new(run_id, delivery.previous_claims, token);
+        entry.pending = Some((delivery.kind, framed(delivery, TOOL)));
+        self.store(session, delivery.id, entry);
     }
 
     fn keep(
@@ -392,19 +412,14 @@ impl Ledger {
         generation: usize,
         token: Option<ClaimToken>,
     ) {
+        self.store(session, id, Shown::new(run_id, generation, token));
+    }
+
+    fn store(&self, session: &str, id: Uuid, mut entry: Shown) {
         let mut memory = self.lock();
         memory.next += 1;
-        let order = memory.next;
-        memory.shown.insert(
-            Self::key(session, id),
-            Shown {
-                previous_claims: generation,
-                run_id,
-                token,
-                order,
-                held_at: Instant::now(),
-            },
-        );
+        entry.order = memory.next;
+        memory.shown.insert(Self::key(session, id), entry);
         if memory.shown.len() > MAX_REMEMBERED {
             if let Some(oldest) = memory
                 .shown
@@ -414,6 +429,38 @@ impl Ledger {
             {
                 memory.shown.remove(&oldest);
             }
+        }
+    }
+
+    // No await after this take: a cancelled batch leaves all its frames here.
+    fn take_frames(&self, owner: &str, run: Uuid) -> Offered {
+        let mut mem = self.lock();
+        let mut ready: Vec<_> = mem
+            .shown
+            .iter_mut()
+            .filter(|((session, _), s)| session == owner && s.run_id == run && s.pending.is_some())
+            .collect();
+        ready.sort_unstable_by_key(|(_, s)| s.order);
+        let mut offered = Offered::default();
+        for ((_, id), entry) in ready.into_iter().take(MAX_SHOWN_AT_ONCE) {
+            if let Some((kind, text)) = entry.pending.take() {
+                offered.blocks.push(text);
+                offered.shown.push(json!({"id":id, "kind":kind}));
+            }
+        }
+        offered
+    }
+
+    async fn finish_claims(&self, owner: &str, run: Uuid) {
+        let already_sent: Vec<_> = self
+            .lock()
+            .in_flight
+            .iter()
+            .filter(|((session, _), flight)| session == owner && flight.run == run)
+            .map(|(_, flight)| flight.done.clone())
+            .collect();
+        for mut done in already_sent {
+            let _ = done.changed().await;
         }
     }
 
@@ -496,6 +543,13 @@ pub(super) async fn poll(
     agent: &Value,
     wait: bool,
 ) -> Offered {
+    if wait {
+        ledger.finish_claims(&owner.key, run_id).await;
+    }
+    let ready = ledger.take_frames(&owner.key, run_id);
+    if !ready.blocks.is_empty() {
+        return ready;
+    }
     let key = (owner.key.clone(), run_id);
     let (mut finished, result) = {
         let mut mem = ledger.lock();
@@ -575,7 +629,8 @@ pub(super) async fn poll(
         return Offered::default();
     }
     ledger.lock().reports.remove(&key);
-    claim_offers(client, ledger, owner, run_id, agent, deliveries).await
+    claim_offers(client, ledger, owner, run_id, agent, deliveries).await;
+    ledger.take_frames(&owner.key, run_id)
 }
 
 #[cfg(test)]
@@ -633,19 +688,13 @@ async fn read(
 
 async fn claim_offers(
     client: &ContextStreamClient,
-    ledger: &Ledger,
+    ledger: &Arc<Ledger>,
     owner: &Owner,
     run_id: Uuid,
     agent: &Value,
     deliveries: &[Delivery],
-) -> Offered {
+) {
     let session = &owner.key;
-    let workspace_id = owner.workspace;
-    let reader = DeliveryReader {
-        workspace_id,
-        run_id: Some(run_id),
-    };
-    let mut offered = Offered::default();
     let deadline = Instant::now() + Duration::from_secs(5);
     for delivery in deliveries
         .iter()
@@ -658,7 +707,7 @@ async fn claim_offers(
         if Instant::now() >= deadline {
             break;
         }
-        let Ok(_reservation) = owner.reserve(delivery.id).await else {
+        let Ok(reservation) = owner.reserve(delivery.id).await else {
             continue;
         };
         if owner.already_claimed(delivery.id, delivery.previous_claims) {
@@ -679,49 +728,78 @@ async fn claim_offers(
         if Instant::now() >= deadline {
             break;
         }
-        let claimed = match client.claim_delivery(delivery.id, &who, &reader).await {
-            Ok(claimed) => claimed,
-            Err(error) => {
-                tracing::debug!(
-                    "run delivery {} not claimed: {}",
-                    delivery.id,
-                    error_tag(&error)
-                );
-                if let Error::RateLimited { retry_after, .. } = error {
-                    ledger.cool_down(&owner.key, Duration::from_secs(retry_after.unwrap_or(60)));
-                    break;
-                }
-                continue;
-            }
-        };
-        // What is shown is what the claim answered: the API's statement that
-        // this delivery, in this state, is this run's.
-        if claimed.claim_attempt != Some(attempt) {
-            continue;
-        }
-        // A validated claim must reach the caller even if its recovery
-        // record cannot be saved. The scoped ledger still holds its token.
-        if !owner.bind(
-            run_id,
-            Some(claimed.id),
-            claimed.previous_claims,
-            Some(attempt),
-        ) {
-            tracing::warn!("could not save recovery evidence for a shown delivery");
-        }
-        ledger.remember(
-            session,
-            &claimed,
-            workspace_id,
-            run_id,
-            claimed.claim_token.clone(),
+        let key = Ledger::key(session, delivery.id);
+        let (finished, done) = tokio::sync::watch::channel(());
+        ledger.lock().in_flight.insert(
+            key.clone(),
+            InFlight {
+                attempt,
+                run: run_id,
+                done,
+            },
         );
-        offered.blocks.push(framed(&claimed, TOOL));
-        offered
-            .shown
-            .push(json!({"id": claimed.id, "kind": claimed.kind}));
+        let (client, ledger, owner, id) =
+            (client.clone(), ledger.clone(), owner.clone(), delivery.id);
+        // Only start a claim selected by this call. Once sent, its receipt
+        // must survive cancellation, including while the caller collects a later claim.
+        let (replaying, replay_started) = tokio::sync::oneshot::channel();
+        let worker = mcp_client::spawn_with_task_context(async move {
+            let reader = DeliveryReader {
+                workspace_id: owner.workspace,
+                run_id: Some(run_id),
+            };
+            let mut claim = client.claim_delivery(id, &who, &reader).await;
+            if matches!(claim, Err(Error::Timeout(_))) {
+                // The API may already hold this attempt. A replay must carry
+                // the identical actor, even when the delivery is no longer listed.
+                let _ = replaying.send(());
+                claim = client.claim_delivery(id, &who, &reader).await;
+            }
+            let mut limited = false;
+            match claim {
+                Ok(claimed) if claimed.claim_attempt == Some(attempt) => {
+                    if !owner.bind(run_id, Some(id), claimed.previous_claims, Some(attempt)) {
+                        tracing::warn!("could not save recovery evidence for a shown delivery");
+                    }
+                    ledger.remember(
+                        &owner.key,
+                        &claimed,
+                        owner.workspace,
+                        run_id,
+                        claimed.claim_token.clone(),
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!("run delivery {} not claimed: {}", id, error_tag(&error));
+                    if let Error::RateLimited { retry_after, .. } = error {
+                        ledger
+                            .cool_down(&owner.key, Duration::from_secs(retry_after.unwrap_or(60)));
+                        limited = true;
+                    }
+                }
+                _ => {}
+            }
+            {
+                let mut mem = ledger.lock();
+                if mem
+                    .in_flight
+                    .get(&key)
+                    .is_some_and(|flight| flight.attempt == attempt)
+                {
+                    mem.in_flight.remove(&key);
+                }
+            }
+            drop(reservation);
+            drop(finished);
+            limited
+        });
+        tokio::select! {
+            // The first request exhausted its timeout. Leave its replay running,
+            // but do not spend another request timeout in this report.
+            Ok(()) = replay_started => break,
+            limited = worker => if limited.unwrap_or(true) { break; },
+        }
     }
-    offered
 }
 
 // ============================================================================

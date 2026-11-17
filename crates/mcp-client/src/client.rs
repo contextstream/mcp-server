@@ -5287,11 +5287,13 @@ impl ContextStreamClient {
         }
         let mut bytes = Vec::new();
         let mut response = response;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| Error::Network(e.to_string()))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            if e.is_timeout() {
+                Error::Timeout(timeout.as_secs())
+            } else {
+                Error::Network(e.to_string())
+            }
+        })? {
             if bytes.len() + chunk.len() > max_bytes {
                 return Ok(RawResponse {
                     status,

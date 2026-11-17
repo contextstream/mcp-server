@@ -1788,6 +1788,7 @@ dependencies = [
  "phf",
  "regex",
  "reqwest",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",

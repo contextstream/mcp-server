@@ -357,6 +357,10 @@ impl Gateway {
                 "CONTEXTSTREAM_API_URL",
                 format!("http://127.0.0.1:{}", api.port),
             )
+            .env(
+                "CONTEXTSTREAM_DELIVERY_STATE_DIR",
+                home.path().join("deliveries"),
+            )
             .env("MCP_HTTP_REQUIRE_AUTH", "true")
             .env("CONTEXTSTREAM_ALLOW_HEADER_AUTH", "true")
             .env("MCP_MAX_CONCURRENT_REQUESTS", "32")

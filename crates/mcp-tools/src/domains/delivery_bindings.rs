@@ -26,38 +26,40 @@ pub(super) const CLAIM_SECONDS: i64 = 3600;
 
 /// Release the lock when its owner finishes, even if a fork still holds
 /// another descriptor for the same open file description.
-pub(super) struct FileLock(fs::File);
+pub(super) struct FileLock(fs::File, PathBuf);
 
 impl FileLock {
-    fn acquire(file: fs::File) -> io::Result<Self> {
+    fn acquire(path: PathBuf) -> io::Result<Self> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
         file.try_lock()?;
-        Ok(Self(file))
+        // A previous holder may have unlinked this inode between open and
+        // try_lock. Only the holder of the currently named file may proceed.
+        if same_file::Handle::from_file(file.try_clone()?)? != same_file::Handle::from_path(&path)?
+        {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        Ok(Self(file, path))
     }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
+        let _ = fs::remove_file(&self.1);
         let _ = self.0.unlock();
     }
 }
 
 impl Owner {
-    // One lock per API/credential/workspace, including across processes.
-    // Rename under a separate lock so a crash never leaves a partial book.
-    fn book<T>(&self, f: impl FnOnce(&mut Vec<Binding>) -> (T, bool)) -> io::Result<T> {
-        let dir = self.store.parent().ok_or(io::ErrorKind::InvalidInput)?;
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        let mut options = fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-            builder.mode(0o700);
-            options.mode(0o600);
-        }
-        builder.create(dir)?;
-        let _lock = FileLock::acquire(options.open(self.store.with_extension("lock"))?)?;
+    // Readers see either complete revision of the atomically replaced book.
+    // In particular a lookup of unknown evidence never creates a directory.
+    fn entries(&self) -> io::Result<Vec<Binding>> {
         let mut entries: Vec<Binding> = match fs::read(&self.store) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
@@ -73,6 +75,24 @@ impl Owner {
             })
                 .contains(&age)
         });
+        Ok(entries)
+    }
+
+    fn book<T>(&self, f: impl FnOnce(&mut Vec<Binding>) -> (T, bool)) -> io::Result<T> {
+        let dir = self.store.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+            builder.mode(0o700);
+            options.mode(0o600);
+        }
+        builder.create(dir)?;
+        let _lock = FileLock::acquire(self.store.with_extension("lock"))?;
+        let mut entries = self.entries()?;
         let (answer, changed) = f(&mut entries);
         if changed {
             if entries.len() > 1024 {
@@ -86,27 +106,16 @@ impl Owner {
     }
 
     /// A bounded set of nonblocking OS locks; drop releases the reservation
-    /// even on cancellation or process exit. Never unlink a live lock file.
+    /// even on cancellation or process exit. Unlink while locked, so idle reservations leave no files.
     pub fn reserve(&self, id: Uuid) -> Option<FileLock> {
-        let mut dir = fs::DirBuilder::new();
-        dir.recursive(true);
-        let mut options = fs::OpenOptions::new();
-        options.create(true).truncate(false).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-            dir.mode(0o700);
-            options.mode(0o600);
+        if !self.store.is_file() {
+            return None;
         }
-        let root = self.store.parent()?;
-        dir.create(root).ok()?;
-        let file = options
-            .open(
-                self.store
-                    .with_extension(format!("claim-{:02x}.lock", id.as_bytes()[0])),
-            )
-            .ok()?;
-        FileLock::acquire(file).ok()
+        FileLock::acquire(
+            self.store
+                .with_extension(format!("claim-{:02x}.lock", id.as_bytes()[0])),
+        )
+        .ok()
     }
 
     pub fn bind(
@@ -135,42 +144,30 @@ impl Owner {
     }
 
     pub fn reported(&self, run: Uuid) -> bool {
-        self.book(|entries| {
-            (
-                entries
-                    .iter()
-                    .any(|e| e.run == run && e.delivery.is_none() && e.owner == self.key),
-                false,
-            )
+        self.entries().is_ok_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.run == run && e.delivery.is_none() && e.owner == self.key)
         })
-        .unwrap_or(false)
     }
 
     pub fn already_claimed(&self, id: Uuid, generation: usize) -> bool {
-        self.book(|entries| {
-            (
+        self.entries()
+            .map(|entries| {
                 entries
                     .iter()
-                    .any(|e| e.delivery == Some(id) && e.generation >= generation),
-                false,
-            )
-        })
-        .unwrap_or(true)
+                    .any(|e| e.delivery == Some(id) && e.generation >= generation)
+            })
+            .unwrap_or(true)
     }
 
     pub fn claim(&self, id: Uuid) -> Option<(Uuid, usize, Uuid)> {
-        self.book(|entries| {
-            (
-                entries
-                    .iter()
-                    .rev()
-                    .find(|e| e.delivery == Some(id) && e.owner == self.key)
-                    .and_then(|e| Some((e.run, e.generation, e.attempt?))),
-                false,
-            )
-        })
-        .ok()
-        .flatten()
+        self.entries()
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|e| e.delivery == Some(id) && e.owner == self.key)
+            .and_then(|e| Some((e.run, e.generation, e.attempt?)))
     }
 }
 
@@ -200,6 +197,7 @@ mod tests {
             store: dir.path().join("bindings"),
         };
         let id = Uuid::new_v4();
+        assert!(owner.bind(Uuid::new_v4(), None, 0, None));
         let held = owner.reserve(id).unwrap();
         // A duplicate references the same open file description, just as a
         // concurrent child between fork and exec does.

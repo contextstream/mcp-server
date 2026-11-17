@@ -857,6 +857,7 @@ async fn end(
     client.way_back().await?;
     let no_claim = || Error::Validation(NO_CLAIM.to_string());
     let owner = owner.ok_or_else(no_claim)?;
+    owner.claim(id).ok_or_else(no_claim)?;
     let _reservation = owner.reserve(id).ok_or_else(no_claim)?;
     let (run_id, generation, attempt) = owner.claim(id).ok_or_else(no_claim)?;
     let session = &owner.key;

@@ -114,7 +114,9 @@ impl Fixture {
         config.is_http_transport = true;
         let client = ContextStreamClient::new(config.clone());
         let session = Arc::new(SessionManager::new(client.clone(), config));
-        ProgressTool::new(client, session)
+        let mut tool = ProgressTool::new(client, session);
+        tool.delivery_state_dir = super::super::delivery_bindings::default_root();
+        tool
     }
 
     /// The run as the API shows it; `agent` is whoever reported it.
@@ -2078,6 +2080,7 @@ async fn review7_racing_workers_reserve_before_sending_a_claim() {
     let tool = f.tool(&api);
     let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
     let agent = json!({"runtime":"mcp"});
+    assert!(owner.bind(f.run, None, 0, None));
     let first = Arc::default();
     let second = Arc::default();
     let (a, b) = tokio::join!(

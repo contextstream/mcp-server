@@ -233,6 +233,7 @@ pub struct ProgressTool {
     runs: Runs,
     /// What each session was shown of what people sent its runs.
     deliveries: Arc<Ledger>,
+    delivery_state_dir: Option<std::path::PathBuf>,
 }
 
 impl ProgressTool {
@@ -245,6 +246,9 @@ impl ProgressTool {
             heartbeat: None,
             runs: Arc::new(Mutex::new(HashMap::new())),
             deliveries: DELIVERIES.clone(),
+            delivery_state_dir: std::env::var_os("CONTEXTSTREAM_DELIVERY_STATE_DIR")
+                .filter(|v| !v.is_empty())
+                .map(Into::into),
         }
     }
 
@@ -761,9 +765,13 @@ impl ProgressTool {
                 &session,
             ],
         );
-        let root = std::env::var_os("CONTEXTSTREAM_DELIVERY_STATE_DIR")
-            .map(std::path::PathBuf::from)
-            .or_else(super::delivery_bindings::default_root)?;
+        let root = self.delivery_state_dir.clone().or_else(|| {
+            if is_http {
+                None
+            } else {
+                super::delivery_bindings::default_root()
+            }
+        })?;
         Some(super::delivery_bindings::Owner {
             key,
             workspace,

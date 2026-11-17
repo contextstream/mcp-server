@@ -28,6 +28,7 @@ regex = "1"
 which = "8.0"
 globset = "0.4"
 ignore = "0.4"
+same-file = "1"
 reqwest = { workspace = true }
 urlencoding = "2.1.3"
 futures = { workspace = true }

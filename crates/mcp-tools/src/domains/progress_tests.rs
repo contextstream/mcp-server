@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::domains::parity_eval_tests::{client_and_session, text_of};
-use crate::domains::plan_loops_tests::Api;
+use crate::domains::plan_loops_tests::{Api, Seen};
 use crate::testing::TestFixtures;
 
 /// A scope, a run and a ticket of one test.
@@ -96,6 +96,19 @@ impl Fixture {
     }
 }
 
+/// What the tool sent for the run's progress. After a recorded report (and a
+/// `get` of the session's own run) it also reads what a person sent the run,
+/// `GET /decision-requests/deliveries`, which this mock does not have and
+/// answers with 404, as an API without the routes does. Those reads have
+/// tests of their own (`progress_deliveries_tests.rs`); here they are left
+/// out, so each test still counts the requests it is about.
+fn progress_requests(api: &Api) -> Vec<Seen> {
+    api.requests()
+        .into_iter()
+        .filter(|request| !request.target.contains("/decision-requests/deliveries"))
+        .collect()
+}
+
 fn input(arguments: Value) -> ProgressInput {
     serde_json::from_value(arguments).expect("progress arguments")
 }
@@ -134,7 +147,7 @@ async fn a_call_without_an_action_reports_the_step_and_the_checklist() {
     .await
     .expect("report");
 
-    let requests = api.requests();
+    let requests = progress_requests(&api);
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert_eq!(requests[0].method, "POST");
     assert_eq!(requests[0].target, "/api/v1/run-progress/report");
@@ -219,7 +232,7 @@ async fn report_is_also_an_action_and_a_later_report_says_only_what_changed() {
         }))
         .await
         .expect("report");
-    let requests = api.requests();
+    let requests = progress_requests(&api);
     assert_eq!(requests.len(), 1, "{requests:?}");
     let body = &requests[0].body;
     // One MCP session working one ticket is one run.
@@ -690,7 +703,11 @@ async fn a_call_that_cannot_be_right_is_refused_before_anything_is_sent() {
             .to_string();
         assert!(error.contains(expected), "{arguments}: {error}");
     }
-    assert!(api.requests().is_empty(), "{:?}", api.requests());
+    assert!(
+        progress_requests(&api).is_empty(),
+        "{:?}",
+        progress_requests(&api)
+    );
 }
 
 // ============================================================================
@@ -727,7 +744,12 @@ async fn an_api_without_the_route_is_answered_calmly_and_never_retried() {
     );
     // One request: no retry, and no heartbeat for a run that was not recorded.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(api.requests().len(), 1, "{:?}", api.requests());
+    assert_eq!(
+        progress_requests(&api).len(),
+        1,
+        "{:?}",
+        progress_requests(&api)
+    );
 
     // The same for the reads.
     let read = tool
@@ -804,7 +826,7 @@ async fn what_the_api_refuses_is_said_in_its_own_words_without_an_error() {
         assert_eq!(structured["reason"], reason, "{status}");
         assert_eq!(structured["status"], status, "{status}");
         // A step is reported once, whatever the answer.
-        assert_eq!(api.requests().len(), 1, "{status}");
+        assert_eq!(progress_requests(&api).len(), 1, "{status}");
     }
 }
 
@@ -873,7 +895,11 @@ async fn a_session_without_a_workspace_is_told_so_and_nothing_is_sent() {
             text_of(&read)
         );
     }
-    assert!(api.requests().is_empty(), "{:?}", api.requests());
+    assert!(
+        progress_requests(&api).is_empty(),
+        "{:?}",
+        progress_requests(&api)
+    );
 }
 
 #[test]
@@ -908,7 +934,7 @@ async fn a_local_server_keeps_a_reported_run_alive_until_it_is_finished() {
         .expect("report");
     tokio::time::sleep(Duration::from_millis(260)).await;
 
-    let requests = api.requests();
+    let requests = progress_requests(&api);
     assert!(
         requests.len() >= 3,
         "a report and at least two heartbeats: {requests:?}"
@@ -956,7 +982,7 @@ async fn a_local_server_keeps_a_reported_run_alive_until_it_is_finished() {
     }))
     .await
     .expect("finish");
-    let sent = api.requests().len();
+    let sent = progress_requests(&api).len();
     let last = api
         .requests()
         .last()
@@ -966,10 +992,10 @@ async fn a_local_server_keeps_a_reported_run_alive_until_it_is_finished() {
     assert_eq!(last["status"], "completed");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
-        api.requests().len(),
+        progress_requests(&api).len(),
         sent,
         "no heartbeat after the run was finished: {:?}",
-        api.requests()
+        progress_requests(&api)
     );
 }
 
@@ -991,7 +1017,12 @@ async fn a_heartbeat_stops_when_the_api_says_the_run_is_over() {
         .expect("report");
     tokio::time::sleep(Duration::from_millis(220)).await;
     // The report, and the one heartbeat that learned the run is over.
-    assert_eq!(api.requests().len(), 2, "{:?}", api.requests());
+    assert_eq!(
+        progress_requests(&api).len(),
+        2,
+        "{:?}",
+        progress_requests(&api)
+    );
 }
 
 #[tokio::test]
@@ -1013,7 +1044,7 @@ async fn the_hosted_gateway_runs_no_timer_and_tells_the_api_to_expect_a_longer_s
     tokio::time::sleep(Duration::from_millis(120)).await;
     // The call named no run, so the session's open runs were read first (the
     // mock has none to show); then the report, and nothing after it.
-    let all = api.requests();
+    let all = progress_requests(&api);
     assert_eq!(all.len(), 2, "no background request: {all:?}");
     assert!(
         all[0].target.starts_with("/api/v1/run-progress/runs?"),
@@ -1036,7 +1067,12 @@ async fn the_hosted_gateway_runs_no_timer_and_tells_the_api_to_expect_a_longer_s
         "{}",
         text_of(&read)
     );
-    assert_eq!(api.requests().len(), 2, "{:?}", api.requests());
+    assert_eq!(
+        progress_requests(&api).len(),
+        2,
+        "{:?}",
+        progress_requests(&api)
+    );
 }
 
 // ============================================================================
@@ -1074,7 +1110,7 @@ async fn get_reads_the_run_this_session_reported_or_the_one_named() {
         .await
         .expect("get by id");
 
-    let requests = api.requests();
+    let requests = progress_requests(&api);
     assert_eq!(requests.len(), 3, "{requests:?}");
     assert_eq!(requests[1].method, "GET");
     // A run is read inside the workspace the caller names.
@@ -1131,7 +1167,7 @@ async fn get_without_a_known_run_reads_the_newest_run_on_the_ticket() {
         .execute(json!({"action": "get", "ticket_id": fixture.ticket}))
         .await
         .expect("get");
-    let requests = api.requests();
+    let requests = progress_requests(&api);
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert_eq!(
         requests[0].target,
@@ -1153,7 +1189,7 @@ async fn get_without_a_known_run_reads_the_newest_run_on_the_ticket() {
         "{}",
         text_of(&nothing)
     );
-    assert_eq!(api.requests().len(), 1);
+    assert_eq!(progress_requests(&api).len(), 1);
 }
 
 #[tokio::test]
@@ -1185,7 +1221,7 @@ async fn list_filters_the_runs_and_says_each_on_one_line() {
         .await
         .expect("list ended");
 
-    let requests = api.requests();
+    let requests = progress_requests(&api);
     assert_eq!(requests.len(), 2, "{requests:?}");
     assert_eq!(
         requests[0].target,
@@ -1250,7 +1286,7 @@ fn the_tool_asks_for_no_action_and_its_schema_fits_every_provider() {
     let properties = &schema["properties"];
     assert_eq!(
         properties["action"]["enum"],
-        json!(["report", "get", "list"])
+        json!(["report", "get", "list", "reply", "decline"])
     );
     for param in [
         "step",
@@ -1538,7 +1574,7 @@ async fn on_a_local_server_a_report_that_names_no_run_goes_to_the_one_open_run()
     )])
     .await;
     let tool = fixture.tool(&api.base_url).with_heartbeat(Heartbeat::None);
-    let sent = |index: usize| api.requests()[index].body.clone();
+    let sent = |index: usize| progress_requests(&api)[index].body.clone();
 
     // The session takes up a ticket: one run is open.
     tool.execute(json!({"step": "Reading the parser", "ticket_id": fixture.ticket}))
@@ -1604,7 +1640,7 @@ async fn on_a_local_server_no_open_run_means_the_default_run() {
     .await;
     let tool = fixture.tool(&api.base_url).with_heartbeat(Heartbeat::None);
     let key = |index: usize| {
-        api.requests()[index].body["source_run_id"]
+        progress_requests(&api)[index].body["source_run_id"]
             .as_str()
             .expect("a key")
             .to_string()
@@ -1709,7 +1745,7 @@ async fn hosted_report(
     })
     .await
     .expect("report");
-    let requests = api.requests();
+    let requests = progress_requests(&api);
     let targets = requests.iter().map(|seen| seen.target.clone()).collect();
     let report = requests.last().expect("the report").body.clone();
     HostedReport {
@@ -1922,7 +1958,7 @@ async fn reported_agent(caller: Caller<'_>) -> Value {
     })
     .await
     .expect("report");
-    let requests = api.requests();
+    let requests = progress_requests(&api);
     assert_eq!(requests.len(), 1, "{requests:?}");
     requests[0].body["agent"].clone()
 }
@@ -2212,7 +2248,7 @@ async fn a_workspace_not_on_the_list_sees_exactly_todays_behaviour() {
     })
     .await;
     assert!(local.is_none());
-    assert!(api.requests().is_empty());
+    assert!(progress_requests(&api).is_empty());
 }
 
 #[tokio::test]
@@ -2294,7 +2330,7 @@ async fn review_report_body(fixture: &Fixture, caller: Caller<'_>) -> Value {
     })
     .await
     .expect("report");
-    api.requests()
+    progress_requests(&api)
         .into_iter()
         .find(|seen| seen.target.ends_with("/run-progress/report"))
         .expect("a report")
@@ -2632,7 +2668,7 @@ async fn a_refused_sign_is_one_request_and_never_refreshes_the_session() {
             task.await.expect("the sign of life finishes");
         }
     }
-    let requests = api.requests();
+    let requests = progress_requests(&api);
     let refreshed = refreshes.load(std::sync::atomic::Ordering::SeqCst);
     println!(
         "SIGNS refused: requests {} {:?}, session refreshes {refreshed}",
@@ -3205,7 +3241,7 @@ async fn only_the_apis_word_on_whose_a_credential_is_accepts_it() {
             .expect("the version is public");
     })
     .await;
-    assert_eq!(api.requests().len(), 2);
+    assert_eq!(progress_requests(&api).len(), 2);
     assert_eq!(
         accepted_user_of_key(&key),
         None,
@@ -3438,10 +3474,10 @@ async fn a_recorded_report_has_the_api_asked_whose_the_credential_is() {
     // Another workspace: nothing is asked and nothing is remembered.
     assert!(!reported_under(&client, &key, Uuid::new_v4(), &here).await);
     assert!(!reported_under(&client, &key, fixture.workspace, &[]).await);
-    assert!(api.requests().is_empty());
+    assert!(progress_requests(&api).is_empty());
 
     assert!(reported_under(&client, &key, fixture.workspace, &here).await);
-    let asked = api.requests();
+    let asked = progress_requests(&api);
     assert_eq!(asked.len(), 1, "{asked:?}");
     assert_eq!(
         (asked[0].method.as_str(), asked[0].target.as_str()),
@@ -3450,7 +3486,7 @@ async fn a_recorded_report_has_the_api_asked_whose_the_credential_is() {
     assert_eq!(accepted_user_of_key(&key), Some(user_digest(user)));
     // The word is fresh: the next reports ask nothing.
     assert!(!reported_under(&client, &key, fixture.workspace, &here).await);
-    assert_eq!(api.requests().len(), 1);
+    assert_eq!(progress_requests(&api).len(), 1);
     // The credential has a run: it counts beyond the fresh word.
     let digest = credential_digest(mcp_client::SentCredential::ApiKey(&key));
     let beyond = Instant::now() + ACCEPTED_FOR + Duration::from_secs(1);

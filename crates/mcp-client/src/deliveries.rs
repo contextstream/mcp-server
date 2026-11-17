@@ -223,24 +223,30 @@ fn answered(id: Uuid, answer: Value) -> Delivery {
     })
 }
 
-/// Not built yet: the calls are named and typed, and none is made.
-fn not_built<T>() -> Result<T> {
-    Err(Error::Tool("run deliveries are not built yet".to_string()))
-}
-
 impl ContextStreamClient {
     /// What is deliverable to the reader's run. Endpoint:
     /// `GET /decision-requests/deliveries?workspace_id=&run_id=`.
     pub async fn read_deliveries(&self, reader: &DeliveryReader) -> Result<Vec<Delivery>> {
-        let _ = (reader.query(), once(), deliveries_of(&Value::Null));
-        not_built()
+        let answer: Value = self
+            .get_without_session_refresh(
+                &format!("/decision-requests/deliveries{}", reader.query()),
+                once(),
+            )
+            .await?;
+        Ok(deliveries_of(&answer))
     }
 
     /// Take a delivery for the length of a lease. Endpoint:
     /// `POST /decision-requests/deliveries/:id/claim`.
     pub async fn claim_delivery(&self, id: Uuid, who: &DeliveryActor) -> Result<Delivery> {
-        let _ = answered(id, Value::Object(who.body()));
-        not_built()
+        let answer: Value = self
+            .post_without_session_refresh(
+                &format!("/decision-requests/deliveries/{id}/claim"),
+                Value::Object(who.body()),
+                once(),
+            )
+            .await?;
+        Ok(answered(id, answer))
     }
 
     /// Confirm a delivery: the agent acted on it, and `note` is its reply to
@@ -251,8 +257,18 @@ impl ContextStreamClient {
         note: Option<&str>,
         who: &DeliveryActor,
     ) -> Result<Delivery> {
-        let _ = (id, note, who);
-        not_built()
+        let mut body = who.body();
+        if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
+            body.insert("note".into(), json!(note));
+        }
+        let answer: Value = self
+            .post_without_session_refresh(
+                &format!("/decision-requests/deliveries/{id}/applied"),
+                Value::Object(body),
+                once(),
+            )
+            .await?;
+        Ok(answered(id, answer))
     }
 
     /// Decline a delivery: `reason` is one of [`DECLINE_REASONS`], `note` what
@@ -265,8 +281,19 @@ impl ContextStreamClient {
         note: Option<&str>,
         who: &DeliveryActor,
     ) -> Result<Delivery> {
-        let _ = (id, reason, note, who);
-        not_built()
+        let mut body = who.body();
+        body.insert("reason".into(), json!(reason));
+        if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
+            body.insert("note".into(), json!(note));
+        }
+        let answer: Value = self
+            .post_without_session_refresh(
+                &format!("/decision-requests/deliveries/{id}/declined"),
+                Value::Object(body),
+                once(),
+            )
+            .await?;
+        Ok(answered(id, answer))
     }
 }
 

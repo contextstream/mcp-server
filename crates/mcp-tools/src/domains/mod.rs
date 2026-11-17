@@ -33,6 +33,7 @@ pub mod qa;
 pub mod read_only;
 pub mod reminder;
 pub(crate) mod result_cache;
+pub mod run_deliveries;
 pub(crate) mod scope;
 pub(crate) mod scope_resolution;
 pub mod search;

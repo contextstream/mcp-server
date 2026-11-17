@@ -1335,6 +1335,52 @@ mod tests {
         Delivery::from_value(&value).expect("a delivery")
     }
 
+    fn quota_owner(credential: usize, slot: usize) -> Owner {
+        Owner {
+            key: OwnerKey {
+                namespace: format!("credential-{credential}"),
+                digest: slot.to_string(),
+            },
+            workspace: Uuid::nil(),
+            store: "unused".into(),
+        }
+    }
+
+    #[test]
+    fn round5_other_credentials_keep_their_frames_and_tokens_at_capacity() {
+        let ledger = Ledger::default();
+        let run = Uuid::new_v4();
+        let quiet = quota_owner(0, 0);
+        let message = delivery(json!({"id": Uuid::new_v4(), "text": "still waiting"}));
+        let token = ClaimToken::new("held");
+        ledger.remember(&quiet.key, &message, quiet.workspace, run, token.clone());
+
+        for index in 1..MAX_OWNERS {
+            let owner = quota_owner(index / OWNERS_PER_CREDENTIAL, index % OWNERS_PER_CREDENTIAL);
+            ledger.note_report(&owner, run);
+        }
+        // A full credential can reuse its own slot. A fresh credential cannot
+        // take a slot from any existing owner, even the oldest one.
+        let busy = quota_owner(1, OWNERS_PER_CREDENTIAL);
+        ledger.note_report(&busy, run);
+        assert!(ledger.saw_report(&busy, run));
+        let newcomer = quota_owner(MAX_OWNERS, 0);
+        ledger.note_report(&newcomer, run);
+
+        let offered = ledger.take_frames(&quiet.key, run, TOOL, 1);
+        assert!(offered.text().contains("> still waiting"));
+        assert_eq!(
+            ledger.claimed_as(&quiet.key, message.id),
+            Some((run, token))
+        );
+        assert!(ledger
+            .take_frames(&quiet.key, run, TOOL, 1)
+            .shown
+            .is_empty());
+        assert!(!ledger.saw_report(&newcomer, run));
+        assert_eq!(ledger.owner_count(), MAX_OWNERS);
+    }
+
     #[tokio::test]
     async fn round2_abandoned_read_does_not_strand_the_next_get() {
         let workspace = Uuid::new_v4();

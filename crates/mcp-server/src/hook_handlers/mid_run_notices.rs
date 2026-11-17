@@ -1620,8 +1620,22 @@ fn apply_progress_finding(entry: &mut MidRunSessionState, finding: ProgressFindi
     }
     for id in finding.shown {
         // The agent has read it: a pointer at it would only send it back.
-        let named = format!("delivery_id={id}");
-        entry.pending.retain(|notice| !notice.contains(&named));
+        let named = format!("(delivery_id={id})");
+        // Old state files can contain several pointers in a single entry.
+        entry.pending.retain_mut(|notice| {
+            if notice.lines().any(|line| {
+                line.starts_with("[CONTEXTSTREAM LIVE NOTICE]") && line.contains(&named)
+            }) {
+                *notice = notice
+                    .lines()
+                    .filter(|line| {
+                        !(line.starts_with("[CONTEXTSTREAM LIVE NOTICE]") && line.contains(&named))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            !notice.is_empty()
+        });
         push_bounded(
             &mut entry.noticed_deliveries,
             format!("{id}#tool"),
@@ -1663,7 +1677,6 @@ struct Waiting {
 
 /// Queue a pointer for each delivery the session has not been pointed at.
 fn queue_delivery_pointers(entry: &mut MidRunSessionState, found: Vec<Waiting>) {
-    let mut lines = Vec::new();
     for waiting in found {
         let token = format!("{}#{}", waiting.id, waiting.previous_claims);
         if entry.noticed_deliveries.contains(&token) {
@@ -1678,12 +1691,8 @@ fn queue_delivery_pointers(entry: &mut MidRunSessionState, found: Vec<Waiting>) 
         {
             continue;
         }
-        lines.push(waiting.pointer);
+        entry.pending.push(waiting.pointer);
     }
-    if lines.is_empty() {
-        return;
-    }
-    entry.pending.push(lines.join("\n"));
     let excess = entry.pending.len().saturating_sub(MAX_PENDING_NOTICES);
     entry.pending.drain(0..excess);
 }

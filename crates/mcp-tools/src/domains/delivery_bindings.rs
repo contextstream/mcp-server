@@ -171,3 +171,27 @@ pub(super) fn default_root() -> Option<PathBuf> {
         std::sync::LazyLock::new(|| tempfile::tempdir().unwrap());
     Some(ROOT.path().to_path_buf())
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review7_an_inherited_descriptor_does_not_extend_a_finished_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Owner {
+            key: "test owner".into(),
+            workspace: Uuid::new_v4(),
+            store: dir.path().join("bindings"),
+        };
+        let id = Uuid::new_v4();
+        let held = owner.reserve(id).unwrap();
+        // A duplicate references the same open file description, just as a
+        // concurrent child between fork and exec does.
+        let inherited = held.try_clone().unwrap();
+        assert!(owner.reserve(id).is_none(), "still held by the worker");
+        drop(held);
+        assert!(owner.reserve(id).is_some(), "the worker has finished");
+        drop(inherited);
+    }
+}

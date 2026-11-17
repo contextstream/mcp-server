@@ -18,6 +18,8 @@ pub(super) struct Binding {
     delivery: Option<Uuid>,
     at: i64,
     pub generation: usize,
+    #[serde(default)]
+    attempt: Option<Uuid>,
 }
 
 pub(super) const CLAIM_SECONDS: i64 = 3600;
@@ -67,14 +69,49 @@ impl Owner {
         Ok(answer)
     }
 
-    pub fn bind(&self, run: Uuid, delivery: Option<Uuid>, generation: usize) -> bool {
+    /// A bounded set of nonblocking OS locks; drop releases the reservation
+    /// even on cancellation or process exit. Never unlink a live lock file.
+    pub fn reserve(&self, id: Uuid) -> Option<fs::File> {
+        let mut dir = fs::DirBuilder::new();
+        dir.recursive(true);
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+            dir.mode(0o700);
+            options.mode(0o600);
+        }
+        let root = self.store.parent()?;
+        dir.create(root).ok()?;
+        let file = options
+            .open(
+                self.store
+                    .with_extension(format!("claim-{:02x}.lock", id.as_bytes()[0])),
+            )
+            .ok()?;
+        file.try_lock().ok()?;
+        Some(file)
+    }
+
+    pub fn bind(
+        &self,
+        run: Uuid,
+        delivery: Option<Uuid>,
+        generation: usize,
+        attempt: Option<Uuid>,
+    ) -> bool {
         self.book(|entries| {
-            entries.retain(|e| !(e.run == run && e.delivery == delivery && e.owner == self.key));
+            entries.retain(|e| {
+                !(e.delivery == delivery
+                    && (delivery.is_some() || (e.run == run && e.owner == self.key)))
+            });
             entries.push(Binding {
                 owner: self.key.clone(),
                 run,
                 delivery,
                 generation,
+                attempt,
                 at: chrono::Utc::now().timestamp(),
             });
             ((), true)
@@ -94,14 +131,26 @@ impl Owner {
         .unwrap_or(false)
     }
 
-    pub fn claim(&self, id: Uuid) -> Option<(Uuid, usize)> {
+    pub fn already_claimed(&self, id: Uuid, generation: usize) -> bool {
+        self.book(|entries| {
+            (
+                entries
+                    .iter()
+                    .any(|e| e.delivery == Some(id) && e.generation >= generation),
+                false,
+            )
+        })
+        .unwrap_or(true)
+    }
+
+    pub fn claim(&self, id: Uuid) -> Option<(Uuid, usize, Uuid)> {
         self.book(|entries| {
             (
                 entries
                     .iter()
                     .rev()
                     .find(|e| e.delivery == Some(id) && e.owner == self.key)
-                    .map(|e| (e.run, e.generation)),
+                    .and_then(|e| Some((e.run, e.generation, e.attempt?))),
                 false,
             )
         })

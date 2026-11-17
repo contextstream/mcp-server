@@ -97,6 +97,7 @@ impl Api {
         let log = seen.clone();
         let answers = Arc::new(answers);
         let served: Arc<Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
+        let claimants = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -105,6 +106,7 @@ impl Api {
                 let answers = answers.clone();
                 let log = log.clone();
                 let served = served.clone();
+                let claimants = claimants.clone();
                 tokio::spawn(async move {
                     let request = read_request(&mut socket).await;
                     let (head, body) = request
@@ -147,7 +149,19 @@ impl Api {
                         other => other,
                     };
                     let (status, answer) = chosen
-                        .map(|(_, status, answer)| (*status, answer.to_string()))
+                        .map(|(_, status, answer)| {
+                            let mut answer = answer.clone();
+                            // As on the API, a second claim on the same generation
+                            // preserves the first actor even when it rotates the token.
+                            if target.ends_with("/claim") && answer.pointer("/data/state") == Some(&json!("claimed"))
+                                && answer["data"]["claimed_by"].is_null() {
+                                let actor: Value = serde_json::from_str(&body).unwrap();
+                                let key = (target.clone(), answer["data"]["previous_claims"].to_string());
+                                answer["data"]["claimed_by"] = claimants.lock().unwrap().entry(key)
+                                    .or_insert_with(|| json!({"agent":actor["agent"], "run_id":actor["run_id"]})).clone();
+                            }
+                            (*status, answer.to_string())
+                        })
                         .unwrap_or((404, json!({"error": "not found"}).to_string()));
                     let reason = match status {
                         200 => "OK",

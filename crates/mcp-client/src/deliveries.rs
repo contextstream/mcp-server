@@ -211,6 +211,8 @@ pub struct Answer {
 /// token, wherever the API may have put one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Delivery {
+    /// Attempt id preserved by the API when a competing claim rotates its token.
+    pub claim_attempt: Option<Uuid>,
     pub id: Uuid,
     /// What it carries: [`KIND_ANSWER`] (also when the server names nothing),
     /// [`KIND_PERSON_MESSAGE`], or [`KIND_OTHER`] for anything else.
@@ -329,6 +331,9 @@ impl Delivery {
             .map(str::to_string);
         Some(Self {
             id,
+            claim_attempt: value
+                .pointer("/claimed_by/agent")
+                .and_then(|a| uuid_field(a, "id")),
             kind: match value.get("kind").and_then(Value::as_str).map(str::trim) {
                 None | Some("") | Some(KIND_ANSWER) => KIND_ANSWER,
                 Some(KIND_PERSON_MESSAGE) => KIND_PERSON_MESSAGE,

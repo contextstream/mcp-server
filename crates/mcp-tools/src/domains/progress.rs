@@ -384,7 +384,7 @@ impl ProgressTool {
                 // under a sign-in or an app's token.
                 let owner = self.delivery_owner(workspace_id, is_http).await;
                 let offered = match (reported_run, owner.as_ref()) {
-                    (Some(run_id), Some(owner)) if owner.bind(run_id, None, 0) => {
+                    (Some(run_id), Some(owner)) if owner.bind(run_id, None, 0, None) => {
                         run_deliveries::poll(
                             &self.client,
                             &self.deliveries,

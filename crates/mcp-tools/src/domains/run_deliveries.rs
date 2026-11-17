@@ -291,6 +291,7 @@ pub fn pointer(delivery: &Delivery, run_id: Uuid, tool: &str) -> String {
 
 #[derive(Debug, Clone)]
 struct Shown {
+    held_at: Instant,
     /// How many claims had lapsed when it was shown.
     previous_claims: usize,
     /// The run it was claimed as.
@@ -322,9 +323,14 @@ pub(crate) struct Ledger {
 
 impl Ledger {
     fn lock(&self) -> MutexGuard<'_, Memory> {
-        self.memory
+        let mut mem = self
+            .memory
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        mem.shown.retain(|_, s| {
+            s.held_at.elapsed().as_secs() < super::delivery_bindings::CLAIM_SECONDS as u64
+        });
+        mem
     }
 
     fn key(session: &str, id: Uuid) -> String {
@@ -348,65 +354,53 @@ impl Ledger {
         run_id: Uuid,
         token: Option<ClaimToken>,
     ) {
-        let mut memory = self.lock();
-        memory.next += 1;
-        let order = memory.next;
-        memory.shown.insert(
-            Self::key(session, delivery.id),
-            Shown {
-                previous_claims: delivery.previous_claims,
-                run_id,
-                token,
-                order,
-            },
+        self.keep(
+            session,
+            delivery.id,
+            run_id,
+            delivery.previous_claims,
+            token,
         );
-        if memory.shown.len() > MAX_REMEMBERED {
-            let oldest = memory
-                .shown
-                .iter()
-                .min_by_key(|(_, shown)| shown.order)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                memory.shown.remove(&oldest);
-            }
-        }
     }
 
-    /// A claim made again: the delivery is this session's as `run_id`, under
-    /// `token`. What the session was shown of it stays as it was.
-    fn hold(
+    fn keep(
         &self,
         session: &str,
         id: Uuid,
-        _workspace_id: Uuid,
         run_id: Uuid,
+        generation: usize,
         token: Option<ClaimToken>,
     ) {
         let mut memory = self.lock();
         memory.next += 1;
         let order = memory.next;
-        let previous_claims = memory
-            .shown
-            .get(&Self::key(session, id))
-            .map_or(0, |shown| shown.previous_claims);
         memory.shown.insert(
             Self::key(session, id),
             Shown {
-                previous_claims,
+                previous_claims: generation,
                 run_id,
                 token,
                 order,
+                held_at: Instant::now(),
             },
         );
+        if memory.shown.len() > MAX_REMEMBERED {
+            if let Some(oldest) = memory
+                .shown
+                .iter()
+                .min_by_key(|(_, s)| s.order)
+                .map(|(k, _)| k.clone())
+            {
+                memory.shown.remove(&oldest);
+            }
+        }
     }
 
-    /// The run this session claimed the delivery as, and the claim's token,
-    /// when it did.
     fn claimed_as(&self, session: &str, id: Uuid) -> Option<(Uuid, Option<ClaimToken>)> {
         self.lock()
             .shown
             .get(&Self::key(session, id))
-            .map(|shown| (shown.run_id, shown.token.clone()))
+            .map(|s| (s.run_id, s.token.clone()))
     }
 
     fn is_not_there(&self, workspace_id: Uuid) -> bool {
@@ -604,11 +598,6 @@ pub(super) async fn offer(
             return Offered::default();
         }
     };
-    let who = DeliveryActor {
-        run_id: Some(run_id),
-        agent: Some(agent.clone()),
-        claim_token: None,
-    };
     let mut offered = Offered {
         available: true,
         ..Offered::default()
@@ -621,6 +610,23 @@ pub(super) async fn offer(
         // Shown only once it is this agent's: one another agent holds, or one
         // whose claim did not get through, is offered again later. One try
         // per read: the next report reads again.
+        let Some(_reservation) = owner.reserve(delivery.id) else {
+            continue;
+        };
+        if owner.already_claimed(delivery.id, delivery.previous_claims) {
+            continue;
+        }
+        // Reclaiming as the same key/run rotates the token but leaves the
+        // original agent unchanged. Distinct attempts must remain distinct
+        // even on replicas without a shared filesystem.
+        let attempt = Uuid::new_v4();
+        let mut labels = agent.clone();
+        labels["id"] = json!(attempt);
+        let who = DeliveryActor {
+            run_id: Some(run_id),
+            agent: Some(labels),
+            claim_token: None,
+        };
         let claimed = match client.claim_delivery(delivery.id, &who, &reader).await {
             Ok(claimed) => claimed,
             Err(error) => {
@@ -638,7 +644,14 @@ pub(super) async fn offer(
         };
         // What is shown is what the claim answered: the API's statement that
         // this delivery, in this state, is this run's.
-        if !owner.bind(run_id, Some(claimed.id), claimed.previous_claims) {
+        if claimed.claim_attempt != Some(attempt)
+            || !owner.bind(
+                run_id,
+                Some(claimed.id),
+                claimed.previous_claims,
+                Some(attempt),
+            )
+        {
             continue;
         }
         ledger.remember(
@@ -846,7 +859,8 @@ async fn end(
     client.way_back().await?;
     let no_claim = || Error::Validation(NO_CLAIM.to_string());
     let owner = owner.ok_or_else(no_claim)?;
-    let (run_id, generation) = owner.claim(id).ok_or_else(no_claim)?;
+    let _reservation = owner.reserve(id).ok_or_else(no_claim)?;
+    let (run_id, generation, attempt) = owner.claim(id).ok_or_else(no_claim)?;
     let session = &owner.key;
     let workspace_id = owner.workspace;
     if let Some((held_run, Some(token))) = ledger.claimed_as(session, id) {
@@ -873,16 +887,13 @@ async fn end(
         run_id: Some(run_id),
     };
     let claimed = client.claim_delivery(id, &again, &expect).await?;
-    if !owner.bind(run_id, Some(id), generation) {
+    if claimed.claim_attempt != Some(attempt)
+        || claimed.previous_claims != generation
+        || !owner.bind(run_id, Some(id), generation, Some(attempt))
+    {
         return Err(no_claim().into());
     }
-    ledger.hold(
-        session,
-        id,
-        workspace_id,
-        run_id,
-        claimed.claim_token.clone(),
-    );
+    ledger.keep(session, id, run_id, generation, claimed.claim_token.clone());
     let who = DeliveryActor {
         claim_token: claimed.claim_token,
         ..again
@@ -1193,17 +1204,20 @@ mod tests {
         let ledger = Ledger::default();
         let run = Uuid::new_v4();
         let first = Uuid::new_v4();
-        ledger.hold("session", first, Uuid::nil(), run, ClaimToken::new("first"));
+        ledger.keep("session", first, run, 0, ClaimToken::new("first"));
         for _ in 0..MAX_REMEMBERED {
-            ledger.hold(
-                "session",
-                Uuid::new_v4(),
-                Uuid::nil(),
-                run,
-                ClaimToken::new("later"),
-            );
+            ledger.keep("session", Uuid::new_v4(), run, 0, ClaimToken::new("later"));
         }
         assert!(ledger.claimed_as("session", first).is_none());
+        let expired = Uuid::new_v4();
+        ledger.keep("session", expired, run, 0, ClaimToken::new("expired"));
+        ledger
+            .lock()
+            .shown
+            .get_mut(&Ledger::key("session", expired))
+            .unwrap()
+            .held_at -= Duration::from_secs(3600);
+        assert!(ledger.claimed_as("session", expired).is_none());
     }
 
     #[test]

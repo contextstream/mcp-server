@@ -249,4 +249,24 @@ mod tests {
         assert!(owner.reserve(id).await.is_ok(), "the worker has finished");
         drop(inherited);
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn round3_contended_binding_does_not_block_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Owner {
+            key: "test".into(),
+            workspace: Uuid::new_v4(),
+            store: dir.path().join("book"),
+        };
+        let held = FileLock::acquire(owner.store.with_extension("lock")).unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        });
+        assert!(
+            owner.bind(Uuid::new_v4(), None, 0, None),
+            "timer must release the lock before the writer times out"
+        );
+        release.await.unwrap();
+    }
 }

@@ -2543,3 +2543,59 @@ async fn round4_stale_offer_is_silent_when_routes_are_off() {
     assert_eq!(sent(&api, "GET", "/deliveries").len(), 2);
     assert!(sent(&api, "POST", "/claim").is_empty());
 }
+
+#[tokio::test]
+async fn round4_unknown_gateway_sessions_and_workspaces_do_not_allocate() {
+    with_caller(async {
+        let f = Fixture::new();
+        let api = Api::start(vec![]).await;
+        let mut tool = f.hosted_tool(&api);
+        tool.deliveries = Arc::default();
+        for n in 0..50 {
+            mcp_client::run_with_mcp_session_id(format!("header-{n}"), || async {
+                let reply = tool.execute(json!({"action":"reply", "workspace_id":Uuid::new_v4(),"delivery_id":f.delivery, "note":"done"})).await.unwrap();
+                assert_eq!(reply.structured_content.unwrap()["reason"], "no_owned_claim");
+            }).await;
+        }
+        assert_eq!(tool.deliveries.owner_count(), 0);
+        assert!(api.requests().is_empty());
+    }).await;
+}
+
+#[tokio::test]
+async fn round4_gateway_caps_report_owners_per_key_and_globally_by_recent_use() {
+    let f = Fixture::new();
+    let api = Api::start(vec![]).await;
+    let mut tool = f.hosted_tool(&api);
+    tool.deliveries = Arc::default();
+    let run = f.run;
+    for key in 0..9 {
+        let auth = mcp_types::AuthOverride {
+            api_key: Some(format!("cbiq_quota_fixture_{key}")),
+            ..Default::default()
+        };
+        mcp_client::run_with_auth_override(auth, || async {
+            let mut owners = Vec::new();
+            for n in 0..33 {
+                let owner = mcp_client::run_with_mcp_session_id(format!("header-{n}"), || {
+                    tool.delivery_owner(Uuid::new_v4(), true)
+                })
+                .await
+                .unwrap();
+                if n == 32 {
+                    assert!(tool.deliveries.saw_report(&owners[0], run));
+                }
+                tool.deliveries.note_report(&owner, run);
+                owners.push(owner);
+            }
+            assert!(tool.deliveries.saw_report(&owners[0], run));
+            assert!(
+                !tool.deliveries.saw_report(&owners[1], run),
+                "the least recently used owner of this key should make room"
+            );
+            assert!(tool.deliveries.saw_report(&owners[32], run));
+        })
+        .await;
+        assert_eq!(tool.deliveries.owner_count(), ((key + 1) * 32).min(256));
+    }
+}

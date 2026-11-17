@@ -381,6 +381,11 @@ pub(crate) struct Ledger {
 }
 
 impl Ledger {
+    #[cfg(test)]
+    pub(super) fn owner_count(&self) -> usize {
+        self.owners.lock().unwrap().by_key.len()
+    }
+
     fn with<T>(&self, owner: &str, f: impl FnOnce(&mut Memory) -> T) -> T {
         let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
         if owners
@@ -1491,6 +1496,22 @@ mod tests {
         ledger.remember("a", &lapsed, Uuid::nil(), run, None);
         assert!(!ledger.is_new("a", &lapsed));
         assert!(!ledger.is_new("a", &fresh));
+    }
+
+    #[test]
+    fn round4_report_only_evidence_expires_in_two_hours() {
+        let ledger = Ledger::default();
+        let owner = Owner {
+            key: "expiry".into(),
+            workspace: Uuid::new_v4(),
+            store: "unused".into(),
+        };
+        let run = Uuid::new_v4();
+        ledger.note_report(&owner, run);
+        ledger.with(&owner.key, |mem| {
+            *mem.reports.get_mut(&run).unwrap() -= Duration::from_secs(7201)
+        });
+        assert!(!ledger.saw_report(&owner, run));
     }
 
     #[test]

@@ -883,11 +883,20 @@ fn a_request_without_a_credential_is_refused_and_asks_the_api_nothing() {
 }
 
 fn quiet_workspace_paths(paths: &[&str], personal_key: bool) -> bool {
-    if personal_key {
-        paths == [ME, OPEN_RUNS, REPORT, DELIVERIES, VERSION, VERSION, VERSION]
-    } else {
-        paths == [ME, OPEN_RUNS, REPORT, VERSION, VERSION, VERSION]
-    }
+    let mut reads = paths
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| (*p == DELIVERIES).then_some(i));
+    let expected = [ME, OPEN_RUNS, REPORT, VERSION, VERSION, VERSION];
+    paths
+        .iter()
+        .copied()
+        .filter(|p| *p != DELIVERIES)
+        .eq(expected)
+        && match reads.next() {
+            Some(i) => personal_key && i >= 3 && reads.next().is_none(),
+            None => !personal_key,
+        }
 }
 
 #[test]
@@ -921,6 +930,12 @@ fn nothing_is_asked_for_a_workspace_the_setting_does_not_name() {
             for _ in 0..3 {
                 gateway.call(credential, "sid-1", "help", version());
             }
+        }
+        // Completion of help does not join the report's delivery reader.
+        // Wait for the expected request itself before inspecting the trace.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !api.paths().iter().any(|p| p == DELIVERIES) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
         api.settle();
         // For each caller: the check of the credential at `initialize`, the

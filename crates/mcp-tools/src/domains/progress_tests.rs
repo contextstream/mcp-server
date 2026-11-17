@@ -105,7 +105,14 @@ impl Fixture {
 fn progress_requests(api: &Api) -> Vec<Seen> {
     api.requests()
         .into_iter()
-        .filter(|request| !request.target.contains("/decision-requests/deliveries"))
+        .filter(|request| {
+            const DELIVERIES: &str = "/api/v1/decision-requests/deliveries";
+            let path = request.target.split('?').next().unwrap_or_default();
+            if path == DELIVERIES || path.starts_with("/api/v1/decision-requests/deliveries/") {
+                assert_eq!(request.method, "GET", "unexpected delivery write to {path}");
+            }
+            path != DELIVERIES
+        })
         .collect()
 }
 

@@ -2,6 +2,8 @@
 
 ## 1.0.82
 
+- Reports minutes apart refresh stale delivery offers and claim them within one five-second budget. If time runs out with a known offer, the report names the client’s `get` call. An unavailable deliveries route stays silent.
+
 - A nonterminal `progress` report or `progress(action="get")` on your own run can return a person's answer in a `[PERSON ANSWER]` block or a message in a `[PERSON MESSAGE]` block. The call that shows the words claims the delivery. After acting, use `progress(action="reply", delivery_id="...", note="what I did")`; the person sees the note. To decline, pass `action="decline"`, the `delivery_id`, a `reason` and an optional `note`. A delivery grants no new permissions.
 - A mid-run hook can show a pointer to the delivery and the `get` call that reads it. In local Claude Code, a waiting report can suggest the background command `contextstream-mcp await-answer --run-id=<id> --workspace-id=<id>`. It prints a pointer on arrival (exit 0), times out after four hours by default (124), or exits with 1 if another waiter holds the run, no credentials are available, the credential is not a person’s full API key, or no workspace is supplied or linked. Neither the hook nor the waiter claims anything. Run `contextstream-mcp update-rules --scope=all --only-configured` to install the new guidance.
 - Only personal, full API keys participate. While the API answers 404, progress works as before: no delivery, claim, binding file or wake advice; the deliveries probe backs off for ten minutes.

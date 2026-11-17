@@ -400,9 +400,9 @@ impl Ledger {
 
     // A get can follow its report before the first read has finished. Keep
     // this evidence in memory until a successful read warrants a disk book.
-    pub(super) fn note_report(&self, owner: &Owner, run: Uuid) {
+    pub(super) fn note_report(&self, owner: &Owner, run: Uuid) -> Option<Instant> {
         self.with(&owner.key, |mem| {
-            mem.reports.insert(run, Instant::now());
+            let previous = mem.reports.insert(run, Instant::now());
             if mem.reports.len() > MAX_REMEMBERED {
                 if let Some(oldest) = mem
                     .reports
@@ -413,7 +413,8 @@ impl Ledger {
                     mem.reports.remove(&oldest);
                 }
             }
-        });
+            previous
+        })
     }
 
     pub(super) fn saw_report(&self, owner: &Owner, run: Uuid) -> bool {
@@ -545,6 +546,7 @@ pub(crate) struct Offered {
     pub blocks: Vec<String>,
     /// The same deliveries for a client that shows the structured answer.
     pub shown: Vec<Value>,
+    pub notice: Option<String>,
 }
 
 impl Offered {
@@ -552,6 +554,7 @@ impl Offered {
     pub(crate) fn text(&self) -> String {
         self.blocks
             .iter()
+            .chain(&self.notice)
             .map(|block| format!("\n\n{block}"))
             .collect()
     }
@@ -563,15 +566,21 @@ struct Batch {
     deliveries: Vec<Delivery>,
 }
 
+#[derive(Debug, PartialEq)]
+enum ReadFailure {
+    TimedOut,
+    Unavailable,
+}
+
 #[derive(Debug)]
 struct Poll {
     started: Instant,
     finished: tokio::sync::watch::Receiver<bool>,
-    result: Arc<OnceLock<Option<Batch>>>,
+    result: Arc<OnceLock<std::result::Result<Batch, ReadFailure>>>,
 }
 
-/// A report only consumes a finished poll or starts one. An explicit get
-/// may wait for the same worker. All consumers race for one take of its
+/// Cold reports start a probe. A report with a stale probe refreshes and
+/// collects inline, sharing one deadline between the read and claims. All consumers race for one take of its
 /// result; never hold a lock across an API call.
 pub(super) async fn poll(
     client: &ContextStreamClient,
@@ -582,6 +591,16 @@ pub(super) async fn poll(
     wait: bool,
 ) -> Offered {
     let tool = tool_for(agent.get("client").and_then(Value::as_str));
+    let deadline = tokio::time::Instant::now() + OFFER_FRESH_FOR;
+    let spaced = !wait
+        && ledger
+            .note_report(owner, run_id)
+            .is_some_and(|last| last.elapsed() >= OFFER_FRESH_FOR);
+    let notice = |waiting: bool| {
+        waiting.then(|| format!(
+        "A person's answer or message waits for this run: read it with {tool}(action=\"get\", run_id=\"{run_id}\")"
+    ))
+    };
     if wait {
         ledger.finish_claims(&owner.key, run_id).await;
     }
@@ -589,72 +608,96 @@ pub(super) async fn poll(
     if !ready.blocks.is_empty() {
         return ready;
     }
-    let Some((mut finished, result)) = ledger.with(&owner.key, |mem| {
-        // A hook or waiter can announce a new arrival after a previous poll
-        // finished empty. An explicit get must read that arrival now.
-        if mem.polls.get(&run_id).is_some_and(|p| {
-            if *p.finished.borrow() {
-                p.result
-                    .get()
-                    .and_then(Option::as_ref)
-                    .is_some_and(|batch| {
-                        batch.read_at.elapsed() >= OFFER_FRESH_FOR
-                            || (wait && batch.deliveries.is_empty())
-                    })
-            } else {
-                // A cancelled worker dropped its sender before publishing.
-                p.finished.has_changed().is_err()
-            }
-        }) {
-            mem.polls.remove(&run_id);
-        }
-        if !mem.polls.contains_key(&run_id) {
-            if mem.polls.len() >= MAX_REMEMBERED {
-                let oldest = mem
-                    .polls
-                    .iter()
-                    .filter(|(_, p)| *p.finished.borrow())
-                    .min_by_key(|(_, p)| p.started)
-                    .map(|(k, _)| *k);
-                if let Some(oldest) = oldest {
-                    mem.polls.remove(&oldest);
+    let Some((mut finished, result, refreshing, stale_had_offers)) =
+        ledger.with(&owner.key, |mem| {
+            // A hook or waiter can announce a new arrival after a previous poll
+            // finished empty. An explicit get must read that arrival now.
+            let mut refreshing = spaced;
+            let mut stale_had_offers = false;
+            if mem.polls.get(&run_id).is_some_and(|p| {
+                if *p.finished.borrow() {
+                    p.result
+                        .get()
+                        .and_then(|b| b.as_ref().ok())
+                        .is_some_and(|batch| {
+                            let stale = batch.read_at.elapsed() >= OFFER_FRESH_FOR;
+                            refreshing |= stale;
+                            stale_had_offers = stale && !batch.deliveries.is_empty();
+                            stale || (wait && batch.deliveries.is_empty())
+                        })
                 } else {
-                    return None;
+                    // A cancelled worker dropped its sender before publishing.
+                    p.finished.has_changed().is_err()
                 }
+            }) {
+                mem.polls.remove(&run_id);
             }
-            let (tx, finished) = tokio::sync::watch::channel(false);
-            let result = Arc::new(OnceLock::new());
-            mem.polls.insert(
-                run_id,
-                Poll {
-                    started: Instant::now(),
-                    finished,
-                    result: result.clone(),
-                },
-            );
-            let (client, ledger, owner) = (client.clone(), ledger.clone(), owner.clone());
-            mcp_client::spawn_with_task_context(async move {
-                let offered = read(&client, &ledger, &owner, run_id)
-                    .await
-                    .map(|deliveries| Batch {
-                        read_at: Instant::now(),
-                        deliveries,
-                    });
-                let _ = result.set(offered);
-                tx.send_replace(true);
-            });
-        }
-        let p = &mem.polls[&run_id];
-        Some((p.finished.clone(), p.result.clone()))
-    }) else {
+            if !mem.polls.contains_key(&run_id) {
+                if mem.polls.len() >= MAX_REMEMBERED {
+                    let oldest = mem
+                        .polls
+                        .iter()
+                        .filter(|(_, p)| *p.finished.borrow())
+                        .min_by_key(|(_, p)| p.started)
+                        .map(|(k, _)| *k);
+                    if let Some(oldest) = oldest {
+                        mem.polls.remove(&oldest);
+                    } else {
+                        return None;
+                    }
+                }
+                let (tx, finished) = tokio::sync::watch::channel(false);
+                let result = Arc::new(OnceLock::new());
+                mem.polls.insert(
+                    run_id,
+                    Poll {
+                        started: Instant::now(),
+                        finished,
+                        result: result.clone(),
+                    },
+                );
+                let (client, ledger, owner) = (client.clone(), ledger.clone(), owner.clone());
+                mcp_client::spawn_with_task_context(async move {
+                    let offered = read(&client, &ledger, &owner, run_id)
+                        .await
+                        .map(|deliveries| Batch {
+                            read_at: Instant::now(),
+                            deliveries,
+                        });
+                    let _ = result.set(offered);
+                    tx.send_replace(true);
+                });
+            }
+            let p = &mem.polls[&run_id];
+            Some((
+                p.finished.clone(),
+                p.result.clone(),
+                refreshing,
+                stale_had_offers,
+            ))
+        })
+    else {
         return Offered::default();
     };
     if !*finished.borrow() {
-        if !wait {
+        if !wait && !refreshing {
             return Offered::default();
         }
         // Only the list runs in the worker.
-        let _ = tokio::time::timeout(Duration::from_secs(6), finished.changed()).await;
+        if tokio::time::timeout_at(deadline, finished.changed())
+            .await
+            .is_err()
+        {
+            let known = result.get().map_or(stale_had_offers, |r| match r {
+                Ok(batch) => !batch.deliveries.is_empty(),
+                Err(ReadFailure::TimedOut) => stale_had_offers,
+                Err(ReadFailure::Unavailable) => false,
+            });
+            return Offered {
+                notice: notice(!wait && known),
+                ..Default::default()
+            };
+        }
     }
     let collected = ledger.with(&owner.key, |mem| {
         if mem
@@ -671,15 +714,33 @@ pub(super) async fn poll(
     if !collected {
         return Offered::default();
     }
-    let Some(batch) = result.get().and_then(Option::as_ref) else {
-        return Offered::default();
+    let Some(Ok(batch)) = result.get() else {
+        return Offered {
+            notice: notice(
+                !wait
+                    && stale_had_offers
+                    && matches!(result.get(), Some(Err(ReadFailure::TimedOut))),
+            ),
+            ..Default::default()
+        };
     };
-    if !owner.reported(run_id) && !owner.bind(run_id, None, 0, None).await {
-        return Offered::default();
-    }
-    ledger.with(&owner.key, |mem| mem.reports.remove(&run_id));
-    claim_offers(client, ledger, owner, run_id, agent, batch).await;
-    ledger.take_frames(&owner.key, run_id, tool)
+    let collect = async {
+        if owner.reported(run_id) || owner.bind(run_id, None, 0, None).await {
+            claim_offers(client, ledger, owner, run_id, agent, batch).await;
+        }
+    };
+    // Dropping collection never cancels a claim already sent. Its worker
+    // retains the receipt for the next tool response.
+    let late = if refreshing && !wait {
+        tokio::time::timeout_at(deadline, collect).await.is_err()
+            || tokio::time::Instant::now() >= deadline
+    } else {
+        collect.await;
+        false
+    };
+    let mut offered = ledger.take_frames(&owner.key, run_id, tool);
+    offered.notice = notice(late && batch.deliveries.len() > offered.shown.len());
+    offered
 }
 
 #[cfg(test)]
@@ -706,7 +767,7 @@ pub(super) fn age_poll(ledger: &Ledger, owner: &Owner, run: Uuid, age: Duration)
         let poll = mem.polls.get_mut(&run).unwrap();
         poll.started -= age;
         let batch = poll.result.get().unwrap().as_ref().unwrap();
-        poll.result = Arc::new(OnceLock::from(Some(Batch {
+        poll.result = Arc::new(OnceLock::from(Ok(Batch {
             read_at: batch.read_at - age,
             deliveries: batch.deliveries.clone(),
         })));
@@ -718,10 +779,10 @@ async fn read(
     ledger: &Ledger,
     owner: &Owner,
     run_id: Uuid,
-) -> Option<Vec<Delivery>> {
+) -> std::result::Result<Vec<Delivery>, ReadFailure> {
     let workspace_id = owner.workspace;
     if ledger.is_not_there(&owner.key) {
-        return None;
+        return Err(ReadFailure::Unavailable);
     }
     let reader = DeliveryReader {
         workspace_id,
@@ -730,7 +791,7 @@ async fn read(
     match client.read_deliveries(&reader).await {
         Ok(deliveries) => {
             ledger.with(&owner.key, |mem| mem.last_read = Some(Instant::now()));
-            Some(deliveries)
+            Ok(deliveries)
         }
         Err(error) => {
             if is_not_there(&error) || is_not_ready(&error) {
@@ -739,7 +800,11 @@ async fn read(
                 ledger.cool_down(&owner.key, Duration::from_secs(retry_after.unwrap_or(60)));
             }
             tracing::debug!("run deliveries not read: {}", error_tag(&error));
-            None
+            Err(if matches!(error, Error::Timeout(_)) {
+                ReadFailure::TimedOut
+            } else {
+                ReadFailure::Unavailable
+            })
         }
     }
 }

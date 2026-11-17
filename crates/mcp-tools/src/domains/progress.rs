@@ -393,7 +393,6 @@ impl ProgressTool {
                     (Some(run_id), Some(owner))
                         if !report.is_terminal() && !run_has_ended(&answer) =>
                     {
-                        self.deliveries.note_report(owner, run_id);
                         run_deliveries::poll(
                             &self.client,
                             &self.deliveries,
@@ -413,6 +412,7 @@ impl ProgressTool {
                     !report.is_terminal()
                         && !run_has_ended(&answer)
                         && offered.blocks.is_empty()
+                        && offered.notice.is_none()
                         && report.asks_a_person()
                         && owner
                             .as_ref()
@@ -438,6 +438,9 @@ impl ProgressTool {
                             "await_answer".into(),
                             json!({ "command": run_deliveries::await_command(run_id, workspace_id) }),
                         );
+                    }
+                    if let Some(notice) = offered.notice {
+                        fields.insert("delivery_notice".into(), json!(notice));
                     }
                     if !offered.shown.is_empty() {
                         fields.insert("deliveries".into(), json!(offered.shown));

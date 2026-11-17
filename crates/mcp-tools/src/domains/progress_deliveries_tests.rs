@@ -1765,7 +1765,11 @@ async fn review10_only_the_restarted_owner_can_reclaim_and_confirm() {
         if phase == "recover" {
             assert_eq!(writes.len(), 3);
             assert!(writes[1].target.ends_with("/claim"));
-            assert_eq!(writes[1].body["run_id"], json!(f.run));
+            assert!(
+                writes[1].body.get("run_id").is_none(),
+                "pending: no token rotation"
+            );
+            assert_eq!(writes[1].body["agent"]["id"], writes[0].body["agent"]["id"]);
             assert!(writes[2].target.ends_with("/applied"));
             assert_eq!(writes[2].body["claim_token"], SECOND_TOKEN);
         } else {
@@ -1814,7 +1818,10 @@ async fn a_token_that_a_later_claim_replaced_is_replaced_here_too() {
     assert_eq!(declined[1].body["claim_token"], SECOND_TOKEN);
     let claims = sent(&api, "POST", "/claim");
     assert_eq!(claims.len(), 2);
-    assert_eq!(claims[1].body["run_id"], json!(fixture.run));
+    assert!(
+        claims[1].body.get("run_id").is_none(),
+        "pending: no token rotation"
+    );
     assert!(claims[1].body.get("claim_token").is_none());
 }
 
@@ -2597,5 +2604,106 @@ async fn round4_gateway_caps_report_owners_per_key_and_globally_by_recent_use() 
         })
         .await;
         assert_eq!(tool.deliveries.owner_count(), ((key + 1) * 32).min(256));
+    }
+}
+
+async fn check_recovery(case: &str, allowed: bool) {
+    let f = Fixture::new();
+    let attempt = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let mut view = f.message();
+    let history = |id| json!({"agent":{"id":id}, "ended":"lapsed"});
+    match case {
+        "held" | "other_holder" => {
+            view["state"] = json!("claimed");
+            view["claimed_by"] = json!({"agent":{"id":if allowed { attempt } else { other }}});
+        }
+        "own_lapsed" => view["previous_claims"] = json!([history(attempt)]),
+        "newer_lapsed" => view["previous_claims"] = json!([history(attempt), history(other)]),
+        "other_lapsed" => view["previous_claims"] = json!([history(other)]),
+        "no_history" => {
+            view.as_object_mut().unwrap().remove("previous_claims");
+        }
+        "closed" => view["state"] = json!("applied"),
+        "wrong_run" => view["address"]["run_id"] = json!(Uuid::new_v4()),
+        "wrong_workspace" => view["workspace_id"] = json!(Uuid::new_v4()),
+        "unchanged_pending" | "not_listed" => {}
+        _ => unreachable!(),
+    }
+    let api = Api::start(vec![
+        offered(if case == "not_listed" {
+            vec![]
+        } else {
+            vec![view.clone()]
+        }),
+        (CLAIM, 200, held_with("claimed", &view, TOKEN)),
+        (APPLIED, 200, answers_with("applied", &view)),
+    ])
+    .await;
+    let tool = f.tool(&api);
+    let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
+    assert!(owner.bind(f.run, Some(f.delivery), 0, Some(attempt)).await);
+    let reply = tool
+        .execute(json!({"action":"reply","delivery_id":f.delivery,"note":"done"}))
+        .await
+        .unwrap();
+    let fields = reply.structured_content.unwrap();
+    assert_eq!(fields["replied"], allowed, "{case}: {fields}");
+    let requests = api.requests();
+    assert_eq!(requests[0].method, "GET", "{case}: read before any write");
+    assert_eq!(
+        requests[0].target,
+        format!(
+            "/api/v1/decision-requests/deliveries?workspace_id={}&run_id={}",
+            f.workspace, f.run
+        )
+    );
+    if allowed {
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].body["agent"]["id"], json!(attempt));
+        if case == "held" {
+            assert_eq!(requests[1].body["run_id"], json!(f.run));
+        } else {
+            assert!(
+                requests[1].body.get("run_id").is_none(),
+                "a pending claim racing a newer holder must not request token rotation"
+            );
+        }
+        assert_eq!(requests[2].body["claim_token"], TOKEN);
+    } else {
+        assert_eq!(fields["reason"], "no_owned_claim", "{case}");
+        assert_eq!(
+            requests.len(),
+            1,
+            "{case}: refusal must not rotate a token or hold a lease"
+        );
+    }
+}
+
+#[tokio::test]
+async fn round4_recovery_checks_the_holder() {
+    check_recovery("held", true).await;
+    check_recovery("other_holder", false).await;
+}
+
+#[tokio::test]
+async fn round4_recovery_reuses_only_its_own_attempt_on_pending() {
+    for case in ["own_lapsed", "unchanged_pending"] {
+        check_recovery(case, true).await;
+    }
+}
+
+#[tokio::test]
+async fn round4_recovery_does_not_claim_a_newer_or_unproven_delivery() {
+    for case in [
+        "newer_lapsed",
+        "other_lapsed",
+        "not_listed",
+        "closed",
+        "wrong_run",
+        "wrong_workspace",
+        "no_history",
+    ] {
+        check_recovery(case, false).await;
     }
 }

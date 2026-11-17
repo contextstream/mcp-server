@@ -1630,6 +1630,26 @@ async fn a_session_signed_in_with_oauth_is_never_told_to_wait_and_asks_for_nothi
         .await
         .expect("get");
     assert!(sent(&api, "GET", "/decision-requests/deliveries").is_empty());
+    // Nor can it confirm or decline one: nothing is sent, and it is told why.
+    for call in [
+        json!({"action": "reply", "delivery_id": fixture.delivery, "note": "Done."}),
+        json!({"action": "decline", "delivery_id": fixture.delivery, "reason": "moot"}),
+    ] {
+        let result = tool.execute(call.clone()).await.expect("an answer");
+        let text = text_of(&result);
+        assert!(
+            text.contains("not recorded: this session's credential cannot receive or confirm what a person sends a run (only a person's full API key can)"),
+            "{call}: {text}"
+        );
+        assert_eq!(result.structured_content.unwrap()["reason"], "no_way_back");
+    }
+    let asked: Vec<String> = api
+        .requests()
+        .iter()
+        .filter(|request| request.target.contains("/decision-requests"))
+        .map(|request| format!("{} {}", request.method, request.target))
+        .collect();
+    assert!(asked.is_empty(), "{asked:?}");
 }
 
 #[tokio::test]

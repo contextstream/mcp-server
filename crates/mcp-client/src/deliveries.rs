@@ -98,6 +98,29 @@ impl DeliveryReader {
     }
 }
 
+/// How a key limited to one workspace begins. Nothing comes back to one.
+const WORKSPACE_KEY_PREFIX: &str = "cbiq_ws_";
+
+/// What every delivery call answers when the credential it would be sent
+/// under is not one anything can come back to ([`is_no_way_back`]).
+const NO_WAY_BACK: &str =
+    "deliveries go only to a run reported under a person's full API key; this credential is not one";
+
+/// Whether a key is a person's full API key: not empty, and not one limited
+/// to a workspace.
+pub fn is_full_api_key(key: &str) -> bool {
+    let key = key.trim();
+    !key.is_empty() && !key.starts_with(WORKSPACE_KEY_PREFIX)
+}
+
+/// Whether a delivery call was not made because this client's credential is
+/// not a person's full API key: a sign-in, an app's token, or a key limited
+/// to one workspace. ContextStream sends nothing to a run such a credential
+/// reported, so nothing is asked under it.
+pub fn is_no_way_back(error: &Error) -> bool {
+    matches!(error, Error::Validation(message) if message == NO_WAY_BACK)
+}
+
 /// The token of a claim: what the claim's answer gave its holder, and what
 /// the holder sends back to renew, confirm or decline. It never prints: its
 /// `Debug` is a placeholder, and it has no `Display` and no `Serialize`.
@@ -400,6 +423,15 @@ fn answered(id: Uuid, answer: Value) -> Delivery {
 }
 
 impl ContextStreamClient {
+    /// Whether anything can come back to the credential this client's
+    /// requests carry: it is a person's full API key, the caller's own (on
+    /// the hosted gateway) or else the one this process was given. This is
+    /// the one rule every delivery operation follows: each call below makes
+    /// no request when it does not hold ([`is_no_way_back`]).
+    pub async fn receives_deliveries(&self) -> bool {
+        false
+    }
+
     /// What is deliverable to the reader's run. Endpoint:
     /// `GET /decision-requests/deliveries?workspace_id=&run_id=`.
     pub async fn read_deliveries(&self, reader: &DeliveryReader) -> Result<Vec<Delivery>> {
@@ -694,6 +726,129 @@ mod tests {
         let none =
             Delivery::from_value(&json!({"id": id, "message": {"from": {"role": " "}}})).unwrap();
         assert_eq!(none.senders_role(), None);
+    }
+
+    /// A client under `config`, and how many requests its API was sent.
+    async fn counted(
+        config: Config,
+    ) -> (
+        ContextStreamClient,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = asked.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buffer = vec![0_u8; 16 * 1024];
+                let _ = socket.read(&mut buffer).await;
+                let body = r#"{"success":true,"data":{"count":0,"deliveries":[]}}"#;
+                let _ = socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        let config = Config {
+            api_url: format!("http://{addr}"),
+            ..config
+        };
+        (ContextStreamClient::new(config), asked)
+    }
+
+    #[tokio::test]
+    async fn only_a_full_api_key_makes_any_delivery_call() {
+        use std::sync::atomic::Ordering;
+        let (id, workspace, run) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let reader = DeliveryReader {
+            workspace_id: workspace,
+            run_id: Some(run),
+        };
+        let who = DeliveryActor::default();
+        // A sign-in, an app's token, a key limited to one workspace, nothing.
+        for (what, config) in [
+            (
+                "a bearer token",
+                Config {
+                    api_key: None,
+                    jwt: Some("header.payload.signature".to_string()),
+                    ..Config::default()
+                },
+            ),
+            (
+                "a key limited to one workspace",
+                Config {
+                    api_key: Some("cbiq_ws_0123456789abcdef".to_string()),
+                    ..Config::default()
+                },
+            ),
+            (
+                "a blank key",
+                Config {
+                    api_key: Some("  ".to_string()),
+                    jwt: Some("header.payload.signature".to_string()),
+                    ..Config::default()
+                },
+            ),
+            (
+                "no credential",
+                Config {
+                    api_key: None,
+                    jwt: None,
+                    ..Config::default()
+                },
+            ),
+        ] {
+            let (client, asked) = counted(config).await;
+            assert!(!client.receives_deliveries().await, "{what}");
+            let read = client.read_deliveries(&reader).await.expect_err(what);
+            assert!(is_no_way_back(&read), "{what}: {read:?}");
+            let claim = client.claim_delivery(id, &who).await.expect_err(what);
+            assert!(is_no_way_back(&claim), "{what}: {claim:?}");
+            let applied = client
+                .delivery_applied(id, Some("done"), &who)
+                .await
+                .expect_err(what);
+            assert!(is_no_way_back(&applied.error), "{what}: {applied:?}");
+            let declined = client
+                .delivery_declined(id, "moot", None, &who)
+                .await
+                .expect_err(what);
+            assert!(is_no_way_back(&declined.error), "{what}: {declined:?}");
+            // Not one request went out.
+            assert_eq!(asked.load(Ordering::SeqCst), 0, "{what}");
+        }
+        // A person's full API key asks.
+        let (client, asked) = counted(Config {
+            api_key: Some("cbiq_0123456789abcdef".to_string()),
+            ..Config::default()
+        })
+        .await;
+        assert!(client.receives_deliveries().await);
+        assert!(client
+            .read_deliveries(&reader)
+            .await
+            .expect("read")
+            .is_empty());
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert!(is_full_api_key("cbiq_0123456789abcdef"));
+        assert!(!is_full_api_key("cbiq_ws_0123456789abcdef"));
+        assert!(!is_full_api_key(" "));
+        // No other error is taken for it.
+        assert!(!is_no_way_back(&Error::Validation("other".to_string())));
+        assert!(!is_no_way_back(&Error::http(404, "")));
     }
 
     #[test]

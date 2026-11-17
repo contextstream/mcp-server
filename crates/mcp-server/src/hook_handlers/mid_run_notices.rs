@@ -3330,18 +3330,16 @@ mod tests {
     fn a_delivery_is_pointed_at_once_per_offer_and_not_after_the_tool_showed_it() {
         let mut entry = MidRunSessionState::default();
         queue_delivery_pointers(&mut entry, vec![waiting(DELIVERY_A, 0), waiting(RUN_B, 0)]);
-        // One notice with a line each.
-        assert_eq!(entry.pending.len(), 1);
-        assert_eq!(entry.pending[0].lines().count(), 2);
+        assert_eq!(
+            entry.pending,
+            [waiting(DELIVERY_A, 0).pointer, waiting(RUN_B, 0).pointer]
+        );
         // Still waiting at the next poll: not said again.
         let before = entry.pending.clone();
         queue_delivery_pointers(&mut entry, vec![waiting(DELIVERY_A, 0)]);
         assert_eq!(entry.pending, before);
         // The agent read one of them with `progress`: its pointer is taken back.
-        entry.pending = vec![
-            format!("[CONTEXTSTREAM LIVE NOTICE] something waits (delivery_id={DELIVERY_A})."),
-            "[CONTEXTSTREAM LIVE NOTICE] New while you were working".to_string(),
-        ];
+        entry.pending.push("unrelated notice".into());
         apply_progress_finding(
             &mut entry,
             ProgressFinding {
@@ -3352,7 +3350,7 @@ mod tests {
         );
         assert_eq!(
             entry.pending,
-            ["[CONTEXTSTREAM LIVE NOTICE] New while you were working"]
+            [waiting(RUN_B, 0).pointer, "unrelated notice".to_string()]
         );
         // Its claim ran out and the API offers it again: pointed at once more.
         entry.pending.clear();

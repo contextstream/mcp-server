@@ -812,11 +812,16 @@ pub(super) fn age_poll(ledger: &Ledger, owner: &Owner, run: Uuid, age: Duration)
     ledger.with(&owner.key, |mem| {
         let poll = mem.polls.get_mut(&run).unwrap();
         poll.started -= age;
-        let batch = poll.result.get().unwrap().as_ref().unwrap();
-        poll.result = Arc::new(OnceLock::from(Ok(Batch {
-            read_at: batch.read_at - age,
-            deliveries: batch.deliveries.clone(),
-        })));
+        if let Ok(batch) = poll.result.get().unwrap() {
+            poll.result = Arc::new(OnceLock::from(Ok(Batch {
+                read_at: batch.read_at - age,
+                deliveries: batch.deliveries.clone(),
+            })));
+        }
+        *mem.reports.get_mut(&run).unwrap() -= age;
+        if let Some(until) = mem.not_there.as_mut() {
+            *until -= age;
+        }
     });
 }
 

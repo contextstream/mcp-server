@@ -2761,3 +2761,25 @@ async fn round4_terminal_report_returns_only_its_claimed_frames_and_can_reply() 
     assert_eq!(reply.structured_content.unwrap()["replied"], true);
     assert_eq!(sent(&api, "POST", "/applied")[0].body["claim_token"], TOKEN);
 }
+
+#[tokio::test]
+async fn round4_spaced_report_refreshes_a_404_after_cooldown() {
+    let f = Fixture::new();
+    let d = f.message();
+    let api = Api::start_in_turn(vec![
+        f.recorded("working"),
+        (READ, 404, json!({})),
+        offered(vec![d.clone()]),
+        (CLAIM, 200, held_with("claimed", &d, TOKEN)),
+    ])
+    .await;
+    let tool = f.tool(&api);
+    tool.execute(json!({"step":"starting"})).await.unwrap();
+    assert!(run_deliveries::wait_for_poll(&tool.deliveries, f.run).await);
+    let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
+    run_deliveries::age_poll(&tool.deliveries, &owner, f.run, Duration::from_secs(660));
+    let second = tool.execute(json!({"step":"still working"})).await.unwrap();
+    assert!(text_of(&second).contains(&message_block(&f)));
+    assert_eq!(sent(&api, "GET", "/deliveries").len(), 2);
+    assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+}

@@ -2447,3 +2447,33 @@ async fn round3_get_refreshes_an_old_offer_before_claiming() {
         json!(replacement)
     );
 }
+
+#[tokio::test]
+async fn round3_confirmation_names_the_connected_clients_tool() {
+    for (client_name, tool_name) in [
+        ("claude-code", "mcp__contextstream__progress"),
+        ("Claude Code", "mcp__contextstream__progress"),
+        ("codex-cli", "progress"),
+    ] {
+        let f = Fixture::new();
+        let d = f.message();
+        let api = Api::start(vec![
+            f.recorded("working"),
+            offered(vec![d.clone()]),
+            (CLAIM, 200, held_with("claimed", &d, TOKEN)),
+        ])
+        .await;
+        let result = crate::client_identity::run_with_client_name(
+            Some(client_name.into()),
+            f.tool(&api).report_then_collect(json!({"step":"working"})),
+        )
+        .await
+        .unwrap();
+        let line = confirm(f.delivery).replace("progress(", &format!("{tool_name}("));
+        assert!(
+            text_of(&result).ends_with(&line),
+            "{client_name}: {}",
+            text_of(&result)
+        );
+    }
+}

@@ -112,6 +112,10 @@ class ReleaseContractTest(unittest.TestCase):
         for topic in ("update-rules", "await-answer", "CONTEXTSTREAM_DELIVERY_STATE_DIR"):
             self.assertIn(topic, section)
 
+        await_note = next(line for line in section.splitlines() if "await-answer" in line)
+        for cause in ("another waiter", "no credentials", "full API key", "no workspace"):
+            self.assertIn(cause, await_note)
+
     def test_semver_and_ordering_are_strict(self) -> None:
         self.assertEqual(contract.canonical_stable_semver("1.2.3"), (1, 2, 3))
         self.assertEqual(contract.stable_version_relation("1.2.2", "1.2.3"), "older")

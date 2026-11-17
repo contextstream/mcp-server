@@ -2570,7 +2570,7 @@ async fn round4_unknown_gateway_sessions_and_workspaces_do_not_allocate() {
 }
 
 #[tokio::test]
-async fn round4_gateway_caps_report_owners_per_key_and_globally_by_recent_use() {
+async fn round5_gateway_reuses_only_its_own_slots_at_the_global_limit() {
     let f = Fixture::new();
     let api = Api::start(vec![]).await;
     let mut tool = f.hosted_tool(&api);
@@ -2589,11 +2589,15 @@ async fn round4_gateway_caps_report_owners_per_key_and_globally_by_recent_use() 
                 })
                 .await
                 .unwrap();
-                if n == 32 {
+                if n == 32 && key < 8 {
                     assert!(tool.deliveries.saw_report(&owners[0], run));
                 }
                 tool.deliveries.note_report(&owner, run);
                 owners.push(owner);
+            }
+            if key == 8 {
+                assert!(owners.iter().all(|o| !tool.deliveries.saw_report(o, run)));
+                return;
             }
             assert!(tool.deliveries.saw_report(&owners[0], run));
             assert!(

@@ -90,7 +90,7 @@ workspaces it is switched on for; for every other workspace the paths answer 404
 | Your assistant confirms it (`progress(action="reply", ...)`) | `POST .../deliveries/<id>/applied` with the note your assistant wrote, which the person reads with the run, and the claim's token |
 | Your assistant declines it (`progress(action="decline", ...)`) | `POST .../deliveries/<id>/declined` with `moot` or `cannot_apply`, its note, and the claim's token |
 | Hooks are installed, the session reported a run, and it makes tool calls | The mid-run poll (at most every 35 s, a detached request) makes the same read for each run the session reported, at most eight. It claims nothing; it tells your assistant in one line that something waits and how to read it |
-| Your assistant started `contextstream-mcp await-answer` before it ended its turn | The same read every 20 s (every 2 minutes after a 404 or a 503 `deliveries_not_ready`, and after failures up to every 5 minutes) for at most four hours. It claims nothing: it ends with a line naming what waits, and your assistant reads it with `progress` |
+| Your assistant started `contextstream-mcp await-answer` before it ended its turn | The same read every 20 s (every 2 minutes after a 404 or a 503 `deliveries_not_ready`, and after failures up to every 5 minutes) for at most four hours. It claims nothing: it ends with one notice that something waits, and your assistant reads it with `progress` |
 
 - **What a delivery can do:** it is shown to your assistant as a person's words, with the sentence that it is to be
   acted on only within the task and the permissions the session already has. This client approves no tool call,
@@ -114,7 +114,7 @@ workspaces it is switched on for; for every other workspace the paths answer 404
   `~/.contextstream/mid-run-notices/<digest>.json`, removed a day after its last use. The `progress` tool remembers
   up to 512 tokens in memory for at most one hour. Its bounded local binding file stores ids, digests and
   timestamps, never tokens or words (in the platform state directory under `contextstream/deliveries`, or
-  `CONTEXTSTREAM_DELIVERY_STATE_DIR`). Replicas can use a private shared directory supporting file locks and atomic rename. `await-answer` keeps nothing.
+  `CONTEXTSTREAM_DELIVERY_STATE_DIR`). Replicas can use a private shared directory supporting file locks and atomic rename. `await-answer` keeps an empty per-run lock file in the user's state directory so only one local waiter polls; its lock is released on exit.
 - **Controls:** `CONTEXTSTREAM_RUN_PROGRESS=off` (nothing is reported, so the tool asks for nothing),
   `CONTEXTSTREAM_MID_RUN_NOTICES=0` (the hooks do not ask). `await-answer` runs only when it is started.
 

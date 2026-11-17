@@ -1,5 +1,5 @@
 //! `contextstream-mcp await-answer --run-id <id>`: wait until a person
-//! answers or messages a run, print it, and exit.
+//! answers or messages a run, print one notice, and exit.
 //!
 //! An agent that asked a person something and ended its turn makes no tool
 //! call, so no tool answer and no hook can show it what the person says. A
@@ -11,8 +11,8 @@
 //!
 //! - every [`DEFAULT_POLL_SECS`] it asks the API what is deliverable to the
 //!   run (`GET /decision-requests/deliveries?workspace_id=&run_id=`);
-//! - when something is, it prints a line for each (what it is, and the
-//!   `progress(action="get", run_id=...)` that reads it) and exits 0;
+//! - when something is, it prints one notice naming the
+//!   `progress(action="get", run_id=...)` that reads it and exits 0;
 //! - when nothing arrived within `--timeout-min` it says so in one line and
 //!   exits [`EXIT_TIMED_OUT`].
 //!
@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use mcp_client::deliveries::{is_not_ready, is_not_there, DeliveryReader};
 use mcp_client::ContextStreamClient;
-use mcp_tools::domains::run_deliveries::wake_lines;
+use mcp_types::Error;
 use uuid::Uuid;
 
 /// Something arrived, and was printed.
@@ -67,8 +67,37 @@ const MAX_BACKOFF: u32 = 15;
 /// The longest a wait may be asked to last: a week.
 const MAX_TIMEOUT_MIN: f64 = 7.0 * 24.0 * 60.0;
 
-/// Most deliveries one wait names; the session's read shows them all.
-const MAX_PRINTED: usize = 5;
+/// Keep the inode: unlinking it at exit could let a third process lock a
+/// different file while a second process holds the original lock. Only the
+/// kernel lock denotes a running waiter; a crash releases it automatically.
+fn reserve(workspace: Uuid, run: Uuid) -> Result<std::fs::File, &'static str> {
+    const UNAVAILABLE: &str = "contextstream: could not reserve a waiter for this run.";
+    let dir = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .ok_or(UNAVAILABLE)?
+        .join("contextstream/waiters");
+    let mut dirs = std::fs::DirBuilder::new();
+    dirs.recursive(true);
+    let mut file = std::fs::OpenOptions::new();
+    file.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        dirs.mode(0o700);
+        file.mode(0o600);
+    }
+    dirs.create(&dir).map_err(|_| UNAVAILABLE)?;
+    let lock = file
+        .open(dir.join(format!("{workspace}-{run}.lock")))
+        .map_err(|_| UNAVAILABLE)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err("contextstream: already waiting for this run.")
+        }
+        Err(std::fs::TryLockError::Error(_)) => Err(UNAVAILABLE),
+    }
+}
 
 /// What to wait for, and for how long.
 #[derive(Debug, Clone, Copy)]
@@ -144,8 +173,15 @@ pub async fn run(wait: Wait) -> i32 {
         return EXIT_NOT_STARTED;
     }
 
+    let _reservation = match reserve(workspace_id, wait.run_id) {
+        Ok(lock) => lock,
+        Err(message) => {
+            say(message);
+            return EXIT_NOT_STARTED;
+        }
+    };
     let minutes = within(wait.timeout_min, DEFAULT_TIMEOUT_MIN, MAX_TIMEOUT_MIN);
-    let poll = Duration::from_secs_f64(within(wait.poll_secs, DEFAULT_POLL_SECS, 3600.0).max(0.05));
+    let poll = Duration::from_secs_f64(within(wait.poll_secs, DEFAULT_POLL_SECS, 3600.0).max(1.0));
     let deadline = Instant::now() + Duration::from_secs_f64(minutes * 60.0);
     let reader = DeliveryReader {
         workspace_id,
@@ -153,12 +189,17 @@ pub async fn run(wait: Wait) -> i32 {
     };
     let mut failures = 0_u32;
     loop {
-        let next = match client.read_deliveries(&reader).await {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(response) =
+            tokio::time::timeout_at(deadline.into(), client.read_deliveries(&reader)).await
+        else {
+            break;
+        };
+        let next = match response {
             Ok(deliveries) if !deliveries.is_empty() => {
-                // A read changes nothing but a count: what it found is still
-                // there for the session, which claims it when it reads it.
-                let named = &deliveries[..deliveries.len().min(MAX_PRINTED)];
-                say(&wake_lines(named, wait.run_id));
+                say(&format!("[CONTEXTSTREAM LIVE NOTICE] Something from a person waits for this run. Read it with progress(action=\"get\", run_id=\"{}\").", wait.run_id));
                 return EXIT_ARRIVED;
             }
             Ok(_) => {
@@ -171,6 +212,9 @@ pub async fn run(wait: Wait) -> i32 {
             Err(error) if is_not_there(&error) || is_not_ready(&error) => {
                 failures = 0;
                 poll.saturating_mul(NOT_THERE_SLOWER)
+            }
+            Err(Error::RateLimited { retry_after, .. }) => {
+                poll.max(Duration::from_secs(retry_after.unwrap_or(60)))
             }
             Err(_) => {
                 failures = (failures + 1).min(8);

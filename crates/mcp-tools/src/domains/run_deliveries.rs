@@ -253,21 +253,9 @@ pub fn await_command(run_id: Uuid, workspace_id: Uuid) -> String {
 /// What a report that waits on a person says about being woken.
 pub fn wake_paragraph(run_id: Uuid, workspace_id: Uuid) -> String {
     format!(
-        "To be woken when the person answers, start this in the background now (in Claude Code: the Bash tool with run_in_background) and then end your turn: `{}`. It waits quietly and exits when a person answers or writes to this run; then read it with {TOOL}(action=\"get\", run_id=\"{run_id}\").",
+        "First read {TOOL}(action=\"get\", run_id=\"{run_id}\") for anything the report already picked up. If nothing is waiting, start `{}` with the Bash tool's run_in_background option and then end your turn. When it exits with a live notice, read the run again.",
         await_command(run_id, workspace_id)
     )
-}
-
-/// What `contextstream-mcp await-answer` prints when something waits for
-/// its run: a line for each, naming it and how to read it, never its words.
-/// The waiter claims nothing: the session that reads it claims it.
-pub fn wake_lines(deliveries: &[Delivery], run_id: Uuid) -> String {
-    let mut lines: Vec<String> = deliveries
-        .iter()
-        .map(|delivery| pointer(delivery, run_id, TOOL))
-        .collect();
-    lines.push(format!("In Claude Code the tool is {CLAUDE_TOOL}."));
-    lines.join("\n")
 }
 
 /// What the hooks tell a working session about a delivery that waits for a
@@ -441,8 +429,8 @@ impl Ledger {
 /// What a read of a run's deliveries came to.
 #[derive(Debug, Default)]
 pub(crate) struct Offered {
-    /// The API has the routes for this workspace and answered the read.
-    pub available: bool,
+    /// The read succeeded or is still in flight, and there is no known cooldown.
+    pub can_wait: bool,
     /// The deliveries claimed and to be shown, each as its block.
     pub blocks: Vec<String>,
     /// The same deliveries for a client that shows the structured answer.
@@ -533,7 +521,10 @@ pub(super) async fn poll(
     };
     if !*finished.borrow() {
         if !wait {
-            return Offered::default();
+            return Offered {
+                can_wait: !ledger.is_not_there(owner.workspace),
+                ..Offered::default()
+            };
         }
         // One bounded list and at most five bounded claims, including joins.
         let _ = tokio::time::timeout(Duration::from_secs(32), finished.changed()).await;
@@ -599,7 +590,7 @@ pub(super) async fn offer(
         }
     };
     let mut offered = Offered {
-        available: true,
+        can_wait: true,
         ..Offered::default()
     };
     for delivery in deliveries

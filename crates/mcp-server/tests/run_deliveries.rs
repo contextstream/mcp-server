@@ -534,7 +534,7 @@ fn the_waiter_wakes_the_agent_when_an_answer_arrives_and_claims_nothing() {
 }
 
 #[test]
-fn the_waiter_prints_a_persons_message_under_its_own_label() {
+fn the_waiter_notices_a_message_without_printing_its_words() {
     let api = FakeApi::start();
     let sandbox = Sandbox::new(&api);
     api.deliver(message_delivery(RUN));
@@ -636,10 +636,9 @@ fn quietly_and_slowly(api: &FakeApi) {
         )
     );
     assert_eq!(err(&output), "");
-    // 2.4 s at a poll of 0.2 s would be a dozen asks; a server that says it
-    // has no such thing is asked at a sixth of that pace.
+    // The six-poll cooldown lasts beyond this deadline.
     let reads = api.reads().len();
-    assert!((1..=4).contains(&reads), "{reads} reads");
+    assert_eq!(reads, 1);
 }
 
 #[test]
@@ -764,7 +763,13 @@ fn the_hooks_tell_a_working_session_once_that_a_person_answered_and_claim_nothin
     let expected = format!(
         "[CONTEXTSTREAM LIVE NOTICE] A person answered a question this run asked (delivery_id={ANSWER}). Read it now with mcp__contextstream__progress(action=\"get\", run_id=\"{RUN}\"): it comes with how to confirm it.\n[CONTEXTSTREAM LIVE NOTICE] A person sent this run a message (delivery_id={MESSAGE}). Read it now with mcp__contextstream__progress(action=\"get\", run_id=\"{RUN}\"): it comes with how to confirm it."
     );
-    assert!(shown.contains(&expected), "{shown}");
+    for pointer in expected.lines() {
+        assert_eq!(
+            shown.lines().filter(|line| *line == pointer).count(),
+            1,
+            "{shown}"
+        );
+    }
     // The words a person wrote are not the hooks' to show.
     assert!(!shown.contains("Keep it warm"), "{shown}");
     assert!(!shown.contains("Please rebase"), "{shown}");

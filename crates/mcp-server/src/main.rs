@@ -265,9 +265,9 @@ enum Commands {
         command: Vec<String>,
     },
 
-    /// Wait until a person answers or messages a run, then print it and exit
+    /// Wait until a person answers or messages a run, then print a notice and exit
     #[command(
-        long_about = "Wait until a person answers a question a run asked, or sends the run a message, in ContextStream; then print it and exit.\n\nAn agent that asked a person something and ended its turn makes no tool call, so nothing can be shown to it. It starts this command in the background before it ends its turn (the `progress` tool's answer to a report that waits on a person names the exact command), and the command's exit brings the agent back with what the person said. It asks every 20 seconds and, when something arrived, prints what it is and the `progress(action=\"get\", ...)` call that reads it; it claims nothing and prints no word a person wrote, because the session that reads it claims it and replies. While it waits it prints nothing.\n\nExit status: 0 when something arrived; 124 when nothing arrived within --timeout-min (one line says so); 1 when there are no credentials or no workspace to wait with. It uses the credentials the hooks use in this folder and prints none of them."
+        long_about = "Wait until a person answers a question a run asked, or sends the run a message, in ContextStream; then print a notice and exit.\n\nIn local Claude Code, start the command with Bash run_in_background to wake the session when it exits. Other clients can read the run with progress(action=\"get\", ...). The command asks every 20 seconds and prints a single notice when anything arrives. It claims nothing and never prints the person's words.\n\nExit status: 0 when something arrived; 124 on timeout; 1 if the wait cannot start, including when another waiter already holds the run. It uses the credentials the hooks use in this folder and prints none of them."
     )]
     AwaitAnswer {
         /// The run to wait for (the `progress` tool's answer names it)
@@ -849,7 +849,7 @@ Commands:
   migrate-remote [--scope=..]  Convert existing local MCP configs to hosted remote transport
   update-rules [--scope=..]    Update AI rules for editors selected during setup (non-interactive)
   detect-editors               Detect installed editors and output as JSON
-  await-answer --run-id=..     Wait until a person answers or messages a run, then print it and exit
+  await-answer --run-id=..     Wait until a person answers or messages a run, then print a notice and exit
   generate-configs             Generate MCP config payloads as JSON (for scripted setup)
 
 Environment variables:

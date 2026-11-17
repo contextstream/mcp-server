@@ -429,12 +429,34 @@ impl ContextStreamClient {
     /// the one rule every delivery operation follows: each call below makes
     /// no request when it does not hold ([`is_no_way_back`]).
     pub async fn receives_deliveries(&self) -> bool {
-        false
+        // The key a request carries is the caller's when it sent one, else
+        // this process's own (the rule `request` attaches `X-API-Key` by).
+        match crate::get_task_auth_override() {
+            Some(auth) if auth.api_key.as_deref().is_some_and(|key| !key.is_empty()) => {
+                auth.api_key.as_deref().is_some_and(is_full_api_key)
+            }
+            _ => self
+                .config()
+                .await
+                .api_key
+                .as_deref()
+                .is_some_and(is_full_api_key),
+        }
+    }
+
+    /// Nothing is asked under a credential nothing can come back to.
+    async fn way_back(&self) -> Result<()> {
+        if self.receives_deliveries().await {
+            Ok(())
+        } else {
+            Err(Error::Validation(NO_WAY_BACK.to_string()))
+        }
     }
 
     /// What is deliverable to the reader's run. Endpoint:
     /// `GET /decision-requests/deliveries?workspace_id=&run_id=`.
     pub async fn read_deliveries(&self, reader: &DeliveryReader) -> Result<Vec<Delivery>> {
+        self.way_back().await?;
         let answer: Value = self
             .get_without_session_refresh(
                 &format!("/decision-requests/deliveries{}", reader.query()),
@@ -449,6 +471,7 @@ impl ContextStreamClient {
     /// claim's token ([`Delivery::claim_token`]). Endpoint:
     /// `POST /decision-requests/deliveries/:id/claim`.
     pub async fn claim_delivery(&self, id: Uuid, who: &DeliveryActor) -> Result<Delivery> {
+        self.way_back().await?;
         let answer: Value = self
             .post_without_session_refresh(
                 &format!("/decision-requests/deliveries/{id}/claim"),
@@ -483,6 +506,7 @@ impl ContextStreamClient {
         ending: &str,
         body: Value,
     ) -> std::result::Result<Delivery, Refused> {
+        self.way_back().await?;
         let raw = self
             .send_raw_json(
                 "POST",

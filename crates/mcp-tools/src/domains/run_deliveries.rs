@@ -60,8 +60,9 @@
 //!   again for a while.
 
 use mcp_client::deliveries::{
-    is_not_ready, is_not_there, refusal_code, ClaimToken, Delivery, DeliveryActor, DeliveryReader,
-    Refused, DECLINE_REASONS, KIND_ANSWER, KIND_PERSON_MESSAGE, NOTE_MAX, UNDELIVERABLE,
+    is_no_way_back, is_not_ready, is_not_there, refusal_code, ClaimToken, Delivery, DeliveryActor,
+    DeliveryReader, Refused, DECLINE_REASONS, KIND_ANSWER, KIND_PERSON_MESSAGE, NOTE_MAX,
+    UNDELIVERABLE,
 };
 use mcp_client::ContextStreamClient;
 use mcp_types::{tool::ToolResult, Error, Result};
@@ -342,30 +343,14 @@ pub fn pointer(delivery: &Delivery, run_id: Uuid, tool: &str) -> String {
     )
 }
 
-/// How a key limited to one workspace begins. Such a key has no way back.
-const WORKSPACE_KEY_PREFIX: &str = "cbiq_ws_";
-
 /// Whether anything can come back to the credential a client's requests go
-/// under: it is a person's full API key, the caller's own (on the hosted
-/// gateway) or else the one this process was given. ContextStream sends an
-/// answer or a message only to a run such a key reported; for a sign-in, an
-/// app's token or a key limited to one workspace it raises no request and
-/// refuses the message (`emitter_cannot_receive`). So nothing is read for
-/// those, and they are never told to wait for an answer.
+/// under: a person's full API key. The rule itself is the client's
+/// (`ContextStreamClient::receives_deliveries`), the one place every delivery
+/// operation follows it: a sign-in, an app's token and a key limited to one
+/// workspace read nothing, claim nothing, confirm nothing, and are never told
+/// to wait for an answer.
 pub(crate) async fn receives_deliveries(client: &ContextStreamClient) -> bool {
-    let full_key = |key: &Option<String>| {
-        key.as_deref()
-            .map(str::trim)
-            .is_some_and(|key| !key.is_empty() && !key.starts_with(WORKSPACE_KEY_PREFIX))
-    };
-    // The key a request carries is the caller's when it sent one, else this
-    // process's own (`ContextStreamClient`'s rule for `X-API-Key`).
-    match mcp_client::get_task_auth_override() {
-        Some(auth) if auth.api_key.as_deref().is_some_and(|key| !key.is_empty()) => {
-            full_key(&auth.api_key)
-        }
-        _ => full_key(&client.config().await.api_key),
-    }
+    client.receives_deliveries().await
 }
 
 // ============================================================================
@@ -639,6 +624,13 @@ fn api_words(message: &str) -> String {
 fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolResult {
     let error = &refused.error;
     let (reason, status, why) = match error {
+        // Nothing was sent: nothing comes back to this credential.
+        error if is_no_way_back(error) => (
+            "no_way_back",
+            None,
+            "this session's credential cannot receive or confirm what a person sends a run (only a person's full API key can)"
+                .to_string(),
+        ),
         // The server ended it after a week with nobody taking it.
         Error::Http { status: 409, .. }
             if refusal_code(error) == Some("delivery_closed")

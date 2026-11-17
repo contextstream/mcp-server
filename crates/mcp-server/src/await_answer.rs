@@ -137,6 +137,12 @@ pub async fn run(wait: Wait) -> i32 {
     };
     config.default_workspace_id = Some(workspace_id);
     let client = ContextStreamClient::new(config);
+    // The one rule of every delivery operation: only a person's full API key
+    // receives. Under anything else the wait could only end with nothing.
+    if !client.receives_deliveries().await {
+        say("contextstream: only a person's full API key receives what a person sends a run, and the credentials found here are not one, so there is nothing to wait on.");
+        return EXIT_NOT_STARTED;
+    }
 
     let minutes = within(wait.timeout_min, DEFAULT_TIMEOUT_MIN, MAX_TIMEOUT_MIN);
     let poll = Duration::from_secs_f64(within(wait.poll_secs, DEFAULT_POLL_SECS, 3600.0).max(0.05));

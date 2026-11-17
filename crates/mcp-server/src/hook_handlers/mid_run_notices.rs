@@ -1696,7 +1696,7 @@ fn queue_delivery_pointers(entry: &mut MidRunSessionState, found: Vec<Waiting>) 
 /// whose database cannot hold deliveries yet (503 `deliveries_not_ready`),
 /// is not asked again for ten minutes; any failure says nothing.
 async fn check_deliveries(key: &str, editor: &str, config: &ApiConfig) {
-    use mcp_client::deliveries::{is_not_ready, is_not_there, DeliveryReader};
+    use mcp_client::deliveries::{is_no_way_back, is_not_ready, is_not_there, DeliveryReader};
     use mcp_tools::domains::run_deliveries::{pointer, CLAUDE_TOOL, TOOL};
 
     let Some(entry) = read_session_entry_fast(key) else {
@@ -1738,7 +1738,11 @@ async fn check_deliveries(key: &str, editor: &str, config: &ApiConfig) {
                 previous_claims: delivery.previous_claims,
                 pointer: pointer(delivery, run_id, tool),
             })),
-            Err(error) if is_not_there(&error) || is_not_ready(&error) => {
+            // No such routes, or not yet; or this folder's key is not one
+            // anything comes back to (the client asks nothing under it).
+            Err(error)
+                if is_not_there(&error) || is_not_ready(&error) || is_no_way_back(&error) =>
+            {
                 not_there = true;
                 break;
             }

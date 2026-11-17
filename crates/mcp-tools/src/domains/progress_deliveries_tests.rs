@@ -1881,3 +1881,44 @@ async fn the_tool_names_reply_and_decline() {
         other => panic!("{other:?}"),
     }
 }
+
+#[tokio::test]
+async fn recorded_reports_do_not_wait_for_a_slow_delivery_poll_or_start_a_second_one() {
+    let f = Fixture::new();
+    let api = Api::start_with(
+        vec![f.recorded("working"), offered(vec![])],
+        false,
+        Some((READ, Duration::from_millis(750))),
+    )
+    .await;
+    let tool = f.tool(&api);
+    let start = Instant::now();
+    for _ in 0..3 {
+        assert!(
+            !tool
+                .execute(json!({"step":"working","run_key":"latency"}))
+                .await
+                .unwrap()
+                .is_error
+        );
+    }
+    assert!(
+        start.elapsed() < Duration::from_millis(400),
+        "reports took {:?}",
+        start.elapsed()
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(sent(&api, "GET", "/deliveries").len(), 1);
+}
+
+#[tokio::test]
+async fn delivery_poll_respects_retry_after_from_the_api() {
+    let f = Fixture::new();
+    let api = Api::start(vec![f.recorded("working"), (READ, 429, json!({}))]).await;
+    let tool = f.tool(&api);
+    for _ in 0..3 {
+        tool.execute(json!({"step":"working"})).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert_eq!(sent(&api, "GET", "/deliveries").len(), 1);
+}

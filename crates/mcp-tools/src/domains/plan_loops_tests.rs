@@ -74,17 +74,21 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
 
 impl Api {
     pub(super) async fn start(answers: Vec<(&'static str, u16, Value)>) -> Self {
-        Self::start_with(answers, false).await
+        Self::start_with(answers, false, None).await
     }
 
     /// Like [`Api::start`], except that several answers given for one route
     /// are given in turn: the first request gets the first, the next one the
     /// next, and the last answer is given from then on.
     pub(super) async fn start_in_turn(answers: Vec<(&'static str, u16, Value)>) -> Self {
-        Self::start_with(answers, true).await
+        Self::start_with(answers, true, None).await
     }
 
-    async fn start_with(answers: Vec<(&'static str, u16, Value)>, in_turn: bool) -> Self {
+    pub(super) async fn start_with(
+        answers: Vec<(&'static str, u16, Value)>,
+        in_turn: bool,
+        delay: Option<(&'static str, std::time::Duration)>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock api");
@@ -122,6 +126,9 @@ impl Api {
                             route.split_once(' ').unwrap_or(("", route));
                         route_method == method && target.contains(route_path)
                     };
+                    if let Some((_, time)) = delay.filter(|(route, _)| fits(route)) {
+                        tokio::time::sleep(time).await;
+                    }
                     let first = answers.iter().find(|(route, _, _)| fits(route));
                     let chosen = match first {
                         Some((route, _, _)) if in_turn => {
@@ -152,7 +159,7 @@ impl Api {
                         _ => "Not Found",
                     };
                     let response = format!(
-                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nRetry-After: 60\r\nconnection: close\r\n\r\n{answer}",
                         answer.len()
                     );
                     let _ = socket.write_all(response.as_bytes()).await;

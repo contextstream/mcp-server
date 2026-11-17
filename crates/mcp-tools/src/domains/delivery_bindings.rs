@@ -24,6 +24,23 @@ pub(super) struct Binding {
 
 pub(super) const CLAIM_SECONDS: i64 = 3600;
 
+/// Release the lock when its owner finishes, even if a fork still holds
+/// another descriptor for the same open file description.
+pub(super) struct FileLock(fs::File);
+
+impl FileLock {
+    fn acquire(file: fs::File) -> io::Result<Self> {
+        file.try_lock()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 impl Owner {
     // One lock per API/credential/workspace, including across processes.
     // Rename under a separate lock so a crash never leaves a partial book.
@@ -40,8 +57,7 @@ impl Owner {
             options.mode(0o600);
         }
         builder.create(dir)?;
-        let lock = options.open(self.store.with_extension("lock"))?;
-        lock.try_lock()?;
+        let _lock = FileLock::acquire(options.open(self.store.with_extension("lock"))?)?;
         let mut entries: Vec<Binding> = match fs::read(&self.store) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
@@ -71,7 +87,7 @@ impl Owner {
 
     /// A bounded set of nonblocking OS locks; drop releases the reservation
     /// even on cancellation or process exit. Never unlink a live lock file.
-    pub fn reserve(&self, id: Uuid) -> Option<fs::File> {
+    pub fn reserve(&self, id: Uuid) -> Option<FileLock> {
         let mut dir = fs::DirBuilder::new();
         dir.recursive(true);
         let mut options = fs::OpenOptions::new();
@@ -90,8 +106,7 @@ impl Owner {
                     .with_extension(format!("claim-{:02x}.lock", id.as_bytes()[0])),
             )
             .ok()?;
-        file.try_lock().ok()?;
-        Some(file)
+        FileLock::acquire(file).ok()
     }
 
     pub fn bind(
@@ -188,7 +203,7 @@ mod tests {
         let held = owner.reserve(id).unwrap();
         // A duplicate references the same open file description, just as a
         // concurrent child between fork and exec does.
-        let inherited = held.try_clone().unwrap();
+        let inherited = held.0.try_clone().unwrap();
         assert!(owner.reserve(id).is_none(), "still held by the worker");
         drop(held);
         assert!(owner.reserve(id).is_some(), "the worker has finished");

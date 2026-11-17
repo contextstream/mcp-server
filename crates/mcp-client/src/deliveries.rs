@@ -1057,6 +1057,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review6_bearer_caller_cannot_inherit_the_gateway_delivery_key() {
+        let client = ContextStreamClient::new(Config {
+            api_key: Some("process-key-for-test".into()),
+            is_http_transport: true,
+            ..Config::default()
+        });
+        let auth = mcp_types::AuthOverride {
+            jwt: Some("test-sign-in".into()),
+            ..Default::default()
+        };
+        crate::run_with_auth_override(auth, || async {
+            assert!(!client.receives_deliveries().await);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn a_read_offers_only_what_is_pending_for_the_readers_workspace_and_run() {
         let (workspace, run, id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let offer = |id: Uuid, workspace: Uuid, run: Uuid, state: &str| {

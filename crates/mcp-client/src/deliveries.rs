@@ -1001,6 +1001,20 @@ mod tests {
                 },
             ),
             (
+                "an opaque token in the API-key slot",
+                Config {
+                    api_key: Some("opaque-token".into()),
+                    ..Config::default()
+                },
+            ),
+            (
+                "a setup token",
+                Config {
+                    api_key: Some("cbst_fixture".into()),
+                    ..Config::default()
+                },
+            ),
+            (
                 "a blank key",
                 Config {
                     api_key: Some("  ".to_string()),

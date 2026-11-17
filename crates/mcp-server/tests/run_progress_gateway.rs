@@ -895,7 +895,7 @@ fn nothing_is_asked_for_a_workspace_the_setting_does_not_name() {
         let api = FakeApi::start();
         let gateway = Gateway::start_with(&api, &env);
         let ann = bearer(json!({"sub": "user-ann"}), "signature-a");
-        for credential in [Credential::ApiKey("a-good-key"), Credential::Bearer(&ann)] {
+        for credential in [Credential::ApiKey("cbiq_fixture"), Credential::Bearer(&ann)] {
             assert_eq!(gateway.initialize(credential), 200);
             gateway.call(credential, "sid-1", "progress", a_step("A"));
             for _ in 0..3 {

@@ -251,7 +251,7 @@ impl TestFixtures {
     pub fn test_config() -> Config {
         Config {
             api_url: "https://mock.contextstream.io".to_string(),
-            api_key: Some("test-api-key".to_string()),
+            api_key: Some("cbiq_fixture".to_string()),
             jwt: None,
             default_workspace_id: Some(Uuid::new_v4()),
             default_project_id: Some(Uuid::new_v4()),

@@ -110,11 +110,12 @@ const WORKSPACE_KEY_PREFIX: &str = "cbiq_ws_";
 const NO_WAY_BACK: &str =
     "deliveries go only to a run reported under a person's full API key; this credential is not one";
 
-/// Whether a key is a person's full API key: not empty, and not one limited
-/// to a workspace.
+/// Only personal ContextStream keys receive deliveries.
 pub fn is_full_api_key(key: &str) -> bool {
     let key = key.trim();
-    !key.is_empty() && !key.starts_with(WORKSPACE_KEY_PREFIX)
+    key.strip_prefix("cbiq_")
+        .is_some_and(|suffix| !suffix.is_empty())
+        && !key.starts_with(WORKSPACE_KEY_PREFIX)
 }
 
 /// Whether a delivery call was not made because this client's credential is
@@ -759,7 +760,7 @@ mod tests {
         });
         let config = Config {
             api_url: format!("http://{addr}"),
-            api_key: Some("a-made-up-key".to_string()),
+            api_key: Some("cbiq_fixture".to_string()),
             ..Config::default()
         };
         (ContextStreamClient::new(config), server)
@@ -1458,7 +1459,7 @@ mod tests {
         assert_eq!(requests.len(), 4);
         assert!(requests[0]
             .to_ascii_lowercase()
-            .contains("x-api-key: a-made-up-key"));
+            .contains("x-api-key: cbiq_fixture"));
     }
 
     #[test]
@@ -1605,7 +1606,7 @@ mod tests {
             assert!(
                 request
                     .to_ascii_lowercase()
-                    .contains("x-api-key: a-made-up-key"),
+                    .contains("x-api-key: cbiq_fixture"),
                 "{request}"
             );
         }

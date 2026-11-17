@@ -32,7 +32,7 @@ const RUN: &str = "66666666-6666-4666-8666-666666666666";
 const OTHER_RUN: &str = "77777777-7777-4777-8777-777777777777";
 const ANSWER: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const MESSAGE: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-const KEY: &str = "a-made-up-key-for-this-test";
+const KEY: &str = "cbiq_fixture";
 
 /// The exit code of a wait that ended with nothing: what `timeout(1)` uses.
 const TIMED_OUT: i32 = 124;

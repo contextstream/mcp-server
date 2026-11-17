@@ -413,7 +413,7 @@ impl Ledger {
         f(mem)
     }
 
-    fn with<T>(&self, owner: &OwnerKey, f: impl FnOnce(&mut Memory) -> T) -> T {
+    fn with<T: Default>(&self, owner: &OwnerKey, f: impl FnOnce(&mut Memory) -> T) -> T {
         let mut owners = self.directory();
         if !owners.by_key.contains_key(owner) {
             let same_key = owners
@@ -423,7 +423,9 @@ impl Ledger {
             let victim = if same_key.clone().count() >= OWNERS_PER_CREDENTIAL {
                 same_key.min_by_key(|(_, mem)| mem.last_used)
             } else if owners.by_key.len() >= MAX_OWNERS {
-                owners.by_key.iter().min_by_key(|(_, mem)| mem.last_used)
+                // The global limit refuses growth; another credential's slots
+                // are never available to this owner.
+                return T::default();
             } else {
                 None
             };

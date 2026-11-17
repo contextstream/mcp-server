@@ -696,9 +696,11 @@ async fn review8_clients_without_background_wake_are_told_to_read_the_run() {
         let result = crate::client_identity::run_with_client_name(
             Some(client.into()),
             mcp_client::run_with_mcp_session_id("session".into(), || async {
-                tool.report_then_collect(json!({"waiting":{"on":"person","question":"Which cache?"}}))
-                    .await
-                    .unwrap()
+                tool.report_then_collect(
+                    json!({"waiting":{"on":"person","question":"Which cache?"}}),
+                )
+                .await
+                .unwrap()
             }),
         )
         .await;
@@ -2102,4 +2104,69 @@ async fn review7_isolated_replica_must_not_display_another_attempts_rotated_clai
         .await
         .unwrap();
     assert!(sent(&api, "POST", "/applied").is_empty());
+}
+
+#[tokio::test]
+async fn round2_new_gateway_tool_per_call_claims_only_when_returning_the_frame() {
+    let f = Fixture::new();
+    let delivery = f.message();
+    let api = Api::start(vec![
+        f.recorded("working"),
+        offered(vec![delivery.clone()]),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+        (
+            "GET /api/v1/run-progress/runs/",
+            200,
+            json!({"data":f.run_view("working",json!({}))}),
+        ),
+        (APPLIED, 200, answers_with("applied", &delivery)),
+    ])
+    .await;
+    mcp_client::run_with_mcp_session_id("fresh-registry".into(), || async {
+        let first = f.hosted_tool(&api);
+        let answer = first
+            .execute(json!({"step":"working","run_key":"own"}))
+            .await
+            .unwrap();
+        assert!(!text_of(&answer).contains("[PERSON"));
+        assert!(run_deliveries::wait_for_poll(&first.deliveries).await);
+        drop(first);
+        assert!(
+            sent(&api, "POST", "/claim").is_empty(),
+            "a read cannot pick up a delivery"
+        );
+        for expected in [true, false] {
+            let get = f
+                .hosted_tool(&api)
+                .execute(json!({"action":"get","run_id":f.run}))
+                .await
+                .unwrap();
+            assert_eq!(text_of(&get).contains(&message_block(&f)), expected);
+            assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+        }
+        let reply = f
+            .hosted_tool(&api)
+            .execute(json!({"action":"reply","delivery_id":f.delivery,"note":"done"}))
+            .await
+            .unwrap();
+        assert_eq!(reply.structured_content.unwrap()["replied"], true);
+        assert_eq!(
+            sent(&api, "POST", "/claim").len(),
+            1,
+            "the gateway retained the token"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn round2_terminal_reports_do_not_start_a_delivery_read() {
+    let f = Fixture::new();
+    let api = Api::start(vec![f.recorded("finished"), offered(vec![f.message()])]).await;
+    let tool = f.tool(&api);
+    tool.execute(json!({"status":"completed","summary":"done"}))
+        .await
+        .unwrap();
+    assert!(!run_deliveries::wait_for_poll(&tool.deliveries).await);
+    assert!(sent(&api, "GET", "/deliveries").is_empty());
 }

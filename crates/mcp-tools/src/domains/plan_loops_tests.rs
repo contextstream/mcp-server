@@ -89,6 +89,16 @@ impl Api {
         in_turn: bool,
         delay: Option<(&'static str, std::time::Duration)>,
     ) -> Self {
+        Self::start_delaying(answers, in_turn, delay, None).await
+    }
+
+    /// Model an API that committed the request before its response was delayed.
+    pub(super) async fn start_delaying(
+        answers: Vec<(&'static str, u16, Value)>,
+        in_turn: bool,
+        delay: Option<(&'static str, std::time::Duration)>,
+        only_nth: Option<usize>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock api");
@@ -98,6 +108,7 @@ impl Api {
         let answers = Arc::new(answers);
         let served: Arc<Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
         let claimants = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let delay_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -105,6 +116,7 @@ impl Api {
                 };
                 let answers = answers.clone();
                 let log = log.clone();
+                let delay_count = delay_count.clone();
                 let served = served.clone();
                 let claimants = claimants.clone();
                 tokio::spawn(async move {
@@ -128,9 +140,6 @@ impl Api {
                             route.split_once(' ').unwrap_or(("", route));
                         route_method == method && target.contains(route_path)
                     };
-                    if let Some((_, time)) = delay.filter(|(route, _)| fits(route)) {
-                        tokio::time::sleep(time).await;
-                    }
                     let first = answers.iter().find(|(route, _, _)| fits(route));
                     let chosen = match first {
                         Some((route, _, _)) if in_turn => {
@@ -179,6 +188,13 @@ impl Api {
                         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nRetry-After: 60\r\nconnection: close\r\n\r\n{answer}",
                         answer.len()
                     );
+                    if let Some((_, time)) = delay.filter(|(route, _)| fits(route)) {
+                        let nth =
+                            delay_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if only_nth.is_none_or(|n| nth == n) {
+                            tokio::time::sleep(time).await;
+                        }
+                    }
                     let _ = socket.write_all(response.as_bytes()).await;
                     let _ = socket.shutdown().await;
                 });

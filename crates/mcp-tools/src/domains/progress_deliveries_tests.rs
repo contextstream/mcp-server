@@ -2318,3 +2318,91 @@ async fn round3_one_claim_budget_leaves_the_remaining_offers_for_next_time() {
     );
     assert_eq!(sent(&api, "POST", "/claim").len(), 5);
 }
+
+#[tokio::test]
+async fn round3_lost_claim_response_retries_only_the_original_attempt() {
+    let f = Fixture::new();
+    let d = f.message();
+    let api = Api::start_delaying(
+        vec![
+            f.recorded("working"),
+            offered(vec![d.clone()]),
+            offered(vec![]),
+            (CLAIM, 200, held_with("claimed", &d, TOKEN)),
+            (
+                "GET /api/v1/run-progress/runs/",
+                200,
+                json!({"data":f.run_view("working",json!({}))}),
+            ),
+        ],
+        true,
+        Some((CLAIM, Duration::from_secs(6))),
+        Some(1),
+    )
+    .await;
+    let tool = f.tool(&api);
+    let first = tool
+        .report_then_collect(json!({"step":"working"}))
+        .await
+        .unwrap();
+    let next = tool
+        .execute(json!({"action":"get","run_id":f.run}))
+        .await
+        .unwrap();
+    let claims = sent(&api, "POST", "/claim");
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[0].body["agent"]["id"], claims[1].body["agent"]["id"]);
+    assert_eq!(
+        [first, next]
+            .iter()
+            .filter(|r| text_of(r).contains(&message_block(&f)))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn round3_cancelled_batch_is_collected_once_by_the_next_get() {
+    let f = Fixture::new();
+    let d = f.message();
+    let mut d2 = f.answer(json!([]));
+    d2["id"] = json!(Uuid::new_v4());
+    let api = Api::start_delaying(
+        vec![
+            f.recorded("working"),
+            offered(vec![d.clone(), d2.clone()]),
+            offered(vec![]),
+            (CLAIM, 200, held_with("claimed", &d, TOKEN)),
+            (CLAIM, 200, held_with("claimed", &d2, SECOND_TOKEN)),
+            (
+                "GET /api/v1/run-progress/runs/",
+                200,
+                json!({"data":f.run_view("working",json!({}))}),
+            ),
+        ],
+        true,
+        Some((CLAIM, Duration::from_millis(250))),
+        Some(2),
+    )
+    .await;
+    let tool = f.tool(&api);
+    tool.execute(json!({"step":"working"})).await.unwrap();
+    assert!(run_deliveries::wait_for_poll(&tool.deliveries, f.run).await);
+    {
+        let collect = tool.execute(json!({"step":"working"}));
+        tokio::select! {
+            _ = collect => panic!("the second response should still be in flight"),
+            _ = async { while sent(&api,"POST","/claim").len() < 2 { tokio::time::sleep(Duration::from_millis(2)).await; } } => {}
+        }
+    }
+    let get = json!({"action":"get","run_id":f.run});
+    let result = tool.execute(get.clone()).await.unwrap();
+    let shown = result.structured_content.as_ref().unwrap()["deliveries"]
+        .as_array()
+        .expect("both claimed frames");
+    assert_eq!(shown.len(), 2);
+    assert!(text_of(&result).contains(&message_block(&f)));
+    assert!(text_of(&result).contains("Which cache stays warm?"));
+    assert!(!text_of(&tool.execute(get).await.unwrap()).contains("[PERSON"));
+    assert_eq!(sent(&api, "POST", "/claim").len(), 2);
+}

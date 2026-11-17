@@ -3,3 +3,7 @@
 # The current test uses `metric`; retain only this exact historical fingerprint
 # because CI scans all commits. No rule, path, or future finding is excluded.
 c6958417fa68ab9407cc53fbd0595dd8f8447ba7:crates/mcp-tools/src/domains/grounding_rollout.rs:generic-api-key:303
+
+# Former CLI test fixtures, constructed at runtime in current revisions.
+d9b8147c6e6c72725a1062952ffb65a41942343f:crates/mcp-server/tests/run_deliveries.rs:generic-api-key:727
+d9b8147c6e6c72725a1062952ffb65a41942343f:crates/mcp-server/tests/run_deliveries.rs:generic-api-key:754

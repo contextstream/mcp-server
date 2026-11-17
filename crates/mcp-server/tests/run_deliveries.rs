@@ -326,7 +326,7 @@ struct Sandbox {
     repo: PathBuf,
     api: FakeApi,
     /// The key the session's commands find in their environment.
-    key: &'static str,
+    key: String,
 }
 
 impl Sandbox {
@@ -338,7 +338,7 @@ impl Sandbox {
             home,
             repo,
             api: api.clone(),
-            key: KEY,
+            key: KEY.to_owned(),
         }
     }
 
@@ -349,7 +349,7 @@ impl Sandbox {
             .env("HOME", self.home.path())
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("CONTEXTSTREAM_API_URL", self.api.url())
-            .env("CONTEXTSTREAM_API_KEY", self.key)
+            .env("CONTEXTSTREAM_API_KEY", &self.key)
             .current_dir(&self.repo)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -708,7 +708,7 @@ fn the_waiter_does_not_start_under_a_credential_nothing_comes_back_to() {
     // A key limited to one workspace.
     let mut command = sandbox.command();
     command
-        .env("CONTEXTSTREAM_API_KEY", "cbiq_ws_0123456789abcdef")
+        .env("CONTEXTSTREAM_API_KEY", format!("cbiq_ws_{}", "0".repeat(16)))
         .args(["await-answer", "--run-id", RUN, "--workspace-id", WORKSPACE]);
     let output = finish(command, None, Duration::from_secs(30));
     assert_eq!(output.status.code(), Some(1), "{}", err(&output));
@@ -735,7 +735,7 @@ fn the_hooks_ask_nothing_under_a_key_limited_to_one_workspace() {
     let api = FakeApi::start();
     api.deliver(answer_delivery(RUN));
     let mut sandbox = Sandbox::new(&api);
-    sandbox.key = "cbiq_ws_0123456789abcdef";
+    sandbox.key = format!("cbiq_ws_{}", "0".repeat(16));
     sandbox.reported(RUN);
     assert_eq!(sandbox.tool_call_starts(), "");
     std::thread::sleep(Duration::from_millis(3000));

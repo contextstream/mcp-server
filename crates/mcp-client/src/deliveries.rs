@@ -1060,9 +1060,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round2_http_without_a_caller_key_cannot_use_the_process_key() {
+        let client = ContextStreamClient::new(Config {
+            api_key: Some("cbiq_process_fixture".into()),
+            is_http_transport: true,
+            ..Config::default()
+        });
+        assert!(!client.receives_deliveries().await);
+        crate::run_with_auth_override(Default::default(), || async {
+            assert!(!client.receives_deliveries().await);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn review6_bearer_caller_cannot_inherit_the_gateway_delivery_key() {
         let client = ContextStreamClient::new(Config {
-            api_key: Some("process-key-for-test".into()),
+            api_key: Some("cbiq_process_fixture".into()),
             is_http_transport: true,
             ..Config::default()
         });

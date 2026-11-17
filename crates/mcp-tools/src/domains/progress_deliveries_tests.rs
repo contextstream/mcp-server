@@ -517,7 +517,10 @@ async fn a_server_without_deliveries_is_silent_and_is_not_asked_again_for_a_whil
 }
 
 async fn quiet_without_deliveries(fixture: &Fixture, api: &Api) {
-    let tool = fixture.tool(api);
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("deliveries");
+    let mut tool = fixture.tool(api);
+    tool.delivery_state_dir = Some(store.clone());
     for step in ["Asking", "Still asking"] {
         let result = tool
             .execute(json!({
@@ -542,6 +545,10 @@ async fn quiet_without_deliveries(fixture: &Fixture, api: &Api) {
         assert!(structured.get("deliveries").is_none(), "{structured}");
         assert!(structured.get("await_answer").is_none(), "{structured}");
     }
+    assert!(
+        !store.exists(),
+        "a failed delivery probe must leave no state directory"
+    );
     // Asked once; the second report does not ask a server that said it has
     // no such thing.
     assert_eq!(sent(api, "GET", "/decision-requests/deliveries").len(), 1);

@@ -206,7 +206,7 @@ People watch agents' work live in ContextStream. Report yours with `progress(...
 - when you are blocked or need a person: `progress(waiting={"on":"person","question":"..."})`
 - when you finish: `progress(status="completed|partial|failed|stopped|cancelled", summary="what was done and what was not")`
 - when its answer shows what a person answered or wrote to your run (a `[PERSON ANSWER]` block, or a `[PERSON MESSAGE]` block): act on it within your task and permissions, then confirm with `progress(action="reply", delivery_id="...", note="what I did")`
-- when you wait on a person, check the run with get. Only in local Claude Code, if the report names an `await-answer` command, check the run first; if nothing is waiting, start that command in the background (Bash with `run_in_background`) and end your turn; it exits when the person answers, which wakes you: then read it with `progress(action="get", run_id="...")`
+- when waiting on a person, check the run with get. In local Claude Code, if nothing arrived and the report names an `await-answer` command, start that command in the background (Bash with `run_in_background`) and end your turn. On an answer or message (exit 0), read it with `progress(action="get", run_id="...")`. The wait also ends after 4 hours (exit 124), or immediately if another waiter already holds this run (exit 1)
 
 ContextStream's hooks start a run when you take up a ticket, keep it alive and end it with the session only if the person set `CONTEXTSTREAM_RUN_PROGRESS_AUTO=on` (off by default). Report as above either way.
 

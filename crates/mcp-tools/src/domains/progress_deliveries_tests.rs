@@ -2230,3 +2230,22 @@ async fn round2_reply_with_unknown_ids_creates_no_files() {
         .with_extension(format!("claim-{:02x}.lock", f.delivery.as_bytes()[0]))
         .exists());
 }
+
+#[tokio::test]
+async fn round2_contended_claim_bucket_reports_busy_without_writing() {
+    let f = Fixture::new();
+    let api = Api::start(vec![]).await;
+    let tool = f.tool(&api);
+    let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
+    assert!(owner.bind(f.run, Some(f.delivery), 0, Some(Uuid::new_v4())));
+    let mut other = *f.delivery.as_bytes();
+    other[15] ^= 1;
+    let _held = owner.reserve(Uuid::from_bytes(other)).unwrap();
+    let reply = tool
+        .execute(json!({"action":"reply","delivery_id":f.delivery,"note":"done"}))
+        .await
+        .unwrap();
+    assert_eq!(reply.structured_content.as_ref().unwrap()["reason"], "busy");
+    assert!(text_of(&reply).contains("retry"));
+    assert!(api.requests().is_empty());
+}

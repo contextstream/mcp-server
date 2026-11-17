@@ -189,6 +189,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn round2_contended_binding_waits_for_its_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Owner {
+            key: "owner".into(),
+            workspace: Uuid::new_v4(),
+            store: dir.path().join("book"),
+        };
+        let lock = FileLock::acquire(owner.store.with_extension("lock")).unwrap();
+        let (started, ready) = std::sync::mpsc::sync_channel(0);
+        let writer = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            owner.bind(Uuid::new_v4(), None, 0, None)
+        });
+        ready.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(lock);
+        assert!(
+            writer.join().unwrap(),
+            "a concurrent writer should only delay the bind"
+        );
+    }
+
+    #[test]
     fn review7_an_inherited_descriptor_does_not_extend_a_finished_reservation() {
         let dir = tempfile::tempdir().unwrap();
         let owner = Owner {

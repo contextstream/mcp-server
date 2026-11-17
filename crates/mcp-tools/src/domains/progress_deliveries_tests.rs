@@ -2406,3 +2406,40 @@ async fn round3_cancelled_batch_is_collected_once_by_the_next_get() {
     assert!(!text_of(&tool.execute(get).await.unwrap()).contains("[PERSON"));
     assert_eq!(sent(&api, "POST", "/claim").len(), 2);
 }
+
+#[tokio::test]
+async fn round3_get_refreshes_an_old_offer_before_claiming() {
+    let f = Fixture::new();
+    let stale = f.message();
+    let mut current = f.answer(json!([]));
+    let replacement = Uuid::new_v4();
+    current["id"] = json!(replacement);
+    let api = Api::start_in_turn(vec![
+        f.recorded("working"),
+        offered(vec![stale]),
+        offered(vec![current.clone()]),
+        (CLAIM, 200, held_with("claimed", &current, TOKEN)),
+        (
+            "GET /api/v1/run-progress/runs/",
+            200,
+            json!({"data":f.run_view("working",json!({}))}),
+        ),
+    ])
+    .await;
+    let tool = f.tool(&api);
+    tool.execute(json!({"step":"working"})).await.unwrap();
+    assert!(run_deliveries::wait_for_poll(&tool.deliveries, f.run).await);
+    tokio::time::sleep(Duration::from_millis(5100)).await;
+    let get = tool
+        .execute(json!({"action":"get","run_id":f.run}))
+        .await
+        .unwrap();
+    assert_eq!(sent(&api, "GET", "/deliveries").len(), 2);
+    let claims = sent(&api, "POST", "/claim");
+    assert_eq!(claims.len(), 1);
+    assert!(claims[0].target.ends_with(&format!("/{replacement}/claim")));
+    assert_eq!(
+        get.structured_content.unwrap()["deliveries"][0]["id"],
+        json!(replacement)
+    );
+}

@@ -259,7 +259,7 @@ async fn a_report_shows_a_persons_answer_once_and_claims_it() {
     let api = Api::start(vec![
         fixture.recorded("working"),
         offered(vec![delivery.clone()]),
-        (CLAIM, 200, answers_with("claimed", &delivery)),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
     ])
     .await;
     let tool = fixture.tool(&api);
@@ -400,7 +400,7 @@ async fn a_message_that_is_not_in_the_servers_wrapper_is_framed_and_quoted_here(
         let api = Api::start(vec![
             fixture.recorded("working"),
             offered(vec![delivery.clone()]),
-            (CLAIM, 200, answers_with("claimed", &delivery)),
+            (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
         ])
         .await;
         let result = fixture
@@ -431,7 +431,7 @@ async fn what_a_person_wrote_stays_inside_the_frame() {
     let api = Api::start(vec![
         fixture.recorded("working"),
         offered(vec![delivery.clone()]),
-        (CLAIM, 200, answers_with("claimed", &delivery)),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
     ])
     .await;
     let result = fixture
@@ -590,7 +590,7 @@ async fn a_delivery_another_agent_holds_is_not_shown_until_it_is_this_agents() {
             409,
             json!({"error": {"code": "claimed_by_other", "message": "another agent holds this delivery"}}),
         ),
-        (CLAIM, 200, answers_with("claimed", &delivery)),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
     ])
     .await;
     let tool = fixture.tool(&api);
@@ -628,7 +628,7 @@ async fn a_claim_that_lapsed_and_is_offered_again_is_shown_again_once() {
         fixture.recorded("working"),
         offered(vec![fresh.clone()]),
         offered(vec![lapsed.clone()]),
-        (CLAIM, 200, answers_with("claimed", &fresh)),
+        (CLAIM, 200, held_with("claimed", &fresh, TOKEN)),
     ])
     .await;
     let tool = fixture.tool(&api);
@@ -663,7 +663,7 @@ async fn the_hosted_gateway_shows_a_delivery_and_claims_it_too() {
     let api = Api::start(vec![
         fixture.recorded("working"),
         offered(vec![delivery.clone()]),
-        (CLAIM, 200, answers_with("claimed", &delivery)),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
     ])
     .await;
     let tool = fixture.hosted_tool(&api);
@@ -761,7 +761,7 @@ async fn an_answer_that_is_already_there_is_shown_instead_of_the_way_to_wait() {
     let api = Api::start(vec![
         fixture.recorded("waiting"),
         offered(vec![delivery.clone()]),
-        (CLAIM, 200, answers_with("claimed", &delivery)),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
     ])
     .await;
     let result = fixture
@@ -785,7 +785,7 @@ async fn reply_confirms_the_delivery_with_the_note() {
     let api = Api::start(vec![
         fixture.recorded("working"),
         offered(vec![delivery.clone()]),
-        (CLAIM, 200, answers_with("claimed", &delivery)),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
         (APPLIED, 200, answers_with("applied", &delivery)),
     ])
     .await;
@@ -826,18 +826,18 @@ async fn reply_confirms_the_delivery_with_the_note() {
         applied[0].body["note"],
         "Kept the build cache warm; the build is green again."
     );
-    // The claim's answer carried no token (a server from before claims had
-    // one), so none is sent: such a server refuses a field it does not know.
-    assert!(applied[0].body.get("claim_token").is_none());
+    // It confirms as the claim's holder: with the claim's token.
+    assert_eq!(applied[0].body["claim_token"], TOKEN);
     // It confirms as the run that claimed it.
     assert_eq!(applied[0].body["run_id"], json!(fixture.run));
     assert!(
-        applied[0]
-            .body
-            .as_object()
-            .unwrap()
-            .keys()
-            .all(|key| ["note", "run_id", "agent"].contains(&key.as_str())),
+        applied[0].body.as_object().unwrap().keys().all(|key| [
+            "note",
+            "run_id",
+            "agent",
+            "claim_token"
+        ]
+        .contains(&key.as_str())),
         "{}",
         applied[0].body
     );
@@ -1031,7 +1031,7 @@ async fn get_reads_this_sessions_run_with_what_waits_for_it() {
         ),
         offered(vec![]),
         offered(vec![delivery.clone()]),
-        (CLAIM, 200, answers_with("claimed", &delivery)),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
     ])
     .await;
     let tool = fixture.tool(&api);
@@ -1067,7 +1067,7 @@ async fn get_of_a_run_that_is_not_this_sessions_asks_for_no_delivery() {
             )}),
         ),
         offered(vec![delivery.clone()]),
-        (CLAIM, 200, answers_with("claimed", &delivery)),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
     ])
     .await;
     let result = fixture
@@ -1112,6 +1112,139 @@ fn a_run_is_this_sessions_by_its_agents_id_or_by_the_name_a_person_gave_it() {
         &json!({"name": " "}),
         Some(&json!({"name": " "}))
     ));
+}
+
+// ============================================================================
+// What the API answers is checked before it is used
+// ============================================================================
+
+#[tokio::test]
+async fn what_is_shown_is_what_the_claim_answered_not_what_the_read_offered() {
+    // The read and the claim are two answers of the API. The one that is
+    // shown is the one that says the delivery is this agent's.
+    let fixture = Fixture::new();
+    let offered_as = fixture.answer(json!([]));
+    let mut claimed_as = offered_as.clone();
+    claimed_as["answer"]["option_label"] = json!("Keep it cold");
+    claimed_as["answer"]["note"] = json!("after all");
+    let api = Api::start(vec![
+        fixture.recorded("working"),
+        offered(vec![offered_as]),
+        (CLAIM, 200, held_with("claimed", &claimed_as, TOKEN)),
+    ])
+    .await;
+    let result = fixture
+        .tool(&api)
+        .execute(json!({"step": "Running the tests"}))
+        .await
+        .expect("report");
+    let text = text_of(&result);
+    assert!(text.contains("Their answer: Keep it cold"), "{text}");
+    assert!(text.contains("Their note: after all"), "{text}");
+    assert!(!text.contains("Keep it warm"), "{text}");
+}
+
+#[tokio::test]
+async fn a_claim_whose_answer_is_not_that_delivery_claimed_shows_nothing() {
+    let fixture = Fixture::new();
+    let delivery = fixture.answer(json!([]));
+    let other_run = {
+        let mut view = delivery.clone();
+        view["address"]["run_id"] = json!(Uuid::new_v4());
+        held_with("claimed", &view, TOKEN)
+    };
+    for (what, answer) in [
+        ("an empty answer", json!({"success": true, "data": {}})),
+        ("no token", answers_with("claimed", &delivery)),
+        ("not claimed", held_with("pending", &delivery, TOKEN)),
+        ("another run's", other_run),
+    ] {
+        let api = Api::start(vec![
+            fixture.recorded("working"),
+            offered(vec![delivery.clone()]),
+            (CLAIM, 200, answer),
+        ])
+        .await;
+        let result = fixture
+            .tool(&api)
+            .execute(json!({"step": "Running the tests"}))
+            .await
+            .expect("report");
+        assert_eq!(
+            text_of(&result),
+            format!(
+                "[PROGRESS] Recorded: step. state=working run_id={}",
+                fixture.run
+            ),
+            "{what}"
+        );
+        assert!(result
+            .structured_content
+            .unwrap()
+            .get("deliveries")
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn an_offer_that_is_not_addressed_to_this_run_is_never_claimed() {
+    let fixture = Fixture::new();
+    let mut elsewhere = fixture.answer(json!([]));
+    elsewhere["address"]["run_id"] = json!(Uuid::new_v4());
+    let mut another_workspace = fixture.answer(json!([]));
+    another_workspace["id"] = json!(Uuid::new_v4());
+    another_workspace["workspace_id"] = json!(Uuid::new_v4());
+    let api = Api::start(vec![
+        fixture.recorded("working"),
+        offered(vec![elsewhere.clone(), another_workspace]),
+        (CLAIM, 200, held_with("claimed", &elsewhere, TOKEN)),
+    ])
+    .await;
+    let result = fixture
+        .tool(&api)
+        .execute(json!({"step": "Running the tests"}))
+        .await
+        .expect("report");
+    assert!(
+        !text_of(&result).contains("[PERSON"),
+        "{}",
+        text_of(&result)
+    );
+    assert!(sent(&api, "POST", "/claim").is_empty());
+}
+
+#[tokio::test]
+async fn a_confirmation_that_does_not_say_so_is_not_reported_as_one() {
+    let fixture = Fixture::new();
+    let delivery = fixture.answer(json!([]));
+    for (what, answer) in [
+        ("an empty answer", json!({"success": true, "data": {}})),
+        ("still claimed", held_with("claimed", &delivery, TOKEN)),
+    ] {
+        let api = Api::start(vec![
+            fixture.recorded("working"),
+            offered(vec![delivery.clone()]),
+            (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+            (APPLIED, 200, answer),
+        ])
+        .await;
+        let tool = fixture.tool(&api);
+        tool.execute(json!({"step": "Running the tests"}))
+            .await
+            .expect("report");
+        let result = tool
+            .execute(json!({"action": "reply", "delivery_id": fixture.delivery, "note": "Done."}))
+            .await
+            .expect("an answer");
+        assert_eq!(
+            text_of(&result),
+            "[PROGRESS] Reply not recorded: ContextStream's answer did not say the delivery was confirmed; send the same call again in a moment.",
+            "{what}"
+        );
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["replied"], false, "{what}");
+        assert_eq!(structured["reason"], "malformed_answer", "{what}");
+    }
 }
 
 // ============================================================================

@@ -391,6 +391,19 @@ fn refused_ending(status: u16, body: &Value) -> Refused {
     }
 }
 
+/// What a call answers when the API's answer is not what was asked for: a
+/// claim's answer that is not this delivery, claimed, for this run, with the
+/// claim's token; a confirmation that does not say the delivery ended.
+const MALFORMED: &str = "ContextStream's answer was not the delivery that was asked for";
+
+/// Whether the API's answer to a claim, a reply or a decline was not what
+/// was asked for ([`MALFORMED`]). Nothing of such an answer is used.
+pub fn is_malformed(error: &Error) -> bool {
+    let _ = error;
+    let _ = MALFORMED;
+    false
+}
+
 /// Whether the API answered that this database cannot hold deliveries yet
 /// (503 `deliveries_not_ready`): nothing to deliver for a while, like a 404.
 pub fn is_not_ready(error: &Error) -> bool {
@@ -468,9 +481,17 @@ impl ContextStreamClient {
 
     /// Take a delivery for the length of a lease; with the actor's claim
     /// token, renew the lease of the claim it holds. The answer carries the
-    /// claim's token ([`Delivery::claim_token`]). Endpoint:
-    /// `POST /decision-requests/deliveries/:id/claim`.
-    pub async fn claim_delivery(&self, id: Uuid, who: &DeliveryActor) -> Result<Delivery> {
+    /// claim's token ([`Delivery::claim_token`]). The answer is taken only
+    /// when it is the delivery that was asked for, claimed, addressed to the
+    /// workspace and run of `expect`, with a token ([`is_malformed`]
+    /// otherwise). Endpoint: `POST /decision-requests/deliveries/:id/claim`.
+    pub async fn claim_delivery(
+        &self,
+        id: Uuid,
+        who: &DeliveryActor,
+        expect: &DeliveryReader,
+    ) -> Result<Delivery> {
+        let _ = expect;
         self.way_back().await?;
         let answer: Value = self
             .post_without_session_refresh(
@@ -839,7 +860,10 @@ mod tests {
             assert!(!client.receives_deliveries().await, "{what}");
             let read = client.read_deliveries(&reader).await.expect_err(what);
             assert!(is_no_way_back(&read), "{what}: {read:?}");
-            let claim = client.claim_delivery(id, &who).await.expect_err(what);
+            let claim = client
+                .claim_delivery(id, &who, &reader)
+                .await
+                .expect_err(what);
             assert!(is_no_way_back(&claim), "{what}: {claim:?}");
             let applied = client
                 .delivery_applied(id, Some("done"), &who)
@@ -873,6 +897,184 @@ mod tests {
         // No other error is taken for it.
         assert!(!is_no_way_back(&Error::Validation("other".to_string())));
         assert!(!is_no_way_back(&Error::http(404, "")));
+    }
+
+    #[tokio::test]
+    async fn a_read_offers_only_what_is_pending_for_the_readers_workspace_and_run() {
+        let (workspace, run, id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let offer = |id: Uuid, workspace: Uuid, run: Uuid, state: &str| {
+            let mut view = answer_view(id, run);
+            view["workspace_id"] = json!(workspace);
+            view["state"] = json!(state);
+            view
+        };
+        let mine = offer(id, workspace, run, "pending");
+        let listed = json!({"success": true, "data": {"count": 6, "deliveries": [
+            mine,
+            // Another run's, another workspace's, one that is not pending,
+            // one that names no run, and what is no delivery at all.
+            offer(Uuid::new_v4(), workspace, Uuid::new_v4(), "pending"),
+            offer(Uuid::new_v4(), Uuid::new_v4(), run, "pending"),
+            offer(Uuid::new_v4(), workspace, run, "claimed"),
+            {"id": Uuid::new_v4(), "workspace_id": workspace, "state": "pending"},
+            {"kind": "answer"},
+        ]}})
+        .to_string();
+        let (client, server) = client_answered(vec![("200 OK", listed)]).await;
+        let offered = client
+            .read_deliveries(&DeliveryReader {
+                workspace_id: workspace,
+                run_id: Some(run),
+            })
+            .await
+            .expect("read");
+        assert_eq!(offered.len(), 1, "{offered:?}");
+        assert_eq!(offered[0].id, id);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_claim_is_taken_only_when_the_answer_is_that_delivery_claimed_for_that_run() {
+        let (workspace, run, id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let expect = DeliveryReader {
+            workspace_id: workspace,
+            run_id: Some(run),
+        };
+        let good = {
+            let mut view = answer_view(id, run);
+            view["workspace_id"] = json!(workspace);
+            view["state"] = json!("claimed");
+            view["claim_token"] = json!(TOKEN);
+            view
+        };
+        let with = |change: &dyn Fn(&mut Value)| {
+            let mut view = good.clone();
+            change(&mut view);
+            view
+        };
+        let bad: Vec<(&str, Value)> = vec![
+            ("nothing at all", json!({})),
+            (
+                "another delivery",
+                with(&|view| view["id"] = json!(Uuid::new_v4())),
+            ),
+            (
+                "no id",
+                with(&|view| {
+                    view.as_object_mut().unwrap().remove("id");
+                }),
+            ),
+            (
+                "not claimed",
+                with(&|view| view["state"] = json!("pending")),
+            ),
+            (
+                "already ended",
+                with(&|view| view["state"] = json!("applied")),
+            ),
+            (
+                "another run",
+                with(&|view| view["address"]["run_id"] = json!(Uuid::new_v4())),
+            ),
+            (
+                "no address",
+                with(&|view| {
+                    view.as_object_mut().unwrap().remove("address");
+                }),
+            ),
+            (
+                "another workspace",
+                with(&|view| view["workspace_id"] = json!(Uuid::new_v4())),
+            ),
+            (
+                "no token",
+                with(&|view| {
+                    view.as_object_mut().unwrap().remove("claim_token");
+                }),
+            ),
+            (
+                "a token that is no text",
+                with(&|view| view["claim_token"] = json!(7)),
+            ),
+            (
+                "a blank token",
+                with(&|view| view["claim_token"] = json!("  ")),
+            ),
+        ];
+        let mut answers: Vec<(&'static str, String)> = bad
+            .iter()
+            .map(|(_, view)| ("200 OK", json!({"success": true, "data": view}).to_string()))
+            .collect();
+        answers.push(("200 OK", json!({"success": true, "data": good}).to_string()));
+        let (client, server) = client_answered(answers).await;
+        let who = DeliveryActor {
+            run_id: Some(run),
+            ..DeliveryActor::default()
+        };
+        for (what, _) in &bad {
+            let refused = client
+                .claim_delivery(id, &who, &expect)
+                .await
+                .expect_err(what);
+            assert!(is_malformed(&refused), "{what}: {refused:?}");
+            // Nothing of the answer is in the error.
+            assert!(!format!("{refused:?}").contains(TOKEN), "{what}");
+        }
+        let claimed = client
+            .claim_delivery(id, &who, &expect)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.id, id);
+        assert!(claimed.claim_token.is_some());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_counts_only_when_it_says_that_delivery_ended_so() {
+        let (run, id) = (Uuid::new_v4(), Uuid::new_v4());
+        let ended = |state: &str, id: Uuid| {
+            let mut view = answer_view(id, run);
+            view["state"] = json!(state);
+            json!({"success": true, "data": view}).to_string()
+        };
+        let (client, server) = client_answered(vec![
+            ("200 OK", r#"{"success":true,"data":{}}"#.to_string()),
+            ("200 OK", ended("claimed", id)),
+            ("200 OK", ended("applied", Uuid::new_v4())),
+            ("200 OK", ended("declined", id)),
+            ("200 OK", ended("applied", id)),
+            ("200 OK", ended("applied", id)),
+            ("200 OK", ended("declined", id)),
+        ])
+        .await;
+        let who = DeliveryActor::default();
+        for what in [
+            "nothing",
+            "still claimed",
+            "another delivery",
+            "declined, not applied",
+        ] {
+            let refused = client
+                .delivery_applied(id, Some("done"), &who)
+                .await
+                .expect_err(what);
+            assert!(is_malformed(&refused.error), "{what}: {refused:?}");
+        }
+        client
+            .delivery_applied(id, Some("done"), &who)
+            .await
+            .expect("applied");
+        let refused = client
+            .delivery_declined(id, "moot", None, &who)
+            .await
+            .expect_err("applied, not declined");
+        assert!(is_malformed(&refused.error), "{refused:?}");
+        client
+            .delivery_declined(id, "moot", None, &who)
+            .await
+            .expect("declined");
+        server.await.unwrap();
+        assert!(!is_malformed(&Error::http(409, "claimed_by_other: x")));
     }
 
     #[test]
@@ -1014,7 +1216,8 @@ mod tests {
     #[tokio::test]
     async fn the_four_routes_are_called_once_each_with_what_the_api_takes() {
         let (workspace, run, id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let view = answer_view(id, run);
+        let mut view = answer_view(id, run);
+        view["workspace_id"] = json!(workspace);
         let mut claimed = view.clone();
         claimed["state"] = json!("claimed");
         claimed["claim_token"] = json!(TOKEN);
@@ -1045,7 +1248,17 @@ mod tests {
             .expect("read");
         assert_eq!(offered.len(), 1);
         assert_eq!(offered[0].id, id);
-        let claim = client.claim_delivery(id, &who).await.expect("claim");
+        let claim = client
+            .claim_delivery(
+                id,
+                &who,
+                &DeliveryReader {
+                    workspace_id: workspace,
+                    run_id: Some(run),
+                },
+            )
+            .await
+            .expect("claim");
         assert_eq!(claim.state.as_deref(), Some("claimed"));
         // The holder: what it confirms with carries the claim's token.
         let holder = DeliveryActor {

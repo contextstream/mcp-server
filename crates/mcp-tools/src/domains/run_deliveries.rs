@@ -565,7 +565,7 @@ pub(crate) async fn offer(
         // Shown only once it is this agent's: one another agent holds, or one
         // whose claim did not get through, is offered again later. One try
         // per read: the next report reads again.
-        let claimed = match client.claim_delivery(delivery.id, &who).await {
+        let claimed = match client.claim_delivery(delivery.id, &who, &reader).await {
             Ok(claimed) => claimed,
             Err(error) => {
                 tracing::debug!(
@@ -728,6 +728,12 @@ fn actor(ledger: &Ledger, session: &str, id: Uuid, agent: &Value) -> DeliveryAct
     }
 }
 
+/// The workspace a session claimed a delivery in, when it remembers.
+fn claimed_in(ledger: &Ledger, session: &str, id: Uuid) -> Option<Uuid> {
+    let _ = (ledger, session, id);
+    None
+}
+
 /// Which runs are a session's own, for a claim that is made again ([`end`]).
 #[async_trait::async_trait]
 pub(crate) trait OwnRuns: Sync {
@@ -798,7 +804,11 @@ async fn end(
         agent: Some(agent.clone()),
         claim_token: None,
     };
-    let claimed = match client.claim_delivery(id, &again).await {
+    let expect = DeliveryReader {
+        workspace_id: claimed_in(ledger, session, id).unwrap_or_default(),
+        run_id: Some(run_id),
+    };
+    let claimed = match client.claim_delivery(id, &again, &expect).await {
         Ok(claimed) => claimed,
         Err(error) => {
             tracing::debug!(

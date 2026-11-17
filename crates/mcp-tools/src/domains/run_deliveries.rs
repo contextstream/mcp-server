@@ -5,7 +5,7 @@
 //! agent claims it and confirms what it did (`mcp_client::deliveries`). This
 //! module is what the agent's side does with one:
 //!
-//! - [`offer`] reads what waits for a run, claims each delivery this session
+//! - [`poll`] reads what waits for a run, claims each delivery this session
 //!   has not been shown, and renders it ([`framed`]). The `progress` tool
 //!   calls it after a report and after a `get` of the session's own run;
 //! - [`reply`] and [`decline`] are the tool's `reply` and `decline` actions:
@@ -299,7 +299,7 @@ struct Memory {
     polls: HashMap<(String, Uuid), Poll>,
     /// Workspaces whose API said it has no delivery routes, and until when
     /// that word stands.
-    not_there: HashMap<Uuid, Instant>,
+    not_there: HashMap<String, Instant>,
 }
 
 /// What this process remembers of deliveries: which ones each session was
@@ -391,22 +391,22 @@ impl Ledger {
             .map(|s| (s.run_id, s.token.clone()))
     }
 
-    fn is_not_there(&self, workspace_id: Uuid) -> bool {
+    fn is_not_there(&self, workspace_id: &str) -> bool {
         let mut memory = self.lock();
-        match memory.not_there.get(&workspace_id) {
+        match memory.not_there.get(workspace_id) {
             Some(until) if *until > Instant::now() => true,
             Some(_) => {
-                memory.not_there.remove(&workspace_id);
+                memory.not_there.remove(workspace_id);
                 false
             }
             None => false,
         }
     }
 
-    fn note_not_there(&self, workspace_id: Uuid) {
+    fn note_not_there(&self, workspace_id: &str) {
         self.cool_down(workspace_id, NOT_THERE_FOR);
     }
-    fn cool_down(&self, workspace_id: Uuid, duration: Duration) {
+    fn cool_down(&self, workspace_id: &str, duration: Duration) {
         let mut memory = self.lock();
         if memory.not_there.len() >= MAX_WORKSPACES_OFF {
             let now = Instant::now();
@@ -416,7 +416,7 @@ impl Ledger {
             }
         }
         memory.not_there.insert(
-            workspace_id,
+            workspace_id.to_owned(),
             Instant::now() + duration.min(Duration::from_secs(u32::MAX.into())),
         );
     }
@@ -451,7 +451,7 @@ impl Offered {
 struct Poll {
     started: Instant,
     finished: tokio::sync::watch::Receiver<bool>,
-    result: Arc<Mutex<Option<Offered>>>,
+    result: Arc<Mutex<Option<Vec<Delivery>>>>,
 }
 
 /// A report only consumes a finished poll or starts one. An explicit get
@@ -468,18 +468,12 @@ pub(super) async fn poll(
     let key = (owner.key.clone(), run_id);
     let (mut finished, result) = {
         let mut mem = ledger.lock();
-        mem.polls
-            .retain(|_, p| p.started.elapsed() < NOT_THERE_FOR);
+        mem.polls.retain(|_, p| p.started.elapsed() < NOT_THERE_FOR);
         // A hook or waiter can announce a new arrival after a previous poll
         // finished empty. An explicit get must read that arrival now.
         if wait
             && mem.polls.get(&key).is_some_and(|p| {
-                *p.finished.borrow()
-                    && p.result
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .is_some_and(|r| r.blocks.is_empty())
+                *p.finished.borrow() && p.result.lock().unwrap().as_ref().is_some_and(Vec::is_empty)
             })
         {
             mem.polls.remove(&key);
@@ -508,11 +502,10 @@ pub(super) async fn poll(
                     result: result.clone(),
                 },
             );
-            let (client, ledger, owner, agent) =
-                (client.clone(), ledger.clone(), owner.clone(), agent.clone());
+            let (client, ledger, owner) = (client.clone(), ledger.clone(), owner.clone());
             mcp_client::spawn_with_task_context(async move {
-                let offered = offer(&client, &ledger, &owner, run_id, &agent).await;
-                *result.lock().unwrap() = Some(offered);
+                let offered = read(&client, &ledger, &owner, run_id).await;
+                *result.lock().unwrap() = offered;
                 tx.send_replace(true);
             });
         }
@@ -523,29 +516,32 @@ pub(super) async fn poll(
         if !wait {
             return Offered::default();
         }
-        // One bounded list and at most five bounded claims, including joins.
-        let _ = tokio::time::timeout(Duration::from_secs(32), finished.changed()).await;
+        // Only the list runs in the worker.
+        let _ = tokio::time::timeout(Duration::from_secs(6), finished.changed()).await;
     }
-    let mut mem = ledger.lock();
-    if mem
-        .polls
-        .get(&key)
-        .is_some_and(|p| Arc::ptr_eq(&p.result, &result) && *p.finished.borrow())
-    {
+    let deliveries = {
+        let mut mem = ledger.lock();
+        if !mem
+            .polls
+            .get(&key)
+            .is_some_and(|p| Arc::ptr_eq(&p.result, &result) && *p.finished.borrow())
+        {
+            return Offered::default();
+        }
         mem.polls.remove(&key);
-        return result.lock().unwrap().take().unwrap_or_default();
-    }
-    Offered::default()
+        result.lock().unwrap().take()
+    };
+    claim_offers(client, ledger, owner, run_id, agent, deliveries).await
 }
 
 #[cfg(test)]
-pub(super) async fn wait_for_poll(ledger: &Ledger) -> bool {
+pub(super) async fn wait_for_poll(ledger: &Ledger, run: Uuid) -> bool {
     let Some(mut done) = ledger
         .lock()
         .polls
-        .values()
-        .next()
-        .map(|p| p.finished.clone())
+        .iter()
+        .find(|((_, id), _)| *id == run)
+        .map(|(_, p)| p.finished.clone())
     else {
         return false;
     };
@@ -555,36 +551,50 @@ pub(super) async fn wait_for_poll(ledger: &Ledger) -> bool {
     true
 }
 
-/// Read what waits for `run_id`, claim each delivery `session` has not been
-/// shown, and render it. Never fails: whatever goes wrong, nothing is offered
-/// and nothing is said.
-pub(super) async fn offer(
+async fn read(
     client: &ContextStreamClient,
     ledger: &Ledger,
     owner: &Owner,
     run_id: Uuid,
-    agent: &Value,
-) -> Offered {
-    let session = &owner.key;
+) -> Option<Vec<Delivery>> {
     let workspace_id = owner.workspace;
-    if ledger.is_not_there(workspace_id) {
-        return Offered::default();
+    if ledger.is_not_there(&owner.key) {
+        return None;
     }
     let reader = DeliveryReader {
         workspace_id,
         run_id: Some(run_id),
     };
-    let deliveries = match client.read_deliveries(&reader).await {
-        Ok(deliveries) => deliveries,
+    match client.read_deliveries(&reader).await {
+        Ok(deliveries) => Some(deliveries),
         Err(error) => {
             if is_not_there(&error) || is_not_ready(&error) {
-                ledger.note_not_there(workspace_id);
+                ledger.note_not_there(&owner.key);
             } else if let Error::RateLimited { retry_after, .. } = &error {
-                ledger.cool_down(workspace_id, Duration::from_secs(retry_after.unwrap_or(60)));
+                ledger.cool_down(&owner.key, Duration::from_secs(retry_after.unwrap_or(60)));
             }
             tracing::debug!("run deliveries not read: {}", error_tag(&error));
-            return Offered::default();
+            None
         }
+    }
+}
+
+async fn claim_offers(
+    client: &ContextStreamClient,
+    ledger: &Ledger,
+    owner: &Owner,
+    run_id: Uuid,
+    agent: &Value,
+    deliveries: Option<Vec<Delivery>>,
+) -> Offered {
+    let Some(deliveries) = deliveries else {
+        return Offered::default();
+    };
+    let session = &owner.key;
+    let workspace_id = owner.workspace;
+    let reader = DeliveryReader {
+        workspace_id,
+        run_id: Some(run_id),
     };
     let mut offered = Offered {
         can_wait: true,
@@ -624,7 +634,7 @@ pub(super) async fn offer(
                     error_tag(&error)
                 );
                 if let Error::RateLimited { retry_after, .. } = error {
-                    ledger.cool_down(workspace_id, Duration::from_secs(retry_after.unwrap_or(60)));
+                    ledger.cool_down(&owner.key, Duration::from_secs(retry_after.unwrap_or(60)));
                     break;
                 }
                 continue;
@@ -1211,7 +1221,7 @@ mod tests {
     #[test]
     fn an_api_without_the_routes_is_remembered_for_its_workspace_only() {
         let ledger = Ledger::default();
-        let (here, there) = (Uuid::new_v4(), Uuid::new_v4());
+        let (here, there) = ("owner A", "owner B");
         assert!(!ledger.is_not_there(here));
         ledger.note_not_there(here);
         assert!(ledger.is_not_there(here));
@@ -1220,7 +1230,7 @@ mod tests {
         ledger
             .lock()
             .not_there
-            .insert(here, Instant::now() - Duration::from_secs(1));
+            .insert(here.to_owned(), Instant::now() - Duration::from_secs(1));
         assert!(!ledger.is_not_there(here));
     }
 

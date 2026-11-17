@@ -515,7 +515,7 @@ async fn quiet_without_deliveries(fixture: &Fixture, api: &Api) {
             }))
             .await
             .expect("the report is the agent's, whatever the deliveries say");
-        run_deliveries::wait_for_poll(&tool.deliveries).await;
+        run_deliveries::wait_for_poll(&tool.deliveries, fixture.run).await;
         assert!(!result.is_error);
         let text = text_of(&result);
         // The report, and not a word more: nothing about deliveries, nothing
@@ -1088,7 +1088,7 @@ async fn get_reads_this_sessions_run_with_what_waits_for_it() {
         .await
         .expect("report");
 
-    assert!(run_deliveries::wait_for_poll(&tool.deliveries).await);
+    assert!(run_deliveries::wait_for_poll(&tool.deliveries, fixture.run).await);
 
     // What the hooks' notice tells the agent to call.
     let result = tool
@@ -2047,11 +2047,18 @@ impl ProgressTool {
     /// its completed batch. Never use this helper in latency/concurrency tests.
     async fn report_then_collect(&self, args: Value) -> Result<ToolResult> {
         let first = self.execute(args.clone()).await?;
-        if run_deliveries::wait_for_poll(&self.deliveries).await {
-            self.execute(args).await
-        } else {
-            Ok(first)
+        let run = first
+            .structured_content
+            .as_ref()
+            .and_then(|v| v.pointer("/run/run_id"))
+            .and_then(Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok());
+        if let Some(run) = run {
+            if run_deliveries::wait_for_poll(&self.deliveries, run).await {
+                return self.execute(args).await;
+            }
         }
+        Ok(first)
     }
 }
 
@@ -2071,11 +2078,11 @@ async fn review7_racing_workers_reserve_before_sending_a_claim() {
     let tool = f.tool(&api);
     let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
     let agent = json!({"runtime":"mcp"});
-    let first = Ledger::default();
-    let second = Ledger::default();
+    let first = Arc::default();
+    let second = Arc::default();
     let (a, b) = tokio::join!(
-        run_deliveries::offer(&tool.client, &first, &owner, f.run, &agent),
-        run_deliveries::offer(&tool.client, &second, &owner, f.run, &agent)
+        run_deliveries::poll(&tool.client, &first, &owner, f.run, &agent, true),
+        run_deliveries::poll(&tool.client, &second, &owner, f.run, &agent, true)
     );
     assert_eq!(sent(&api, "POST", "/claim").len(), 1);
     assert_eq!(a.blocks.len() + b.blocks.len(), 1);
@@ -2129,7 +2136,7 @@ async fn round2_new_gateway_tool_per_call_claims_only_when_returning_the_frame()
             .await
             .unwrap();
         assert!(!text_of(&answer).contains("[PERSON"));
-        assert!(run_deliveries::wait_for_poll(&first.deliveries).await);
+        assert!(run_deliveries::wait_for_poll(&first.deliveries, f.run).await);
         drop(first);
         assert!(
             sent(&api, "POST", "/claim").is_empty(),
@@ -2167,6 +2174,6 @@ async fn round2_terminal_reports_do_not_start_a_delivery_read() {
     tool.execute(json!({"status":"completed","summary":"done"}))
         .await
         .unwrap();
-    assert!(!run_deliveries::wait_for_poll(&tool.deliveries).await);
+    assert!(!run_deliveries::wait_for_poll(&tool.deliveries, f.run).await);
     assert!(sent(&api, "GET", "/deliveries").is_empty());
 }

@@ -237,12 +237,14 @@ pub struct ProgressTool {
 
 impl ProgressTool {
     pub fn new(client: ContextStreamClient, session: Arc<SessionManager>) -> Self {
+        static DELIVERIES: std::sync::LazyLock<Arc<Ledger>> =
+            std::sync::LazyLock::new(Arc::default);
         Self {
             client,
             session,
             heartbeat: None,
             runs: Arc::new(Mutex::new(HashMap::new())),
-            deliveries: Arc::default(),
+            deliveries: DELIVERIES.clone(),
         }
     }
 
@@ -384,7 +386,11 @@ impl ProgressTool {
                 // under a sign-in or an app's token.
                 let owner = self.delivery_owner(workspace_id, is_http).await;
                 let offered = match (reported_run, owner.as_ref()) {
-                    (Some(run_id), Some(owner)) if owner.bind(run_id, None, 0, None) => {
+                    (Some(run_id), Some(owner))
+                        if !report.is_terminal()
+                            && !run_has_ended(&answer)
+                            && owner.bind(run_id, None, 0, None) =>
+                    {
                         run_deliveries::poll(
                             &self.client,
                             &self.deliveries,
@@ -674,7 +680,11 @@ impl ProgressTool {
             return Ok(
                 match self.client.get_run_progress(workspace_id, run_id).await {
                     Ok(mut view) => {
-                        let offered = self.offered_to_own_run(workspace_id, run_id, is_http).await;
+                        let offered = if run_has_ended(&view) {
+                            Offered::default()
+                        } else {
+                            self.offered_to_own_run(workspace_id, run_id, is_http).await
+                        };
                         let text = format!("{}{}", run_text(&view), offered.text());
                         if let (Some(fields), false) =
                             (view.as_object_mut(), offered.shown.is_empty())

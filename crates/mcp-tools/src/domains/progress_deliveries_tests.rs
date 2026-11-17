@@ -2251,3 +2251,27 @@ async fn round2_contended_claim_bucket_reports_busy_without_writing() {
     assert!(text_of(&reply).contains("retry"));
     assert!(api.requests().is_empty());
 }
+
+#[tokio::test]
+async fn round3_consecutive_waiting_reports_use_the_last_successful_read() {
+    for available in [true, false] {
+        let f = Fixture::new();
+        let mut routes = vec![f.recorded("waiting")];
+        if available {
+            routes.push(offered(vec![]));
+        }
+        let api = Api::start(routes).await;
+        let tool = f.tool(&api);
+        tool.execute(json!({"step":"starting"})).await.unwrap();
+        assert!(run_deliveries::wait_for_poll(&tool.deliveries, f.run).await);
+        // One report collects the probe, the next starts another one.
+        for _ in 0..2 {
+            let report = tool
+                .execute(json!({"waiting":{"on":"person","question":"Ready?"}}))
+                .await
+                .unwrap();
+            let text = text_of(&report);
+            assert_eq!(text.contains("action=\"get\""), available, "{text}");
+        }
+    }
+}

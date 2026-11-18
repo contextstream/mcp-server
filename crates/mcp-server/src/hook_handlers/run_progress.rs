@@ -15,13 +15,27 @@
 //!   process is gone, its open runs end as `stopped` with a fixed sentence.
 //!   No summary is invented.
 //! - **A run that starts by itself.** When a tool call of the session moves a
-//!   ticket to `in_progress`, a run for that ticket starts. This is the one
-//!   thing here that reports a session whose model never called `progress`.
+//!   ticket to `in_progress`, a run for that ticket starts.
+//! - **The session's own run.** A session whose model never calls `progress`
+//!   and takes up no ticket was on no floor at all, however long it worked.
+//!   Once such a session has worked for two minutes of a turn
+//!   ([`session_run_after_ms`]) with no run, the hooks open its own: the key
+//!   and the agent a `progress` report that names no run would use, the
+//!   workspace and project `init` resolved, and fixed words for a title
+//!   ("Working in" and the project's name). The two minutes are the model's:
+//!   a run's title is set when it starts, so a report of the model's that
+//!   comes first keeps its own. A later report that names no run lands on
+//!   this run and makes it the model's; work reported as another run (a
+//!   ticket's, a named one) ends it by a fixed sentence. At most once for a
+//!   session part, and never after the model reported or a ticket was taken
+//!   up. These two are what reports a session whose model never called
+//!   `progress`.
 //! - **Turn state.** When the model's turn ends, the session's runs wait on a
 //!   person (no question text); the next prompt or tool call says working.
 //! - **A coarse step.** Only after ten minutes without a step from the model:
 //!   one of the fixed sentences in [`super::run_step_labels`], picked by the
-//!   tool's name.
+//!   tool's name. On the session's own run, while the model has reported
+//!   nothing, from the first tool call: no step of the model's stands there.
 //!
 //! The hooks never choose who they are. The server says it: `init`'s result
 //! and every `progress` answer carry the server's session part and agent, and
@@ -137,6 +151,23 @@ pub(crate) const SESSION_ENDED: &str = "The session ended without a final report
 pub(crate) const HOST_GONE: &str = "The session's process ended without a final report.";
 pub(crate) const AGENT_ENDED: &str = "The agent ended without a final report.";
 pub(crate) const RECONNECTED: &str = "The session reconnected; its work continues as another run.";
+/// The end of the run the hooks opened for a session that had reported
+/// nothing, when its work is reported as another run after all.
+pub(crate) const MOVED_ON: &str = "The session reported its work as another run.";
+
+/// Seconds a session works in a turn, with no run of its own, before the
+/// hooks open one for it (0..=3600; 120 when unset).
+const SESSION_RUN_AFTER_ENV: &str = "CONTEXTSTREAM_RUN_PROGRESS_SESSION_AFTER_SECS";
+/// Two minutes: a model that follows its rules reports within its first few
+/// tool calls, and a run's title is set when the run starts, so the hooks
+/// wait for the model's own before they start one under fixed words.
+const DEFAULT_SESSION_RUN_AFTER_SECS: u64 = 120;
+const MAX_SESSION_RUN_AFTER_SECS: u64 = 60 * 60;
+/// The title of the run the hooks open for a session, before the project's
+/// name.
+const SESSION_RUN_TITLE: &str = "Working";
+/// The most of a project's name a title carries.
+const MAX_PROJECT_NAME: usize = 80;
 
 // ============================================================================
 // Settings
@@ -203,6 +234,25 @@ fn beat_secs() -> u64 {
         .unwrap_or(DEFAULT_BEAT_SECS)
 }
 
+/// How long a session works in a turn with no run of its own before the
+/// hooks open one ([`SESSION_RUN_AFTER_ENV`]).
+pub(crate) fn session_run_after_ms() -> u64 {
+    session_run_after_ms_of(std::env::var(SESSION_RUN_AFTER_ENV).ok().as_deref())
+}
+
+pub(crate) fn session_run_after_ms_of(setting: Option<&str>) -> u64 {
+    setting
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs <= MAX_SESSION_RUN_AFTER_SECS)
+        .unwrap_or(DEFAULT_SESSION_RUN_AFTER_SECS)
+        * 1000
+}
+
+/// ContextStream's own tools: bookkeeping, not the session's work.
+fn is_contextstream_tool(tool: &str) -> bool {
+    tool.to_ascii_lowercase().contains("contextstream")
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -264,6 +314,11 @@ pub(crate) struct Run {
     /// no more signs of life.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_by: Option<String>,
+    /// The hooks opened this run for a session whose model had reported
+    /// nothing ([`SessionFile::open_session_run`]), and the model has not
+    /// reported on it since.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreported: bool,
 }
 
 /// What the hooks keep about one host session.
@@ -304,6 +359,25 @@ pub(crate) struct SessionFile {
     pub pending: Vec<Value>,
     #[serde(default)]
     pub spawned_ms: u64,
+    /// When `init` first named the session under its current part.
+    #[serde(default)]
+    pub identity_ms: u64,
+    /// When the person's last prompt arrived.
+    #[serde(default)]
+    pub prompt_ms: u64,
+    /// The workspace and project `init` resolved for the session, and the
+    /// project's name as the server gave it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    /// The session part whose work is spoken for: the model reported a run,
+    /// a ticket was taken up, or the hooks opened the session's own run. The
+    /// hooks open no run of their own for it (again).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoken_for: Option<String>,
 }
 
 /// Who made a tool call: the session's main agent, or one of its subagents.
@@ -487,7 +561,7 @@ impl SessionFile {
             self.resume();
         }
         // ContextStream's own calls are bookkeeping, not the work.
-        if tool.to_ascii_lowercase().contains("contextstream") {
+        if is_contextstream_tool(tool) {
             return;
         }
         let (kind, label) = step_for_tool(tool);
@@ -508,7 +582,9 @@ impl SessionFile {
                 continue;
             }
             let model_spoke = run.model_step_ms.max(run.started_ms);
-            if now.saturating_sub(model_spoke) < COARSE_STEP_AFTER_MS
+            // On a run the model has said nothing on, no step of its own
+            // stands to be written over.
+            if (!run.unreported && now.saturating_sub(model_spoke) < COARSE_STEP_AFTER_MS)
                 || run.coarse_kind.as_deref() == Some(kind)
                 || now.saturating_sub(run.coarse_ms) < COARSE_STEP_EVERY_MS
             {
@@ -605,6 +681,7 @@ impl SessionFile {
     pub(crate) fn prompt_submitted(&mut self, now: u64) {
         self.last_hook_ms = now;
         self.closed = false;
+        self.prompt_ms = now;
         self.resume();
     }
 
@@ -642,6 +719,117 @@ impl SessionFile {
         self.last_hook_ms = now;
         self.subagents.retain(|known| known != agent_id);
         self.end_where(AGENT_ENDED, |run| run.owner.as_deref() == Some(agent_id));
+    }
+
+    /// `init` answered: who the session is, where it works (the workspace and
+    /// project the server resolved, and the project's name), and when. A
+    /// session part that is new starts its own span before the session's run.
+    pub(crate) fn named(
+        &mut self,
+        session: &str,
+        agent: &Value,
+        scope: &Scope,
+        project_name: Option<&str>,
+        now: u64,
+    ) {
+        let part = session.trim();
+        let new_part = !part.is_empty() && self.session.as_deref() != Some(part);
+        self.learn_identity(Some(session), Some(agent));
+        if new_part {
+            self.identity_ms = now;
+        }
+        if let Some(workspace_id) = &scope.workspace_id {
+            self.workspace_id = Some(workspace_id.clone());
+            self.project_id = scope.project_id.clone();
+            self.project_name = project_name
+                .map(|name| name.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|name| !name.is_empty())
+                .map(|name| common::truncate_with_ellipsis(&name, MAX_PROJECT_NAME));
+        }
+    }
+
+    /// Whether the hooks may still open this session's own run: the server
+    /// said who the session is, and nothing has spoken for its work under
+    /// this part (see `spoken_for`).
+    pub(crate) fn awaits_session_run(&self) -> bool {
+        !self.refused
+            && self.agent.is_some()
+            && self
+                .session
+                .as_deref()
+                .is_some_and(|part| self.spoken_for.as_deref() != Some(part))
+    }
+
+    /// Whether the session's own run is due at `now`: it may still be opened,
+    /// the session has no run of its own, and `after_ms` have passed since
+    /// its turn began (the later of `init`'s answer and the last prompt).
+    pub(crate) fn session_run_due(&self, after_ms: u64, now: u64) -> bool {
+        self.awaits_session_run()
+            && self.runs.len() < MAX_RUNS
+            && !self.runs.iter().any(|run| run.owner.is_none())
+            && now.saturating_sub(self.identity_ms.max(self.prompt_ms)) >= after_ms
+    }
+
+    /// Open the session's own run when it is due: a session at work whose
+    /// model reported nothing is shown with its agent and where it works.
+    /// The workspace and project are the ones `init` resolved, else the
+    /// folder's (`fallback`); where `init` resolved a workspace and no
+    /// project, the folder's project in that same workspace. With no
+    /// workspace nothing is opened, and nothing is decided. The key is the
+    /// one a `progress` report that names no run goes to, so the model's
+    /// later report lands on this run.
+    pub(crate) fn open_session_run(&mut self, fallback: &Scope, after_ms: u64, now: u64) -> bool {
+        if !self.session_run_due(after_ms, now) {
+            return false;
+        }
+        let Some(session) = self.session.clone() else {
+            return false;
+        };
+        let (workspace_id, project_id) = match &self.workspace_id {
+            Some(workspace_id) => (
+                workspace_id.clone(),
+                self.project_id.clone().or_else(|| {
+                    fallback
+                        .project_id
+                        .clone()
+                        .filter(|_| fallback.workspace_id.as_ref() == Some(workspace_id))
+                }),
+            ),
+            None => match &fallback.workspace_id {
+                Some(workspace_id) => (workspace_id.clone(), fallback.project_id.clone()),
+                None => return false,
+            },
+        };
+        let run = Run {
+            key: Some(mcp_tools::domains::progress::default_run_key(
+                &session, None,
+            )),
+            workspace_id,
+            project_id,
+            started_ms: now,
+            unreported: true,
+            ..Run::default()
+        };
+        let Some(mut body) = self.base(&run) else {
+            return false;
+        };
+        // Fixed words and the project's own name: nothing of the work.
+        let title = match &self.project_name {
+            Some(name) => format!("{SESSION_RUN_TITLE} in {name}"),
+            None => SESSION_RUN_TITLE.to_string(),
+        };
+        body.insert("title".into(), json!(title));
+        body.insert("status".into(), json!("working"));
+        self.runs.push(run);
+        self.queue(body);
+        self.spoken_for = Some(session);
+        true
+    }
+
+    /// The session's work is reported as another run: the run the hooks
+    /// opened for it, which the model never reported on, ends.
+    fn end_unreported(&mut self) {
+        self.end_where(MOVED_ON, |run| run.unreported && run.owner.is_none());
     }
 
     /// The server said who this session is. A changed session part (the
@@ -691,6 +879,11 @@ impl SessionFile {
             answer.get("session").and_then(Value::as_str),
             view.get("agent"),
         );
+        // The model has spoken for this session's work: the hooks open no
+        // run of their own for it.
+        if self.session.is_some() {
+            self.spoken_for = self.session.clone();
+        }
         let run_id = uuid_text(view, "run_id");
         let key = text(answer, "run_key");
         let found = self
@@ -722,6 +915,8 @@ impl SessionFile {
                 if self.runs.len() >= MAX_RUNS || (run_id.is_none() && key.is_none()) {
                     return None;
                 }
+                // The work is this run now, not the one the hooks opened.
+                self.end_unreported();
                 self.runs.push(Run {
                     workspace_id,
                     project_id: uuid_text(view, "project_id"),
@@ -732,6 +927,8 @@ impl SessionFile {
             }
         };
         let run = &mut self.runs[index];
+        // The model reported on it: the run is the model's.
+        run.unreported = false;
         if run_id.is_some() {
             run.run_id = run_id;
         }
@@ -921,6 +1118,11 @@ impl SessionFile {
             );
         }
         body.insert("status".into(), json!("working"));
+        if run.owner.is_none() {
+            // The ticket's run is the session's work now.
+            self.end_unreported();
+            self.spoken_for = Some(session);
+        }
         self.runs.push(run);
         self.queue(body);
     }
@@ -981,6 +1183,28 @@ fn session_state(input: &Value) -> Option<(String, PathBuf)> {
 fn known_session(input: &Value) -> Option<PathBuf> {
     let (_, path) = session_state(input)?;
     path.exists().then_some(path)
+}
+
+/// Where the session's own run would open, when it is due at `now`: the
+/// folder's workspace and project, read only for a session `init` resolved
+/// no workspace or no project for. `None` when the run is not due, or there
+/// is no workspace to open it in: nothing is written for such a session on
+/// the tool path.
+fn session_run_place(
+    known: &SessionFile,
+    host: &str,
+    cwd: &str,
+    after_ms: u64,
+    now: u64,
+) -> Option<Scope> {
+    if !known.session_run_due(after_ms, now) {
+        return None;
+    }
+    if known.workspace_id.is_some() && known.project_id.is_some() {
+        return Some(Scope::default());
+    }
+    Some(default_scope(host, cwd))
+        .filter(|scope| known.workspace_id.is_some() || scope.workspace_id.is_some())
 }
 
 fn default_scope(host: &str, cwd: &str) -> Scope {
@@ -1165,21 +1389,33 @@ fn process_alive(_pid: u32, _start: Option<u64>) -> bool {
 
 /// PreToolUse: a tool call starts. Never touches the network.
 pub(crate) fn tool_started(input: &Value, cwd: &str, tool: &str) {
-    let Some(path) = known_session(input) else {
+    let Some((host, path)) = session_state(input) else {
         return;
     };
+    let Some(known) = read(&path).filter(|file| !file.refused) else {
+        return;
+    };
+    let settings = Settings::from_env();
+    let now = now_ms();
+    let after_ms = session_run_after_ms();
+    // A tool call of the session's own work, and no run to show it on.
+    let fallback = (settings.enabled && !is_contextstream_tool(tool))
+        .then(|| session_run_place(&known, &host, cwd, after_ms, now))
+        .flatten();
     // Nothing open: nothing to note, and no write on the tool path.
-    if read(&path).is_none_or(|file| file.runs.is_empty() || file.refused) {
+    if known.runs.is_empty() && fallback.is_none() {
         return;
     }
     let actor = Actor::of(input);
-    let now = now_ms();
-    let signs_only = Settings::from_env().signs_only();
+    let signs_only = settings.signs_only();
     update(&path, |file: &mut SessionFile| {
         refresh_host(file);
         if signs_only {
             file.hook_event(now);
         } else {
+            if let Some(fallback) = &fallback {
+                file.open_session_run(fallback, after_ms, now);
+            }
             file.tool_started(&actor, tool, now);
         }
     });
@@ -1218,8 +1454,23 @@ pub(crate) fn tool_finished(
     let finding = finding.filter(|finding| !signs_only || !matches!(finding, Finding::Ticket(_)));
     let now = now_ms();
     let Some(finding) = finding else {
-        if read(&path).is_some_and(|file| !file.runs.is_empty() && !file.refused) {
-            update(&path, |file: &mut SessionFile| file.tool_ended(now));
+        let Some(known) = read(&path).filter(|file| !file.refused) else {
+            return;
+        };
+        // A long tool call of the session's own work came back, and there
+        // is still no run to show it on.
+        let after_ms = session_run_after_ms();
+        let fallback = (Settings::from_env().enabled && contextstream_tool.is_none())
+            .then(|| session_run_place(&known, &host, cwd, after_ms, now))
+            .flatten();
+        if !known.runs.is_empty() || fallback.is_some() {
+            update(&path, |file: &mut SessionFile| {
+                if let Some(fallback) = &fallback {
+                    refresh_host(file);
+                    file.open_session_run(fallback, after_ms, now);
+                }
+                file.tool_ended(now);
+            });
             ensure_beater(&path, cwd);
         }
         return;
@@ -1235,8 +1486,13 @@ pub(crate) fn tool_finished(
         refresh_host(file);
         let part_before = file.session.clone();
         let reported = match &finding {
-            Finding::Identity { session, agent } => {
-                file.learn_identity(Some(session.as_str()), Some(agent));
+            Finding::Identity {
+                session,
+                agent,
+                scope,
+                project_name,
+            } => {
+                file.named(session, agent, scope, project_name.as_deref(), now);
                 None
             }
             Finding::Report(answer) => {
@@ -1296,11 +1552,16 @@ pub(crate) fn prompt_submitted(input: &Value, cwd: &str) {
     let Some(path) = known_session(input) else {
         return;
     };
-    if read(&path).is_none_or(|file| file.runs.is_empty() || file.refused) {
+    let Some(known) = read(&path).filter(|file| !file.refused) else {
+        return;
+    };
+    let signs_only = Settings::from_env().signs_only();
+    // With no run open, a prompt is noted only for a session the hooks may
+    // still open a run for: its turn, and the model's span to report, begin.
+    if known.runs.is_empty() && (signs_only || !known.awaits_session_run()) {
         return;
     }
     let now = now_ms();
-    let signs_only = Settings::from_env().signs_only();
     update(&path, |file: &mut SessionFile| {
         refresh_host(file);
         if signs_only {
@@ -1394,8 +1655,14 @@ pub(crate) async fn session_ended(input: &Value, cwd: &str) {
 
 /// What a ContextStream tool call means for the session's runs.
 enum Finding {
-    /// `init` said who the session is.
-    Identity { session: String, agent: Value },
+    /// `init` said who the session is, and where it works: the workspace and
+    /// project it resolved, and the project's name.
+    Identity {
+        session: String,
+        agent: Value,
+        scope: Scope,
+        project_name: Option<String>,
+    },
     /// The model called `progress` (a report), and the answer is at hand.
     Report(Value),
     /// The same, answered in words: the run's id and state, when the words
@@ -1414,6 +1681,33 @@ fn identity_in_text(text: &str) -> Option<Value> {
         .lines()
         .find(|line| line.starts_with(mcp_tools::domains::progress::IDENTITY_LINE))?;
     serde_json::from_str(line.get(line.find('{')?..)?).ok()
+}
+
+/// Where the session works, as `init` says it in words (a local server): the
+/// ids on its "Resolved workspace_id:" and "Resolved project_id:" lines, and
+/// the project's name after ", project: " on its first line.
+fn place_in_text(text: &str) -> (Scope, Option<String>) {
+    let id_on = |label: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(label))
+            .map(str::trim)
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+            .map(str::to_string)
+    };
+    let name = text
+        .lines()
+        .next()
+        .filter(|line| line.starts_with("Session ready for workspace: "))
+        .and_then(|line| line.rsplit_once(", project: "))
+        .map(|(_, name)| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    (
+        Scope {
+            workspace_id: id_on("Resolved workspace_id:"),
+            project_id: id_on("Resolved project_id:"),
+        },
+        name,
+    )
 }
 
 /// The word after `mark` in a tool's text (`run_id=...`, `state=...`).
@@ -1453,12 +1747,29 @@ fn classify(tool: &str, tool_input: &Value, answer: &Answer) -> Option<Finding> 
                 .and_then(|json| json.get("run_progress"))
                 .cloned()
                 .or_else(|| answer.text.and_then(identity_in_text))?;
+            let (scope, project_name) = match answer.json {
+                Some(json) => (
+                    Scope {
+                        workspace_id: uuid_text(json, "workspace_id"),
+                        project_id: uuid_text(json, "project_id"),
+                    },
+                    json.get("project")
+                        .and_then(|project| text(project, "name")),
+                ),
+                None => answer.text.map(place_in_text).unwrap_or_default(),
+            };
             Some(Finding::Identity {
                 session: text(&identity, "session")?,
                 agent: identity
                     .get("agent")
                     .filter(|agent| agent.is_object())?
                     .clone(),
+                // A project belongs to the workspace it was resolved in.
+                scope: Scope {
+                    project_id: scope.project_id.filter(|_| scope.workspace_id.is_some()),
+                    workspace_id: scope.workspace_id,
+                },
+                project_name,
             })
         }
         "progress" if action.is_empty() || action == "report" => {

@@ -2,6 +2,11 @@
 
 ## 1.0.82
 
+- Live progress from the hooks (`CONTEXTSTREAM_RUN_PROGRESS_AUTO=on`; still off unless you turn it on): a session that works without reporting is now shown. Until now a run started by itself only when a ticket was taken up, so a session whose assistant never called `progress` and took no ticket was on no floor at all, however long it worked. Now, once such a session has worked for two minutes of a turn with no run, the hooks start the session's own: the workspace and project `init` resolved, the agent and run key a `progress` report that names no run would use, and the title "Working in" with the project's name. It is kept alive, shows the kind of work in the hooks' fixed sentences from its first tool call, waits when the turn ends and ends with the session or its process, like every run the hooks keep.
+  - The two minutes are your assistant's: a run's title is set when it starts, so a report that comes first keeps its own title, and the hooks then start nothing. A later report that names no run lands on the session's own run and makes it the assistant's; work reported on a ticket or under a `run_key`, or a ticket taken up, ends it with "The session reported its work as another run."
+  - At most one such run per MCP connection, and none once the assistant has reported or a ticket was taken up. Nothing starts without a workspace (the one `init` resolved, else the folder's). `CONTEXTSTREAM_RUN_PROGRESS_SESSION_AFTER_SECS` sets the span (0 to 3600 seconds).
+  - What is sent is in [Live run progress from the hooks](docs/data-handling.md#live-run-progress-from-the-hooks). No hook registration changes: the hooks read `init`'s answer as before.
+
 - Reports minutes apart refresh stale delivery offers and claim them within one five-second budget. If time runs out with a known offer, the report names the client’s `get` call. A 404 stays silent; after the cooldown, the next spaced report can pick up deliveries if the routes have come online.
 
 - A terminal report returns any messages or answers this session already claimed for that run but has not shown. They can still be replied to or declined; finishing starts no delivery read or claim.

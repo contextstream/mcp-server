@@ -771,7 +771,8 @@ fn a_local_server_answers_in_words_and_the_hooks_still_follow() {
         "Session ready for workspace: Testing\nResolved workspace_id: {WORKSPACE}\n{}: {identity}\n\n[ACCOUNT_CONTEXT]\nactive_mode=team",
         mcp_tools::domains::progress::IDENTITY_LINE
     );
-    let Some(Finding::Identity { session, agent }) = classify("init", &json!({}), &words(&init))
+    let Some(Finding::Identity { session, agent, .. }) =
+        classify("init", &json!({}), &words(&init))
     else {
         panic!("the identity line is read");
     };
@@ -1150,4 +1151,476 @@ fn no_sign_of_life_for_a_waiting_run_a_run_without_an_id_or_one_silent_for_hours
     );
     file.hook_event(t0 + 4 * 60 * MINUTE);
     assert!(file.signs_due(every, t0 + 4 * 60 * MINUTE).is_empty());
+}
+
+// ============================================================================
+// The session's own run: a session that works without a report
+// ============================================================================
+
+const SPAN: u64 = 2 * MINUTE;
+const PROJECT_NAME: &str = "mcp-server";
+
+fn in_project() -> Scope {
+    Scope {
+        workspace_id: Some(WORKSPACE.to_string()),
+        project_id: Some(PROJECT.to_string()),
+    }
+}
+
+/// A session `init` answered at `at`: who it is, and where it works.
+fn named_at(at: u64) -> SessionFile {
+    let mut file = SessionFile::default();
+    file.named(
+        SESSION,
+        &tool_agent(),
+        &in_project(),
+        Some(PROJECT_NAME),
+        at,
+    );
+    file
+}
+
+fn session_key() -> String {
+    default_run_key(SESSION, None)
+}
+
+/// What the `progress` tool answers for a report on the session's default run.
+fn default_answer(state: &str) -> Value {
+    json!({
+        "run": {
+            "run_id": RUN,
+            "workspace_id": WORKSPACE,
+            "project_id": PROJECT,
+            "state": state,
+            "liveness": if state == "working" { "live" } else { "ended" },
+            "agent": tool_agent(),
+            "scope": {"workspace_id": WORKSPACE},
+        },
+        "written": ["run.step"],
+        "session": SESSION,
+        "run_key": session_key(),
+    })
+}
+
+#[test]
+fn a_session_that_works_without_a_report_gets_a_run_of_its_own() {
+    let mut file = named_at(1_000);
+    // Knowing who the session is sends nothing, and neither does its first
+    // while of work: the model's own report, with its own title, comes first.
+    assert!(file.pending.is_empty());
+    assert!(!file.session_run_due(SPAN, 1_000 + SPAN - 1));
+    assert!(!file.open_session_run(&Scope::default(), SPAN, 1_000 + SPAN - 1));
+    assert!(file.pending.is_empty() && file.runs.is_empty());
+
+    // It has worked the span with no run: the hooks open the session's own.
+    assert!(file.session_run_due(SPAN, 1_000 + SPAN));
+    assert!(file.open_session_run(&Scope::default(), SPAN, 1_000 + SPAN));
+    let sent = take(&mut file);
+    assert_eq!(sent.len(), 1);
+    let body = sent[0].as_object().unwrap();
+    // The key the tool makes for a report that names no run, and the tool's
+    // agent: the model's later report lands on this run under this name.
+    assert_eq!(body["source_run_id"], json!(session_key()));
+    assert_eq!(body["agent"], tool_agent());
+    assert_eq!(body["group_id"], tool_agent()["id"]);
+    // Where the session works, as `init` resolved it.
+    assert_eq!(body["workspace_id"], json!(WORKSPACE));
+    assert_eq!(body["project_id"], json!(PROJECT));
+    assert_eq!(body["status"], json!("working"));
+    // Fixed words and the project's own name: nothing of the work.
+    assert_eq!(body["title"], json!("Working in mcp-server"));
+    let mut keys: Vec<&str> = body.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "agent",
+            "group_id",
+            "heartbeat_s",
+            "project_id",
+            "source_run_id",
+            "status",
+            "title",
+            "workspace_id"
+        ]
+    );
+    assert_eq!(file.runs.len(), 1);
+    assert!(file.runs[0].unreported);
+
+    // One run, once: nothing more is due while it is open, or after it ended.
+    assert!(!file.session_run_due(SPAN, 1_000 + 10 * SPAN));
+    assert!(!file.open_session_run(&Scope::default(), SPAN, 1_000 + 10 * SPAN));
+    file.end_all(SESSION_ENDED);
+    take(&mut file);
+    assert!(!file.session_run_due(SPAN, 1_000 + 20 * SPAN));
+}
+
+#[test]
+fn the_span_counts_from_the_turns_start() {
+    // A session that sat idle after `init` and then got a prompt: the model
+    // has the same span to report its new work under its own title.
+    let mut file = named_at(1_000);
+    file.prompt_submitted(1_000 + 30 * MINUTE);
+    assert!(!file.session_run_due(SPAN, 1_000 + 30 * MINUTE + SPAN - 1));
+    assert!(file.session_run_due(SPAN, 1_000 + 30 * MINUTE + SPAN));
+}
+
+#[test]
+fn a_session_whose_model_reports_gets_no_run_from_the_hooks() {
+    let mut file = named_at(1_000);
+    file.model_reported(
+        &json!({"title": "Fix the flaky login test", "step": "Reading the test"}),
+        &default_answer("working"),
+        &Scope::default(),
+        5_000,
+    );
+    assert!(file.pending.is_empty());
+    assert_eq!(file.runs.len(), 1);
+    assert!(!file.runs[0].unreported);
+    assert!(!file.session_run_due(SPAN, 1_000 + SPAN));
+    assert!(!file.open_session_run(&Scope::default(), SPAN, 1_000 + SPAN));
+
+    // The model's word stands after its run is over, too: the hooks do not
+    // speak for a session whose model has.
+    file.model_reported(
+        &json!({"status": "completed", "summary": "Fixed."}),
+        &default_answer("finished"),
+        &Scope::default(),
+        9_000,
+    );
+    assert!(file.runs.is_empty());
+    assert!(!file.session_run_due(SPAN, 1_000 + 30 * SPAN));
+    assert!(file.pending.is_empty());
+}
+
+#[test]
+fn a_session_on_a_ticket_gets_no_second_run() {
+    let mut file = named_at(1_000);
+    file.ticket_changed(
+        &main_agent(),
+        &ticket("in_progress"),
+        &Scope::default(),
+        2_000,
+    );
+    take(&mut file);
+    assert!(!file.session_run_due(SPAN, 1_000 + SPAN));
+    assert!(!file.open_session_run(&Scope::default(), SPAN, 1_000 + SPAN));
+    assert_eq!(file.runs.len(), 1);
+    assert!(file.pending.is_empty());
+}
+
+#[test]
+fn the_models_report_makes_the_session_run_its_own() {
+    let mut file = named_at(0);
+    assert!(file.open_session_run(&Scope::default(), SPAN, SPAN));
+    take(&mut file);
+
+    // A report that names no run lands on the session's run by its key.
+    let index = file.model_reported(
+        &json!({"step": "Reading the handler"}),
+        &default_answer("working"),
+        &Scope::default(),
+        SPAN + 5_000,
+    );
+    assert_eq!(index, Some(0));
+    assert_eq!(file.runs.len(), 1);
+    assert!(!file.runs[0].unreported);
+    assert_eq!(file.runs[0].run_id.as_deref(), Some(RUN));
+    // Nothing is ended and nothing is said by the hooks.
+    assert!(file.pending.is_empty());
+    // The model gave a step: the hooks leave it alone for ten minutes.
+    file.tool_started(&main_agent(), "Edit", SPAN + 5 * MINUTE);
+    assert!(file.pending.is_empty());
+}
+
+#[test]
+fn work_reported_as_another_run_ends_the_unreported_session_run() {
+    // Taking up a ticket: the ticket's run is the session's work now.
+    let mut file = named_at(0);
+    assert!(file.open_session_run(&Scope::default(), SPAN, SPAN));
+    take(&mut file);
+    file.ticket_changed(
+        &main_agent(),
+        &ticket("in_progress"),
+        &Scope::default(),
+        SPAN + 1_000,
+    );
+    let sent = take(&mut file);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["source_run_id"], json!(session_key()));
+    assert_eq!(sent[0]["status"], json!("stopped"));
+    assert_eq!(sent[0]["summary"], json!(MOVED_ON));
+    assert_eq!(sent[1]["source_run_id"], json!(ticket_key()));
+    assert_eq!(sent[1]["status"], json!("working"));
+    assert_eq!(file.runs.len(), 1);
+    assert_eq!(file.runs[0].key, Some(ticket_key()));
+
+    // The model reporting on a ticket does the same.
+    let mut file = named_at(0);
+    assert!(file.open_session_run(&Scope::default(), SPAN, SPAN));
+    take(&mut file);
+    file.model_reported(
+        &json!({"ticket_id": TICKET, "step": "Reading"}),
+        &answer(&ticket_key(), "working"),
+        &Scope::default(),
+        SPAN + 1_000,
+    );
+    let sent = take(&mut file);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["source_run_id"], json!(session_key()));
+    assert_eq!(sent[0]["summary"], json!(MOVED_ON));
+    assert_eq!(file.runs.len(), 1);
+    assert_eq!(file.runs[0].key, Some(ticket_key()));
+
+    // A subagent's ticket is its own work: the session is still at its own.
+    let mut file = named_at(0);
+    assert!(file.open_session_run(&Scope::default(), SPAN, SPAN));
+    take(&mut file);
+    file.ticket_changed(
+        &explore(),
+        &ticket("in_progress"),
+        &Scope::default(),
+        SPAN + 1_000,
+    );
+    let sent = take(&mut file);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["status"], json!("working"));
+    assert_eq!(file.runs.len(), 2);
+    assert!(file.runs[0].unreported);
+}
+
+#[test]
+fn an_unreported_session_run_shows_the_kind_of_work_at_once() {
+    let mut file = named_at(0);
+    assert!(file.open_session_run(&Scope::default(), SPAN, SPAN));
+    take(&mut file);
+
+    // No step of the model's stands to be written over: the fixed sentence
+    // for the tool's kind is said with the first tool call.
+    file.tool_started(&main_agent(), "Bash", SPAN + 1);
+    let sent = take(&mut file);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["source_run_id"], json!(session_key()));
+    assert_eq!(
+        sent[0]["step"],
+        json!({"label": "Running a command", "kind": "run", "status": "started"})
+    );
+    // The same kind again says nothing, and another kind waits its minute.
+    file.tool_started(&main_agent(), "Bash", SPAN + 5_000);
+    file.tool_started(&main_agent(), "Read", SPAN + 30_000);
+    assert!(file.pending.is_empty());
+    file.tool_started(&main_agent(), "Read", SPAN + MINUTE + 2);
+    assert_eq!(take(&mut file)[0]["step"]["label"], json!("Reading files"));
+    // ContextStream's own calls are not the work.
+    file.tool_started(
+        &main_agent(),
+        "mcp__contextstream__search",
+        SPAN + 5 * MINUTE,
+    );
+    assert!(file.pending.is_empty());
+}
+
+#[test]
+fn no_session_run_without_a_name_or_a_workspace() {
+    // The server has not said who the session is.
+    let mut file = SessionFile::default();
+    assert!(!file.session_run_due(SPAN, 10 * SPAN));
+    assert!(!file.open_session_run(&in_project(), SPAN, 10 * SPAN));
+    assert!(file.pending.is_empty() && file.runs.is_empty());
+
+    // `init` resolved no workspace and the folder is linked to none.
+    let mut file = SessionFile::default();
+    file.named(SESSION, &tool_agent(), &Scope::default(), None, 0);
+    assert!(!file.open_session_run(&Scope::default(), SPAN, SPAN));
+    assert!(file.pending.is_empty() && file.runs.is_empty());
+    // Nothing was decided: the folder's own link still opens it.
+    assert!(file.open_session_run(&in_project(), SPAN, SPAN));
+    let sent = take(&mut file);
+    assert_eq!(sent[0]["workspace_id"], json!(WORKSPACE));
+    assert_eq!(sent[0]["project_id"], json!(PROJECT));
+    // No project name was given: the fixed word alone.
+    assert_eq!(sent[0]["title"], json!("Working"));
+
+    // A refused session opens nothing.
+    let mut file = named_at(0);
+    file.refuse();
+    assert!(!file.session_run_due(SPAN, SPAN));
+    assert!(!file.open_session_run(&Scope::default(), SPAN, SPAN));
+}
+
+#[test]
+fn a_session_whose_init_named_no_project_takes_the_folders_in_its_workspace() {
+    let workspace_only = Scope {
+        workspace_id: Some(WORKSPACE.to_string()),
+        project_id: None,
+    };
+    let named = || {
+        let mut file = SessionFile::default();
+        file.named(SESSION, &tool_agent(), &workspace_only, None, 0);
+        file
+    };
+
+    // The folder is linked to a project of that workspace (a session opened
+    // from a parent folder, say): that is the project the session works in.
+    let mut file = named();
+    assert!(file.open_session_run(&in_project(), SPAN, SPAN));
+    let sent = take(&mut file);
+    assert_eq!(sent[0]["workspace_id"], json!(WORKSPACE));
+    assert_eq!(sent[0]["project_id"], json!(PROJECT));
+    assert_eq!(sent[0]["title"], json!("Working"));
+
+    // A folder linked into another workspace says nothing about this one.
+    let elsewhere = Scope {
+        workspace_id: Some("99999999-9999-4999-8999-999999999999".to_string()),
+        project_id: Some(PROJECT.to_string()),
+    };
+    let mut file = named();
+    assert!(file.open_session_run(&elsewhere, SPAN, SPAN));
+    let sent = take(&mut file);
+    assert_eq!(sent[0]["workspace_id"], json!(WORKSPACE));
+    assert!(sent[0].get("project_id").is_none());
+
+    // No link at all: the session is still shown, in its workspace.
+    let mut file = named();
+    assert!(file.open_session_run(&Scope::default(), SPAN, SPAN));
+    let sent = take(&mut file);
+    assert_eq!(sent[0]["workspace_id"], json!(WORKSPACE));
+    assert!(sent[0].get("project_id").is_none());
+
+    // What `init` resolved is never replaced by the folder's link.
+    let mut file = named_at(0);
+    let other_project = Scope {
+        workspace_id: Some(WORKSPACE.to_string()),
+        project_id: Some("77777777-7777-4777-8777-777777777777".to_string()),
+    };
+    assert!(file.open_session_run(&other_project, SPAN, SPAN));
+    assert_eq!(take(&mut file)[0]["project_id"], json!(PROJECT));
+}
+
+#[test]
+fn a_project_name_is_one_short_line() {
+    let mut file = SessionFile::default();
+    let long = format!("  api\n{}  ", "x".repeat(300));
+    file.named(SESSION, &tool_agent(), &in_project(), Some(&long), 0);
+    assert!(file.open_session_run(&Scope::default(), SPAN, SPAN));
+    let title = take(&mut file)[0]["title"].as_str().unwrap().to_string();
+    assert!(title.starts_with("Working in api x"), "{title}");
+    assert!(!title.contains('\n'));
+    assert!(title.chars().count() <= 100, "{}", title.chars().count());
+}
+
+#[test]
+fn a_reconnected_session_gets_a_run_under_its_new_name() {
+    let mut file = named_at(0);
+    assert!(file.open_session_run(&Scope::default(), SPAN, SPAN));
+    take(&mut file);
+
+    let other = "77b2aa00112233445566778899aabbcc";
+    let agent = agent_for_session(None, Some("claude-code".to_string()), other);
+    file.named(other, &agent, &in_project(), Some(PROJECT_NAME), 10 * SPAN);
+    let sent = take(&mut file);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["source_run_id"], json!(session_key()));
+    assert_eq!(sent[0]["summary"], json!(RECONNECTED));
+    assert!(file.runs.is_empty());
+
+    // The new part has its own span, and its own run after it.
+    assert!(!file.session_run_due(SPAN, 11 * SPAN - 1));
+    assert!(file.open_session_run(&Scope::default(), SPAN, 11 * SPAN));
+    let sent = take(&mut file);
+    assert_eq!(
+        sent[0]["source_run_id"],
+        json!(default_run_key(other, None))
+    );
+    assert_eq!(sent[0]["agent"], agent);
+}
+
+#[test]
+fn the_session_run_waits_at_the_turns_end_and_ends_with_the_session() {
+    let mut file = named_at(0);
+    assert!(file.open_session_run(&Scope::default(), SPAN, SPAN));
+    take(&mut file);
+
+    file.turn_ended(SPAN + 1_000);
+    let sent = take(&mut file);
+    assert_eq!(sent[0]["status"], json!("waiting_input"));
+    assert_eq!(sent[0]["waiting"], json!({"on": "person"}));
+    file.prompt_submitted(SPAN + 2_000);
+    assert_eq!(take(&mut file)[0]["status"], json!("working"));
+
+    file.end_all(SESSION_ENDED);
+    let sent = take(&mut file);
+    assert_eq!(sent[0]["source_run_id"], json!(session_key()));
+    assert_eq!(sent[0]["status"], json!("stopped"));
+    assert_eq!(sent[0]["summary"], json!(SESSION_ENDED));
+}
+
+#[test]
+fn init_says_where_the_session_works() {
+    let identity = json!({"session": SESSION, "agent": tool_agent()});
+    // The hosted gateway: the structured answer.
+    let json = json!({
+        "workspace_id": WORKSPACE,
+        "project_id": PROJECT,
+        "project": {"id": PROJECT, "name": PROJECT_NAME},
+        "run_progress": identity,
+    });
+    match classify("init", &json!({}), &structured(&json)) {
+        Some(Finding::Identity {
+            session,
+            scope,
+            project_name,
+            ..
+        }) => {
+            assert_eq!(session, SESSION);
+            assert_eq!(scope.workspace_id.as_deref(), Some(WORKSPACE));
+            assert_eq!(scope.project_id.as_deref(), Some(PROJECT));
+            assert_eq!(project_name.as_deref(), Some(PROJECT_NAME));
+        }
+        _ => panic!("init names the session"),
+    }
+    // A local server: the same in words.
+    let said = format!(
+        "Session ready for workspace: Engineering, project: {PROJECT_NAME}\nResolved workspace_id: {WORKSPACE}\nResolved project_id: {PROJECT}\n{}: {identity}",
+        mcp_tools::domains::progress::IDENTITY_LINE
+    );
+    match classify("init", &json!({}), &words(&said)) {
+        Some(Finding::Identity {
+            scope,
+            project_name,
+            ..
+        }) => {
+            assert_eq!(scope.workspace_id.as_deref(), Some(WORKSPACE));
+            assert_eq!(scope.project_id.as_deref(), Some(PROJECT));
+            assert_eq!(project_name.as_deref(), Some(PROJECT_NAME));
+        }
+        _ => panic!("init names the session in words"),
+    }
+    // No workspace resolved: who the session is, and no place.
+    let said = format!(
+        "Session initialized without a resolved workspace_id.\n{}: {identity}",
+        mcp_tools::domains::progress::IDENTITY_LINE
+    );
+    match classify("init", &json!({}), &words(&said)) {
+        Some(Finding::Identity {
+            scope,
+            project_name,
+            ..
+        }) => {
+            assert!(scope.workspace_id.is_none() && scope.project_id.is_none());
+            assert!(project_name.is_none());
+        }
+        _ => panic!("init names the session"),
+    }
+}
+
+#[test]
+fn the_span_before_the_session_run_is_two_minutes_unless_set() {
+    assert_eq!(session_run_after_ms_of(None), 2 * MINUTE);
+    assert_eq!(session_run_after_ms_of(Some("0")), 0);
+    assert_eq!(session_run_after_ms_of(Some(" 45 ")), 45_000);
+    // Anything else, or more than an hour, is the default.
+    assert_eq!(session_run_after_ms_of(Some("soon")), 2 * MINUTE);
+    assert_eq!(session_run_after_ms_of(Some("-1")), 2 * MINUTE);
+    assert_eq!(session_run_after_ms_of(Some("3601")), 2 * MINUTE);
 }

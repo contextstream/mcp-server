@@ -189,6 +189,30 @@ pub fn forwarded_env(
     env
 }
 
+/// The first variable the call names in `local_if_set` that is set here. The
+/// API lists there the variables that change what the call's command does and
+/// that it never asks the value of: a build tool's own options, another set of
+/// dependencies, a search path of this machine. A call that names one that is
+/// set is not made, and the command is run here instead; the names are looked
+/// up on this machine only, and nothing is sent to decide it. Only plain names
+/// count (letters, digits and `_`, at most 64 characters), the first 64 of them.
+pub fn set_here(request: &Value, is_set: impl Fn(&str) -> bool) -> Option<String> {
+    request
+        .get("local_if_set")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 64
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .take(64)
+        .find(|name| is_set(name))
+        .map(str::to_string)
+}
+
 /// Whether `value` holds `scheme://user:password@host`.
 fn has_login_in_url(value: &str) -> bool {
     value.split("://").skip(1).any(|rest| {

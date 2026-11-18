@@ -276,6 +276,41 @@ fn only_plain_names_that_hold_no_credentials_are_forwarded() {
 }
 
 #[test]
+fn a_variable_the_call_marks_local_keeps_it_here() {
+    let request = json!({"local_if_set": ["MAVEN_OPTS", "bad name", "", 7, "BUNDLE_GEMFILE", "COMPOSER_AUTH"]});
+    assert_eq!(set_here(&request, |_| false), None);
+    assert_eq!(
+        set_here(&request, |name| name == "BUNDLE_GEMFILE"),
+        Some("BUNDLE_GEMFILE".to_string())
+    );
+    // A name that looks like a credential is still looked up: nothing of it is sent.
+    assert_eq!(
+        set_here(&request, |name| name == "COMPOSER_AUTH"),
+        Some("COMPOSER_AUTH".to_string())
+    );
+    // A name that is not a plain one is never looked up, and a call that names none is made.
+    assert_eq!(
+        set_here(&request, |name| name == "bad name" || name.is_empty()),
+        None
+    );
+    assert_eq!(set_here(&json!({}), |_| true), None);
+    assert_eq!(
+        set_here(&json!({"local_if_set": "MAVEN_OPTS"}), |_| true),
+        None
+    );
+    // Only the first 64 names are looked up.
+    let many: Vec<String> = (0..80).map(|i| format!("V{i}")).collect();
+    assert_eq!(
+        set_here(&json!({ "local_if_set": many }), |name| name == "V70"),
+        None
+    );
+    assert_eq!(
+        set_here(&json!({ "local_if_set": many }), |name| name == "V63"),
+        Some("V63".to_string())
+    );
+}
+
+#[test]
 fn a_call_is_given_its_limits_plus_slack() {
     assert_eq!(
         deadline_of(&json!({"timeout_s": 100, "wait_s": 20})),

@@ -90,21 +90,32 @@ impl<W: AsyncWrite + Unpin + Send + Sync> PeerChannel for StdioPeer<W> {
             self.forget(&id);
             return Err(format!("the request could not be written: {error}"));
         }
-        let answer = match tokio::time::timeout(timeout, receiver).await {
+        let mut receiver = receiver;
+        let answer = match tokio::time::timeout(timeout, &mut receiver).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => Err("the client went away".to_string()),
             Err(_) => {
-                // Nobody waits for the answer any more: say so, so the client can take the
-                // question down instead of leaving the person to answer into nothing.
-                self.notify(
-                    "notifications/cancelled",
-                    json!({"requestId": id, "reason": "No answer came in time; the tool went on without one."}),
-                )
-                .await;
-                Err(format!(
-                    "no answer within {} seconds",
-                    timeout.as_secs().max(1)
-                ))
+                // No further answer can be delivered once the request is forgotten; one that
+                // landed as the timer fired is still the person's answer (their no must not
+                // be dropped and the call go on without it).
+                self.forget(&id);
+                match receiver.try_recv() {
+                    Ok(answer) => answer,
+                    Err(_) => {
+                        // Nobody waits for the answer any more: say so, so the client can
+                        // take the question down instead of leaving the person to answer
+                        // into nothing.
+                        self.notify(
+                            "notifications/cancelled",
+                            json!({"requestId": id, "reason": "No answer came in time; the tool went on without one."}),
+                        )
+                        .await;
+                        Err(format!(
+                            "no answer within {} seconds",
+                            timeout.as_secs().max(1)
+                        ))
+                    }
+                }
             }
         };
         self.forget(&id);

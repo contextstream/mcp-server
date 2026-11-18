@@ -105,12 +105,14 @@ to pick.
   it next to the team's own context.
 - **Your go-ahead.** `make` spends at most the plan's price, and only after you agree. The
   agent shows you the plan and its price and passes the price you accepted. A client that
-  shows you a form in the middle of a call (MCP elicitation) still asks you itself, and your
-  no wins. A client that answers through the call's result (`input_required`, as Claude Code
+  shows you a form in the middle of a call (MCP elicitation) still asks you itself, for up
+  to 45 seconds: your no wins, and if you give no answer in that time the price the agent
+  passed counts. A client that answers through the call's result (`input_required`, as Claude Code
   does) asks you only when the agent passed no accepted price: with one, the plan is made at
   once. To take no go-ahead from the agent at all, set `CONTEXTSTREAM_GO_AHEAD=asked` (a
   local binary) or send `X-ContextStream-Go-Ahead: asked` (a hosted connection): then only
-  your own yes in the client's form counts, for spending, sending and deleting.
+  your own yes in the client's form counts for spending and sending, and the `delete` tool,
+  which never asks, deletes nothing.
 - **Following it.** `status` reports each piece while it waits (with
   `notifications/progress` where the call asks for them); a product film takes 13 to 21
   minutes. `result` shows images inline and links video and sound (signed links valid

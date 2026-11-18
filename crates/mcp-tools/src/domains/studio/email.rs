@@ -2856,12 +2856,13 @@ impl StudioTool {
         let what = format!("{email} ({why})");
 
         // As for a send: on a stateless call the address the agent confirms is the go, and
-        // no question is sent. Not for an address whose person unsubscribed or complained:
-        // the address is this call's own argument, so confirming it shows nothing was read,
-        // and writing to them again is theirs to allow. They are asked wherever the client
-        // can ask.
+        // no question is sent, but only for a reason that is the team's own to undo: a bounce
+        // or an address added by hand. For any other (the person unsubscribed or complained,
+        // a reason Create adds later, or none), the address is this call's own argument, so
+        // confirming it shows nothing was read, and writing to them again is theirs to allow.
+        // They are asked wherever the client can ask.
         let confirmed = input.confirm_email.as_deref().and_then(address_of);
-        let theirs_to_allow = matches!(reason.as_str(), "unsubscribed" | "complained");
+        let theirs_to_allow = !matches!(reason.as_str(), "bounced" | "manual");
         let agents_word = !crate::go_ahead::asked_only()
             && confirmed.as_deref() == Some(email.as_str())
             && !theirs_to_allow;

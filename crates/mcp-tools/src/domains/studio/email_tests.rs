@@ -1057,6 +1057,95 @@ async fn an_address_that_unsubscribed_comes_off_only_when_the_person_is_asked() 
     assert_eq!(stub.calls_to("POST", remove).len(), 1);
 }
 
+/// Only a reason known to be the team's own to undo (a bounce, an address added by hand) comes
+/// off on the agent's word on a stateless call. Any other reason, one Create adds later or
+/// none at all, is asked about: unknown is not permission (second read of cd7028f).
+#[tokio::test]
+async fn an_unknown_reason_is_asked_about_and_the_other_ways_through_are_pinned() {
+    let stub = Stub::start(Arc::new(|request: &Recorded| {
+        if request.method == "GET" && request.path == "/create/email/suppressions" {
+            return Answer::ok(json!({
+                "suppressions": [
+                    {"email": "ada@northwind.example", "reason": "spam", "source": "webhook",
+                     "detail": null, "createdAt": "2026-10-21T08:00:00Z"},
+                    {"email": "lin@northwind.example", "source": "import",
+                     "detail": null, "createdAt": "2026-10-22T08:00:00Z"},
+                    {"email": "bounced@resend.dev", "reason": "bounced", "source": "webhook",
+                     "detail": "550 5.1.1 Unknown user", "createdAt": "2026-10-19T08:00:00Z"}
+                ],
+                "nextCursor": null, "total": 3
+            }));
+        }
+        (usual())(request)
+    }))
+    .await;
+    let tool = stub.tool();
+    let remove = "/create/email/suppressions/remove";
+    let off = |email: &str| json!({"action": "email_unsubscribes", "operation": "remove", "email": email, "confirm_email": email});
+    let stateless = || {
+        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}))
+    };
+    for email in ["ada@northwind.example", "lin@northwind.example"] {
+        let peer = stateless();
+        let asking = run_with_call_peer(peer.clone(), tool.execute(off(email)))
+            .await
+            .unwrap();
+        assert!(
+            text_of(&asking).starts_with("Asking the person"),
+            "{email}: {}",
+            text_of(&asking)
+        );
+        assert!(peer.take_input_required().is_some(), "{email}");
+    }
+    assert!(stub.calls_to("POST", remove).is_empty());
+
+    // Where only the person's own go counts, a bounce is asked about too.
+    let peer = stateless();
+    let asked_only = mcp_types::config::ConfigOverride {
+        go_ahead_asked_only: Some(true),
+        ..Default::default()
+    };
+    let asking = mcp_client::run_with_config_override(asked_only, || {
+        run_with_call_peer(peer.clone(), tool.execute(off("bounced@resend.dev")))
+    })
+    .await
+    .unwrap();
+    assert!(
+        text_of(&asking).starts_with("Asking the person"),
+        "{}",
+        text_of(&asking)
+    );
+    assert!(peer.take_input_required().is_some());
+    assert!(stub.calls_to("POST", remove).is_empty());
+
+    // A live question about a bounce that nobody answers: with no confirm_email it says so,
+    // and with it the agent's word carries the call.
+    let silent = Arc::new(FakeClient::default());
+    let unanswered = run_with_call_peer(
+        CallPeer::new(silent.clone(), None, true),
+        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "bounced@resend.dev"})),
+    )
+    .await
+    .unwrap();
+    assert!(
+        text_of(&unanswered).starts_with(
+            "Not removed yet: the person was asked through the client and gave no answer in time."
+        ),
+        "{}",
+        text_of(&unanswered)
+    );
+    assert!(stub.calls_to("POST", remove).is_empty());
+    let removed = run_with_call_peer(
+        CallPeer::new(silent.clone(), None, true),
+        tool.execute(off("bounced@resend.dev")),
+    )
+    .await
+    .unwrap();
+    assert!(!removed.is_error, "{}", text_of(&removed));
+    assert_eq!(silent.sent.lock().unwrap().len(), 2, "asked both times");
+    assert_eq!(stub.calls_to("POST", remove).len(), 1);
+}
+
 #[tokio::test]
 async fn a_send_is_refused_plainly_when_it_cant_go() {
     // Already sent: not again.

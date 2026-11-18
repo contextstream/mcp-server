@@ -43,6 +43,7 @@ use crate::domains::destructive::DELETE_TOOL;
 use crate::peer::{self, Elicited};
 
 mod contacts;
+mod drafts;
 mod go;
 mod health;
 mod segments;
@@ -64,6 +65,8 @@ pub(crate) const EMAIL_ACTIONS: &[&str] = &[
     "email_segments",
     "email_recipients",
     "email_diagnostics",
+    "email_templates",
+    "email_ab",
 ];
 
 /// Erasing a contact, which `delete` calls (`studio.email_contact_erase`). It cannot be
@@ -197,6 +200,7 @@ pub(crate) enum Topic {
     Campaign,
     Audience,
     Contact,
+    Template,
     Other,
 }
 
@@ -206,6 +210,7 @@ impl Topic {
             Self::Campaign => "There is no such campaign in this workspace (a campaign is the campaign_id email_draft or email_campaigns returned).",
             Self::Audience => "There is no such audience or segment in this workspace (email_audiences lists them).",
             Self::Contact => "There is no such contact in this workspace (email_contacts lists them).",
+            Self::Template => "There is no such template in this workspace (email_templates lists them).",
             Self::Other => "Create couldn't find that in this workspace.",
         }
     }
@@ -925,6 +930,8 @@ impl StudioTool {
             "email_segments" => self.email_segments(workspace_id, input).await,
             "email_recipients" => self.email_recipients(workspace_id, input).await,
             "email_diagnostics" => self.email_diagnostics(workspace_id, input).await,
+            "email_templates" => self.email_templates(workspace_id, input).await,
+            "email_ab" => self.email_ab(workspace_id, input).await,
             ERASE_ACTION => self.erase_contact(workspace_id, input).await,
             other => Err(Error::Validation(format!("Unknown email action: {other}"))),
         }

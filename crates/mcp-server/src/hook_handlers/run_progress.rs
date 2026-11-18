@@ -748,6 +748,19 @@ impl SessionFile {
         }
     }
 
+    /// The project the session works in, within `workspace_id`: the one
+    /// `init` resolved, else the folder's (`fallback`). A project belongs to
+    /// one workspace, so one resolved for another workspace is nobody's here.
+    fn project_in(&self, workspace_id: &str, fallback: &Scope) -> Option<String> {
+        let within = |workspace: &Option<String>, project: &Option<String>| {
+            project
+                .clone()
+                .filter(|_| workspace.as_deref() == Some(workspace_id))
+        };
+        within(&self.workspace_id, &self.project_id)
+            .or_else(|| within(&fallback.workspace_id, &fallback.project_id))
+    }
+
     /// Whether the hooks may still open this session's own run: the server
     /// said who the session is, and nothing has spoken for its work under
     /// this part (see `spoken_for`).
@@ -788,12 +801,7 @@ impl SessionFile {
         let (workspace_id, project_id) = match &self.workspace_id {
             Some(workspace_id) => (
                 workspace_id.clone(),
-                self.project_id.clone().or_else(|| {
-                    fallback
-                        .project_id
-                        .clone()
-                        .filter(|_| fallback.workspace_id.as_ref() == Some(workspace_id))
-                }),
+                self.project_in(workspace_id, fallback),
             ),
             None => match &fallback.workspace_id {
                 Some(workspace_id) => (workspace_id.clone(), fallback.project_id.clone()),
@@ -926,6 +934,14 @@ impl SessionFile {
                 self.runs.len() - 1
             }
         };
+        // A run the server had no project for is shown in the session's: the
+        // hooks' signals carry it, and the API takes a run's project from
+        // them. A project the report named stands.
+        if self.runs[index].project_id.is_none() {
+            let workspace_id = self.runs[index].workspace_id.clone();
+            self.runs[index].project_id =
+                uuid_text(view, "project_id").or_else(|| self.project_in(&workspace_id, scope));
+        }
         let run = &mut self.runs[index];
         // The model reported on it: the run is the model's.
         run.unreported = false;

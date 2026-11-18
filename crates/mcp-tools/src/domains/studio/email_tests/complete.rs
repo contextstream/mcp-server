@@ -744,6 +744,33 @@ async fn an_import_tells_a_newer_create_what_the_person_saw() {
 }
 
 #[tokio::test]
+async fn an_import_checks_the_people_in_the_original_preview_even_if_the_count_matches() {
+    let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = changed.clone();
+    let base = import_api(true);
+    let stub = Stub::start(Arc::new(move |r| {
+        let mut answer = base(r);
+        if r.path == "/create/email/contacts/import/preview"
+            && flag.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            answer.body["data"]["digest"] = json!("new-digest");
+        }
+        answer
+    }))
+    .await;
+    let preview = run(&stub, import_input("import_preview")).await;
+    assert!(text_of(&preview).contains("Suppressed addresses: not answered"));
+    let mut approved = structured(&preview)["confirm_with"].clone();
+    approved["csv"] = json!(CSV);
+    changed.store(true, std::sync::atomic::Ordering::Relaxed);
+    let result = run(&stub, approved).await;
+    assert!(text_of(&result).contains("preview again"));
+    assert!(stub
+        .calls_to("POST", "/create/email/contacts/import")
+        .is_empty());
+}
+
+#[tokio::test]
 async fn an_import_asks_the_person_where_the_client_can() {
     let stub = Stub::start(import_api(false)).await;
     let tool = stub.tool();

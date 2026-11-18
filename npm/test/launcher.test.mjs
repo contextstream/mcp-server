@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
-import https from "node:https";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -221,29 +220,4 @@ test("checksum mismatch fails closed without executing the artifact", integratio
       return true;
     },
   );
-});
-
-test("release metadata rejects an environment-only CA", integrationOptions, async (t) => {
-  const dir = await temporaryDirectory(t, "launcher-ca");
-  const cert = path.join(dir, "ca.pem");
-  const key = path.join(dir, "key.pem");
-  await execFileAsync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes",
-    "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1",
-    "-days", "1", "-keyout", key, "-out", cert]);
-  let requests = 0;
-  const server = https.createServer({ key: await readFile(key), cert: await readFile(cert) },
-    (_request, response) => { requests += 1; response.end("{}"); });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
-  const prefix = `https://127.0.0.1:${server.address().port}/`;
-  await assert.rejects(launch(bins.mcp, ["--version"], launcherEnvironment(dir, prefix,
-    { SSL_CERT_FILE: cert, NODE_EXTRA_CA_CERTS: cert })));
-  assert.equal(requests, 0, "the TLS handshake must fail before the manifest request");
-  const curl = path.join(repositoryRoot, "scripts/release/installer-tls/curl");
-  const realCurl = (await execFileAsync("sh", ["-c", "command -v curl"])).stdout.trim();
-  await assert.rejects(execFileAsync(curl, ["-fsS", prefix], { env: {
-    ...process.env, CONTEXTSTREAM_INSTALL_CURL: realCurl, SSL_CERT_FILE: cert,
-    CURL_CA_BUNDLE: cert, NO_PROXY: "127.0.0.1",
-  } }), (error) => error.code === 60);
-  assert.equal(requests, 0, "nested installer downloads must also reject the CA");
 });

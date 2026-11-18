@@ -594,6 +594,11 @@ class CompiledInFilesAreTracked(unittest.TestCase):
                 checked += 1
                 with self.subTest(source=source.relative_to(root).as_posix(), include=name):
                     self.assertTrue(relative in tracked, f"{relative} is compiled in but not tracked by git")
+                    if "src" in source.relative_to(root).parts:
+                        self.assertTrue(
+                            relative.startswith("crates/"),
+                            f"{relative} is compiled into crate sources from outside crates/",
+                        )
         self.assertGreater(checked, 0)
 
 

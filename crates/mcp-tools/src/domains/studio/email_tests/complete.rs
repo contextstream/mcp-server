@@ -864,3 +864,444 @@ async fn a_csv_file_is_read_only_by_a_local_binary_and_only_as_a_csv() {
         1
     );
 }
+
+// ============================================================================
+// email_segments and email_recipients
+// ============================================================================
+
+const NEW_SEGMENT: &str = "14141414-1414-4414-8414-141414141414";
+
+fn rules() -> Value {
+    json!({"match": "all", "conditions": [
+        {"field": "tag", "op": "has", "value": "vip"},
+        {"field": "engagement", "op": "opened_within", "value": "30"},
+    ]})
+}
+
+fn segment(id: &str, name: &str, rules: &Value) -> Value {
+    json!({
+        "id": id, "audienceId": AUDIENCE, "name": name, "rules": rules,
+        "contacts": 12, "subscribed": 10,
+        "createdAt": "2026-10-01T10:00:00Z", "updatedAt": "2026-10-01T10:00:00Z",
+    })
+}
+
+fn segments_api() -> Responder {
+    over(
+        |request| match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/create/email/audiences") => Some(Answer::ok(json!([
+                audience(AUDIENCE, "Coffee club", Some("production"), 40, 37),
+                audience(PROOF, "Proof", Some("test"), 3, 3),
+            ]))),
+            ("GET", "/create/email/segments") => {
+                Some(Answer::ok(json!([segment(SEGMENT, "Regulars", &rules())])))
+            }
+            ("POST", "/create/email/segments/preview") => Some(Answer::ok(json!({
+                "contacts": 12, "subscribed": 10,
+                "sample": [
+                    {"email": "ada@northwind.example", "firstName": "Ada"},
+                    {"email": "bob@northwind.example", "firstName": null},
+                ],
+            }))),
+            ("POST", "/create/email/segments") => {
+                if request.body["rules"]["conditions"][0]["op"] == "wears" {
+                    return Some(Answer::error(
+                        400,
+                        "BAD_REQUEST",
+                        "Bad request: Condition 1: tag takes has, has_not.",
+                    ));
+                }
+                Some(Answer::status(
+                    201,
+                    segment(
+                        NEW_SEGMENT,
+                        request.body["name"].as_str().unwrap_or(""),
+                        &request.body["rules"],
+                    ),
+                ))
+            }
+            ("PATCH", path) if path == format!("/create/email/segments/{SEGMENT}") => {
+                Some(Answer::ok(segment(
+                    SEGMENT,
+                    request.body["name"].as_str().unwrap_or("Regulars"),
+                    request.body.get("rules").unwrap_or(&rules()),
+                )))
+            }
+            _ => None,
+        },
+    )
+}
+
+#[tokio::test]
+async fn segments_are_listed_previewed_created_and_changed() {
+    let stub = Stub::start(segments_api()).await;
+
+    let listed = run(&stub, json!({"action": "email_segments"})).await;
+    let text = text_of(&listed);
+    assert!(!listed.is_error, "{text}");
+    assert!(text.starts_with("1 segment as of now:"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "- Regulars, of Coffee club: 12 contacts, 10 subscribed; all of: tag has vip; engagement opened within 30 (segment_id {SEGMENT})"
+        )),
+        "{text}"
+    );
+    assert_eq!(structured(&listed)["segments"][0]["subscribed"], 10);
+    let scoped = run(
+        &stub,
+        json!({"action": "email_segments", "audience_id": AUDIENCE}),
+    )
+    .await;
+    assert!(!scoped.is_error);
+    assert!(stub
+        .calls_to("GET", "/create/email/segments")
+        .last()
+        .unwrap()
+        .query
+        .contains(&format!("audienceId={AUDIENCE}")));
+
+    // A preview counts who matches and saves nothing.
+    let preview = run(
+        &stub,
+        json!({"action": "email_segments", "operation": "preview", "audience_id": AUDIENCE, "rules": rules()}),
+    )
+    .await;
+    let text = text_of(&preview);
+    assert!(!preview.is_error, "{text}");
+    assert_eq!(
+        stub.calls_to("POST", "/create/email/segments/preview")[0].body,
+        json!({"workspaceId": WORKSPACE, "audienceId": AUDIENCE, "rules": rules()})
+    );
+    assert!(
+        text.starts_with("These rules match 12 contacts in “Coffee club”, 10 of them subscribed: all of: tag has vip; engagement opened within 30."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Sample: ada@northwind.example, bob@northwind.example."),
+        "{text}"
+    );
+    assert!(text.contains("Nothing is saved"), "{text}");
+    assert!(stub.calls_to("POST", "/create/email/segments").is_empty());
+
+    let created = run(
+        &stub,
+        json!({"action": "email_segments", "operation": "create", "audience_id": AUDIENCE, "name": "VIPs", "rules": rules()}),
+    )
+    .await;
+    let text = text_of(&created);
+    assert!(!created.is_error, "{text}");
+    assert_eq!(
+        stub.calls_to("POST", "/create/email/segments")[0].body,
+        json!({"workspaceId": WORKSPACE, "audienceId": AUDIENCE, "name": "VIPs", "rules": rules()})
+    );
+    assert!(
+        text.starts_with(&format!(
+            "Created the segment “VIPs” of “Coffee club” (segment_id {NEW_SEGMENT}): 12 contacts, 10 subscribed."
+        )),
+        "{text}"
+    );
+    assert_eq!(structured(&created)["segment_id"], NEW_SEGMENT);
+
+    let renamed = run(
+        &stub,
+        json!({"action": "email_segments", "operation": "update", "segment_id": SEGMENT, "name": "Loyal regulars"}),
+    )
+    .await;
+    assert!(!renamed.is_error, "{}", text_of(&renamed));
+    assert_eq!(
+        stub.calls_to("PATCH", &format!("/create/email/segments/{SEGMENT}"))[0].body,
+        json!({"workspaceId": WORKSPACE, "name": "Loyal regulars"})
+    );
+    assert!(
+        text_of(&renamed).starts_with(&format!(
+            "Changed the segment “Loyal regulars” (segment_id {SEGMENT}): 12 contacts, 10 subscribed."
+        )),
+        "{}",
+        text_of(&renamed)
+    );
+
+    // Create's own sentence about rules it refuses is kept.
+    let mut bad = rules();
+    bad["conditions"][0]["op"] = json!("wears");
+    let refused = run(
+        &stub,
+        json!({"action": "email_segments", "operation": "create", "audience_id": AUDIENCE, "name": "Odd", "rules": bad}),
+    )
+    .await;
+    assert_eq!(
+        text_of(&refused),
+        "Not created: Condition 1: tag takes has, has_not."
+    );
+
+    for (input, said) in [
+        (
+            json!({"action": "email_segments", "operation": "preview", "audience_id": AUDIENCE}),
+            "rules is required",
+        ),
+        (
+            json!({"action": "email_segments", "operation": "preview", "rules": rules()}),
+            "audience_id is required",
+        ),
+        (
+            json!({"action": "email_segments", "operation": "create", "audience_id": AUDIENCE, "rules": rules()}),
+            "name is required",
+        ),
+        (
+            json!({"action": "email_segments", "operation": "update", "segment_id": SEGMENT}),
+            "needs something to change",
+        ),
+        (
+            json!({"action": "email_segments", "operation": "update", "name": "X"}),
+            "segment_id is required",
+        ),
+        (
+            json!({"action": "email_segments", "operation": "preview", "audience_id": AUDIENCE, "rules": "vips"}),
+            "rules is",
+        ),
+    ] {
+        let refused = stub.tool().execute(input).await.unwrap_err();
+        assert!(refused.to_string().contains(said), "{refused}");
+    }
+}
+
+fn reach(basis: &str) -> Value {
+    json!({
+        "campaignId": CAMPAIGN, "status": if basis == "sends" { "paused" } else { "draft" }, "revision": 4,
+        "audience": {"id": AUDIENCE, "name": "Coffee club", "purpose": "production"},
+        "segment": null, "basis": basis, "contacts": 40, "eligible": if basis == "sends" { 25 } else { 37 },
+        "leftOut": {"unsubscribed": 2, "bounced": 1, "complained": 0, "manual": 0},
+        "sample": [
+            {"email": "ada@northwind.example", "firstName": "Ada"},
+            {"email": "bob@northwind.example", "firstName": null},
+        ],
+    })
+}
+
+#[tokio::test]
+async fn who_a_send_would_reach_is_read_from_create() {
+    let stub = Stub::start(over(|request| {
+        (request.path == format!("/create/email/campaigns/{CAMPAIGN}/reach"))
+            .then(|| Answer::ok(reach("audience")))
+    }))
+    .await;
+    let result = run(
+        &stub,
+        json!({"action": "email_recipients", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    assert!(
+        text.starts_with("As of now “Winter sale” (draft) would reach 37 people in the audience “Coffee club” (production), which holds 40 contacts."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Left out: 2 unsubscribed, 1 bounced."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Sample: ada@northwind.example, bob@northwind.example."),
+        "{text}"
+    );
+    let out = structured(&result);
+    assert_eq!(out["eligible"], 37);
+    assert_eq!(out["audience"]["purpose"], "production");
+    assert_eq!(out["left_out"]["unsubscribed"], 2);
+    assert!(stub.requests().iter().all(|r| r.method == "GET"), "a read");
+
+    // A campaign that has started: who still waits, of those it was written for.
+    let paused = Stub::start(api_with_reach("sends")).await;
+    let result = run(
+        &paused,
+        json!({"action": "email_recipients", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    assert!(
+        text_of(&result).starts_with("As of now “Winter sale” (paused) has 25 people still to reach in the audience “Coffee club” (production), of the 40 it was written for."),
+        "{}",
+        text_of(&result)
+    );
+
+    let missing = stub
+        .tool()
+        .execute(json!({"action": "email_recipients"}))
+        .await;
+    assert!(matches!(missing, Err(Error::Validation(_))));
+}
+
+fn api_with_reach(basis: &'static str) -> Responder {
+    let status = Arc::new(Mutex::new(
+        if basis == "sends" { "paused" } else { "draft" }.to_string(),
+    ));
+    let base = api(status, 37);
+    Arc::new(move |request: &Recorded| {
+        if request.path == format!("/create/email/campaigns/{CAMPAIGN}/reach") {
+            Answer::ok(reach(basis))
+        } else {
+            base(request)
+        }
+    })
+}
+
+/// Today's main has no `/reach`: the answer is put together from what it does answer, and
+/// what it doesn't is said as not answered.
+#[tokio::test]
+async fn without_reach_the_recipients_are_put_together_from_what_create_answers() {
+    let stub = Stub::start(over(|request| {
+        if request.method != "GET" {
+            return None;
+        }
+        match request.path.as_str() {
+            "/create/email/audiences" => Some(Answer::ok(json!([audience(
+                AUDIENCE,
+                "Coffee club",
+                None,
+                40,
+                37
+            )]))),
+            "/create/email/contacts" if request.query.contains("status=suppressed") => {
+                Some(Answer::ok(json!({
+                    "contacts": [
+                        {"id": CONTACT, "email": "grace@northwind.example", "suppressed": {"reason": "unsubscribed", "at": "2026-10-20T08:00:00Z"}},
+                        {"id": PROOF, "email": "hal@northwind.example", "suppressed": {"reason": "unsubscribed", "at": "2026-10-21T08:00:00Z"}},
+                        {"id": NEW_AUDIENCE, "email": "bounced@resend.dev", "suppressed": {"reason": "bounced", "at": "2026-10-19T08:00:00Z"}},
+                    ],
+                    "nextCursor": null, "total": 3,
+                })))
+            }
+            "/create/email/contacts" if request.query.contains("status=subscribed") => {
+                Some(Answer::ok(json!({
+                    "contacts": [{"id": CONTACT, "email": "ada@northwind.example", "suppressed": null}],
+                    "nextCursor": null, "total": 37,
+                })))
+            }
+            _ => None,
+        }
+    }))
+    .await;
+    let result = run(
+        &stub,
+        json!({"action": "email_recipients", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    assert!(
+        text.starts_with("As of now “Winter sale” (draft) would reach 37 people in the audience “Coffee club” (purpose not answered), which holds 40 contacts."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Left out: 2 unsubscribed, 1 bounced."),
+        "{text}"
+    );
+    assert!(text.contains("Sample: ada@northwind.example."), "{text}");
+    assert_eq!(
+        stub.calls_to("GET", &format!("/create/email/campaigns/{CAMPAIGN}/reach"))
+            .len(),
+        1,
+        "asked once, and it isn't there"
+    );
+    let asked = stub.calls_to("GET", "/create/email/contacts");
+    assert!(asked
+        .iter()
+        .any(|r| r.query.contains(&format!("audienceId={AUDIENCE}"))
+            && r.query.contains("status=suppressed")));
+    assert!(stub.requests().iter().all(|r| r.method == "GET"), "a read");
+}
+
+#[tokio::test]
+async fn a_segments_left_out_people_are_not_answered_without_reach() {
+    let stub = Stub::start({
+        let segments = segments_api();
+        Arc::new(move |request: &Recorded| {
+            if request.method == "GET"
+                && request.path == format!("/create/email/campaigns/{CAMPAIGN}")
+            {
+                let mut campaign = campaign("draft");
+                campaign["segmentId"] = json!(SEGMENT);
+                campaign["segment"] = json!({"id": SEGMENT, "name": "Regulars"});
+                return Answer::ok(campaign);
+            }
+            if request.path == format!("/create/email/campaigns/{CAMPAIGN}/preview") {
+                return Answer::ok(
+                    json!({"subject": "s", "from": "Northwind <hello@news.northwind.example>", "warnings": [], "recipients": 10}),
+                );
+            }
+            segments(request)
+        })
+    })
+    .await;
+    let result = run(
+        &stub,
+        json!({"action": "email_recipients", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    assert!(
+        text.starts_with("As of now “Winter sale” (draft) would reach 10 people in the segment “Regulars” of the audience “Coffee club” (production), which holds 12 contacts."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Left out: 2, and why is not answered for a segment."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Sample: ada@northwind.example, bob@northwind.example."),
+        "{text}"
+    );
+    assert_eq!(structured(&result)["left_out"], Value::Null);
+    // The sample comes from the segment's own rules.
+    assert_eq!(
+        stub.calls_to("POST", "/create/email/segments/preview")[0].body,
+        json!({"workspaceId": WORKSPACE, "audienceId": AUDIENCE, "rules": rules()})
+    );
+}
+
+#[tokio::test]
+async fn a_campaign_with_no_audience_reaches_no_one_and_says_so() {
+    let stub = Stub::start(over(|request| {
+        if request.method == "GET" && request.path == format!("/create/email/campaigns/{CAMPAIGN}")
+        {
+            let mut campaign = campaign("draft");
+            campaign["audienceId"] = Value::Null;
+            campaign["audience"] = Value::Null;
+            return Some(Answer::ok(campaign));
+        }
+        (request.path == format!("/create/email/campaigns/{CAMPAIGN}/preview")).then(|| {
+            Answer::ok(
+                json!({"subject": "s", "warnings": ["Pick who it goes to."], "recipients": null}),
+            )
+        })
+    }))
+    .await;
+    let result = run(
+        &stub,
+        json!({"action": "email_recipients", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    assert!(
+        text_of(&result).starts_with(
+            "As of now “Winter sale” (draft) has no audience, so a send would reach no one."
+        ),
+        "{}",
+        text_of(&result)
+    );
+    assert_eq!(structured(&result)["eligible"], Value::Null);
+}
+
+#[test]
+fn segments_and_recipients_are_listed_described_and_in_the_schema() {
+    for action in ["email_segments", "email_recipients"] {
+        assert!(EMAIL_ACTIONS.contains(&action), "{action}");
+        assert!(VALID_ACTIONS.contains(&action), "{action}");
+        assert!(TOOL_REFERENCE.contains(&format!("- {action}:")), "{action}");
+    }
+    let schema = input_schema();
+    let properties = schema["properties"].as_object().unwrap();
+    assert_eq!(properties["rules"]["type"], "object");
+    assert!(properties["operation"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("preview")));
+}

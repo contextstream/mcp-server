@@ -44,6 +44,7 @@ use crate::peer::{self, Elicited};
 
 mod contacts;
 mod go;
+mod health;
 mod segments;
 
 /// The email actions, as `VALID_ACTIONS` lists them.
@@ -62,6 +63,7 @@ pub(crate) const EMAIL_ACTIONS: &[&str] = &[
     "email_unsubscribes",
     "email_segments",
     "email_recipients",
+    "email_diagnostics",
 ];
 
 /// Erasing a contact, which `delete` calls (`studio.email_contact_erase`). It cannot be
@@ -134,7 +136,7 @@ const CONTACT_OPERATIONS: &[&str] = &[
     "import_preview",
     "import",
 ];
-const SUPPRESSION_OPERATIONS: &[&str] = &["list", "add", "remove"];
+const SUPPRESSION_OPERATIONS: &[&str] = &["list", "add", "remove", "report"];
 const CONSENT_SOURCES: &[&str] = &["manual", "form", "api"];
 const SUPPRESSION_REASONS: &[&str] = &["unsubscribed", "bounced", "complained", "manual"];
 const CONTACT_STATUSES: &[&str] = &["subscribed", "suppressed"];
@@ -922,6 +924,7 @@ impl StudioTool {
             "email_unsubscribes" => self.email_unsubscribes(workspace_id, input).await,
             "email_segments" => self.email_segments(workspace_id, input).await,
             "email_recipients" => self.email_recipients(workspace_id, input).await,
+            "email_diagnostics" => self.email_diagnostics(workspace_id, input).await,
             ERASE_ACTION => self.erase_contact(workspace_id, input).await,
             other => Err(Error::Validation(format!("Unknown email action: {other}"))),
         }
@@ -2988,6 +2991,7 @@ impl StudioTool {
                 self.suppress(workspace_id, input, emails).await
             }
             "remove" => self.unsuppress(workspace_id, input).await,
+            "report" => self.unsubscribe_report(workspace_id, input).await,
             _ => self.list_suppressions(workspace_id, input).await,
         }
     }

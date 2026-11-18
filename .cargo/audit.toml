@@ -1,0 +1,6 @@
+# Keep in step with [advisories].ignore in deny.toml (scripts/release/test_advisory_ignores.py checks it);
+# the reason and review date for each id are there.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0543", # chrono is unmaintained, not a vulnerability; review by 2027-02-18
+]

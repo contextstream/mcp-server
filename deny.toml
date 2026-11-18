@@ -11,7 +11,9 @@ all-features = true
 [advisories]
 yanked = "deny"
 unmaintained = "all"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not a vulnerability; no maintained release to move to yet, a ticket tracks moving off it; review by 2027-02-18" },
+]
 
 [licenses]
 confidence-threshold = 0.8

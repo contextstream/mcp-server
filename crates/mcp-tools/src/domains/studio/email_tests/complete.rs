@@ -1662,3 +1662,442 @@ fn diagnostics_and_the_report_are_listed_described_and_in_the_schema() {
         .unwrap()
         .contains(&json!("report")));
 }
+
+// ============================================================================
+// email_templates and email_ab
+// ============================================================================
+
+const TEMPLATE: &str = "15151515-1515-4515-8515-151515151515";
+
+fn template(id: &str, name: &str, built_in: bool) -> Value {
+    json!({
+        "id": id, "name": name,
+        "description": if built_in { json!("One piece of news, one thing to do.") } else { Value::Null },
+        "subject": if built_in { "[Your news in a few words]" } else { "Our winter sale starts today" },
+        "preheader": "Twenty percent off everything until Sunday.",
+        "content": {"version": 1, "blocks": [
+            {"id": "h", "type": "heading", "text": "Winter is here"},
+            {"id": "b", "type": "button", "label": "Shop the sale", "url": "https://northwind.example/sale"},
+        ]},
+        "builtIn": built_in, "createdBy": null, "createdAt": null, "updatedAt": null,
+    })
+}
+
+fn templates_api() -> Responder {
+    over(|request| {
+        let one = format!("/create/email/templates/{TEMPLATE}");
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/create/email/templates") => Some(Answer::ok(json!({"templates": [
+                template(TEMPLATE, "Sale layout", false),
+                template("builtin:announcement", "Announcement", true),
+            ]}))),
+            ("GET", path) if path == one => {
+                Some(Answer::ok(template(TEMPLATE, "Sale layout", false)))
+            }
+            ("GET", "/create/email/templates/builtin:announcement") => Some(Answer::ok(template(
+                "builtin:announcement",
+                "Announcement",
+                true,
+            ))),
+            ("GET", path) if path.starts_with("/create/email/templates/") => Some(Answer::error(
+                404,
+                "NOT_FOUND",
+                "Not found: No such template.",
+            )),
+            ("POST", "/create/email/templates") => Some(Answer::status(
+                201,
+                template(TEMPLATE, request.body["name"].as_str().unwrap_or(""), false),
+            )),
+            ("PATCH", "/create/email/templates/builtin:announcement") => Some(Answer::error(
+                409,
+                "CONFLICT",
+                "Conflict: A built-in template can't be changed; save a copy.",
+            )),
+            ("PATCH", path) if path == one => Some(Answer::ok(template(
+                TEMPLATE,
+                request.body["name"].as_str().unwrap_or("Sale layout"),
+                false,
+            ))),
+            ("POST", "/create/email/campaigns") => {
+                let mut draft = campaign("draft");
+                draft["id"] = json!(COPY);
+                draft["name"] = request
+                    .body
+                    .get("name")
+                    .cloned()
+                    .unwrap_or(json!("Sale layout"));
+                Some(Answer::status(201, draft))
+            }
+            _ => None,
+        }
+    })
+}
+
+#[tokio::test]
+async fn templates_are_listed_read_saved_used_and_renamed() {
+    let stub = Stub::start(templates_api()).await;
+
+    let listed = run(&stub, json!({"action": "email_templates"})).await;
+    let text = text_of(&listed);
+    assert!(!listed.is_error, "{text}");
+    assert!(text.starts_with("2 templates as of now:"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "- Sale layout: subject “Our winter sale starts today” (template_id {TEMPLATE})"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Announcement (built in): One piece of news, one thing to do. (template_id builtin:announcement)"),
+        "{text}"
+    );
+
+    let read = run(
+        &stub,
+        json!({"action": "email_templates", "operation": "get", "template_id": "builtin:announcement"}),
+    )
+    .await;
+    let text = text_of(&read);
+    assert!(
+        text.starts_with("The template “Announcement” (built in; template_id builtin:announcement): One piece of news, one thing to do."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Subject: [Your news in a few words]"),
+        "{text}"
+    );
+    assert!(text.contains("1. Heading: Winter is here"), "{text}");
+    assert!(
+        text.contains("Words in [square brackets] are placeholders"),
+        "{text}"
+    );
+
+    // A campaign saved as a template.
+    let saved = run(
+        &stub,
+        json!({"action": "email_templates", "operation": "save", "campaign_id": CAMPAIGN, "name": "Sale layout", "description": "The winter sale's shape"}),
+    )
+    .await;
+    assert!(!saved.is_error, "{}", text_of(&saved));
+    assert_eq!(
+        stub.calls_to("POST", "/create/email/templates")[0].body,
+        json!({"workspaceId": WORKSPACE, "name": "Sale layout", "description": "The winter sale's shape", "campaignId": CAMPAIGN})
+    );
+    assert!(
+        text_of(&saved).starts_with(&format!(
+            "Saved the template “Sale layout” (template_id {TEMPLATE}) from the campaign"
+        )),
+        "{}",
+        text_of(&saved)
+    );
+
+    // A new draft from a template: nothing is sent.
+    let used = run(
+        &stub,
+        json!({"action": "email_templates", "operation": "use", "template_id": TEMPLATE, "name": "Spring sale", "audience_id": AUDIENCE}),
+    )
+    .await;
+    let text = text_of(&used);
+    assert!(!used.is_error, "{text}");
+    assert_eq!(
+        stub.calls_to("POST", "/create/email/campaigns")[0].body,
+        json!({"workspaceId": WORKSPACE, "templateId": TEMPLATE, "name": "Spring sale", "audienceId": AUDIENCE})
+    );
+    assert!(
+        text.starts_with(&format!(
+            "Started the draft “Spring sale” from the template (campaign_id {COPY}). Nothing is sent."
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("Subject: Our winter sale starts today"),
+        "{text}"
+    );
+    assert_eq!(structured(&used)["campaign_id"], COPY);
+    assert!(stub
+        .requests()
+        .iter()
+        .all(|r| !r.path.ends_with("/schedule") && !r.path.ends_with("/test")));
+
+    let renamed = run(
+        &stub,
+        json!({"action": "email_templates", "operation": "update", "template_id": TEMPLATE, "name": "Sale shape"}),
+    )
+    .await;
+    assert!(!renamed.is_error, "{}", text_of(&renamed));
+    assert_eq!(
+        stub.calls_to("PATCH", &format!("/create/email/templates/{TEMPLATE}"))[0].body,
+        json!({"workspaceId": WORKSPACE, "name": "Sale shape"})
+    );
+    assert!(
+        text_of(&renamed).starts_with(&format!(
+            "Changed the template: “Sale shape” (template_id {TEMPLATE})."
+        )),
+        "{}",
+        text_of(&renamed)
+    );
+
+    // Create's refusals in one sentence each.
+    let built_in = run(
+        &stub,
+        json!({"action": "email_templates", "operation": "update", "template_id": "builtin:announcement", "name": "Mine"}),
+    )
+    .await;
+    assert_eq!(
+        text_of(&built_in),
+        "Not changed: A built-in template can't be changed; save a copy."
+    );
+    let missing = run(
+        &stub,
+        json!({"action": "email_templates", "operation": "get", "template_id": NEW_AUDIENCE}),
+    )
+    .await;
+    assert_eq!(
+        text_of(&missing),
+        "There is no such template in this workspace (email_templates lists them)."
+    );
+
+    for (input, said) in [
+        (
+            json!({"action": "email_templates", "operation": "get"}),
+            "template_id is required",
+        ),
+        (
+            json!({"action": "email_templates", "operation": "get", "template_id": "../connection"}),
+            "template_id is a template's id",
+        ),
+        (
+            json!({"action": "email_templates", "operation": "save", "name": "X"}),
+            "campaign_id is required",
+        ),
+        (
+            json!({"action": "email_templates", "operation": "save", "campaign_id": CAMPAIGN}),
+            "name is required",
+        ),
+        (
+            json!({"action": "email_templates", "operation": "update", "template_id": TEMPLATE}),
+            "needs something to change",
+        ),
+    ] {
+        let refused = stub.tool().execute(input).await.unwrap_err();
+        assert!(refused.to_string().contains(said), "{refused}");
+    }
+}
+
+/// The campaign routes with an A/B test kept on the draft.
+fn ab_api(status: &'static str, test: Option<Value>) -> Responder {
+    let kept = Arc::new(Mutex::new(test));
+    let base = api(Arc::new(Mutex::new(status.to_string())), 37);
+    Arc::new(move |request: &Recorded| {
+        let path = format!("/create/email/campaigns/{CAMPAIGN}");
+        let with_test = |kept: &Option<Value>, subject: Option<&Value>| {
+            let mut campaign = campaign(status);
+            campaign["abTest"] = kept.clone().unwrap_or(Value::Null);
+            if let Some(subject) = subject {
+                campaign["subject"] = subject.clone();
+            }
+            campaign
+        };
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", p) if p == path => Answer::ok(with_test(&kept.lock().unwrap(), None)),
+            ("PATCH", p) if p == path => {
+                let mut kept = kept.lock().unwrap();
+                *kept = match request.body.get("abTest") {
+                    Some(Value::Null) | None => None,
+                    Some(asked) => Some(json!({
+                        "subjects": asked["subjects"],
+                        "samplePercent": asked.get("samplePercent").cloned().unwrap_or(json!(20)),
+                        "waitHours": asked.get("waitHours").cloned().unwrap_or(json!(4)),
+                        "metric": asked.get("metric").cloned().unwrap_or(json!("opens")),
+                        "decideAt": null, "winner": null,
+                    })),
+                };
+                let mut changed = with_test(&kept, request.body.get("subject"));
+                changed["revision"] = json!(5);
+                Answer::ok(changed)
+            }
+            _ => base(request),
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_drafts_subjects_are_tested_against_each_other() {
+    let stub = Stub::start(ab_api("draft", None)).await;
+    let path = format!("/create/email/campaigns/{CAMPAIGN}");
+
+    let none = run(
+        &stub,
+        json!({"action": "email_ab", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    assert!(
+        text_of(&none).starts_with("“Winter sale” has no A/B test: it goes with its one subject, “Our winter sale starts today”."),
+        "{}",
+        text_of(&none)
+    );
+    assert_eq!(structured(&none)["ab_test"], Value::Null);
+
+    // A is the email's own subject: listed first and unchanged, it isn't sent again.
+    let set = run(
+        &stub,
+        json!({
+            "action": "email_ab", "campaign_id": CAMPAIGN, "operation": "set",
+            "subjects": ["Our winter sale starts today", " Twenty percent off, this week only "],
+            "split": 30, "decide_after": 6, "metric": "Clicks",
+        }),
+    )
+    .await;
+    let text = text_of(&set);
+    assert!(!set.is_error, "{text}");
+    let patches = stub.calls_to("PATCH", &path);
+    assert_eq!(
+        patches[0].body,
+        json!({
+            "workspaceId": WORKSPACE, "revision": 4,
+            "abTest": {"subjects": ["Twenty percent off, this week only"], "samplePercent": 30, "waitHours": 6, "metric": "clicks"},
+        })
+    );
+    assert!(
+        text.starts_with("Set the A/B test on “Winter sale”: A “Our winter sale starts today”, B “Twenty percent off, this week only”, tried on 30% of its recipients; after 6 hours the subject with the most clicks goes to the rest."),
+        "{text}"
+    );
+    assert!(text.contains("Nothing is sent"), "{text}");
+
+    // A new A becomes the email's subject, with the test, in one change.
+    let three = run(
+        &stub,
+        json!({
+            "action": "email_ab", "campaign_id": CAMPAIGN, "operation": "set",
+            "subjects": ["Warm up with 20% off", "Our winter sale starts today", "Twenty percent off, this week only"],
+        }),
+    )
+    .await;
+    assert!(!three.is_error, "{}", text_of(&three));
+    assert_eq!(
+        stub.calls_to("PATCH", &path)[1].body,
+        json!({
+            "workspaceId": WORKSPACE, "revision": 4, "subject": "Warm up with 20% off",
+            "abTest": {"subjects": ["Our winter sale starts today", "Twenty percent off, this week only"]},
+        })
+    );
+    assert!(
+        text_of(&three).contains("A “Warm up with 20% off”, B “Our winter sale starts today”, C “Twenty percent off, this week only”, tried on 20% of its recipients; after 4 hours the subject with the most opens goes to the rest."),
+        "{}",
+        text_of(&three)
+    );
+
+    let shown = run(
+        &stub,
+        json!({"action": "email_ab", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    assert!(
+        text_of(&shown).starts_with("“Winter sale” tests 3 subjects: A “Our winter sale starts today”, B “Our winter sale starts today”"),
+        "{}",
+        text_of(&shown)
+    );
+
+    let cleared = run(
+        &stub,
+        json!({"action": "email_ab", "campaign_id": CAMPAIGN, "operation": "clear"}),
+    )
+    .await;
+    assert_eq!(
+        stub.calls_to("PATCH", &path)[2].body,
+        json!({"workspaceId": WORKSPACE, "revision": 4, "abTest": null})
+    );
+    assert!(
+        text_of(&cleared)
+            .starts_with("Cleared the A/B test on “Winter sale”: it goes with its one subject"),
+        "{}",
+        text_of(&cleared)
+    );
+
+    for (input, said) in [
+        (
+            json!({"action": "email_ab", "campaign_id": CAMPAIGN, "operation": "set", "subjects": ["Only one"]}),
+            "subjects is 2 or 3 subject lines",
+        ),
+        (
+            json!({"action": "email_ab", "campaign_id": CAMPAIGN, "operation": "set", "subjects": ["Same", "same "]}),
+            "must differ",
+        ),
+        (
+            json!({"action": "email_ab", "campaign_id": CAMPAIGN, "operation": "set", "subjects": ["A", "B"], "split": 60}),
+            "split is 10 to 50",
+        ),
+        (
+            json!({"action": "email_ab", "campaign_id": CAMPAIGN, "operation": "set", "subjects": ["A", "B"], "decide_after": 0}),
+            "decide_after is 1 to 72",
+        ),
+        (
+            json!({"action": "email_ab", "campaign_id": CAMPAIGN, "operation": "set", "subjects": ["A", "B"], "metric": "replies"}),
+            "metric is opens or clicks",
+        ),
+        (
+            json!({"action": "email_ab", "operation": "set", "subjects": ["A", "B"]}),
+            "campaign_id is required",
+        ),
+    ] {
+        let refused = stub.tool().execute(input).await.unwrap_err();
+        assert!(refused.to_string().contains(said), "{refused}");
+    }
+    assert_eq!(stub.calls_to("PATCH", &path).len(), 3);
+}
+
+#[tokio::test]
+async fn only_a_drafts_subjects_can_be_set_and_a_decided_test_names_its_winner() {
+    let decided = json!({
+        "subjects": ["Twenty percent off, this week only"], "samplePercent": 20, "waitHours": 4, "metric": "opens",
+        "decideAt": "2026-11-02T13:00:00Z",
+        "winner": {"variant": 1, "subject": "Twenty percent off, this week only", "decidedAt": "2026-11-02T13:00:00Z", "reason": "opens", "rates": []},
+    });
+    let stub = Stub::start(ab_api("sent", Some(decided))).await;
+    let shown = run(
+        &stub,
+        json!({"action": "email_ab", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    let text = text_of(&shown);
+    assert!(
+        text.contains("The winner was B “Twenty percent off, this week only” (the most opens), picked on 2026-11-02 13:00 UTC."),
+        "{text}"
+    );
+    for operation in ["set", "clear"] {
+        let refused = run(
+            &stub,
+            json!({"action": "email_ab", "campaign_id": CAMPAIGN, "operation": operation, "subjects": ["A", "B"]}),
+        )
+        .await;
+        assert!(refused.is_error);
+        assert!(
+            text_of(&refused).starts_with(
+                "Not changed: only a draft's subjects can be tested, and “Winter sale” is sent."
+            ),
+            "{}",
+            text_of(&refused)
+        );
+    }
+    assert!(stub
+        .calls_to("PATCH", &format!("/create/email/campaigns/{CAMPAIGN}"))
+        .is_empty());
+}
+
+#[test]
+fn templates_and_ab_are_listed_described_and_in_the_schema() {
+    for action in ["email_templates", "email_ab"] {
+        assert!(EMAIL_ACTIONS.contains(&action), "{action}");
+        assert!(VALID_ACTIONS.contains(&action), "{action}");
+        assert!(TOOL_REFERENCE.contains(&format!("- {action}:")), "{action}");
+    }
+    let schema = input_schema();
+    let properties = schema["properties"].as_object().unwrap();
+    for field in ["template_id", "subjects", "split", "decide_after", "metric"] {
+        assert!(properties.contains_key(field), "{field}");
+    }
+    let operations = properties["operation"]["enum"].as_array().unwrap();
+    for operation in ["get", "save", "use", "show", "set", "clear"] {
+        assert!(operations.contains(&json!(operation)), "{operation}");
+    }
+}

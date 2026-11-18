@@ -225,8 +225,8 @@ pub enum Evidence {
     XdgConfigPath(&'static [&'static str]),
     /// A VS Code extension id prefix is installed.
     VsCodeExtension(&'static str),
-    /// A system install directory containing one of the named launchers.
-    SystemInstall(&'static str, &'static [&'static str]),
+    /// A non-empty system install directory outside HOME.
+    SystemInstall(&'static str),
     /// Platform-specific probing (app bundles, system install paths).
     Check(fn() -> bool),
 }
@@ -255,23 +255,11 @@ impl Evidence {
                 xdg_config_home().is_some_and(|root| join_all(root, parts).exists())
             }
             Evidence::VsCodeExtension(id) => vscode_extension_installed(id),
-            Evidence::SystemInstall(path, launchers) => {
+            Evidence::SystemInstall(path) => {
                 let dir = system_root().join(path.trim_start_matches('/'));
                 dir.is_dir()
-                    && launchers.iter().any(|name| {
-                        let Ok(metadata) = dir.join(name).metadata() else {
-                            return false;
-                        };
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            metadata.is_file()
-                        }
-                    })
+                    && std::fs::read_dir(dir)
+                        .is_ok_and(|mut entries| entries.any(|entry| entry.is_ok()))
             }
             Evidence::Check(check) => check(),
         }
@@ -690,16 +678,14 @@ static ANTIGRAVITY: ClientDescriptor = ClientDescriptor {
     },
     // A bare ~/.gemini may belong to Gemini CLI alone, so it is not evidence.
     // A new Antigravity cloud VM has none of the first four: nothing on PATH
-    // and no state under ~/.gemini yet. Check for a launcher inside its install.
+    // and no state under ~/.gemini yet. A populated /opt/antigravity directory
+    // is always present there without depending on internal binary layout.
     detect: &[
         Evidence::Binary("antigravity"),
         Evidence::Binary("agy"),
         Evidence::HomePath(&[".gemini", "antigravity"]),
         Evidence::HomePath(&[".gemini", "config", "mcp_config.json"]),
-        Evidence::SystemInstall(
-            "/opt/antigravity",
-            &["agy", "bin/agy", "antigravity", "bin/antigravity"],
-        ),
+        Evidence::SystemInstall("/opt/antigravity"),
     ],
     reload_instruction: "Fully quit and reopen Antigravity, then open the intended checkout.",
     status: ClientStatus::Supported,
@@ -1261,7 +1247,7 @@ impl Evidence {
             Evidence::HomeDir(parts) => format!("~/{}/", parts.join("/")),
             Evidence::XdgConfigPath(parts) => format!("~/.config/{}", parts.join("/")),
             Evidence::VsCodeExtension(id) => format!("VS Code extension {id}"),
-            Evidence::SystemInstall(path, _) => (*path).to_string(),
+            Evidence::SystemInstall(path) => (*path).to_string(),
             Evidence::Check(_) => "platform install location".to_string(),
         }
     }

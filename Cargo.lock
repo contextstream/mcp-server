@@ -1671,6 +1671,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
  "urlencoding",

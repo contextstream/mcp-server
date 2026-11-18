@@ -111,6 +111,15 @@ const MAX_NOTE_CHARS: usize = 500;
 const LINK_REUSE_HOURS: i64 = 24;
 /// The subjects of an A/B test, by variant.
 const VARIANT_LABELS: [&str; 3] = ["A", "B", "C"];
+const AUDIENCE_OPERATIONS: &[&str] = &["list", "create", "update"];
+/// What an audience is for: the team's own proofs, or the people a real send reaches.
+const PURPOSES: &[&str] = &["test", "production"];
+/// An audience's, a segment's or a template's name (Create's limit).
+const MAX_NAME_CHARS: usize = 80;
+/// A description (Create's limit).
+const MAX_DESCRIPTION_CHARS: usize = 500;
+/// Said for what Create did not answer: never 0, never "none".
+const NOT_ANSWERED: &str = "not answered";
 const CONTACT_OPERATIONS: &[&str] = &["list", "add", "unsubscribe"];
 const SUPPRESSION_OPERATIONS: &[&str] = &["list", "add", "remove"];
 const CONSENT_SOURCES: &[&str] = &["manual", "form", "api"];
@@ -356,10 +365,20 @@ pub(crate) fn variant_of(raw: Option<i64>) -> Result<Option<i64>> {
 
 /// One of `allowed`, by name; `list` when none is given.
 pub(crate) fn operation_of(raw: Option<&str>, allowed: &[&str], action: &str) -> Result<String> {
+    operation_or(raw, allowed, "list", action)
+}
+
+/// One of `allowed`, by name; `default` when none is given.
+pub(crate) fn operation_or(
+    raw: Option<&str>,
+    allowed: &[&str],
+    default: &str,
+    action: &str,
+) -> Result<String> {
     let operation = raw
         .map(|o| o.trim().to_lowercase())
         .filter(|o| !o.is_empty())
-        .unwrap_or_else(|| "list".to_string());
+        .unwrap_or_else(|| default.to_string());
     if allowed.contains(&operation.as_str()) {
         Ok(operation)
     } else {
@@ -383,6 +402,56 @@ pub(crate) fn address_of(raw: &str) -> Option<String> {
         && address.len() <= 254
         && !address.chars().any(|c| c.is_whitespace() || c.is_control());
     plausible.then_some(address)
+}
+
+/// An argument as given: trimmed, and `None` when empty.
+fn given(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// Whether Create refused `field` as one it does not know: a Create older than this tool,
+/// which reads every body strictly (`unknown field `purpose`, expected one of ...`).
+pub(crate) fn unknown_field(answer: &StudioAnswer, field: &str) -> bool {
+    answer.status == 400
+        && answer.error_message().is_some_and(|said| {
+            said.split(", expected").next().is_some_and(|said| {
+                said.starts_with("unknown field") && said.contains(&format!("`{field}`"))
+            })
+        })
+}
+
+/// `name` for `call`: 1 to 80 characters, as Create keeps an audience's, a segment's or a
+/// template's.
+fn name_of(input: &StudioInput, call: &str) -> Result<Option<String>> {
+    match given(input.name.as_deref()) {
+        Some(name) if name.chars().count() > MAX_NAME_CHARS => Err(Error::Validation(format!(
+            "name can be up to {MAX_NAME_CHARS} characters ({call})."
+        ))),
+        name => Ok(name.map(str::to_string)),
+    }
+}
+
+/// `purpose` as given: test or production.
+fn purpose_of(input: &StudioInput) -> Result<Option<String>> {
+    match given(input.purpose.as_deref()).map(str::to_lowercase) {
+        Some(purpose) if PURPOSES.contains(&purpose.as_str()) => Ok(Some(purpose)),
+        Some(_) => Err(Error::Validation(
+            "purpose is test or production".to_string(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// `description` as given: `Some(None)` clears it (an empty string), `None` leaves it.
+fn description_of(input: &StudioInput) -> Result<Option<Option<String>>> {
+    match input.description.as_deref().map(str::trim) {
+        None => Ok(None),
+        Some("") => Ok(Some(None)),
+        Some(text) if text.chars().count() > MAX_DESCRIPTION_CHARS => Err(Error::Validation(
+            format!("description can be up to {MAX_DESCRIPTION_CHARS} characters."),
+        )),
+        Some(text) => Ok(Some(Some(text.to_string()))),
+    }
 }
 
 /// The refusal for `email_contacts` asked to erase a contact, worded as #334's refusals are:
@@ -597,6 +666,21 @@ fn count(value: &Value, pointer: &str) -> i64 {
     value.pointer(pointer).and_then(Value::as_i64).unwrap_or(0)
 }
 
+/// A number Create answered, or `None` when it did not.
+fn number(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(Value::as_i64)
+}
+
+/// A number in words, or "not answered" for one Create did not give.
+fn said(value: Option<i64>) -> String {
+    value.map_or_else(|| NOT_ANSWERED.to_string(), credits)
+}
+
+/// What an audience is for, as Create answered it.
+fn purpose_words(audience: &Value) -> String {
+    text(audience, "purpose").unwrap_or_else(|| format!("purpose {NOT_ANSWERED}"))
+}
+
 /// An ISO time as "2026-11-02 09:00 UTC".
 fn moment(value: Option<&str>) -> Option<String> {
     let at = chrono::DateTime::parse_from_rfc3339(value?).ok()?;
@@ -714,6 +798,16 @@ pub(crate) fn outline(content: &Value) -> Vec<String> {
     lines
 }
 
+/// Said of a purpose Create did not answer back: it refused the field (`kept` false, a
+/// Create that has no purposes yet), or took the call and answered none.
+fn not_kept(purpose: &str, kept: bool) -> String {
+    if kept {
+        format!("Create did not answer its purpose ({purpose} was asked).")
+    } else {
+        format!("Its purpose ({purpose}) was not kept: Create doesn't take one here yet.")
+    }
+}
+
 /// One campaign in a list, in words.
 fn campaign_state(campaign: &Value) -> String {
     let status = campaign.get("status").and_then(Value::as_str).unwrap_or("");
@@ -771,7 +865,7 @@ impl StudioTool {
         }
         let (workspace_id, _) = self.scope(input).await?;
         match action {
-            "email_audiences" => self.email_audiences(workspace_id).await,
+            "email_audiences" => self.email_audiences(workspace_id, input).await,
             "email_draft" => self.email_draft(workspace_id, input).await,
             "email_campaigns" => self.email_campaigns(workspace_id, input).await,
             "email_test" => self.email_test(workspace_id, input).await,
@@ -826,6 +920,35 @@ impl StudioTool {
             )
             .await
             .map_err(unreachable)
+    }
+
+    /// Sends `body`. When Create answers that it does not know one of `newer` (fields a
+    /// newer Create takes), sends it once more without them: the answer, and whether the
+    /// fields were taken. A failed request leaves no idempotency key behind; the second one
+    /// carries its own, since a key answers one body only.
+    async fn email_call_newer(
+        &self,
+        method: &str,
+        path: &str,
+        body: &Value,
+        newer: &[&str],
+        key: Option<&str>,
+    ) -> Result<(StudioAnswer, bool)> {
+        let answer = self.email_call(method, path, Some(body), key).await?;
+        if !newer.iter().any(|field| unknown_field(&answer, field)) {
+            return Ok((answer, true));
+        }
+        let mut plain = body.clone();
+        if let Some(map) = plain.as_object_mut() {
+            for field in newer {
+                map.remove(*field);
+            }
+        }
+        let key = key.map(|key| format!("{key}-plain"));
+        let answer = self
+            .email_call(method, path, Some(&plain), key.as_deref())
+            .await?;
+        Ok((answer, false))
     }
 
     fn campaign_id(input: &StudioInput, action: &str) -> Result<Uuid> {
@@ -890,7 +1013,20 @@ impl StudioTool {
     // email_audiences
     // ------------------------------------------------------------------------------------
 
-    async fn email_audiences(&self, workspace_id: Uuid) -> Result<ToolResult> {
+    async fn email_audiences(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
+        let operation = operation_of(
+            input.operation.as_deref(),
+            AUDIENCE_OPERATIONS,
+            "email_audiences",
+        )?;
+        match operation.as_str() {
+            "create" => self.create_audience(workspace_id, input).await,
+            "update" => self.update_audience(workspace_id, input).await,
+            _ => self.list_audiences(workspace_id).await,
+        }
+    }
+
+    async fn list_audiences(&self, workspace_id: Uuid) -> Result<ToolResult> {
         let audiences = self
             .email_call(
                 "GET",
@@ -935,12 +1071,13 @@ impl StudioTool {
         }
         let list = audiences.data.as_array().cloned().unwrap_or_default();
         if list.is_empty() {
-            lines.push(format!(
-                "No audiences yet: add contacts in the studio (CSV import, or one by one): {STUDIO_APP}/studio/email."
-            ));
+            lines.push(
+                "No audiences as of now: email_audiences with operation create makes one (name and purpose), then email_contacts adds people or imports a CSV."
+                    .to_string(),
+            );
         } else {
             lines.push(format!(
-                "{} audience{}:",
+                "{} audience{} as of now:",
                 list.len(),
                 if list.len() == 1 { "" } else { "s" }
             ));
@@ -949,12 +1086,18 @@ impl StudioTool {
         for audience in &list {
             let id = text(audience, "id").unwrap_or_default();
             let name = text(audience, "name").unwrap_or_else(|| "An audience".to_string());
-            let contacts = count(audience, "/contacts");
-            let subscribed = count(audience, "/subscribed");
+            let contacts = number(audience, "contacts");
+            let subscribed = number(audience, "subscribed");
+            // Who is in it and can't be sent to: both numbers are Create's own.
+            let suppressed = contacts
+                .zip(subscribed)
+                .map(|(contacts, subscribed)| (contacts - subscribed).max(0));
             lines.push(format!(
-                "- {name}: {} contacts, {} subscribed (audience_id {id})",
-                credits(contacts),
-                credits(subscribed)
+                "- {name} ({}): {} contacts, {} subscribed, {} suppressed (audience_id {id})",
+                purpose_words(audience),
+                said(contacts),
+                said(subscribed),
+                said(suppressed)
             ));
             let mut own = Vec::new();
             for segment in segments
@@ -975,13 +1118,147 @@ impl StudioTool {
             listed.push(json!({
                 "audience_id": id,
                 "name": name,
+                "purpose": audience.get("purpose"),
+                "description": audience.get("description"),
                 "contacts": contacts,
                 "subscribed": subscribed,
+                "suppressed": suppressed,
                 "segments": own,
             }));
         }
         structured["audiences"] = json!(listed);
         Ok(ToolResult::with_structured(lines.join("\n"), structured))
+    }
+
+    /// A new audience, with what it is for. The purpose is the person's to say: a send to
+    /// a test audience and one to customers are different acts, so it is never guessed.
+    async fn create_audience(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
+        let call = "email_audiences with operation create";
+        let name = name_of(input, call)?.ok_or_else(|| {
+            Error::Validation(format!(
+                "name is required for {call}: what the audience is called, e.g. \"Customers\""
+            ))
+        })?;
+        let purpose = purpose_of(input)?.ok_or_else(|| {
+            Error::Validation(format!(
+                "purpose is required for {call}: test (the team's own proofs) or production (the people a real send reaches). Ask the person; never guess it."
+            ))
+        })?;
+        let mut body = json!({"workspaceId": workspace_id, "name": name, "purpose": purpose});
+        if let Some(Some(description)) = description_of(input)? {
+            body["description"] = json!(description);
+        }
+        let (answer, kept) = self
+            .email_call_newer("POST", "/audiences", &body, &["purpose"], None)
+            .await?;
+        if !answer.is_success() {
+            return Ok(ToolResult::error(format!(
+                "Not created: {}",
+                email_refusal(&answer, Topic::Other)
+            )));
+        }
+        let audience = answer.data;
+        let id = text(&audience, "id").unwrap_or_default();
+        let name = text(&audience, "name").unwrap_or(name);
+        let answered = text(&audience, "purpose");
+        let mut lines = vec![match &answered {
+            Some(purpose) => {
+                format!("Created the {purpose} audience “{name}” (audience_id {id}).")
+            }
+            None => format!("Created the audience “{name}” (audience_id {id})."),
+        }];
+        if answered.is_none() {
+            lines.push(not_kept(&purpose, kept));
+        }
+        lines.push(
+            "It holds no one yet: email_contacts adds people (operation add) or imports a CSV (operation import_preview, then import)."
+                .to_string(),
+        );
+        Ok(ToolResult::with_structured(
+            lines.join(" "),
+            json!({
+                "workspace_id": workspace_id,
+                "audience_id": id,
+                "name": name,
+                "purpose": audience.get("purpose"),
+                "purpose_kept": answered.is_some(),
+                "description": audience.get("description"),
+            }),
+        ))
+    }
+
+    async fn update_audience(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
+        let call = "email_audiences with operation update";
+        let id = given(input.audience_id.as_deref()).ok_or_else(|| {
+            Error::Validation(format!(
+                "audience_id is required for {call} (email_audiences lists them)"
+            ))
+        })?;
+        let id = parse_id(id, "audience_id")?;
+        let name = name_of(input, call)?;
+        let purpose = purpose_of(input)?;
+        let description = description_of(input)?;
+        if name.is_none() && purpose.is_none() && description.is_none() {
+            return Err(Error::Validation(format!(
+                "{call} needs something to change: name, purpose or description"
+            )));
+        }
+        let mut body = json!({"workspaceId": workspace_id});
+        if let Some(name) = &name {
+            body["name"] = json!(name);
+        }
+        if let Some(purpose) = &purpose {
+            body["purpose"] = json!(purpose);
+        }
+        if let Some(description) = &description {
+            body["description"] = json!(description);
+        }
+        let path = format!("/audiences/{id}");
+        let mut answer = self.email_call("PATCH", &path, Some(&body), None).await?;
+        let mut kept = true;
+        if unknown_field(&answer, "purpose") {
+            // A Create that keeps no purpose yet: change the rest, and say so.
+            kept = false;
+            if name.is_none() && description.is_none() {
+                return Ok(ToolResult::error(
+                    "Not changed: Create doesn't keep an audience's purpose here yet, and nothing else was asked. Try again once it does."
+                        .to_string(),
+                ));
+            }
+            if let Some(map) = body.as_object_mut() {
+                map.remove("purpose");
+            }
+            answer = self.email_call("PATCH", &path, Some(&body), None).await?;
+        }
+        if !answer.is_success() {
+            return Ok(ToolResult::error(format!(
+                "Not changed: {}",
+                email_refusal(&answer, Topic::Audience)
+            )));
+        }
+        let audience = answer.data;
+        let mut lines = vec![format!(
+            "Changed the audience: “{}” ({}; audience_id {id}), {} contacts, {} subscribed.",
+            text(&audience, "name").unwrap_or_default(),
+            purpose_words(&audience),
+            said(number(&audience, "contacts")),
+            said(number(&audience, "subscribed"))
+        )];
+        if let Some(purpose) = purpose.filter(|_| text(&audience, "purpose").is_none()) {
+            lines.push(not_kept(&purpose, kept));
+        }
+        Ok(ToolResult::with_structured(
+            lines.join(" "),
+            json!({
+                "workspace_id": workspace_id,
+                "audience_id": id,
+                "name": audience.get("name"),
+                "purpose": audience.get("purpose"),
+                "description": audience.get("description"),
+                "contacts": audience.get("contacts"),
+                "subscribed": audience.get("subscribed"),
+            }),
+        ))
     }
 
     // ------------------------------------------------------------------------------------

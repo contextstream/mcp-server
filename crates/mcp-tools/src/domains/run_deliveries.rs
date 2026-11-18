@@ -400,6 +400,23 @@ impl Ledger {
         self.owners.lock().unwrap().by_key.len()
     }
 
+    #[cfg(test)]
+    pub(super) fn pin_credential_slots(&self, owner: &Owner) {
+        for n in 0..OWNERS_PER_CREDENTIAL {
+            let key = OwnerKey {
+                namespace: owner.key.namespace.clone(),
+                digest: format!("pinned-slot-{n}"),
+            };
+            self.keep(
+                &key,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                0,
+                ClaimToken::new("fixture"),
+            );
+        }
+    }
+
     fn directory(&self) -> std::sync::MutexGuard<'_, Owners> {
         let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
         if owners

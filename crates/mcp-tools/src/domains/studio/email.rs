@@ -1408,8 +1408,9 @@ impl StudioTool {
         if let Some(segment) = input.segment_id.as_deref().filter(|s| !s.trim().is_empty()) {
             body["segmentId"] = json!(parse_id(segment, "segment_id")?);
         }
+        let key = format!("email-draft-{}", digest(&body.to_string()));
         let answer = self
-            .email_call("POST", "/campaigns/draft", Some(&body), None)
+            .email_call("POST", "/campaigns/draft", Some(&body), Some(&key))
             .await?;
         if !answer.is_success() {
             return Ok(ToolResult::error(format!(
@@ -1661,12 +1662,13 @@ impl StudioTool {
         if let Some(variant) = variant_of(input.variant)? {
             body["variant"] = json!(variant);
         }
+        let key = format!("email-test-{campaign_id}-{}", digest(&body.to_string()));
         let answer = self
             .email_call(
                 "POST",
                 &format!("/campaigns/{campaign_id}/test"),
                 Some(&body),
-                None,
+                Some(&key),
             )
             .await?;
         if !answer.is_success() {
@@ -2625,36 +2627,42 @@ impl StudioTool {
         ))
     }
 
-    /// The contact with exactly this address, if any.
+    /// The contact with exactly this address, if any, paging past substring matches.
     async fn contact_by_address(
         &self,
         workspace_id: Uuid,
         email: &str,
     ) -> Result<std::result::Result<Option<Value>, String>> {
-        let answer = self
-            .email_call(
-                "GET",
-                &format!(
-                    "/contacts?workspaceId={workspace_id}&limit=50&q={}",
-                    urlencoding::encode(email)
-                ),
-                None,
-                None,
-            )
-            .await?;
-        if !answer.is_success() {
-            return Ok(Err(email_refusal(&answer, Topic::Other)));
+        let mut cursor: Option<String> = None;
+        for _ in 0..50 {
+            let mut path = format!(
+                "/contacts?workspaceId={workspace_id}&limit=50&q={}",
+                urlencoding::encode(email)
+            );
+            if let Some(cursor) = &cursor {
+                path.push_str(&format!("&cursor={}", urlencoding::encode(cursor)));
+            }
+            let answer = self.email_call("GET", &path, None, None).await?;
+            if !answer.is_success() {
+                return Ok(Err(email_refusal(&answer, Topic::Other)));
+            }
+            let Some(items) = answer.data.get("contacts").and_then(Value::as_array) else {
+                return Ok(Ok(None));
+            };
+            if let Some(found) = items
+                .iter()
+                .find(|c| text(c, "email").map(|e| e.to_lowercase()).as_deref() == Some(email))
+                .cloned()
+            {
+                return Ok(Ok(Some(found)));
+            }
+            let next = text(&answer.data, "nextCursor");
+            if items.is_empty() || next.is_none() || next == cursor {
+                break;
+            }
+            cursor = next;
         }
-        Ok(Ok(answer
-            .data
-            .get("contacts")
-            .and_then(Value::as_array)
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find(|c| text(c, "email").map(|e| e.to_lowercase()).as_deref() == Some(email))
-                    .cloned()
-            })))
+        Ok(Ok(None))
     }
 
     async fn erase_email_item(
@@ -2981,43 +2989,54 @@ impl StudioTool {
         ))
     }
 
+    async fn suppression_by_address(
+        &self,
+        workspace_id: Uuid,
+        email: &str,
+    ) -> Result<std::result::Result<Option<Value>, String>> {
+        let mut cursor: Option<String> = None;
+        for _ in 0..50 {
+            let mut path = format!(
+                "/suppressions?workspaceId={workspace_id}&limit=50&q={}",
+                urlencoding::encode(email)
+            );
+            if let Some(cursor) = &cursor {
+                path.push_str(&format!("&cursor={}", urlencoding::encode(cursor)));
+            }
+            let answer = self.email_call("GET", &path, None, None).await?;
+            if !answer.is_success() {
+                return Ok(Err(email_refusal(&answer, Topic::Other)));
+            }
+            let Some(items) = answer.data.get("suppressions").and_then(Value::as_array) else {
+                return Ok(Ok(None));
+            };
+            if let Some(found) = items
+                .iter()
+                .find(|s| text(s, "email").map(|e| e.to_lowercase()).as_deref() == Some(email))
+                .cloned()
+            {
+                return Ok(Ok(Some(found)));
+            }
+            let next = text(&answer.data, "nextCursor");
+            if items.is_empty() || next.is_none() || next == cursor {
+                break;
+            }
+            cursor = next;
+        }
+        Ok(Ok(None))
+    }
+
     /// Takes an address off the suppression list, only with the person's go.
     async fn unsuppress(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
         let email = one_address(input, "email_unsubscribes with operation remove")?;
-        let answer = self
-            .email_call(
-                "GET",
-                &format!(
-                    "/suppressions?workspaceId={workspace_id}&limit=50&q={}",
-                    urlencoding::encode(&email)
-                ),
-                None,
-                None,
-            )
-            .await?;
-        if !answer.is_success() {
-            return Ok(ToolResult::error(format!(
-                "Not removed: {}",
-                email_refusal(&answer, Topic::Other)
-            )));
-        }
-        let Some(suppression) = answer
-            .data
-            .get("suppressions")
-            .and_then(Value::as_array)
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find(|s| {
-                        text(s, "email").map(|e| e.to_lowercase()).as_deref()
-                            == Some(email.as_str())
-                    })
-                    .cloned()
-            })
-        else {
-            return Ok(ToolResult::error(format!(
-                "Not removed: {email} isn't on the suppression list."
-            )));
+        let suppression = match self.suppression_by_address(workspace_id, &email).await? {
+            Ok(Some(suppression)) => suppression,
+            Ok(None) => {
+                return Ok(ToolResult::error(format!(
+                    "Not removed: {email} isn't on the suppression list."
+                )));
+            }
+            Err(refused) => return Ok(ToolResult::error(format!("Not removed: {refused}"))),
         };
         let reason = text(&suppression, "reason").unwrap_or_default();
         let why = suppression_words(&suppression);

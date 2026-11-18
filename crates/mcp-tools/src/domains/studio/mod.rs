@@ -2571,8 +2571,8 @@ pub(crate) fn input_schema() -> Value {
         .uuid("campaign_id", "The email campaign (email_draft returns it; the other email actions take it)", false)
         .uuid("sequence_id", "The email sequence (email_sequences lists them; with it, email_sequences shows that one)", false)
         .integer("step", "An email's number in the sequence, 1 is the first (email_sequences with sequence_id): reads that email's text", false)
-        .uuid("audience_id", "An audience (email_audiences lists them): the one a draft goes to, contacts are listed from, added to or imported into, or the one to update", false)
-        .uuid("segment_id", "A segment of the audience instead (email_draft), or the segment to change (email_segments update)", false)
+        .uuid("audience_id", "An audience (email_audiences lists them): for email_draft, email_templates use, email_send, email_audiences update, email_contacts (list, add, import_preview, import) or email_segments (list, preview, create)", false)
+        .uuid("segment_id", "A segment of the audience (email_draft, email_templates use, email_send), or the segment to change (email_segments update)", false)
         .property(
             "rules",
             json!({
@@ -2619,7 +2619,7 @@ pub(crate) fn input_schema() -> Value {
         )
         .string("status", "Only campaigns with this status (email_campaigns): draft, scheduled, testing, sending, paused, sent, cancelled or failed; or contacts that are subscribed or suppressed (email_contacts)", false)
         .integer("days", "How many days of trends (email_report without campaign_id, 7 to 365), of the unsubscribe report (email_unsubscribes, 1 to 365) or of a sequence's numbers (email_sequences, 1 to 365), default 30; or of webhook deliveries (email_diagnostics, 1 to 30, default 7)", false)
-        .integer("variant", "An A/B test's subject to preview (email_preview): 0 (A, the campaign's own), 1 (B) or 2 (C)", false)
+        .integer("variant", "An A/B test's subject to preview or test (email_preview, email_test): 0 (A, the campaign's own), 1 (B) or 2 (C)", false)
         .string("subject", "A new subject for a draft (email_revise), up to 200 characters", false)
         .string("preheader", "A new preview line for a draft (email_revise), up to 200 characters", false)
         .string_enum(
@@ -2657,7 +2657,7 @@ pub(crate) fn input_schema() -> Value {
             json!({
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "A contact's tags, the whole new list (email_contacts update), or tags for every imported row (email_contacts import)"
+                "description": "A contact's tags, the whole new list (email_contacts update), or tags for every imported row (email_contacts import_preview, import)"
             }),
             false,
         )

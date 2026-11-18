@@ -70,7 +70,7 @@ tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip"]
 hyper = { version = "1.8", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 # Only HS256 is accepted by the hosted transport; PEM decoding is unused.
-jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12.0", default-features = false, features = ["aws_lc_rs"] }
 
 # Static hash maps
 phf = { version = "0.14", features = ["macros"] }

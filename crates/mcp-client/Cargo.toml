@@ -44,3 +44,5 @@ tokio = { workspace = true, features = ["test-util"] }
 # The local TLS server of tests/tls_trust_roots.rs. Already in the tree through
 # reqwest, with the same crypto provider (ring).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# The same tests read what a client logs.
+tracing-subscriber = { workspace = true }

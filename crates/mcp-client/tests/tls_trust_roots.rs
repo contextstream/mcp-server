@@ -8,8 +8,14 @@
 //!
 //! A local TLS server stands in for the proxy. Its authority is made for the
 //! run: no certificate or key is read from the repository, and none is kept.
+//!
+//! The machine's store is never a reason a client cannot be made. A hook is a
+//! fresh process on every prompt and makes a client each time, so a store
+//! that cannot be read, or that holds nothing usable, leaves the bundled
+//! roots and is said once, on the log.
 
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use mcp_client::ContextStreamClient;
@@ -180,17 +186,80 @@ fn api_client(url: &str) -> ContextStreamClient {
     })
 }
 
-#[tokio::test]
-async fn the_api_client_trusts_an_authority_named_by_ssl_cert_file() {
-    // This integration-test process contains only this test, so its
-    // environment cannot race another test's.
+/// The tests below set `SSL_CERT_FILE` and `SSL_CERT_DIR` for the whole
+/// process, which holds nothing but this file: one of them at a time.
+static ENVIRONMENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A home of its own and no proxy or certificate variables.
+fn clean_environment() -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("HOME", home.path());
-    for proxy in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
-        std::env::remove_var(proxy);
+    for name in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+    ] {
+        std::env::remove_var(name);
     }
-    std::env::remove_var("SSL_CERT_DIR");
-    std::env::remove_var("SSL_CERT_FILE");
+    home
+}
+
+fn set_or_remove(name: &str, value: Option<&Path>) {
+    match value {
+        Some(value) => std::env::set_var(name, value),
+        None => std::env::remove_var(name),
+    }
+}
+
+/// What this thread logs at WARN or above, while the guard lives.
+#[derive(Clone, Default)]
+struct Logged(Arc<Mutex<Vec<u8>>>);
+
+impl Logged {
+    fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+        let logged = Self::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logged.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        (logged, tracing::subscriber::set_default(subscriber))
+    }
+
+    fn lines(&self) -> Vec<String> {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+impl std::io::Write for Logged {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for Logged {
+    type Writer = Logged;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn the_api_client_trusts_an_authority_named_by_ssl_cert_file() {
+    let _one_at_a_time = ENVIRONMENT.lock().await;
+    let home = clean_environment();
     let (authority_pem, url) = serve_behind_a_throwaway_authority().await;
 
     // Nobody named the authority: the answer is refused, and the error says
@@ -205,41 +274,219 @@ async fn the_api_client_trusts_an_authority_named_by_ssl_cert_file() {
         "{refused}"
     );
 
-    // The machine names it, as a TLS-inspecting proxy's setup does.
+    // The machine names it, as a TLS-inspecting proxy's setup does: in a
+    // file, or in a directory of certificates.
     let authority_file = home.path().join("proxy-ca.pem");
-    std::fs::write(&authority_file, authority_pem).unwrap();
-    std::env::set_var("SSL_CERT_FILE", &authority_file);
-    let user = api_client(&url)
-        .me()
-        .await
-        .expect("the authority in SSL_CERT_FILE is trusted");
-    assert_eq!(user.email, "fixture@example.test");
-
-    // A machine with no usable store (a bare container, a path that is not
-    // there) still gets a client, which has the bundled roots and nothing
-    // else: it does not trust the throwaway authority.
-    std::env::set_var("SSL_CERT_FILE", home.path().join("not-there.pem"));
-    let refused = api_client(&url)
-        .get_once::<serde_json::Value>("/auth/me")
-        .await
-        .expect_err("the bundled roots do not hold the throwaway authority");
-    assert!(
-        format!("{refused:?}").contains("certificate"),
-        "{refused:?}"
-    );
+    std::fs::write(&authority_file, &authority_pem).unwrap();
+    let authority_dir = home.path().join("certs");
+    std::fs::create_dir(&authority_dir).unwrap();
+    std::fs::write(authority_dir.join("proxy-ca.pem"), &authority_pem).unwrap();
+    for (file, dir) in [
+        (Some(authority_file.as_path()), None),
+        (None, Some(authority_dir.as_path())),
+    ] {
+        set_or_remove("SSL_CERT_FILE", file);
+        set_or_remove("SSL_CERT_DIR", dir);
+        let (logged, _guard) = Logged::start();
+        let user = api_client(&url)
+            .me()
+            .await
+            .expect("the authority the machine names is trusted");
+        assert_eq!(user.email, "fixture@example.test");
+        assert_eq!(logged.lines(), Vec::<String>::new());
+    }
 }
 
-/// Both sets of roots are compiled in: the bundled ones, for a machine with
-/// no store, and the machine's own. Every HTTP client in the workspace takes
-/// its features from this one line.
+// 1.0.82 ignored SSL_CERT_FILE. Reading it must not turn a variable that
+// names nothing usable into a client that cannot be made: that was a panic
+// ("zero valid certificates found in native root store") in every hook and
+// every call on that machine.
+#[tokio::test]
+async fn a_store_that_cannot_be_used_leaves_the_bundled_roots_and_is_said_once() {
+    let _one_at_a_time = ENVIRONMENT.lock().await;
+    let home = clean_environment();
+    let (_, url) = serve_behind_a_throwaway_authority().await;
+
+    let at = |name: &str| home.path().join(name);
+    // A certificate's wrapping around bytes that are not one.
+    let not_a_certificate =
+        "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGUsIGp1c3Qgd29yZHM=\n-----END CERTIFICATE-----\n";
+    std::fs::write(at("not-a-certificate.pem"), not_a_certificate).unwrap();
+    std::fs::write(at("noise.pem"), [0u8, 159, 146, 150, 10, 255, 254]).unwrap();
+    std::fs::create_dir(at("a-directory")).unwrap();
+    std::fs::create_dir(at("bad-certificates")).unwrap();
+    std::fs::write(at("bad-certificates/one.pem"), not_a_certificate).unwrap();
+    std::fs::write(at("unreadable.pem"), not_a_certificate).unwrap();
+    std::fs::create_dir(at("unreadable-directory")).unwrap();
+    std::fs::write(at("unreadable-directory/one.pem"), not_a_certificate).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["unreadable.pem", "unreadable-directory"] {
+            std::fs::set_permissions(at(name), std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+    }
+
+    let cases: [(&str, Option<PathBuf>, Option<PathBuf>); 9] = [
+        (
+            "a file that holds no real certificate",
+            Some(at("not-a-certificate.pem")),
+            None,
+        ),
+        ("a file that is not PEM", Some(at("noise.pem")), None),
+        (
+            "a directory where a file is expected",
+            Some(at("a-directory")),
+            None,
+        ),
+        (
+            "a file that cannot be read",
+            Some(at("unreadable.pem")),
+            None,
+        ),
+        ("a file that is not there", Some(at("not-there.pem")), None),
+        (
+            "a directory of bad certificates",
+            None,
+            Some(at("bad-certificates")),
+        ),
+        (
+            "a file where a directory is expected",
+            None,
+            Some(at("not-a-certificate.pem")),
+        ),
+        (
+            "a directory that cannot be read",
+            None,
+            Some(at("unreadable-directory")),
+        ),
+        ("a directory that is not there", None, Some(at("not-there"))),
+    ];
+    for (case, file, dir) in cases {
+        set_or_remove("SSL_CERT_FILE", file.as_deref());
+        set_or_remove("SSL_CERT_DIR", dir.as_deref());
+        let (logged, _guard) = Logged::start();
+
+        // Three clients, as a process that makes more than one does: none of
+        // them fails to be made, and each still has the bundled roots only
+        // (it reaches the server and refuses its throwaway authority).
+        for _ in 0..3 {
+            let refused = api_client(&url)
+                .get_once::<serde_json::Value>("/auth/me")
+                .await
+                .expect_err("the bundled roots do not hold the throwaway authority");
+            assert!(
+                format!("{refused:?}").contains("certificate"),
+                "{case}: {refused:?}"
+            );
+        }
+
+        // Said once, in plain words: which variable, and what is trusted now.
+        let lines = logged.lines();
+        assert_eq!(lines.len(), 1, "{case}: {lines:?}");
+        let (variable, named) = match (&file, &dir) {
+            (Some(file), _) => ("SSL_CERT_FILE", file),
+            (_, Some(dir)) => ("SSL_CERT_DIR", dir),
+            _ => unreachable!(),
+        };
+        assert!(lines[0].contains("WARN"), "{case}: {lines:?}");
+        assert!(lines[0].contains(variable), "{case}: {lines:?}");
+        assert!(
+            lines[0].contains(&*named.to_string_lossy()),
+            "{case}: {lines:?}"
+        );
+        assert!(lines[0].contains("bundled"), "{case}: {lines:?}");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["unreadable.pem", "unreadable-directory"] {
+            std::fs::set_permissions(at(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+}
+
+/// reqwest is built with the bundled roots only. It does not read the
+/// machine's store itself ("rustls-tls-native-roots"): with that, a store
+/// whose certificates all fail to parse fails the build of the client.
+/// `mcp_client::http` reads the store, and keeps what can be used.
 #[test]
-fn reqwest_is_built_with_the_bundled_roots_and_the_machines_own() {
+fn reqwest_has_the_bundled_roots_and_does_not_read_the_machines_store_itself() {
     let manifest = include_str!("../../../Cargo.toml");
     let reqwest = manifest
         .lines()
         .find(|line| line.starts_with("reqwest = "))
         .expect("the workspace's reqwest dependency");
-    for feature in ["\"rustls-tls\"", "\"rustls-tls-native-roots\""] {
-        assert!(reqwest.contains(feature), "{feature} missing in: {reqwest}");
+    assert!(reqwest.contains("\"rustls-tls\""), "{reqwest}");
+    assert!(!reqwest.contains("native-roots"), "{reqwest}");
+    let client = include_str!("../Cargo.toml");
+    assert!(
+        client
+            .lines()
+            .any(|line| line.starts_with("rustls-native-certs")),
+        "mcp-client reads the machine's store with rustls-native-certs"
+    );
+}
+
+/// One code path: a client made anywhere else would not trust what the
+/// machine trusts. Every `.rs` file of every crate is read, tests included.
+#[test]
+fn every_http_client_in_the_workspace_is_made_by_mcp_client_http() {
+    fn rust_files(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, found);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
     }
+
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let the_one_place = crates.join("mcp-client").join("src").join("http.rs");
+    let this_file = crates
+        .join("mcp-client")
+        .join("tests")
+        .join("tls_trust_roots.rs");
+    let mut files = Vec::new();
+    for member in std::fs::read_dir(crates).unwrap() {
+        for part in ["src", "tests", "benches", "examples"] {
+            let dir = member.as_ref().unwrap().path().join(part);
+            if dir.is_dir() {
+                rust_files(&dir, &mut files);
+            }
+        }
+    }
+    assert!(files.len() > 100, "{} files", files.len());
+    assert!(the_one_place.is_file(), "no {}", the_one_place.display());
+
+    // `reqwest::Client::builder()`, `reqwest::Client::new()`, the same after
+    // `use reqwest::Client`, and `reqwest::ClientBuilder`.
+    let makes_a_client =
+        regex::Regex::new(r"(^|[^A-Za-z0-9_])Client::(builder|new)\(|reqwest::ClientBuilder")
+            .unwrap();
+    let mut elsewhere = Vec::new();
+    for file in files {
+        if file == the_one_place || file == this_file {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        for (number, line) in text.lines().enumerate() {
+            if makes_a_client.is_match(line) {
+                elsewhere.push(format!(
+                    "{}:{}: {}",
+                    file.strip_prefix(crates).unwrap().display(),
+                    number + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        elsewhere.is_empty(),
+        "made outside mcp_client::http:\n{}",
+        elsewhere.join("\n")
+    );
 }

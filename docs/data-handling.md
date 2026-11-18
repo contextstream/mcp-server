@@ -111,9 +111,14 @@ workspaces it is switched on for; for every other workspace the paths answer 404
   or other tool calls goes with these requests.
 - **Local state:** a session's hooks keep the ids of the runs it reported and of the deliveries it was pointed at in
   `~/.contextstream/mid-run-notices/<digest>.json`, removed a day after its last use. The `progress` tool remembers
-  up to 512 tokens in memory for at most one hour. Its bounded local binding file stores ids, digests and
+  up to 512 tokens per delivery owner in memory for at most one hour. Its bounded local binding file stores ids, digests and
   timestamps, never tokens or words (in the platform state directory under `contextstream/deliveries`, or
   `CONTEXTSTREAM_DELIVERY_STATE_DIR`). The HTTP gateway requires this directory to be set explicitly. Replicas can use a private shared directory supporting file locks and atomic rename. `await-answer` keeps an empty per-run lock file under `contextstream/waiters` in the user's state directory so only one local waiter polls; its lock is released on exit.
+- **Gateway memory limits:** Each gateway process keeps at most 32 delivery owners per credential across its
+  workspaces and sessions, and 256 owners in total. At 32, a new owner can reuse the least recently used slot
+  under its own credential that has no unshown delivery, claim in flight or unexpired claim token. It can never
+  take another credential's slot. If all 32 are protected, or a new slot would exceed 256, the report is
+  recorded as usual and silently skips delivery work for that call.
 - **Controls:** `CONTEXTSTREAM_RUN_PROGRESS=off` (nothing is reported, so the tool asks for nothing),
   `CONTEXTSTREAM_MID_RUN_NOTICES=0` (the hooks do not ask). `await-answer` runs only when it is started.
 

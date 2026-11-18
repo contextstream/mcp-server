@@ -6960,6 +6960,14 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
         let previous_api_url = std::env::var_os("CONTEXTSTREAM_API_URL");
         std::env::set_var("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = temp.path().join(".mcp.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "{}").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         write_project_mcp_config_with_remote_auth(
             &Editor::ClaudeCode,
             temp.path(),
@@ -6972,6 +6980,14 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
         )
         .expect("write project claude config");
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = temp.path().join(".mcp.json");
+            for file in [path.clone(), safe_edit::backup_path(&path).unwrap()] {
+                assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+        }
         let config_path = temp.path().join(".mcp.json");
         let content = std::fs::read_to_string(&config_path).expect("read project claude config");
         let value: serde_json::Value = serde_json::from_str(&content).expect("parse json");
@@ -8210,6 +8226,14 @@ CONTEXTSTREAM_API_KEY = "test-key"
         let _xdg_guard = XdgConfigGuard::isolate_under(temp.path());
         std::env::set_var("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = temp.path().join(".gemini/config/mcp_config.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "{}").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         write_mcp_config_force_remote_with_auth(
             &Editor::Antigravity,
             "test-key",
@@ -8221,6 +8245,14 @@ CONTEXTSTREAM_API_KEY = "test-key"
         )
         .expect("write antigravity config");
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = temp.path().join(".gemini/config/mcp_config.json");
+            for file in [path.clone(), safe_edit::backup_path(&path).unwrap()] {
+                assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+        }
         let ag_path = temp
             .path()
             .join(".gemini")

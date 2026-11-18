@@ -1784,19 +1784,32 @@ mod tests {
     }
 
     #[test]
-    fn round4_report_only_evidence_expires_in_two_hours() {
+    fn round6_sweep_expires_report_only_owners_after_ten_minutes() {
         let ledger = Ledger::default();
-        let owner = Owner {
-            key: "expiry".into(),
-            workspace: Uuid::new_v4(),
-            store: "unused".into(),
-        };
+        let idle = quota_owner(0, 0);
+        let recent = quota_owner(0, 1);
         let run = Uuid::new_v4();
-        ledger.note_report(&owner, run);
-        ledger.with(&owner.key, |mem| {
-            *mem.reports.get_mut(&run).unwrap() -= Duration::from_secs(7201)
-        });
-        assert!(!ledger.saw_report(&owner, run));
+        for (owner, seconds) in [(&idle, 600), (&recent, 590)] {
+            ledger.note_report(owner, run);
+            ledger.with(&owner.key, |mem| {
+                let at = Instant::now() - Duration::from_secs(seconds);
+                *mem.reports.get_mut(&run).unwrap() = at;
+                mem.last_used = Some(at);
+                mem.last_read = Some(at);
+                mem.polls.insert(
+                    run,
+                    Poll {
+                        started: at,
+                        finished: tokio::sync::watch::channel(true).1,
+                        result: Arc::default(),
+                    },
+                );
+            });
+        }
+        ledger.owners.lock().unwrap().last_sweep = None;
+        assert!(ledger.saw_report(&recent, run));
+        assert_eq!(ledger.owner_count(), 1, "sweep must free the idle slot");
+        assert!(!ledger.saw_report(&idle, run));
     }
 
     #[test]

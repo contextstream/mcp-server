@@ -646,6 +646,8 @@ class CompiledInFilesAreTracked(unittest.TestCase):
                     )
 
     def test_http_gateway_dockerfile_copies_included_files_and_keeps_real_build_fatal(self):
+        import subprocess
+
         root = Path(__file__).resolve().parents[2]
         dockerfile = (root / "Dockerfile.http-gateway").read_text(encoding="utf-8")
         instructions = self.dockerfile_instructions(dockerfile)
@@ -688,11 +690,17 @@ class CompiledInFilesAreTracked(unittest.TestCase):
         ]
         self.assertEqual(len(cache_builds), 1, "expected the dependency-cache cargo build before COPY crates/")
         self.assertEqual(len(real_builds), 1, "expected the real cargo build after COPY crates/")
-        self.assertNotIn(
-            "|| true",
-            real_builds[0],
-            "real gateway cargo build must fail the image build instead of leaving the dummy binary behind",
-        )
+        real = real_builds[0]
+        compile_and_stats = real[real.index("cargo build"):]
+        for cargo_rc, stats_rc in [(0, 0), (0, 1), (23, 0)]:
+            with self.subTest(cargo=cargo_rc, stats=stats_rc):
+                stubs = f"cargo() {{ return {cargo_rc}; }}\nsccache() {{ return {stats_rc}; }}\n"
+                result = subprocess.run(["sh", "-c", stubs + compile_and_stats])
+                self.assertEqual(result.returncode, cargo_rc)
+
+        stats = "&& { sccache --show-stats 2>/dev/null || true; }"
+        self.assertTrue(real.endswith(stats), "only sccache statistics may fail after compiling")
+        self.assertNotIn("|| true", real.removesuffix(stats), "the real cargo build must be fatal")
         self.assertIn(
             "rm -f target/release/contextstream-mcp",
             real_builds[0],

@@ -2948,7 +2948,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_mount_that_forces_public_mode_warns_before_secret_and_backup_writes() {
+    fn a_mount_that_forces_public_mode_refuses_secret_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
         for errno in [libc::EPERM, libc::ENOTSUP, libc::EOPNOTSUPP] {
             let _mount = ChmodRefused::with(errno);
@@ -2957,16 +2959,109 @@ mod tests {
             let path = folder.path().join("hooks.json");
             std::fs::write(&path, "{}").unwrap();
             let loaded = read_for_edit(&path, JsonDialect::Strict).unwrap();
-            assert!(commit(&path, &loaded, &json!({"key":"fixture"})).unwrap());
-            assert_eq!(mode_of(&path), 0o644);
-            assert_eq!(
-                std::fs::read_to_string(backup_path(&path).unwrap()).unwrap(),
-                "{}"
-            );
-            let warnings = ChmodRefused::warnings();
-            assert_eq!(warnings.len(), 1);
+            let err = commit(&path, &loaded, &json!({"key":"fixture"}))
+                .expect_err("secret write must fail when file cannot be kept private");
+            let message = format!("{err:#}");
+            assert_eq!(message.lines().count(), 1, "{message}");
             assert!(
-                warnings[0].contains("does not let") && warnings[0].contains("be made private")
+                message.contains(&*path.to_string_lossy()),
+                "expected target path in error: {message}"
+            );
+            assert!(
+                !message.contains(".tmp."),
+                "must name the config file, not the staged temp path: {message}"
+            );
+            assert!(
+                message.contains("this location cannot keep the file private"),
+                "{message}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+            assert_eq!(names_in(folder.path()), ["hooks.json"]);
+            assert!(ChmodRefused::warnings().is_empty());
+        }
+
+        // An unchanged 0644 key-bearing file whose permissions cannot be tightened also fails.
+        let unchanged = dir.path().join("unchanged.json");
+        std::fs::write(&unchanged, "{\n  \"key\": \"fixture\"\n}\n").unwrap();
+        std::fs::set_permissions(&unchanged, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let loaded = read_for_edit(&unchanged, JsonDialect::Strict).unwrap();
+        let _mount = ChmodRefused::with(libc::EPERM);
+        let err = commit(&unchanged, &loaded, &json!({"key": "fixture"}))
+            .expect_err("unchanged 0644 secret file must fail when chmod is refused");
+        let message = format!("{err:#}");
+        assert_eq!(message.lines().count(), 1, "{message}");
+        assert!(message.contains(&*unchanged.to_string_lossy()), "{message}");
+        assert!(
+            message.contains("this location cannot keep the file private"),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_preserves_public_modes_unless_backup_holds_a_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let public_cases = [
+            (
+                "public.json",
+                "{\n  \"mcpServers\": {\n    \"other\": { \"url\": \"https://example.test\" }\n  }\n}\n",
+            ),
+            (
+                "public.jsonc",
+                "// shared\n{\n  \"mcp\": {\n    \"other\": { \"headers\": { \"Authorization\": \"${TOKEN}\" } }\n  }\n}\n",
+            ),
+            (
+                "public.toml",
+                "[mcp_servers.other]\nurl = \"https://example.test\"\n",
+            ),
+        ];
+        for (name, backup_text) in public_cases {
+            let path = dir.path().join(name);
+            let backup = backup_path(&path).unwrap();
+            let current = format!("{backup_text}\n");
+            std::fs::write(&path, &current).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::write(&backup, backup_text).unwrap();
+            std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            assert!(restore_text_first_backup(&path, &current, true, backup_text).unwrap());
+            assert_eq!(
+                mode_of(&path),
+                0o644,
+                "{name} without credentials must stay 0644"
+            );
+        }
+
+        let secret_cases = [
+            (
+                "secret.json",
+                "{\n  \"mcpServers\": {\n    \"other\": { \"headers\": { \"apiKey\": \"sk-secret\" } }\n  }\n}\n",
+            ),
+            (
+                "secret.jsonc",
+                "// key\n{\n  \"mcp\": {\n    \"other\": { \"headers\": { \"api_key\": \"sk-secret\" } }\n  }\n}\n",
+            ),
+            (
+                "secret.toml",
+                "[mcp_servers.other.http_headers]\napiKey = \"sk-secret\"\n",
+            ),
+        ];
+        for (name, backup_text) in secret_cases {
+            let path = dir.path().join(name);
+            let backup = backup_path(&path).unwrap();
+            let current = format!("{backup_text}\n");
+            std::fs::write(&path, &current).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::write(&backup, backup_text).unwrap();
+            std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            assert!(restore_text_first_backup(&path, &current, true, backup_text).unwrap());
+            assert_eq!(
+                mode_of(&path),
+                0o600,
+                "{name} with credentials must become 0600"
             );
         }
     }

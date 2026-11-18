@@ -6969,6 +6969,107 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn project_config_protects_preserved_apikey_and_keeps_keyless_public_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let previous_api_url = std::env::var_os("CONTEXTSTREAM_API_URL");
+        std::env::set_var("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+
+        // 1. Preserved `apiKey` (camelCase) routes a keyless ContextStream write through the private writer.
+        let secret_dir = tempfile::tempdir().expect("tempdir");
+        let secret_mcp = secret_dir.path().join(".mcp.json");
+        std::fs::write(
+            &secret_mcp,
+            "{\n  \"mcpServers\": {\n    \"other\": {\n      \"headers\": {\n        \"apiKey\": \"sk-live-secret\"\n      }\n    }\n  }\n}\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&secret_mcp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_project_mcp_config_with_remote_auth(
+            &Editor::ClaudeCode,
+            secret_dir.path(),
+            "",
+            Some("ws-id"),
+            Some("project-id"),
+            None,
+            None,
+            None,
+        )
+        .expect("write project config with preserved apiKey");
+
+        for file in [&secret_mcp, &safe_edit::backup_path(&secret_mcp).unwrap()] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "preserved apiKey must make {} private",
+                file.display()
+            );
+        }
+
+        // 2. Keyless shared project config stays 0644 across write, exact restore, and surgical uninstall.
+        for surgical in [false, true] {
+            let public_dir = tempfile::tempdir().expect("tempdir");
+            let public_mcp = public_dir.path().join(".mcp.json");
+            std::fs::write(
+                &public_mcp,
+                "{\n  \"mcpServers\": {\n    \"other\": {\n      \"headers\": {\n        \"apiKey\": \"${OTHER_API_KEY}\"\n      }\n    }\n  }\n}\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&public_mcp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            write_project_mcp_config_with_remote_auth(
+                &Editor::ClaudeCode,
+                public_dir.path(),
+                "",
+                Some("ws-id"),
+                Some("project-id"),
+                None,
+                None,
+                None,
+            )
+            .expect("write keyless project config");
+
+            for file in [&public_mcp, &safe_edit::backup_path(&public_mcp).unwrap()] {
+                assert_eq!(
+                    std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o644
+                );
+            }
+
+            if surgical {
+                let mut edited: Value =
+                    serde_json::from_str(&std::fs::read_to_string(&public_mcp).unwrap()).unwrap();
+                edited["mcpServers"]["third"] =
+                    json!({"type": "http", "url": "https://example.test/mcp"});
+                std::fs::write(
+                    &public_mcp,
+                    serde_json::to_string_pretty(&edited).unwrap() + "\n",
+                )
+                .unwrap();
+            }
+
+            assert!(remove_contextstream_from_project_mcp_config(
+                &Editor::ClaudeCode,
+                public_dir.path()
+            )
+            .expect("uninstall project config"));
+            assert_eq!(
+                std::fs::metadata(&public_mcp).unwrap().permissions().mode() & 0o777,
+                0o644,
+                "surgical={surgical}: keyless public config must remain 0644 after uninstall"
+            );
+        }
+
+        if let Some(value) = previous_api_url {
+            std::env::set_var("CONTEXTSTREAM_API_URL", value);
+        } else {
+            std::env::remove_var("CONTEXTSTREAM_API_URL");
+        }
+    }
+
     #[test]
     fn test_write_project_mcp_config_with_remote_auth_embeds_api_key_header_for_claude() {
         let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());

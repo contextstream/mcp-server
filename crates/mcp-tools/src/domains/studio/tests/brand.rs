@@ -855,6 +855,127 @@ async fn revise_plans_another_like_a_made_film_from_the_earlier_ask() {
     );
 }
 
+async fn revise_voice_request(job: Value, piece: i64, voice: Option<&str>) -> (Value, String) {
+    let studio = api(Arc::new(Mutex::new(("succeeded".into(), true))));
+    let stub = Stub::start(Arc::new(move |request| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", path) if path == format!("/create/jobs/{JOB}") => Answer::ok(job.clone()),
+            ("POST", "/create/quotes") => Answer::ok(brand_quote("ready", false)),
+            _ => studio(request),
+        }
+    }))
+    .await;
+    let mut input = json!({"action": "revise", "make_id": JOB, "piece": piece,
+                           "change": "shorten the opening", "wait_seconds": 0});
+    if let Some(voice) = voice {
+        input["voice"] = json!(voice);
+    }
+    let result = stub.tool().execute(input).await.unwrap();
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    let posted = stub.posts_to("/create/quotes");
+    assert_eq!(posted.len(), 1);
+    (posted[0].body["request"].clone(), text)
+}
+
+#[tokio::test]
+async fn revise_voice_keeps_the_made_films_curated_key() {
+    let mut job = film_job();
+    job["make"]["pieces"][0]["placard"] = json!({
+        "voice": {"key": "warm-narrator", "voiceId": "ExactEricId", "name": "Eric", "locked": true},
+    });
+    job["make"]["plan"]["pieces"][0]["voice"] =
+        json!({"voiceId": "ExactJoshId", "name": "Josh", "locked": true});
+
+    let (request, text) = revise_voice_request(job, 0, None).await;
+    assert_eq!(request["voice"], "warm-narrator");
+    assert!(
+        text.contains("Voice kept: Eric (pass voice to change it)."),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn revise_voice_keeps_the_made_films_exact_id_without_a_key() {
+    let mut job = film_job();
+    job["make"]["pieces"][0]["placard"] = json!({
+        "voice": {"voiceId": "ExactEricId", "name": "Eric", "locked": true},
+    });
+
+    let (request, _) = revise_voice_request(job, 0, None).await;
+    assert_eq!(request["voice"], "ExactEricId");
+}
+
+#[tokio::test]
+async fn revise_voice_keeps_the_unmade_pieces_planned_voice() {
+    let mut job = brand_job("generating", false);
+    job["make"]["plan"]["pieces"][1] = json!({
+        "index": 1, "id": "sale-voice-over", "title": "Sale Voice-over",
+        "kindOfWork": "sound.voice-over", "medium": "sound", "form": "voice-over",
+        "status": "making", "voice": {"key": "warm-narrator", "name": "Eric", "locked": true},
+    });
+    job["make"]["plan"]["voice"] =
+        json!({"voiceId": "ExactJoshId", "name": "Josh", "locked": true});
+
+    let (request, text) = revise_voice_request(job, 1, None).await;
+    assert_eq!(request["voice"], "warm-narrator");
+    assert!(
+        text.contains("Voice kept: Eric (pass voice to change it)."),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn revise_voice_falls_back_to_the_films_plan_voice() {
+    let mut job = film_job();
+    job["make"]["plan"]["voice"] =
+        json!({"voiceId": "ExactEricId", "name": "Eric", "locked": true});
+
+    let (request, _) = revise_voice_request(job, 0, None).await;
+    assert_eq!(request["voice"], "ExactEricId");
+}
+
+#[tokio::test]
+async fn revise_voice_prefers_the_explicit_argument() {
+    let mut job = film_job();
+    job["make"]["pieces"][0]["placard"] = json!({
+        "voice": {"voiceId": "ExactEricId", "name": "Eric", "locked": true},
+    });
+
+    let (request, text) = revise_voice_request(job, 0, Some("ExactJoshId")).await;
+    assert_eq!(request["voice"], "ExactJoshId");
+    assert!(!text.contains("Voice kept:"), "{text}");
+}
+
+#[tokio::test]
+async fn revise_voice_omits_the_field_without_a_locked_voice() {
+    for placard in [
+        json!({}),
+        json!({"voice": {"voiceId": "ExactEricId", "name": "Eric"}}),
+        json!({"voice": {"voiceId": "ExactEricId", "name": "Eric", "locked": false}}),
+    ] {
+        let mut job = film_job();
+        job["make"]["pieces"][0]["placard"] = placard;
+
+        let (request, text) = revise_voice_request(job, 0, None).await;
+        assert!(request.get("voice").is_none(), "{request}");
+        assert!(!text.contains("Voice kept:"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn revise_voice_leaves_unmade_pieces_that_do_not_speak_without_a_voice() {
+    let mut job = brand_job("generating", false);
+    job["make"]["plan"]["voice"] =
+        json!({"voiceId": "ExactEricId", "name": "Eric", "locked": true});
+
+    for piece in [0, 1] {
+        let (request, text) = revise_voice_request(job.clone(), piece, None).await;
+        assert!(request.get("voice").is_none(), "{request}");
+        assert!(!text.contains("Voice kept:"), "{text}");
+    }
+}
+
 // ============================================================================
 // End to end, as the agent reads it
 // ============================================================================

@@ -101,8 +101,9 @@ pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// Maximum bytes read across all PEM sources in one store load.
 pub const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Maximum candidate PEM files read from a single certificate directory.
-pub const MAX_DIRECTORY_FILES: usize = 1_024;
+/// Maximum candidate PEM files opened across all sources in one store load.
+pub const MAX_FILES: usize = 1_024;
+pub use MAX_FILES as MAX_DIRECTORY_FILES;
 
 /// Maximum certificates added across one store load.
 pub const MAX_CERTIFICATES: usize = 1_024;
@@ -112,6 +113,7 @@ struct Loader {
     seen: HashSet<Vec<u8>>,
     roots: Vec<reqwest::Certificate>,
     total_bytes: u64,
+    files: usize,
     stopped: bool,
     first_problem: Option<String>,
 }
@@ -128,9 +130,6 @@ impl Loader {
     }
 
     fn load_file(&mut self, path: &Path) -> io::Result<()> {
-        if self.stopped {
-            return Ok(());
-        }
         // A configured path may point to a device or pipe. Never wait on one.
         let mut options = File::options();
         options.read(true);
@@ -140,47 +139,52 @@ impl Loader {
             options.custom_flags(libc::O_NONBLOCK);
         }
         let file = options.open(path)?;
-        if !file.metadata()?.is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
             return Err(io::Error::other("expected a regular PEM file"));
         }
-        let remaining_total = MAX_TOTAL_BYTES.saturating_sub(self.total_bytes);
-        let cap = MAX_FILE_BYTES.min(remaining_total);
+        // The byte used to detect an oversized file also comes out of the store budget.
+        let cap = (MAX_FILE_BYTES + 1).min(MAX_TOTAL_BYTES - self.total_bytes);
         let mut bytes = Vec::new();
-        file.take(cap + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > cap {
-            if remaining_total < MAX_FILE_BYTES && bytes.len() as u64 > remaining_total {
-                self.total_bytes = MAX_TOTAL_BYTES;
-                self.stop(
-                    path,
-                    format!(
-                        "stopped after {} MiB across CA store",
-                        MAX_TOTAL_BYTES / (1024 * 1024)
-                    ),
-                );
+        let read = file.take(cap).read_to_end(&mut bytes);
+        let consumed = bytes.len() as u64;
+        self.total_bytes += consumed;
+        if self.total_bytes == MAX_TOTAL_BYTES {
+            self.stop(
+                path,
+                format!(
+                    "stopped after {} MiB across CA store",
+                    MAX_TOTAL_BYTES / (1024 * 1024)
+                ),
+            );
+            if metadata.len() > consumed {
+                // The budget ended in the middle of this file.
                 return Ok(());
             }
+        }
+        read?;
+        if consumed > MAX_FILE_BYTES {
             return Err(io::Error::other("PEM file exceeds 16 MiB"));
         }
-        self.total_bytes += bytes.len() as u64;
         let mut found = false;
         for entry in CertificateDer::pem_slice_iter(&bytes) {
             found = true;
             match entry {
                 Ok(der) if self.seen.contains(der.as_ref()) => {}
                 Ok(der) => {
-                    if self.roots.len() >= MAX_CERTIFICATES {
-                        self.stop(
-                            path,
-                            format!("stopped after {MAX_CERTIFICATES} certificates"),
-                        );
-                        break;
-                    }
                     // reqwest parses each root when building the client. Check
                     // with the same parser so one bad entry cannot break it.
                     if rustls::RootCertStore::empty().add(der.clone()).is_ok() {
                         if let Ok(root) = reqwest::Certificate::from_der(&der) {
                             self.seen.insert(der.to_vec());
                             self.roots.push(root);
+                            if self.roots.len() == MAX_CERTIFICATES {
+                                self.stop(
+                                    path,
+                                    format!("stopped after {MAX_CERTIFICATES} certificates"),
+                                );
+                                break;
+                            }
                             continue;
                         }
                     }
@@ -196,14 +200,23 @@ impl Loader {
     }
 
     fn file(&mut self, path: &Path) {
+        if self.stopped {
+            return;
+        }
+        self.files += 1;
         if let Err(e) = self.load_file(path) {
             self.problem(path, e);
+        }
+        if self.files == MAX_FILES {
+            self.stop(
+                path,
+                format!("stopped after {MAX_FILES} files across CA store"),
+            );
         }
     }
 
     fn directory(&mut self, path: &Path, hashed: bool) -> io::Result<()> {
         let mut found = false;
-        let mut files = 0usize;
         for entry in path.read_dir()? {
             if self.stopped {
                 break;
@@ -212,14 +225,6 @@ impl Loader {
                 Ok(entry) => {
                     let p = entry.path();
                     if (!hashed || system_cert_name(&p)) && !p.is_dir() {
-                        if files >= MAX_DIRECTORY_FILES {
-                            self.stop(
-                                path,
-                                format!("stopped after {MAX_DIRECTORY_FILES} files in directory"),
-                            );
-                            break;
-                        }
-                        files += 1;
                         found = true;
                         self.file(&p);
                     }
@@ -316,6 +321,9 @@ mod tests {
             loader.directory(&path, false).unwrap();
         }
         assert!(loader.stopped);
-        assert_eq!(loader.total_bytes, 1_024, "each candidate contains one byte");
+        assert_eq!(
+            loader.total_bytes, 1_024,
+            "each candidate contains one byte"
+        );
     }
 }

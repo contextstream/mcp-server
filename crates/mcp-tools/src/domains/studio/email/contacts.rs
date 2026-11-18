@@ -186,16 +186,36 @@ impl Import {
         )
     }
 
+    fn review_token(&self) -> String {
+        digest(
+            &json!([
+                self.audience_id,
+                digest(&self.csv),
+                self.preview.get("digest"),
+                self.counts.eligible,
+                self.source,
+                self.note,
+                self.tags
+            ])
+            .to_string(),
+        )
+    }
+
     /// The call that imports it, once the person agrees.
     fn confirm_with(&self) -> Value {
-        json!({
+        let mut args = json!({
             "action": "email_contacts",
             "operation": "import",
             "audience_id": self.audience_id,
             "consent_source": self.source,
             "consent_note": self.note,
             "confirm_rows": self.counts.eligible,
-        })
+            "confirm_review": self.review_token(),
+        });
+        if let Some(tags) = &self.tags {
+            args["tags"] = json!(tags);
+        }
+        args
     }
 }
 
@@ -548,6 +568,9 @@ impl StudioTool {
             Some(eligible) => format!("Eligible: {} can be sent to.", credits(eligible)),
             None => "Eligible: not answered.".to_string(),
         });
+        if counts.suppressed.is_some_and(|n| n > 0) {
+            lines.push("Suppressed addresses: not answered by this preview.".into());
+        }
         let invalid = preview
             .get("invalid")
             .and_then(Value::as_array)
@@ -658,6 +681,14 @@ impl StudioTool {
                     .to_string(),
             ));
         };
+        let token = import.review_token();
+        if input
+            .confirm_review
+            .as_ref()
+            .is_some_and(|seen| seen != &token)
+        {
+            return Ok(ToolResult::error("Not imported: the file, audience, consent or eligible recipients changed. Run the preview again and confirm it."));
+        }
         let what = import.what();
         let mut notes: Vec<String> = Vec::new();
         let go = persons_go(
@@ -668,10 +699,7 @@ impl StudioTool {
                 ),
                 title: "Import them",
                 does: format!("Imports them into “{audience_name}”."),
-                state: format!(
-                    "studio-email-import:{audience_id}:{}:{eligible}",
-                    digest(&json!([digest(&import.csv), import.preview.get("digest"), import.source, import.note, import.tags]).to_string())
-                ),
+                state: format!("studio-email-import:{audience_id}:{token}:{eligible}"),
             },
             input.confirm_rows == Some(eligible),
         )
@@ -761,7 +789,7 @@ impl StudioTool {
         }
         // Different writes carry different keys, including their tags and preview digest.
         let key = format!("email-import-{}", digest(&body.to_string()));
-        let (mut answer, kept) = self
+        let (mut answer, mut kept) = self
             .email_call_newer("POST", "/contacts/import", &body, &newer, Some(&key))
             .await?;
         if unknown_field(&answer, "consentSource") {
@@ -770,10 +798,9 @@ impl StudioTool {
                 .remove("consentSource");
             body["consentNote"] = json!(legacy_note);
             let key = format!("email-import-{}", digest(&body.to_string()));
-            answer = self
+            (answer, kept) = self
                 .email_call_newer("POST", "/contacts/import", &body, &newer, Some(&key))
-                .await?
-                .0;
+                .await?;
         }
         if !kept || newer.is_empty() {
             notes.push("Eligible recipients at import time: not answered by this API.".into());

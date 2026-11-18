@@ -66,8 +66,8 @@ flowchart TD
 
    | Binary | How it is built | How it is checked |
    |---|---|---|
-   | `linux-x64`, `linux-x64-remote-acceleration` | native on x86_64 | `--version` runs; glibc needed stays at 2.39 or below |
-   | `linux-arm64` | native on an arm64 runner | `--version` runs; glibc needed stays at 2.39 or below |
+   | `linux-x64`, `linux-x64-remote-acceleration` | cargo-zigbuild against glibc 2.28 | `--version` runs; the newest glibc symbol it needs is 2.28 or older |
+   | `linux-arm64` | cargo-zigbuild against glibc 2.28, cross-built on x86_64 | `--version` runs under qemu-aarch64; the newest glibc symbol it needs is 2.28 or older |
    | `win-x64.exe` | cargo-xwin (MSVC CRT and SDK) | `--version` runs under Wine |
    | `darwin-arm64`, `darwin-x64` | cross-built (next section) | `mcp_release.py macho-check` |
 

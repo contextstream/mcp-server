@@ -3,8 +3,9 @@
 #
 #   scripts/release/build.sh <artifact> <version>
 #
-# Writes out/<artifact> in the repository root. Linux builds natively on its own architecture, and linux-arm64 also
-# cross-compiles on x86_64 with cargo-zigbuild against glibc 2.39, checked by running it under qemu-aarch64. Windows builds with cargo-xwin (MSVC CRT and SDK, license accepted by
+# Writes out/<artifact> in the repository root. The three Linux binaries build on x86_64 with cargo-zigbuild against glibc
+# 2.28, so they start on RHEL 8, Debian 10 and anything newer whatever glibc this machine has; x64 is run here and arm64
+# under qemu-aarch64, and each is refused when it needs a newer glibc. Windows builds with cargo-xwin (MSVC CRT and SDK, license accepted by
 # the owner) and is run once under Wine. The darwin binaries build with clang and ld64.lld against an SDK root made
 # from Zig's macOS libc headers and the stubs in scripts/release/macos-link-stubs (no macOS runner is used)
 # and are checked structurally, since Linux cannot run them. Every tool download is pinned by sha256. SOURCE_DATE_EPOCH comes from the workflow.
@@ -22,7 +23,12 @@ ZIGBUILD_VERSION=v0.24.0
 ZIGBUILD_SHA256=52be2cb85ad3875682564a29bac1832b2ab3db68b1c504765c92d5249cc9b96f
 XWIN_VERSION=v0.23.1
 XWIN_SHA256=c492c6dfb7e5ac0eee586b796e0fc950ba13077e7f0bbb046f445d71790d5360
-GLIBC_FLOOR=2.39
+# The oldest glibc a Linux binary must start on, which makes it the newest one it may need: 2.28 is RHEL 8 and Debian 10.
+# Until 1.0.82 it was 2.39, the release machine's own (Ubuntu 24.04), and the binaries did not start on Debian 12 (2.36),
+# Ubuntu 22.04 (2.35), RHEL 9 or Amazon Linux 2023 (2.34).
+GLIBC_FLOOR=2.28
+# glibc_within_floor NEWEST: whether a binary whose newest glibc symbol is NEWEST starts on glibc $GLIBC_FLOOR.
+glibc_within_floor() { [ -n "$1" ] && [ "$(printf '%s\n%s\n' "$1" "$GLIBC_FLOOR" | sort -V | tail -1)" = "$GLIBC_FLOOR" ]; }
 
 features=()
 exe=contextstream-mcp
@@ -54,24 +60,22 @@ rustup target add --toolchain "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-tool
 
 case "$kind" in
   linux)
-    case "$(uname -m):$target" in
-      x86_64:x86_64-*|aarch64:aarch64-*)
-        cargo build --locked --release --package mcp-server --target "$target" "${features[@]}" ;;
-      x86_64:aarch64-unknown-linux-gnu)
-        # linux-arm64 on an x86_64 machine: cargo-zigbuild cross-compiles with Zig as the C compiler and linker, against
-        # glibc $GLIBC_FLOOR (the .2.39 target suffix), so the binary needs no newer glibc than the native build did.
-        cross=1
-        fetch "https://ziglang.org/download/$ZIG_VERSION/$ZIG_DIR.tar.xz" "$ZIG_SHA256" "$tools/zig.tar.xz"
-        tar -xJf "$tools/zig.tar.xz" -C "$tools"
-        fetch "https://github.com/rust-cross/cargo-zigbuild/releases/download/$ZIGBUILD_VERSION/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz" \
-          "$ZIGBUILD_SHA256" "$tools/zigbuild.tar.xz"
-        tar -xJf "$tools/zigbuild.tar.xz" -C "$tools"
-        # Zig links it: a linker the environment sets for Linux targets (clang with mold, in RUSTFLAGS) is for native builds.
-        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER \
-          PATH="$tools/$ZIG_DIR:$tools/cargo-zigbuild-x86_64-unknown-linux-musl:$PATH" \
-          cargo zigbuild --locked --release --package mcp-server --target "$target.$GLIBC_FLOOR" "${features[@]}" ;;
-      *) echo "build.sh: $target does not build on $(uname -m)" >&2; exit 2 ;;
-    esac
+    # Every Linux binary, x64 too: cargo-zigbuild compiles the C dependencies and links with Zig, against glibc
+    # $GLIBC_FLOOR (the .$GLIBC_FLOOR target suffix). The machine's own compiler would link against the machine's own
+    # glibc, and the binary would need that one or a newer.
+    [ "$(uname -m)" = x86_64 ] || { echo "build.sh: $target builds on x86_64 (the pinned Zig is the x86_64 one)" >&2; exit 2; }
+    [ "$target" = x86_64-unknown-linux-gnu ] || cross=1
+    fetch "https://ziglang.org/download/$ZIG_VERSION/$ZIG_DIR.tar.xz" "$ZIG_SHA256" "$tools/zig.tar.xz"
+    tar -xJf "$tools/zig.tar.xz" -C "$tools"
+    fetch "https://github.com/rust-cross/cargo-zigbuild/releases/download/$ZIGBUILD_VERSION/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz" \
+      "$ZIGBUILD_SHA256" "$tools/zigbuild.tar.xz"
+    tar -xJf "$tools/zigbuild.tar.xz" -C "$tools"
+    # Zig links it: a linker the environment sets for Linux targets (clang with mold, in RUSTFLAGS) is for native builds.
+    # x64 is this machine's own target, so what the environment sets for that target alone is dropped too.
+    target_variable=CARGO_TARGET_$(echo "${target//-/_}" | tr 'a-z' 'A-Z')
+    env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u "${target_variable}_LINKER" -u "${target_variable}_RUSTFLAGS" \
+      PATH="$tools/$ZIG_DIR:$tools/cargo-zigbuild-x86_64-unknown-linux-musl:$PATH" \
+      cargo zigbuild --locked --release --package mcp-server --target "$target.$GLIBC_FLOOR" "${features[@]}"
     ;;
   windows)
     command -v lld-link >/dev/null && { command -v wine64 >/dev/null || [ -x /usr/lib/wine/wine64 ]; } || {
@@ -156,9 +160,9 @@ case "$kind" in
       objdump=objdump
     fi
     newest=$("$objdump" -T "out/$artifact" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
-    [ "$(printf '%s\n%s\n' "$newest" "$GLIBC_FLOOR" | sort -V | tail -1)" = "$GLIBC_FLOOR" ] || {
-      echo "build.sh: $artifact needs glibc $newest, above the $GLIBC_FLOOR floor" >&2; exit 1; }
-    log "$artifact needs glibc $newest at most"
+    glibc_within_floor "$newest" || {
+      echo "build.sh: $artifact needs glibc $newest, above the $GLIBC_FLOOR floor: it would not start on glibc $GLIBC_FLOOR" >&2; exit 1; }
+    log "$artifact needs glibc $newest at most (floor $GLIBC_FLOOR)"
     ;;
   windows)
     # Ubuntu 24.04's wine64 package leaves its 64-bit loader off PATH, and its `wine` may need the 32-bit one.

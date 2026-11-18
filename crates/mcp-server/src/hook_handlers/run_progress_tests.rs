@@ -1624,3 +1624,120 @@ fn the_span_before_the_session_run_is_two_minutes_unless_set() {
     assert_eq!(session_run_after_ms_of(Some("-1")), 2 * MINUTE);
     assert_eq!(session_run_after_ms_of(Some("3601")), 2 * MINUTE);
 }
+
+// ============================================================================
+// Project details: a run reported without a project
+// ============================================================================
+
+const OTHER_WORKSPACE: &str = "99999999-9999-4999-8999-999999999999";
+const OTHER_PROJECT: &str = "77777777-7777-4777-8777-777777777777";
+
+/// A `progress` answer for a run the server had no project for (a session
+/// opened from a parent folder, or a stateless call that named none).
+fn answer_without_a_project() -> Value {
+    json!({
+        "run": {
+            "run_id": RUN,
+            "workspace_id": WORKSPACE,
+            "project_id": null,
+            "state": "working",
+            "liveness": "live",
+            "agent": tool_agent(),
+            "scope": {"workspace_id": WORKSPACE},
+        },
+        "written": ["run.step"],
+        "session": SESSION,
+        "run_key": session_key(),
+    })
+}
+
+fn signal_of(file: &SessionFile, index: usize) -> Map<String, Value> {
+    file.base(&file.runs[index]).expect("the run has a signal")
+}
+
+#[test]
+fn a_run_reported_without_a_project_is_kept_in_the_sessions_project() {
+    let report = json!({"title": "Fix the flaky login test", "step": "Reading the test"});
+
+    // `init` resolved the session's project: the run's signals carry it, and
+    // the API gives the run its project from the first of them.
+    let mut file = named_at(0);
+    let index = file
+        .model_reported(
+            &report,
+            &answer_without_a_project(),
+            &Scope::default(),
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(signal_of(&file, index)["workspace_id"], json!(WORKSPACE));
+    assert_eq!(signal_of(&file, index)["project_id"], json!(PROJECT));
+
+    // `init` named no project: the folder's, in the run's workspace.
+    let mut file = known();
+    let index = file
+        .model_reported(&report, &answer_without_a_project(), &in_project(), 1_000)
+        .unwrap();
+    assert_eq!(signal_of(&file, index)["project_id"], json!(PROJECT));
+
+    // A project of another workspace is not this run's.
+    let elsewhere = Scope {
+        workspace_id: Some(OTHER_WORKSPACE.to_string()),
+        project_id: Some(OTHER_PROJECT.to_string()),
+    };
+    let mut file = known();
+    let index = file
+        .model_reported(&report, &answer_without_a_project(), &elsewhere, 1_000)
+        .unwrap();
+    assert!(!signal_of(&file, index).contains_key("project_id"));
+    let mut file = SessionFile::default();
+    let scope = Scope {
+        workspace_id: Some(OTHER_WORKSPACE.to_string()),
+        project_id: Some(OTHER_PROJECT.to_string()),
+    };
+    file.named(SESSION, &tool_agent(), &scope, None, 0);
+    let index = file
+        .model_reported(
+            &report,
+            &answer_without_a_project(),
+            &Scope::default(),
+            1_000,
+        )
+        .unwrap();
+    assert!(!signal_of(&file, index).contains_key("project_id"));
+
+    // Nothing known: nothing is made up.
+    let mut file = known();
+    let index = file
+        .model_reported(
+            &report,
+            &answer_without_a_project(),
+            &Scope::default(),
+            1_000,
+        )
+        .unwrap();
+    assert!(!signal_of(&file, index).contains_key("project_id"));
+}
+
+#[test]
+fn the_project_a_report_named_stands() {
+    // The run is in a project of its own: neither what `init` resolved nor
+    // the folder's link replaces it.
+    let mut answer = answer_without_a_project();
+    answer["run"]["project_id"] = json!(OTHER_PROJECT);
+    let mut file = named_at(0);
+    let index = file
+        .model_reported(&json!({"step": "Reading"}), &answer, &in_project(), 1_000)
+        .unwrap();
+    assert_eq!(signal_of(&file, index)["project_id"], json!(OTHER_PROJECT));
+    // A later answer that names none takes nothing away.
+    let index = file
+        .model_reported(
+            &json!({"step": "Editing"}),
+            &answer_without_a_project(),
+            &in_project(),
+            2_000,
+        )
+        .unwrap();
+    assert_eq!(signal_of(&file, index)["project_id"], json!(OTHER_PROJECT));
+}

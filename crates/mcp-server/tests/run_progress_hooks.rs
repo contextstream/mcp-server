@@ -1411,3 +1411,41 @@ fn no_session_run_as_shipped_or_with_signs_of_life_alone() {
         );
     }
 }
+
+#[test]
+fn a_run_reported_without_a_project_is_shown_in_the_sessions_project() {
+    let api = FakeApi::start();
+    let sandbox = Sandbox::new(&api, &[]);
+    let session = Session::new("host-session-a", SESSION_A);
+    let run_id = "44444444-4444-4444-8444-444444444444";
+
+    sandbox.init_in(&session, "platform-api");
+    // The server had no project for the call (a stateless report, or a
+    // session it resolved none for): the run the model reported has none.
+    sandbox.tool_result(
+        &session,
+        "progress",
+        json!({"title": "Fix the flaky login test", "step": "Reading the test"}),
+        json!({
+            "run": {
+                "run_id": run_id,
+                "workspace_id": WORKSPACE,
+                "project_id": null,
+                "state": "working",
+                "agent": session.agent(),
+            },
+            "session": SESSION_A,
+            "run_key": session_key(&session),
+        }),
+    );
+
+    // The run's first signal says where the session works, as `init`
+    // resolved it: the API gives the run its project from it.
+    let signal = api
+        .wait_for(SOON, |body| body["run_id"] == run_id)
+        .expect("the model's run is kept alive");
+    assert_eq!(signal.body["workspace_id"], WORKSPACE);
+    assert_eq!(signal.body["project_id"], PROJECT);
+    assert!(is_heartbeat(&signal.body), "{}", signal.body);
+    assert!(signal.body.get("title").is_none());
+}

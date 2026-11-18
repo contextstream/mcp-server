@@ -6964,6 +6964,73 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
 
     #[cfg(unix)]
     #[test]
+    fn credential_permissions_for_preserved_workspace_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".contextstream/config.json");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        let original = r#"{"apiKey":"fixture"}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_workspace_config(dir.path(), "workspace", "Workspace", None, None).unwrap();
+        let backup = safe_edit::backup_path(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        let live: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(live["apiKey"], "fixture");
+        for file in [&path, &backup] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{}",
+                file.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_permissions_for_legacy_backup_on_keyless_project_setup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let backup = safe_edit::backup_path(&path).unwrap();
+        let original = r#"{"other":{"apiKey":"fixture"}}"#;
+        std::fs::write(&backup, original).unwrap();
+
+        // The first setup edits the live document. The second is a content no-op.
+        for _ in 0..2 {
+            std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o644)).unwrap();
+            write_project_mcp_config_with_remote_auth(
+                &Editor::ClaudeCode,
+                dir.path(),
+                "",
+                Some("ws-id"),
+                Some("project-id"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+            assert_eq!(
+                std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn project_config_protects_preserved_apikey_and_keeps_keyless_public_modes() {
         use std::os::unix::fs::PermissionsExt;
 

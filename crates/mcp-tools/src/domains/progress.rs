@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use super::display_title::one_line;
-use super::run_deliveries::{self, Ledger, Offered};
+use super::run_deliveries::{self, Ledger, Offered, PollFor};
 use crate::registry::ToolHandler;
 use crate::schema::SchemaBuilder;
 
@@ -376,6 +376,12 @@ impl ProgressTool {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 let reported_run = run_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
+                // The delivery slot can expire during the 404 cooldown. A local
+                // session still knows its own run and can collect on this report.
+                let known_run = !is_http
+                    && reported_run.is_some_and(|id| {
+                        self.remembered_run(workspace_id, &report.run_key) == Some(id)
+                    });
                 if report.is_terminal() {
                     self.finish(&key, run_id, is_http);
                 } else {
@@ -401,7 +407,7 @@ impl ProgressTool {
                             owner,
                             run_id,
                             &context.agent,
-                            false,
+                            PollFor::Report { known_run },
                         )
                         .await
                     }
@@ -698,10 +704,13 @@ impl ProgressTool {
                             self.offered_to_own_run(workspace_id, run_id, is_http).await
                         };
                         let text = format!("{}{}", run_text(&view), offered.text());
-                        if let (Some(fields), false) =
-                            (view.as_object_mut(), offered.shown.is_empty())
-                        {
-                            fields.insert("deliveries".into(), json!(offered.shown));
+                        if let Some(fields) = view.as_object_mut() {
+                            if let Some(notice) = offered.notice {
+                                fields.insert("delivery_notice".into(), json!(notice));
+                            }
+                            if !offered.shown.is_empty() {
+                                fields.insert("deliveries".into(), json!(offered.shown));
+                            }
                         }
                         ToolResult::with_structured(text, view)
                     }
@@ -795,6 +804,11 @@ impl ProgressTool {
             return Offered::default();
         };
         if !self.deliveries.saw_report(&owner, run_id) && !owner.reported(run_id) {
+            // A refused report left no ownership evidence. Explain capacity
+            // on retry without allocating a slot or reading this run's deliveries.
+            if is_http && self.deliveries.would_refuse(&owner) {
+                return Offered::refused(&owner, is_http);
+            }
             return Offered::default();
         }
         run_deliveries::poll(
@@ -803,7 +817,7 @@ impl ProgressTool {
             &owner,
             run_id,
             &self.agent(is_http).await,
-            true,
+            PollFor::Get,
         )
         .await
     }

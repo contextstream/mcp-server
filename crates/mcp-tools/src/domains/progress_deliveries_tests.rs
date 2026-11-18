@@ -2121,8 +2121,8 @@ async fn review7_racing_workers_reserve_before_sending_a_claim() {
     let first = Arc::default();
     let second = Arc::default();
     let (a, b) = tokio::join!(
-        run_deliveries::poll(&tool.client, &first, &owner, f.run, &agent, true),
-        run_deliveries::poll(&tool.client, &second, &owner, f.run, &agent, true)
+        run_deliveries::poll(&tool.client, &first, &owner, f.run, &agent, PollFor::Get),
+        run_deliveries::poll(&tool.client, &second, &owner, f.run, &agent, PollFor::Get)
     );
     assert_eq!(sent(&api, "POST", "/claim").len(), 1);
     assert_eq!(a.blocks.len() + b.blocks.len(), 1);

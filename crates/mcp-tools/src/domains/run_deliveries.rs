@@ -387,6 +387,40 @@ struct Owners {
     last_sweep: Option<Instant>,
 }
 
+struct AtCapacity;
+
+impl Owners {
+    /// Inspect admission without reserving a slot. A get without evidence of
+    /// ownership must neither allocate a slot nor evict another session.
+    fn eviction_for(&self, owner: &OwnerKey) -> std::result::Result<Option<&OwnerKey>, AtCapacity> {
+        if self.by_key.contains_key(owner) || self.by_key.len() < OWNERS_PER_CREDENTIAL {
+            return Ok(None);
+        }
+        let same_key = self
+            .by_key
+            .iter()
+            .filter(|(k, _)| k.namespace == owner.namespace);
+        let victim = if same_key.clone().count() >= OWNERS_PER_CREDENTIAL {
+            same_key
+                .filter(|(_, mem)| !mem.pinned())
+                .min_by_key(|(_, mem)| mem.last_used)
+        } else if self.by_key.len() >= MAX_OWNERS {
+            // Count pinned slots too when ranking each credential's footprint.
+            let mut counts = HashMap::new();
+            for key in self.by_key.keys() {
+                *counts.entry(&key.namespace).or_insert(0usize) += 1;
+            }
+            self.by_key
+                .iter()
+                .filter(|(_, mem)| !mem.pinned())
+                .min_by_key(|(k, mem)| (std::cmp::Reverse(counts[&k.namespace]), mem.last_used))
+        } else {
+            return Ok(None);
+        };
+        victim.map(|(key, _)| Some(key)).ok_or(AtCapacity)
+    }
+}
+
 /// The gateway shares this directory, but each credential/workspace/session
 /// owner has its own capacity for claims, reports and reads.
 #[derive(Debug, Default)]
@@ -443,51 +477,37 @@ impl Ledger {
     }
 
     fn with<T: Default>(&self, owner: &OwnerKey, f: impl FnOnce(&mut Memory) -> T) -> T {
+        self.with_slot(owner, f).unwrap_or_default()
+    }
+
+    pub(super) fn would_refuse(&self, owner: &Owner) -> bool {
+        self.directory().eviction_for(&owner.key).is_err()
+    }
+
+    fn with_slot<T>(
+        &self,
+        owner: &OwnerKey,
+        f: impl FnOnce(&mut Memory) -> T,
+    ) -> std::result::Result<T, AtCapacity> {
         let mut owners = self.directory();
-        if !owners.by_key.contains_key(owner) {
-            let same_key = owners
-                .by_key
-                .iter()
-                .filter(|(k, _)| k.namespace == owner.namespace);
-            if same_key.clone().count() >= OWNERS_PER_CREDENTIAL {
-                let Some(key) = same_key
-                    .filter(|(_, mem)| !mem.pinned())
-                    .min_by_key(|(_, mem)| mem.last_used)
-                    .map(|(k, _)| k.clone())
-                else {
-                    return T::default();
-                };
-                owners.by_key.remove(&key);
-            } else if owners.by_key.len() >= MAX_OWNERS {
-                // Rank eligible owners by their credential's total footprint
-                // (including its pinned slots), then by the owner's last use.
-                let mut counts = HashMap::new();
-                for key in owners.by_key.keys() {
-                    *counts.entry(&key.namespace).or_insert(0usize) += 1;
-                }
-                let Some(key) = owners
-                    .by_key
-                    .iter()
-                    .filter(|(_, mem)| !mem.pinned())
-                    .min_by_key(|(k, mem)| (std::cmp::Reverse(counts[&k.namespace]), mem.last_used))
-                    .map(|(k, _)| k.clone())
-                else {
-                    return T::default();
-                };
-                owners.by_key.remove(&key);
-            }
+        if let Some(key) = owners.eviction_for(owner)?.cloned() {
+            owners.by_key.remove(&key);
         }
         let mem = owners.by_key.entry(owner.clone()).or_default();
         mem.last_used = Some(Instant::now());
         mem.prune();
-        f(mem)
+        Ok(f(mem))
     }
 
     // A get can follow its report before the first read has finished. Keep
     // this evidence in memory until a successful read warrants a disk book.
-    // Return whether the reports were spaced apart, or None if the owner was refused.
-    pub(super) fn note_report(&self, owner: &Owner, run: Uuid) -> Option<bool> {
-        self.with(&owner.key, |mem| {
+    // Return the last report time, if any, or an error if no slot was available.
+    fn record_report(
+        &self,
+        owner: &Owner,
+        run: Uuid,
+    ) -> std::result::Result<Option<Instant>, AtCapacity> {
+        self.with_slot(&owner.key, |mem| {
             let previous = mem.reports.insert(run, Instant::now());
             if mem.reports.len() > MAX_REMEMBERED {
                 if let Some(oldest) = mem
@@ -499,8 +519,13 @@ impl Ledger {
                     mem.reports.remove(&oldest);
                 }
             }
-            Some(previous.is_some_and(|last| last.elapsed() >= OFFER_FRESH_FOR))
+            previous
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn note_report(&self, owner: &Owner, run: Uuid) -> Option<()> {
+        self.record_report(owner, run).ok().map(|_| ())
     }
 
     pub(super) fn saw_report(&self, owner: &Owner, run: Uuid) -> bool {
@@ -643,6 +668,21 @@ pub(crate) struct Offered {
 }
 
 impl Offered {
+    pub(super) fn refused(owner: &Owner, is_http: bool) -> Self {
+        if !is_http {
+            return Self::default();
+        }
+        tracing::warn!(
+            event = "delivery_owner_refused",
+            owner_digest = %owner.key.digest,
+            "Delivery owner capacity reached"
+        );
+        Self {
+            notice: Some("Deliveries are paused for this session; read again later.".into()),
+            ..Default::default()
+        }
+    }
+
     /// The blocks, each after an empty line, to add to a tool's answer.
     pub(crate) fn text(&self) -> String {
         self.blocks
@@ -691,6 +731,11 @@ impl Poll {
     }
 }
 
+pub(super) enum PollFor {
+    Get,
+    Report { known_run: bool },
+}
+
 /// Cold reports start a probe. A report with a stale probe refreshes and
 /// collects inline, sharing one deadline between the read and claims. All consumers race for one take of its
 /// result; never hold a lock across an API call.
@@ -700,17 +745,19 @@ pub(super) async fn poll(
     owner: &Owner,
     run_id: Uuid,
     agent: &Value,
-    wait: bool,
+    purpose: PollFor,
 ) -> Offered {
     let tool = tool_for(agent.get("client").and_then(Value::as_str));
     let deadline = tokio::time::Instant::now() + OFFER_FRESH_FOR;
-    let spaced = if wait {
-        false
-    } else {
-        let Some(spaced) = ledger.note_report(owner, run_id) else {
-            return Offered::default();
-        };
-        spaced
+    let refused = || async { Offered::refused(owner, client.config().await.is_http_transport) };
+    let wait = matches!(purpose, PollFor::Get);
+    let spaced = match purpose {
+        PollFor::Get => false,
+        PollFor::Report { known_run } => match ledger.record_report(owner, run_id) {
+            Ok(Some(last)) => last.elapsed() >= OFFER_FRESH_FOR,
+            Ok(None) => known_run,
+            Err(AtCapacity) => return refused().await,
+        },
     };
     let notice = |waiting: bool| {
         waiting.then(|| format!(
@@ -724,61 +771,62 @@ pub(super) async fn poll(
     if !ready.blocks.is_empty() {
         return ready;
     }
-    let Some((mut finished, result, refreshing, stale_had_offers)) =
-        ledger.with(&owner.key, |mem| {
-            // A hook or waiter can announce a new arrival after a previous poll
-            // finished empty. An explicit get must read that arrival now.
-            let previous = mem.polls.get(&run_id);
-            let stale = previous.and_then(Poll::stale_offers);
-            if stale.is_some() || previous.is_some_and(|p| p.abandoned_or_empty_for_get(wait)) {
-                mem.polls.remove(&run_id);
-            }
-            if !mem.polls.contains_key(&run_id) {
-                if mem.polls.len() >= MAX_REMEMBERED {
-                    let oldest = mem
-                        .polls
-                        .iter()
-                        .filter(|(_, p)| *p.finished.borrow())
-                        .min_by_key(|(_, p)| p.started)
-                        .map(|(k, _)| *k);
-                    if let Some(oldest) = oldest {
-                        mem.polls.remove(&oldest);
-                    } else {
-                        return None;
-                    }
+    let poll = ledger.with_slot(&owner.key, |mem| {
+        // A hook or waiter can announce a new arrival after a previous poll
+        // finished empty. An explicit get must read that arrival now.
+        let previous = mem.polls.get(&run_id);
+        let stale = previous.and_then(Poll::stale_offers);
+        if stale.is_some() || previous.is_some_and(|p| p.abandoned_or_empty_for_get(wait)) {
+            mem.polls.remove(&run_id);
+        }
+        if !mem.polls.contains_key(&run_id) {
+            if mem.polls.len() >= MAX_REMEMBERED {
+                let oldest = mem
+                    .polls
+                    .iter()
+                    .filter(|(_, p)| *p.finished.borrow())
+                    .min_by_key(|(_, p)| p.started)
+                    .map(|(k, _)| *k);
+                if let Some(oldest) = oldest {
+                    mem.polls.remove(&oldest);
+                } else {
+                    return None;
                 }
-                let (tx, finished) = tokio::sync::watch::channel(false);
-                let result = Arc::new(OnceLock::new());
-                mem.polls.insert(
-                    run_id,
-                    Poll {
-                        started: Instant::now(),
-                        finished,
-                        result: result.clone(),
-                    },
-                );
-                let (client, ledger, owner) = (client.clone(), ledger.clone(), owner.clone());
-                mcp_client::spawn_with_task_context(async move {
-                    let offered = read(&client, &ledger, &owner, run_id)
-                        .await
-                        .map(|deliveries| Batch {
-                            read_at: Instant::now(),
-                            deliveries,
-                        });
-                    let _ = result.set(offered);
-                    tx.send_replace(true);
-                });
             }
-            let p = &mem.polls[&run_id];
-            Some((
-                p.finished.clone(),
-                p.result.clone(),
-                spaced || stale.is_some(),
-                stale.unwrap_or(false),
-            ))
-        })
-    else {
-        return Offered::default();
+            let (tx, finished) = tokio::sync::watch::channel(false);
+            let result = Arc::new(OnceLock::new());
+            mem.polls.insert(
+                run_id,
+                Poll {
+                    started: Instant::now(),
+                    finished,
+                    result: result.clone(),
+                },
+            );
+            let (client, ledger, owner) = (client.clone(), ledger.clone(), owner.clone());
+            mcp_client::spawn_with_task_context(async move {
+                let offered = read(&client, &ledger, &owner, run_id)
+                    .await
+                    .map(|deliveries| Batch {
+                        read_at: Instant::now(),
+                        deliveries,
+                    });
+                let _ = result.set(offered);
+                tx.send_replace(true);
+            });
+        }
+        let p = &mem.polls[&run_id];
+        Some((
+            p.finished.clone(),
+            p.result.clone(),
+            spaced || stale.is_some(),
+            stale.unwrap_or(false),
+        ))
+    });
+    let (mut finished, result, refreshing, stale_had_offers) = match poll {
+        Ok(Some(poll)) => poll,
+        Ok(None) => return Offered::default(), // this owner's poll queue is full
+        Err(AtCapacity) => return refused().await,
     };
     if !*finished.borrow() {
         if !wait && !refreshing {
@@ -813,6 +861,11 @@ pub(super) async fn poll(
         }
     });
     if !collected {
+        // A different reader can take this batch, or eviction can remove it.
+        // Only explain a capacity pause if this owner cannot get a slot now.
+        if ledger.would_refuse(owner) {
+            return refused().await;
+        }
         return Offered::default();
     }
     let Some(Ok(batch)) = result.get() else {
@@ -827,16 +880,22 @@ pub(super) async fn poll(
     };
     let collect = async {
         if owner.reported(run_id) || owner.bind(run_id, None, 0, None).await {
-            claim_offers(client, ledger, owner, run_id, agent, batch).await;
+            claim_offers(client, ledger, owner, run_id, agent, batch).await?;
         }
+        Ok(())
     };
     // Dropping collection never cancels a claim already sent. Its worker
     // retains the receipt for the next tool response.
     let late = if refreshing && !wait {
-        tokio::time::timeout_at(deadline, collect).await.is_err()
-            || tokio::time::Instant::now() >= deadline
+        match tokio::time::timeout_at(deadline, collect).await {
+            Ok(Ok(())) => tokio::time::Instant::now() >= deadline,
+            Ok(Err(AtCapacity)) => return refused().await,
+            Err(_) => true,
+        }
     } else {
-        collect.await;
+        if let Err(AtCapacity) = collect.await {
+            return refused().await;
+        }
         false
     };
     let mut offered = ledger.take_frames(&owner.key, run_id, tool, MAX_SHOWN_AT_ONCE);
@@ -922,7 +981,7 @@ async fn claim_offers(
     run_id: Uuid,
     agent: &Value,
     batch: &Batch,
-) {
+) -> std::result::Result<(), AtCapacity> {
     let session = &owner.key;
     let deadline = batch.read_at + OFFER_FRESH_FOR;
     for delivery in batch
@@ -959,7 +1018,7 @@ async fn claim_offers(
             break;
         }
         let (finished, done) = tokio::sync::watch::channel(());
-        let registered = ledger.with(session, |mem| {
+        let registered = ledger.with_slot(session, |mem| {
             if mem.in_flight.len() >= MAX_REMEMBERED || mem.in_flight.contains_key(&delivery.id) {
                 return false;
             }
@@ -972,7 +1031,7 @@ async fn claim_offers(
                 },
             );
             true
-        });
+        })?;
         if !registered {
             continue;
         }
@@ -1040,6 +1099,7 @@ async fn claim_offers(
             limited = worker => if limited.unwrap_or(true) { break; },
         }
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -1507,7 +1567,15 @@ mod tests {
             newcomer.workspace,
             None,
         );
-        let offered = poll(&client, &ledger, &newcomer, run, &json!({}), false).await;
+        let offered = poll(
+            &client,
+            &ledger,
+            &newcomer,
+            run,
+            &json!({}),
+            PollFor::Report { known_run: false },
+        )
+        .await;
         assert!(offered.text().is_empty() && offered.shown.is_empty());
         assert!(
             !wait_for_poll(&ledger, run).await,
@@ -1615,7 +1683,7 @@ mod tests {
             )
         });
         drop(producer); // the worker unwound before publishing its result
-        poll(&client, &ledger, &owner, run, &json!({}), true).await;
+        poll(&client, &ledger, &owner, run, &json!({}), PollFor::Get).await;
         assert!(ledger.recently_read(&owner));
         assert_eq!(api.requests().len(), 1);
     }
@@ -1961,7 +2029,7 @@ mod tests {
             owner.workspace,
             None,
         );
-        poll(&client, &ledger, &owner, run, &json!({}), true).await;
+        poll(&client, &ledger, &owner, run, &json!({}), PollFor::Get).await;
         assert_eq!(api.requests().len(), 1);
     }
 }

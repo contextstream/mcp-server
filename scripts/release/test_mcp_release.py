@@ -556,6 +556,19 @@ class Darwin(unittest.TestCase):
         on_disk = sorted(path.name for path in (stubs / "System/Library/Frameworks").iterdir())
         self.assertEqual(on_disk, sorted(lib.rsplit("/", 1)[1] + ".framework" for lib in frameworks))
 
+    # What a binary built on a Mac records for each framework: the versions in the macOS 27.0 SDK (Xcode 27.0), the SDK
+    # 1.0.29 was built with. Read on a Mac (Bitrise, Xcode 27.0, 2026-11-18): Security.tbd there names no compatibility
+    # version, which means 1, and `otool -L` of a system binary shows 1.0.0.
+    def test_the_stubs_carry_the_versions_of_the_macos_27_0_sdk(self):
+        stubs = Path(release.__file__).resolve().parent / "macos-link-stubs" / "System/Library/Frameworks"
+        versions = {"CoreFoundation": ("5027.0.69", "150"), "CoreServices": ("1226", "1"),
+                    "Security": ("62460.1.2", "1"), "SystemConfiguration": ("1446", "1")}
+        for name, (current, compatibility) in versions.items():
+            with self.subTest(framework=name):
+                text = (stubs / (name + ".framework") / (name + ".tbd")).read_text()
+                self.assertIn("\ncurrent-version: %s\n" % current, text)
+                self.assertIn("\ncompatibility-version: %s\n" % compatibility, text)
+
     def test_refusals(self):
         cases = {
             "wrong architecture": ("contextstream-mcp-darwin-arm64", macho(0x01000007, self.required, (11, 0), True)),

@@ -123,23 +123,22 @@ to pick.
 - **Revising.** `revise` starts from a made image or sound: a `variation` (more like it), a
   `revision` (it, changed as you say) or a `resize` (an image in new `sizes`). Also `stop`,
   `library`, `brand` and `products`.
-- **Email, where Create offers it.** Campaigns sent through your team's own Resend account.
-  `email_draft` writes one in your brand from a prompt ("announce our winter sale to
-  customers") and sends nothing; `email_audiences`, `email_campaigns`, `email_test` (to your
-  own address or Resend's test addresses), `email_cancel` and `email_report` (a campaign's
-  delivery, opens, clicks, bounces and complaints, or the workspace's trends). `email_send`
-  goes only with your go, on the same terms as `make`: the agent shows you the campaign and
-  its recipient count and passes the count you agreed to; a client that shows a form in the
-  middle of a call still asks you first.
-  `email_preview` gives a link to share that shows the email in Gmail, Outlook and Apple Mail
-  mockups (desktop, tablet and phone, light and dark, images on or off), with the inbox line
-  and what to check. `email_revise` changes a draft from plain words ("shorter subject") or
-  sets its subject and preview line; `email_duplicate` makes a draft copy. `email_contacts`
-  lists, adds (with where they agreed to hear from you) or unsubscribes contacts; erasing one
-  can't be undone, so it is the `delete` tool's (`studio.email_contact_erase`), after your go;
-  `email_unsubscribes` shows the suppression list with why and when, and takes an address off
-  it only with your go. Resend is connected in the studio, never through an agent: the tool
-  refuses anything shaped like a Resend key.
+- **Email, where Create offers it.** Manage campaigns on your team's Resend account. Ask
+  `email_audiences` which lists exist, what each is for and how many people subscribe.
+  `email_contacts` updates contact fields and membership, previews a CSV and imports it
+  with your consent source, note and confirmed eligible count. Use `email_segments` to
+  preview or save rules and `email_recipients` to see who a campaign would reach today.
+  Draft from a prompt with `email_draft` or from a saved template with `email_templates`.
+  Revise or duplicate the draft, compare subjects with `email_ab`, open a shareable
+  mail-client preview or send a test to yourself. Before `email_send` sends or schedules,
+  review the audience or segment, its purpose, eligible count, sender, local time and
+  warnings. A live client asks you first. You can cancel a campaign, pause delivery or
+  resume it after confirming how many people still wait.
+  `email_report` shows campaign results and workspace trends. `email_unsubscribes`
+  reports opt-outs, bounces and complaints, and `email_diagnostics` shows whether webhook
+  events are arriving. `email_connection` checks or refreshes the sender and domain status.
+  Connect Resend in the studio. Erase a contact, audience, segment or template through
+  the full MCP's `delete` tool after confirmation, or on its email page in the studio.
 - **Connector.** The hosted path `/studio` serves only this tool, for Claude.ai or ChatGPT
   connectors, with OAuth tokens bound to that resource (`read:studio`, `write:studio`).
 

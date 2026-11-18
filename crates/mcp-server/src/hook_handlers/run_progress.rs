@@ -319,6 +319,15 @@ pub(crate) struct Run {
     /// reported on it since.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unreported: bool,
+    /// A run reported without a project: the project the session works in,
+    /// which the run's next signal offers the API ([`SessionFile::signal`]).
+    /// It becomes `project_id` once the API took it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer_project: Option<String>,
+    /// The API refused the project offered for the run: it is not offered
+    /// again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub project_declined: bool,
 }
 
 /// What the hooks keep about one host session.
@@ -490,6 +499,39 @@ impl SessionFile {
             body.insert("group_id".into(), json!(group));
         }
         Some(body)
+    }
+
+    /// The signal that keeps `run` alive, and whether it offers the API a
+    /// project for it: a heartbeat, with the session's project for a run
+    /// that was reported without one. Only this signal carries an offer, so
+    /// a refusal of it is about the project and nothing else.
+    pub(crate) fn signal(&self, run: &Run) -> Option<(Map<String, Value>, bool)> {
+        let mut body = self.base(run)?;
+        let offer = run
+            .offer_project
+            .as_ref()
+            .filter(|_| run.project_id.is_none());
+        if let Some(project_id) = offer {
+            body.insert("project_id".into(), json!(project_id));
+        }
+        Some((body, offer.is_some()))
+    }
+
+    /// The API answered the signal that offered a project for the run
+    /// `ident`. Taken, the project is the run's from now on; refused (a
+    /// project this key may not write), the run stays as it was reported and
+    /// the project is not offered again.
+    pub(crate) fn offer_answered(&mut self, ident: &str, taken: bool) {
+        for run in self.runs.iter_mut().filter(|run| run_ident(run) == ident) {
+            let offered = run.offer_project.take();
+            if taken {
+                if run.project_id.is_none() {
+                    run.project_id = offered;
+                }
+            } else {
+                run.project_declined = true;
+            }
+        }
     }
 
     fn queue(&mut self, body: Map<String, Value>) {
@@ -934,13 +976,15 @@ impl SessionFile {
                 self.runs.len() - 1
             }
         };
-        // A run the server had no project for is shown in the session's: the
-        // hooks' signals carry it, and the API takes a run's project from
-        // them. A project the report named stands.
-        if self.runs[index].project_id.is_none() {
+        // A run the server had no project for is shown in the session's: its
+        // next signal offers the API that project, and the API takes a run's
+        // project from a signal's scope. A project the report named stands.
+        if let Some(named) = uuid_text(view, "project_id") {
+            self.runs[index].project_id = Some(named);
+            self.runs[index].offer_project = None;
+        } else if self.runs[index].project_id.is_none() && !self.runs[index].project_declined {
             let workspace_id = self.runs[index].workspace_id.clone();
-            self.runs[index].project_id =
-                uuid_text(view, "project_id").or_else(|| self.project_in(&workspace_id, scope));
+            self.runs[index].offer_project = self.project_in(&workspace_id, scope);
         }
         let run = &mut self.runs[index];
         // The model reported on it: the run is the model's.
@@ -2156,7 +2200,14 @@ async fn beat(path: &Path, cwd: &str) {
         for run in &file.runs {
             let ident = run_ident(run);
             let waits = run.hook_waiting || run.model_waiting;
-            let due_ms = if waits {
+            let Some((body, offers)) = file.signal(run) else {
+                continue;
+            };
+            // A project to offer goes with the next look; a heartbeat waits
+            // its turn.
+            let due_ms = if offers {
+                0
+            } else if waits {
                 every_ms * WAITING_BEATS
             } else {
                 every_ms
@@ -2165,10 +2216,21 @@ async fn beat(path: &Path, cwd: &str) {
             if now.saturating_sub(last) < due_ms {
                 continue;
             }
-            let Some(body) = file.base(run) else {
-                continue;
-            };
-            match send(&config, &Value::Object(body)).await {
+            let sent = send(&config, &Value::Object(body)).await;
+            if offers && !matches!(sent, Sent::Retry) {
+                // The offer is answered either way. A refusal of it is about
+                // the project (one this key may not write), not the run: the
+                // run stays as the model reported it, and is kept alive so.
+                let taken = matches!(sent, Sent::Ok(_));
+                update(path, |file: &mut SessionFile| {
+                    file.offer_answered(&ident, taken)
+                });
+                if !taken {
+                    last_sent.insert(ident, now_ms());
+                    continue;
+                }
+            }
+            match sent {
                 Sent::Ok(answer) => {
                     failures = 0;
                     last_sent.insert(ident.clone(), now_ms());

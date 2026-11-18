@@ -1651,8 +1651,11 @@ fn answer_without_a_project() -> Value {
     })
 }
 
+/// The signal that keeps the run alive next.
 fn signal_of(file: &SessionFile, index: usize) -> Map<String, Value> {
-    file.base(&file.runs[index]).expect("the run has a signal")
+    file.signal(&file.runs[index])
+        .expect("the run has a signal")
+        .0
 }
 
 #[test]
@@ -1740,4 +1743,71 @@ fn the_project_a_report_named_stands() {
         )
         .unwrap();
     assert_eq!(signal_of(&file, index)["project_id"], json!(OTHER_PROJECT));
+}
+
+#[test]
+fn a_project_is_offered_by_the_signal_alone_and_kept_once_taken() {
+    let report = json!({"title": "Fix the flaky login test", "step": "Reading the test"});
+    let mut file = named_at(0);
+    let index = file
+        .model_reported(
+            &report,
+            &answer_without_a_project(),
+            &Scope::default(),
+            1_000,
+        )
+        .unwrap();
+    // The signal offers it; nothing else the hooks say about the run does,
+    // so a refusal of the offer can only be about the project.
+    let (body, offers) = file.signal(&file.runs[index]).unwrap();
+    assert!(offers);
+    assert_eq!(body["project_id"], json!(PROJECT));
+    assert!(!file
+        .base(&file.runs[index])
+        .unwrap()
+        .contains_key("project_id"));
+    file.turn_ended(2_000);
+    assert!(take(&mut file)[0].get("project_id").is_none());
+
+    // The API took it: the project is the run's, in everything from now on.
+    file.offer_answered(RUN, true);
+    let (body, offers) = file.signal(&file.runs[index]).unwrap();
+    assert!(!offers);
+    assert_eq!(body["project_id"], json!(PROJECT));
+    assert_eq!(
+        file.base(&file.runs[index]).unwrap()["project_id"],
+        json!(PROJECT)
+    );
+}
+
+#[test]
+fn a_refused_project_is_not_offered_again() {
+    let report = json!({"step": "Reading the test"});
+    let mut file = named_at(0);
+    let index = file
+        .model_reported(
+            &report,
+            &answer_without_a_project(),
+            &Scope::default(),
+            1_000,
+        )
+        .unwrap();
+    assert!(file.signal(&file.runs[index]).unwrap().1);
+
+    // A project this key may not write: the run stays as it was reported.
+    file.offer_answered(RUN, false);
+    let (body, offers) = file.signal(&file.runs[index]).unwrap();
+    assert!(!offers);
+    assert!(!body.contains_key("project_id"));
+    assert!(!file.refused);
+    assert_eq!(file.runs.len(), 1);
+
+    // The model reports again, and the server still has no project for it:
+    // the same project is not offered a second time.
+    let index = file
+        .model_reported(&report, &answer_without_a_project(), &in_project(), 2_000)
+        .unwrap();
+    let (body, offers) = file.signal(&file.runs[index]).unwrap();
+    assert!(!offers);
+    assert!(!body.contains_key("project_id"));
 }

@@ -83,6 +83,27 @@ fn audience_words(audience: Option<&Value>) -> String {
     }
 }
 
+/// Flattens newlines and tabs, strips control bytes, replaces curly quotes so a cell cannot
+/// close `“...”` early, and escapes spreadsheet formula prefixes (`=`, `+`, `-`, `@`).
+fn clean_csv_cell(raw: &str) -> String {
+    let flattened = raw.replace("\r\n", " ");
+    let mut cleaned = String::with_capacity(flattened.len());
+    for ch in flattened.chars() {
+        match ch {
+            '\n' | '\r' | '\t' => cleaned.push(' '),
+            '“' | '”' => cleaned.push('\''),
+            c if c.is_control() => {}
+            c => cleaned.push(c),
+        }
+    }
+    let trimmed = cleaned.trim();
+    if trimmed.starts_with(['=', '+', '-', '@']) {
+        format!("'{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Which column was read as what: "address from “Email”, first name from “First”".
 fn mapping_words(preview: &Value) -> Vec<String> {
     let header = |index: &Value| {
@@ -93,6 +114,7 @@ fn mapping_words(preview: &Value) -> Vec<String> {
             .iter()
             .find(|column| column.get("index").and_then(Value::as_u64) == Some(index))
             .and_then(|column| text(column, "header"))
+            .map(|h| clean_csv_cell(&h))
     };
     let mapping = preview.get("mapping").cloned().unwrap_or(Value::Null);
     let mut words = Vec::new();
@@ -110,7 +132,8 @@ fn mapping_words(preview: &Value) -> Vec<String> {
     if let Some(attributes) = mapping.get("attributes").and_then(Value::as_object) {
         for (key, index) in attributes {
             if let Some(header) = header(index) {
-                words.push(format!("attribute {key} from “{header}”"));
+                let attr = clean_csv_cell(key);
+                words.push(format!("attribute {attr} from “{header}”"));
             }
         }
     }
@@ -547,7 +570,7 @@ impl StudioTool {
                     columns
                         .iter()
                         .filter_map(|column| text(column, "header"))
-                        .map(|header| format!("“{header}”"))
+                        .map(|header| format!("“{}”", clean_csv_cell(&header)))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -617,10 +640,23 @@ impl StudioTool {
         if counts.suppressed.is_some_and(|n| n > 0) {
             lines.push("Suppressed addresses: not answered by this preview.".into());
         }
-        let invalid = preview
+        let invalid: Vec<Value> = preview
             .get("invalid")
             .and_then(Value::as_array)
-            .cloned()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        let mut out = json!({
+                            "row": row.get("row"),
+                            "reason": text(row, "reason").map(|r| clean_csv_cell(&r)),
+                        });
+                        if let Some(value) = text(row, "value") {
+                            out["value"] = json!(clean_csv_cell(&value));
+                        }
+                        out
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         if !invalid.is_empty() {
             let shown: Vec<String> = invalid
@@ -658,11 +694,13 @@ impl StudioTool {
                 rows.iter()
                     .take(SHOWN_ROWS)
                     .filter_map(|row| text(row, "email"))
+                    .map(|email| clean_csv_cell(&email))
                     .collect()
             })
             .unwrap_or_default();
         if !sample.is_empty() {
-            lines.push(format!("Sample: {}.", sample.join(", ")));
+            let quoted: Vec<String> = sample.iter().map(|s| format!("“{s}”")).collect();
+            lines.push(format!("Sample: {}.", quoted.join(", ")));
         }
         lines.push(format!("Consent: {}, “{}”.", import.source, import.note));
         lines.push(match (import.audience_id, counts.eligible, import.review_token()) {
@@ -896,22 +934,27 @@ impl StudioTool {
                 is_are(suppressed)
             ));
         }
-        match (invalid.unwrap_or(0), duplicates.unwrap_or(0)) {
-            (0, 0) => {}
-            (invalid, 0) => lines.push(format!(
+        match (invalid, duplicates) {
+            (Some(0), Some(0)) => {}
+            (Some(invalid), Some(0)) => lines.push(format!(
                 "{} row{} weren't read (invalid).",
                 credits(invalid),
                 if invalid == 1 { "" } else { "s" }
             )),
-            (0, duplicates) => lines.push(format!(
+            (Some(0), Some(duplicates)) => lines.push(format!(
                 "{} repeated an address already in the file.",
                 credits(duplicates)
             )),
-            (invalid, duplicates) => lines.push(format!(
+            (Some(invalid), Some(duplicates)) => lines.push(format!(
                 "{} row{} weren't read (invalid), and {} repeated an address already in the file.",
                 credits(invalid),
                 if invalid == 1 { "" } else { "s" },
                 credits(duplicates)
+            )),
+            _ => lines.push(format!(
+                "Invalid rows: {}; duplicates in file: {}.",
+                said(invalid),
+                said(duplicates)
             )),
         }
         lines.extend(notes);

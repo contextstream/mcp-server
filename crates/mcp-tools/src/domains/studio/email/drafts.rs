@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::{
     campaign_url, description_of, email_refusal, given, moment, name_of, number, operation_of,
     operation_or, outline, said, strings, subjects_words, text, Topic, MAX_LINE_CHARS,
-    VARIANT_LABELS,
+    NOT_ANSWERED, VARIANT_LABELS,
 };
 use crate::domains::studio::{parse_id, StudioInput, StudioTool};
 
@@ -58,12 +58,15 @@ fn is_built_in(template: &Value) -> bool {
 fn test_words(own_subject: &str, test: &Value) -> String {
     let mut subjects = vec![own_subject.to_string()];
     subjects.extend(strings(test.get("subjects")));
+    let by = match text(test, "metric") {
+        Some(metric) => format!("the most {metric}"),
+        None => format!("metric {NOT_ANSWERED}"),
+    };
     format!(
-        "{}, tried on {}% of its recipients; after {} hours the subject with the most {} goes to the rest.",
+        "{}, tried on {}% of its recipients; after {} hours the subject with {by} goes to the rest.",
         subjects_words(&subjects),
         said(number(test, "samplePercent")),
         said(number(test, "waitHours")),
-        text(test, "metric").unwrap_or_else(|| "opens".to_string())
     )
 }
 
@@ -71,9 +74,9 @@ fn test_words(own_subject: &str, test: &Value) -> String {
 fn winner_words(test: &Value) -> Option<String> {
     let winner = test.get("winner").filter(|w| w.is_object())?;
     let label = number(winner, "variant")
-        .and_then(|v| VARIANT_LABELS.get(v as usize))
-        .copied()
-        .unwrap_or("A");
+        .and_then(|v| usize::try_from(v).ok())
+        .and_then(|v| VARIANT_LABELS.get(v))
+        .copied();
     let why = match text(winner, "reason").as_deref() {
         Some("opens") => "the most opens",
         Some("clicks") => "the most clicks",
@@ -81,12 +84,13 @@ fn winner_words(test: &Value) -> Option<String> {
         Some("no_signal") => "no opens or clicks to tell by, which goes to A",
         _ => "how it was picked is not answered",
     };
-    Some(format!(
-        "The winner was {label} “{}” ({why}){}.",
-        text(winner, "subject").unwrap_or_default(),
-        moment(winner.get("decidedAt").and_then(Value::as_str))
-            .map_or(String::new(), |at| format!(", picked on {at}"))
-    ))
+    let subject = text(winner, "subject").unwrap_or_else(|| NOT_ANSWERED.to_string());
+    let at = moment(winner.get("decidedAt").and_then(Value::as_str))
+        .map_or(String::new(), |at| format!(", picked on {at}"));
+    Some(match label {
+        Some(label) => format!("The winner was {label} “{subject}” ({why}){at}."),
+        None => format!("The winner (variant {NOT_ANSWERED}) was “{subject}” ({why}){at}."),
+    })
 }
 
 impl StudioTool {

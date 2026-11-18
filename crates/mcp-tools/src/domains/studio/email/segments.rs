@@ -70,8 +70,9 @@ pub(super) fn rules_words(rules: &Value) -> String {
         return format!("rules {NOT_ANSWERED}");
     }
     let matching = match rules.get("match").and_then(Value::as_str) {
-        Some("any") => "any of",
-        _ => "all of",
+        Some("all") => "all of".to_string(),
+        Some("any") => "any of".to_string(),
+        _ => format!("match {NOT_ANSWERED}"),
     };
     format!("{matching}: {}", conditions.join("; "))
 }

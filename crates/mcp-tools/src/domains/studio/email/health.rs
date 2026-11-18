@@ -476,6 +476,10 @@ impl StudioTool {
                     said(number(&totals, "complained")),
                     sent.map_or(String::new(), |sent| format!(", of {} sent", credits(sent)))
                 ));
+                lines.push(
+                    "- Window: all time: this API cannot narrow a campaign's report by days."
+                        .to_string(),
+                );
                 // Why they left, from the campaign's own unsubscribes.
                 let listed = self
                     .email_call(
@@ -600,11 +604,13 @@ impl StudioTool {
             "- Can they be trusted? Unsubscribes are recorded by ContextStream's own unsubscribe link, so they don't depend on Resend's events. Bounces and complaints arrive through Resend's webhook: {}",
             verdict.sentence
         ));
+        let all_time = campaign.is_some() && !narrowed;
         Ok(ToolResult::with_structured(
             lines.join("\n"),
             json!({
                 "workspace_id": workspace_id,
-                "days": days,
+                "days": (!all_time).then_some(days),
+                "window": if all_time { "all_time" } else { "days" },
                 "campaign_id": campaign.as_ref().map(|(id, _)| id),
                 "by_reason": by_reason,
                 "sent": sent,

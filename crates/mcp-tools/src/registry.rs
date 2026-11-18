@@ -826,6 +826,28 @@ pub struct ToolRegistry {
     caller_client: Option<ContextStreamClient>,
 }
 
+fn drop_control_characters_in_value(value: &mut Value) {
+    let unwanted = |c: char| c.is_control() && c != '\n' && c != '\t';
+    match value {
+        Value::String(text) => {
+            if text.contains(unwanted) {
+                text.retain(|c| !unwanted(c));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                drop_control_characters_in_value(item);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                drop_control_characters_in_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Answers carry stored text as stored, and terminal control bytes in it
 /// (ESC, BEL, a bare carriage return) must not reach a client (#419). Line
 /// breaks and tabs stay.
@@ -837,6 +859,9 @@ fn drop_control_characters(mut result: ToolResult) -> ToolResult {
                 text.retain(|c| !unwanted(c));
             }
         }
+    }
+    if let Some(structured) = &mut result.structured_content {
+        drop_control_characters_in_value(structured);
     }
     result
 }

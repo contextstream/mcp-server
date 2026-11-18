@@ -570,7 +570,7 @@ async fn an_import_is_previewed_and_changes_nothing() {
         "{text}"
     );
     assert!(
-        text.contains("Sample: ada@northwind.example, bob@northwind.example."),
+        text.contains("Sample: “ada@northwind.example”, “bob@northwind.example”."),
         "{text}"
     );
     assert!(

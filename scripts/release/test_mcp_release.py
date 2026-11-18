@@ -570,18 +570,12 @@ class Darwin(unittest.TestCase):
 # A file the Rust sources compile in with include_bytes!/include_str! must be in git: a clean checkout (CI, a lane host,
 # the release build) has only tracked files, and a broad .gitignore pattern such as *.pem hides an untracked one locally.
 class CompiledInFilesAreTracked(unittest.TestCase):
-    def test_every_included_file_is_tracked(self):
+    @staticmethod
+    def included_files(root: Path):
         import re
-        import subprocess
 
-        root = Path(__file__).resolve().parents[2]
-        try:
-            tracked = set(subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True)
-                          .stdout.decode().split("\0"))
-        except (OSError, subprocess.CalledProcessError):
-            self.skipTest("not a git checkout")
         include = re.compile(r'include_(?:bytes|str)!\(\s*"([^"]+)"\s*\)')
-        checked = 0
+        found = []
         for source in sorted(root.glob("crates/**/*.rs")):
             if "target" in source.relative_to(root).parts:
                 continue
@@ -591,15 +585,119 @@ class CompiledInFilesAreTracked(unittest.TestCase):
                     relative = target.relative_to(root).as_posix()
                 except ValueError:
                     continue
-                checked += 1
-                with self.subTest(source=source.relative_to(root).as_posix(), include=name):
-                    self.assertTrue(relative in tracked, f"{relative} is compiled in but not tracked by git")
-                    if "src" in source.relative_to(root).parts:
-                        self.assertTrue(
-                            relative.startswith("crates/"),
-                            f"{relative} is compiled into crate sources from outside crates/",
-                        )
-        self.assertGreater(checked, 0)
+                found.append((source, name, relative))
+        return found
+
+    @staticmethod
+    def dockerfile_instructions(text: str):
+        logical = []
+        current = []
+        for raw in text.splitlines():
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.endswith("\\"):
+                current.append(stripped[:-1].strip())
+            else:
+                current.append(stripped)
+                logical.append(" ".join(current).strip())
+                current = []
+        if current:
+            logical.append(" ".join(current).strip())
+        return logical
+
+    @staticmethod
+    def builder_copies_path(copies, relative: str) -> bool:
+        for src, dest in copies:
+            clean_src = src.rstrip("/")
+            clean_dest = dest.rstrip("/")
+            if clean_dest in ("", "."):
+                mapped = clean_src if not src.endswith("/") else clean_src + "/"
+            elif dest.endswith("/"):
+                mapped = f"{clean_dest}/{Path(clean_src).name}" if not src.endswith("/") else f"{clean_dest}/"
+            else:
+                mapped = clean_dest
+            if src.endswith("/"):
+                prefix = clean_src + "/"
+                if relative.startswith(prefix) and mapped.rstrip("/") == clean_src:
+                    return True
+            elif relative == clean_src and mapped == clean_src:
+                return True
+        return False
+
+    def test_every_included_file_is_tracked(self):
+        import subprocess
+
+        root = Path(__file__).resolve().parents[2]
+        try:
+            tracked = set(subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True)
+                          .stdout.decode().split("\0"))
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("not a git checkout")
+        included = self.included_files(root)
+        self.assertGreater(len(included), 0)
+        for source, name, relative in included:
+            with self.subTest(source=source.relative_to(root).as_posix(), include=name):
+                self.assertTrue(relative in tracked, f"{relative} is compiled in but not tracked by git")
+                if "src" in source.relative_to(root).parts:
+                    self.assertTrue(
+                        relative.startswith("crates/"),
+                        f"{relative} is compiled into crate sources from outside crates/",
+                    )
+
+    def test_http_gateway_dockerfile_copies_included_files_and_keeps_real_build_fatal(self):
+        root = Path(__file__).resolve().parents[2]
+        dockerfile = (root / "Dockerfile.http-gateway").read_text(encoding="utf-8")
+        instructions = self.dockerfile_instructions(dockerfile)
+        builder = []
+        stages = 0
+        for line in instructions:
+            if line.upper().startswith("FROM "):
+                stages += 1
+                if stages > 1:
+                    break
+            builder.append(line)
+
+        copies = []
+        copy_crates_index = None
+        for idx, line in enumerate(builder):
+            if not line.upper().startswith("COPY "):
+                continue
+            parts = [token for token in line.split()[1:] if not token.startswith("--")]
+            dest = parts[-1]
+            for src in parts[:-1]:
+                copies.append((src, dest))
+                if src.rstrip("/") == "crates" and dest.rstrip("/") == "crates":
+                    copy_crates_index = idx
+
+        self.assertIsNotNone(copy_crates_index, "Dockerfile.http-gateway must COPY crates/ crates/")
+        for source, name, relative in self.included_files(root):
+            with self.subTest(source=source.relative_to(root).as_posix(), include=name):
+                self.assertTrue(
+                    self.builder_copies_path(copies, relative),
+                    f"Dockerfile.http-gateway does not copy {relative} required by {source.relative_to(root).as_posix()}",
+                )
+
+        cache_builds = [
+            line for line in builder[:copy_crates_index]
+            if line.upper().startswith("RUN ") and "cargo build" in line
+        ]
+        real_builds = [
+            line for line in builder[copy_crates_index + 1:]
+            if line.upper().startswith("RUN ") and "cargo build" in line
+        ]
+        self.assertEqual(len(cache_builds), 1, "expected the dependency-cache cargo build before COPY crates/")
+        self.assertEqual(len(real_builds), 1, "expected the real cargo build after COPY crates/")
+        self.assertNotIn(
+            "|| true",
+            real_builds[0],
+            "real gateway cargo build must fail the image build instead of leaving the dummy binary behind",
+        )
+        self.assertIn(
+            "rm -f target/release/contextstream-mcp",
+            real_builds[0],
+            "real gateway build must remove any cached dummy binary before compiling",
+        )
 
 
 if __name__ == "__main__":

@@ -3685,3 +3685,95 @@ async fn resume_requires_confirm_review_rechecks_after_live_ask_and_notes_legacy
         Some(format!("email-resume-{CAMPAIGN}-r4").as_str())
     );
 }
+
+#[tokio::test]
+async fn template_update_says_plainly_when_the_api_leaves_a_field_unchanged() {
+    let clears_null = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let clears_seen = clears_null.clone();
+    let stub = Stub::start(over(move |request| {
+        let one = format!("/create/email/templates/{TEMPLATE}");
+        (request.method == "PATCH" && request.path == one).then(|| {
+            let mut row = template(
+                TEMPLATE,
+                request.body["name"].as_str().unwrap_or("Sale layout"),
+                false,
+            );
+            // Mirrors TemplatePatch without deserialize_with = "present": JSON null is read as
+            // omitted and preserves current.description ("Winter boilerplate").
+            row["description"] = match request.body.get("description") {
+                Some(Value::Null) if clears_seen.load(std::sync::atomic::Ordering::Relaxed) => {
+                    Value::Null
+                }
+                Some(Value::String(s)) if s != "ignored" => json!(s),
+                _ => json!("Winter boilerplate"),
+            };
+            Answer::ok(row)
+        })
+    }))
+    .await;
+
+    let uncleared = run(
+        &stub,
+        json!({
+            "action": "email_templates", "operation": "update",
+            "template_id": TEMPLATE, "description": "",
+        }),
+    )
+    .await;
+    let text = text_of(&uncleared);
+    assert!(uncleared.is_error, "{text}");
+    assert!(!text.contains("Changed"), "{text}");
+    assert!(
+        text.contains("the description was not cleared: this API did not take it"),
+        "{text}"
+    );
+    assert_eq!(structured(&uncleared)["changed"], false);
+
+    let partial = run(
+        &stub,
+        json!({
+            "action": "email_templates", "operation": "update",
+            "template_id": TEMPLATE, "name": "New name", "description": "",
+        }),
+    )
+    .await;
+    let text = text_of(&partial);
+    assert!(!partial.is_error, "{text}");
+    assert!(!text.starts_with("Changed the template:"), "{text}");
+    assert!(text.contains("“New name”"), "{text}");
+    assert!(
+        text.contains("the description was not cleared: this API did not take it"),
+        "{text}"
+    );
+
+    let unchanged_set = run(
+        &stub,
+        json!({
+            "action": "email_templates", "operation": "update",
+            "template_id": TEMPLATE, "description": "ignored",
+        }),
+    )
+    .await;
+    assert!(unchanged_set.is_error);
+    assert!(text_of(&unchanged_set)
+        .contains("the description was not changed: this API did not take it"));
+
+    clears_null.store(true, std::sync::atomic::Ordering::Relaxed);
+    let cleared = run(
+        &stub,
+        json!({
+            "action": "email_templates", "operation": "update",
+            "template_id": TEMPLATE, "description": "",
+        }),
+    )
+    .await;
+    assert!(!cleared.is_error, "{}", text_of(&cleared));
+    assert!(
+        text_of(&cleared).starts_with(&format!(
+            "Changed the template: “Sale layout” (template_id {TEMPLATE})."
+        )),
+        "{}",
+        text_of(&cleared)
+    );
+    assert_eq!(structured(&cleared)["changed"], true);
+}

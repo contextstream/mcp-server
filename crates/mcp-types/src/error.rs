@@ -594,6 +594,18 @@ mod tests {
 mod tls_refusal_tests {
     use super::*;
 
+    // The client trusts the authorities the machine trusts. Behind a proxy
+    // that re-signs HTTPS the hint says where the machine is told about one.
+    #[test]
+    fn the_hint_says_how_to_make_the_machine_trust_a_proxys_authority() {
+        assert!(TLS_HINT.contains("certificate store"), "{TLS_HINT}");
+        assert!(TLS_HINT.contains("SSL_CERT_FILE"), "{TLS_HINT}");
+        assert!(
+            TLS_HINT.contains("wrong CONTEXTSTREAM_API_URL"),
+            "{TLS_HINT}"
+        );
+    }
+
     #[test]
     fn a_refused_certificate_is_named_not_reported_as_unreachable() {
         // #369: the server answered; "could not reach" sent people to their network.

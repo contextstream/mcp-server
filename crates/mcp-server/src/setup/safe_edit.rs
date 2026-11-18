@@ -670,10 +670,6 @@ fn unique_sibling_path(path: &Path, purpose: &str) -> Result<PathBuf> {
     )))
 }
 
-fn create_unique_temp(path: &Path) -> Result<(PathBuf, File)> {
-    create_unique_temp_with_mode(path, 0o600)
-}
-
 #[cfg(test)]
 thread_local! {
     // The errno every chmod of a staged file fails with on this test thread:
@@ -694,8 +690,75 @@ fn chmod(path: &Path, permissions: std::fs::Permissions) -> std::io::Result<()> 
 
 /// Give a staged file the permissions it must have before it is renamed into
 /// place.
+///
+/// A mount that maps every user to one owner (virtiofs, 9p, a Windows drive
+/// under WSL, NFS with root_squash) refuses chmod even on a file this process
+/// created a moment ago. A staged file is created with the mode it is meant
+/// to end with, so there the refusal changes nothing: it is said once and the
+/// write goes on. Any other error fails the write, and so does a refusal on a
+/// file whose mode is not the one asked: no file is left more open, or less
+/// usable, than asked without an error.
 fn set_staged_permissions(staged: &Path, wanted: std::fs::Permissions) -> std::io::Result<()> {
-    chmod(staged, wanted)
+    let Err(error) = chmod(staged, wanted.clone()) else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let refused = error.raw_os_error().is_some_and(|code| {
+            code == libc::EPERM || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+        });
+        if refused {
+            let mode = std::fs::metadata(staged)?.permissions().mode() & 0o7777;
+            if mode == wanted.mode() & 0o7777 {
+                warn_chmod_refused(staged, mode);
+                return Ok(());
+            }
+        }
+    }
+    Err(error)
+}
+
+/// The mode to create a staged file with so that it already has `wanted`:
+/// the kernel clears the umask's bits from it, and the chmod that follows
+/// sets what is still missing wherever chmod works.
+#[cfg(unix)]
+fn creation_mode(wanted: &std::fs::Permissions) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    wanted.mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn creation_mode(_wanted: &std::fs::Permissions) -> u32 {
+    0o600
+}
+
+/// Say once per process that a mount refuses chmod, naming the first
+/// directory it happened in; every file there is handled the same way.
+#[cfg(unix)]
+fn warn_chmod_refused(staged: &Path, mode: u32) {
+    let directory = staged.parent().unwrap_or(staged);
+    let message = format!(
+        "The file system of {} does not allow changing a file's permissions \
+         (virtiofs, 9p, a Windows drive under WSL and NFS with root_squash do this). \
+         The file was created with mode {mode:03o}, which is the mode asked for, so it is \
+         written as it is. Other files on that file system are handled the same way.",
+        directory.display()
+    );
+
+    #[cfg(not(test))]
+    {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::warn!("{message}"));
+    }
+
+    #[cfg(test)]
+    TEST_CHMOD_WARNINGS.with(|said| {
+        let mut said = said.borrow_mut();
+        if said.is_empty() {
+            said.push(message);
+        }
+    });
 }
 
 fn create_unique_temp_with_mode(path: &Path, initial_mode: u32) -> Result<(PathBuf, File)> {
@@ -712,7 +775,9 @@ fn create_unique_temp_with_mode(path: &Path, initial_mode: u32) -> Result<(PathB
             // Secret-bearing configs pass 0o600 so staged bytes stay private
             // from creation; non-secret project files pass 0o666 on fresh
             // creation so the kernel applies `0o666 & !umask` atomically
-            // without mutating process-global umask state across threads.
+            // without mutating process-global umask state across threads. A
+            // replacement or a backup passes the mode of the file it stands
+            // for, which is as open as its bytes are once it is in place.
             options.mode(initial_mode);
         }
         match options.open(&candidate) {
@@ -995,11 +1060,17 @@ fn create_backup_if_absent(path: &Path, content: &[u8]) -> Result<bool> {
     // it with an atomic no-replace hard link. Writing directly to the final
     // `.bak` path could leave a truncated-but-trusted recovery file if the
     // process crashed halfway through the copy.
-    let (temporary, mut file) = create_unique_temp(&backup)?;
+    // The copy keeps the mode of the file it copies, and is created with it
+    // (see `set_staged_permissions`): it holds nothing that file did not.
+    let permissions = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let (temporary, mut file) =
+        create_unique_temp_with_mode(&backup, permissions.as_ref().map_or(0o600, creation_mode))?;
     let result = (|| -> Result<()> {
         file.write_all(content)?;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            set_staged_permissions(&temporary, metadata.permissions())?;
+        if let Some(permissions) = permissions {
+            set_staged_permissions(&temporary, permissions)?;
         }
         file.sync_all()?;
         Ok(())
@@ -1386,19 +1457,33 @@ fn write_if_changed_impl_full(
         && !force_private_permissions
         && existing.is_none()
         && !explicit_permissions;
-    let initial_temp_mode = if use_umask_for_new { 0o666 } else { 0o600 };
+    // The permissions the staged file must have when it is renamed into
+    // place: owner-only for a secret-bearing file and for a new file nobody
+    // asked to be public, else the requested ones or those of the file it
+    // replaces. `None` leaves what creation gives.
+    #[cfg(unix)]
+    let wanted_permissions = if force_private_permissions
+        || (existing.is_none() && !explicit_permissions && !allow_umask_for_new)
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(std::fs::Permissions::from_mode(0o600))
+    } else {
+        original_permissions
+    };
+    #[cfg(not(unix))]
+    let wanted_permissions = original_permissions;
+    // Created with the mode it is to end with, never a more open one: a
+    // mount that refuses the chmod below then has nothing left to change.
+    let initial_temp_mode = if use_umask_for_new {
+        0o666
+    } else {
+        wanted_permissions.as_ref().map_or(0o600, creation_mode)
+    };
     let (tmp, mut file) = create_unique_temp_with_mode(path, initial_temp_mode)?;
     let prepare_result = (|| -> Result<()> {
         file.write_all(content.as_bytes())?;
-        if let Some(permissions) = original_permissions {
+        if let Some(permissions) = wanted_permissions {
             set_staged_permissions(&tmp, permissions)?;
-        }
-        #[cfg(unix)]
-        if force_private_permissions
-            || (existing.is_none() && !explicit_permissions && !allow_umask_for_new)
-        {
-            use std::os::unix::fs::PermissionsExt;
-            set_staged_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         }
         file.sync_all()?;
         Ok(())

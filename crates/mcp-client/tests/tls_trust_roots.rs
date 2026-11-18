@@ -420,13 +420,7 @@ fn reqwest_has_the_bundled_roots_and_does_not_read_the_machines_store_itself() {
         .expect("the workspace's reqwest dependency");
     assert!(reqwest.contains("\"rustls-tls\""), "{reqwest}");
     assert!(!reqwest.contains("native-roots"), "{reqwest}");
-    let client = include_str!("../Cargo.toml");
-    assert!(
-        client
-            .lines()
-            .any(|line| line.starts_with("rustls-native-certs")),
-        "mcp-client reads the machine's store with rustls-native-certs"
-    );
+    assert!(!include_str!("../Cargo.toml").contains("rustls-native-certs"));
 }
 
 /// One code path: a client made anywhere else would not trust what the

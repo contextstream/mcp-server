@@ -603,7 +603,8 @@ mod tls_refusal_tests {
     // that re-signs HTTPS the hint says where the machine is told about one.
     #[test]
     fn the_hint_says_how_to_make_the_machine_trust_a_proxys_authority() {
-        assert!(TLS_HINT.contains("certificate store"), "{TLS_HINT}");
+        assert!(TLS_HINT.contains("Linux"), "{TLS_HINT}");
+        assert!(TLS_HINT.contains("macOS and Windows"), "{TLS_HINT}");
         assert!(TLS_HINT.contains("SSL_CERT_FILE"), "{TLS_HINT}");
         assert!(
             TLS_HINT.contains("wrong CONTEXTSTREAM_API_URL"),

@@ -153,6 +153,16 @@ fn usable_roots<'a>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_linux_reads_a_system_store_without_an_explicit_pem() {
+        for platform in ["macos", "windows", "linux"] {
+            let sources = root_sources(platform, &(None, None));
+            if platform != "linux" {
+                assert!(sources.is_empty(), "{platform}: {sources:?}");
+            }
+        }
+    }
+
     fn named(file: Option<&str>, dir: Option<&str>) -> Named {
         (file.map(OsString::from), dir.map(OsString::from))
     }

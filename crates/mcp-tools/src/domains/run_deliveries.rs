@@ -91,7 +91,7 @@ const MAX_SHOWN_AT_ONCE: usize = 5;
 const MAX_REMEMBERED: usize = 512;
 const MAX_OWNERS: usize = 256;
 const OWNERS_PER_CREDENTIAL: usize = 32;
-const REPORT_TTL: Duration = Duration::from_secs(2 * 3600);
+const REPORT_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// A cached offer and a batch of claim starts share this short validity window.
 const OFFER_FRESH_FOR: Duration = Duration::from_secs(5);

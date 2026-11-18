@@ -2101,3 +2101,471 @@ fn templates_and_ab_are_listed_described_and_in_the_schema() {
         assert!(operations.contains(&json!(operation)), "{operation}");
     }
 }
+
+// ============================================================================
+// email_pause, email_resume and email_connection
+// ============================================================================
+
+/// A campaign in flight: `sent` of 37 went, the rest wait. `newer` answers `remaining`
+/// and takes `expectedRemaining`.
+fn flight_api(status: &'static str, sent: i64, newer: bool) -> Responder {
+    let now = Arc::new(Mutex::new(status.to_string()));
+    let base = api(now.clone(), 37);
+    Arc::new(move |request: &Recorded| {
+        let path = format!("/create/email/campaigns/{CAMPAIGN}");
+        let in_flight = |status: &str| {
+            let mut campaign = campaign(status);
+            let started = sent > 0;
+            campaign["progress"] = json!({
+                "recipients": if started { 40 } else { 0 }, "queued": if started { 37 - sent } else { 0 },
+                "sent": sent, "failed": 0, "skipped": if started { 3 } else { 0 },
+            });
+            campaign["revision"] = json!(6);
+            if !started {
+                campaign["schedule"] =
+                    json!({"sendAt": "2026-11-20T09:00:00Z", "timeZone": "Europe/London"});
+            }
+            if newer {
+                campaign["remaining"] = json!(37 - sent);
+            }
+            campaign
+        };
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", p) if p == path => Answer::ok(in_flight(&now.lock().unwrap())),
+            ("POST", p) if p == format!("{path}/pause") => {
+                let mut now = now.lock().unwrap();
+                if *now == "paused" {
+                    return Answer::error(
+                        409,
+                        "CONFLICT",
+                        "Conflict: This campaign is already paused.",
+                    );
+                }
+                *now = "paused".to_string();
+                Answer::ok(in_flight("paused"))
+            }
+            ("POST", p) if p == format!("{path}/resume") => {
+                if request.body.get("expectedRemaining").is_some() && !newer {
+                    return unknown_field("expectedRemaining", "`workspaceId`");
+                }
+                if request.body.get("expectedRemaining") == Some(&json!(999)) {
+                    return Answer::error(422, "email_recipients_changed", "This would now go to 25 people, not 999. Nothing was resumed; show who it reaches again and ask again.");
+                }
+                let mut now = now.lock().unwrap();
+                *now = if sent > 0 { "sending" } else { "scheduled" }.to_string();
+                Answer::ok(in_flight(&now))
+            }
+            _ => base(request),
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_send_in_flight_is_paused_and_says_how_many_went_and_how_many_wait() {
+    let stub = Stub::start(flight_api("sending", 12, false)).await;
+    let pause = format!("/create/email/campaigns/{CAMPAIGN}/pause");
+    let paused = run(
+        &stub,
+        json!({"action": "email_pause", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    let text = text_of(&paused);
+    assert!(!paused.is_error, "{text}");
+    let posts = stub.calls_to("POST", &pause);
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body, json!({"workspaceId": WORKSPACE}));
+    assert!(
+        text.starts_with("Paused “Winter sale”: 12 sent, 25 still wait."),
+        "{text}"
+    );
+    assert!(
+        text.contains("email_resume sends to the rest, with the person's go"),
+        "{text}"
+    );
+    let out = structured(&paused);
+    assert_eq!(out["status"], "paused");
+    assert_eq!(out["sent"], 12);
+    assert_eq!(out["waiting"], 25);
+
+    // Create's refusal is kept.
+    let again = run(
+        &stub,
+        json!({"action": "email_pause", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    assert_eq!(
+        text_of(&again),
+        "Not paused: This campaign is already paused."
+    );
+
+    // Paused before it started: nothing went.
+    let scheduled = Stub::start(flight_api("scheduled", 0, true)).await;
+    let paused = run(
+        &scheduled,
+        json!({"action": "email_pause", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    assert!(
+        text_of(&paused).starts_with(
+            "Paused “Winter sale” before it started: nothing was sent, and 37 people wait."
+        ),
+        "{}",
+        text_of(&paused)
+    );
+
+    assert!(matches!(
+        stub.tool().execute(json!({"action": "email_pause"})).await,
+        Err(Error::Validation(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_paused_send_resumes_only_with_the_persons_go_for_who_still_waits() {
+    let stub = Stub::start(flight_api("paused", 12, false)).await;
+    let tool = stub.tool();
+    let resume = format!("/create/email/campaigns/{CAMPAIGN}/resume");
+
+    let unasked = tool
+        .execute(json!({"action": "email_resume", "campaign_id": CAMPAIGN}))
+        .await
+        .unwrap();
+    let text = text_of(&unasked);
+    assert!(
+        text.starts_with("Not resumed yet: the person's go is needed first. Show them: “Winter sale” (subject “Our winter sale starts today”) to the 25 people still waiting (12 of 37 sent so far)."),
+        "{text}"
+    );
+    assert!(text.contains("confirm_remaining 25"), "{text}");
+    assert_eq!(
+        structured(&unasked)["confirm_with"]["confirm_remaining"],
+        25
+    );
+    assert_eq!(structured(&unasked)["resumed"], false);
+
+    let wrong = tool
+        .execute(
+            json!({"action": "email_resume", "campaign_id": CAMPAIGN, "confirm_remaining": 37}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        text_of(&wrong)
+            .starts_with("Not resumed: 25 people still wait now, not the 37 the person agreed to."),
+        "{}",
+        text_of(&wrong)
+    );
+    assert!(stub.calls_to("POST", &resume).is_empty());
+
+    let resumed = tool
+        .execute(
+            json!({"action": "email_resume", "campaign_id": CAMPAIGN, "confirm_remaining": 25}),
+        )
+        .await
+        .unwrap();
+    let text = text_of(&resumed);
+    assert!(!resumed.is_error, "{text}");
+    let posts = stub.calls_to("POST", &resume);
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body, json!({"workspaceId": WORKSPACE}));
+    assert_eq!(
+        posts[0].header("idempotency-key"),
+        Some(format!("email-resume-{CAMPAIGN}-r6").as_str())
+    );
+    assert!(
+        text.starts_with("Resumed “Winter sale”: it goes on to the 25 people still waiting."),
+        "{text}"
+    );
+    assert_eq!(structured(&resumed)["resumed"], true);
+
+    // Not paused any more: nothing to resume, said plainly, and nothing is sent.
+    let not_paused = tool
+        .execute(
+            json!({"action": "email_resume", "campaign_id": CAMPAIGN, "confirm_remaining": 25}),
+        )
+        .await
+        .unwrap();
+    assert!(not_paused.is_error);
+    assert!(
+        text_of(&not_paused).starts_with(
+            "Not resumed: only a paused campaign can be resumed, and “Winter sale” is sending."
+        ),
+        "{}",
+        text_of(&not_paused)
+    );
+    assert_eq!(stub.calls_to("POST", &resume).len(), 1);
+}
+
+#[tokio::test]
+async fn a_resume_tells_a_newer_create_the_count_the_person_saw() {
+    let stub = Stub::start(flight_api("paused", 12, true)).await;
+    let resume = format!("/create/email/campaigns/{CAMPAIGN}/resume");
+    let resumed = run(
+        &stub,
+        json!({"action": "email_resume", "campaign_id": CAMPAIGN, "confirm_remaining": 25}),
+    )
+    .await;
+    assert!(!resumed.is_error, "{}", text_of(&resumed));
+    assert_eq!(
+        stub.calls_to("POST", &resume)[0].body,
+        json!({"workspaceId": WORKSPACE, "expectedRemaining": 25})
+    );
+
+    // Paused before it started: it goes back on its schedule, to who its audience holds now.
+    let scheduled = Stub::start(flight_api("paused", 0, false)).await;
+    let review = run(
+        &scheduled,
+        json!({"action": "email_resume", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    assert!(
+        text_of(&review).contains("Show them: “Winter sale” (subject “Our winter sale starts today”) back on its schedule (2026-11-20 09:00 UTC) to 37 people."),
+        "{}",
+        text_of(&review)
+    );
+    let resumed = run(
+        &scheduled,
+        json!({"action": "email_resume", "campaign_id": CAMPAIGN, "confirm_remaining": 37}),
+    )
+    .await;
+    assert!(
+        text_of(&resumed).starts_with(
+            "Resumed “Winter sale”: it is scheduled again, for 2026-11-20 09:00 UTC, to 37 people."
+        ),
+        "{}",
+        text_of(&resumed)
+    );
+}
+
+#[tokio::test]
+async fn a_resume_asks_the_person_where_the_client_can() {
+    let stub = Stub::start(flight_api("paused", 12, false)).await;
+    let tool = stub.tool();
+    let resume = format!("/create/email/campaigns/{CAMPAIGN}/resume");
+    let confirmed =
+        json!({"action": "email_resume", "campaign_id": CAMPAIGN, "confirm_remaining": 25});
+
+    // Where only the person's own yes counts, the agent's count resumes nothing.
+    let asked_only = || mcp_types::config::ConfigOverride {
+        go_ahead_asked_only: Some(true),
+        ..Default::default()
+    };
+    let kept = mcp_client::run_with_config_override(asked_only(), || async {
+        tool.execute(confirmed.clone()).await.unwrap()
+    })
+    .await;
+    assert!(
+        text_of(&kept).starts_with("Not resumed: on this connection a go-ahead counts only when the person is asked and says yes, and they could not be asked"),
+        "{}",
+        text_of(&kept)
+    );
+
+    // Asked live, their no wins over the agent's count.
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));
+    let declined = run_with_call_peer(
+        CallPeer::new(client.clone(), None, true),
+        tool.execute(confirmed.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        text_of(&declined).starts_with("Not resumed: the person didn't say go"),
+        "{}",
+        text_of(&declined)
+    );
+    let message = client.sent.lock().unwrap()[0].1["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        message.starts_with("Resume “Winter sale” (subject “Our winter sale starts today”) to the 25 people still waiting (12 of 37 sent so far)?"),
+        "{message}"
+    );
+    assert!(stub.calls_to("POST", &resume).is_empty());
+
+    // A stateless call without the count asks through its result, bound to this pause.
+    let peer =
+        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}));
+    let asking = run_with_call_peer(
+        peer.clone(),
+        tool.execute(json!({"action": "email_resume", "campaign_id": CAMPAIGN})),
+    )
+    .await
+    .unwrap();
+    assert!(text_of(&asking).starts_with("Asking the person before"));
+    assert_eq!(
+        peer.take_input_required().unwrap()["requestState"],
+        format!("studio-email-resume:{CAMPAIGN}:6:25")
+    );
+
+    *client.answer.lock().unwrap() =
+        Some(json!({"action": "accept", "content": {"confirm": true}}));
+    let resumed = mcp_client::run_with_config_override(asked_only(), || {
+        run_with_call_peer(
+            CallPeer::new(client.clone(), None, true),
+            tool.execute(json!({"action": "email_resume", "campaign_id": CAMPAIGN})),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(!resumed.is_error, "{}", text_of(&resumed));
+    assert!(text_of(&resumed).contains("The person said go when the client asked them."));
+    assert_eq!(stub.calls_to("POST", &resume).len(), 1);
+}
+
+#[tokio::test]
+async fn a_send_that_is_paused_points_at_resume() {
+    let stub = Stub::start(flight_api("paused", 12, false)).await;
+    let refused = run(
+        &stub,
+        json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37}),
+    )
+    .await;
+    assert_eq!(
+        text_of(&refused),
+        "Not sent: “Winter sale” is paused. email_resume sends to the people still waiting, with the person's go; email_cancel stops it for good."
+    );
+}
+
+fn connection_answer() -> Value {
+    json!({
+        "connected": true,
+        "key": {"last4": "Qa7x", "access": "full_access", "verifiedAt": "2026-10-29T18:00:00Z"},
+        "domains": [
+            {"id": "d1", "name": "news.northwind.example", "status": "verified", "region": "us-east-1",
+             "sending": true, "openTracking": true, "clickTracking": false, "records": []},
+            {"id": "d2", "name": "shop.northwind.example", "status": "pending", "region": "us-east-1",
+             "sending": true, "openTracking": false, "clickTracking": false, "records": []},
+        ],
+        "domainsReadAt": "2026-11-18T10:00:00Z",
+        "sender": {"fromName": "Northwind", "fromEmail": "hello@news.northwind.example", "replyTo": "team@northwind.example",
+                   "companyName": "Northwind Coffee Ltd", "postalAddress": null},
+        "webhook": {"mode": "auto", "url": format!("https://api.contextstream.io/api/v1/create/email/webhooks/{WORKSPACE}"),
+                    "secretSet": true, "lastEventAt": "2026-11-17T09:05:00Z"},
+        "ready": false, "missing": ["postal_address"], "revision": 3,
+    })
+}
+
+#[tokio::test]
+async fn the_connection_is_shown_and_refreshed_and_never_a_key() {
+    let stub = Stub::start(over(|request| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/create/email/connection") => Some(Answer::ok(connection_answer())),
+            ("POST", "/create/email/connection/refresh") => {
+                let mut refreshed = connection_answer();
+                refreshed["domains"][1]["status"] = json!("verified");
+                Some(Answer::ok(refreshed))
+            }
+            _ => None,
+        }
+    }))
+    .await;
+    let shown = run(&stub, json!({"action": "email_connection"})).await;
+    let text = text_of(&shown);
+    assert!(!shown.is_error, "{text}");
+    assert!(
+        text.starts_with("Resend is connected (key ending Qa7x), but campaigns can't be sent until the studio has a postal address for the footer: https://ctxproduct.com/studio/email/settings."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Sender: Northwind <hello@news.northwind.example>, replies to team@northwind.example."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Domains: news.northwind.example verified (opens tracked, clicks not tracked); shop.northwind.example pending."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Webhook: set up by Create, with its signing secret; last event on 2026-11-17 09:05 UTC."),
+        "{text}"
+    );
+    assert!(!text.contains("api.contextstream.io"), "{text}");
+    let out = structured(&shown);
+    assert_eq!(out["connected"], true);
+    assert_eq!(out["ready"], false);
+    assert_eq!(out["domains"][1]["status"], "pending");
+    assert!(
+        out.get("key").is_none() && !out.to_string().contains("re_"),
+        "{out}"
+    );
+    assert!(stub.requests().iter().all(|r| r.method == "GET"), "a read");
+
+    let refreshed = run(
+        &stub,
+        json!({"action": "email_connection", "operation": "refresh"}),
+    )
+    .await;
+    let text = text_of(&refreshed);
+    assert!(!refreshed.is_error, "{text}");
+    assert_eq!(
+        stub.calls_to("POST", "/create/email/connection/refresh")[0].body,
+        json!({"workspaceId": WORKSPACE})
+    );
+    assert!(
+        text.starts_with("Asked Resend again.\nResend is connected"),
+        "{text}"
+    );
+    assert!(text.contains("shop.northwind.example verified"), "{text}");
+
+    // A key in the call is refused unread, as everywhere.
+    let keyed = run(
+        &stub,
+        json!({"action": "email_connection", "operation": "refresh", "note": "re_Ab12Cd34_EfGh5678IjKl9012MnOp3456"}),
+    )
+    .await;
+    assert_eq!(text_of(&keyed), KEY_REFUSED);
+    assert_eq!(
+        stub.calls_to("POST", "/create/email/connection/refresh")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_connection_that_isnt_made_is_made_in_the_studio() {
+    let stub = Stub::start(over(|request| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/create/email/connection") => Some(Answer::ok(json!({"connected": false}))),
+            ("POST", "/create/email/connection/refresh") => Some(Answer::error(
+                404,
+                "NOT_FOUND",
+                "Not found: This workspace hasn't connected Resend yet.",
+            )),
+            _ => None,
+        }
+    }))
+    .await;
+    let shown = run(&stub, json!({"action": "email_connection"})).await;
+    assert!(
+        text_of(&shown).starts_with(&format!("Resend isn't connected yet: the team connects its own Resend key in the studio ({CONNECT_URL}).")),
+        "{}",
+        text_of(&shown)
+    );
+    assert_eq!(structured(&shown)["connected"], false);
+    let refreshed = run(
+        &stub,
+        json!({"action": "email_connection", "operation": "refresh"}),
+    )
+    .await;
+    assert!(refreshed.is_error);
+    assert_eq!(
+        text_of(&refreshed),
+        format!("Not refreshed: Resend isn't connected yet. The team connects it in the studio: {CONNECT_URL}")
+    );
+}
+
+#[test]
+fn pause_resume_and_the_connection_are_listed_described_and_in_the_schema() {
+    for action in ["email_pause", "email_resume", "email_connection"] {
+        assert!(EMAIL_ACTIONS.contains(&action), "{action}");
+        assert!(VALID_ACTIONS.contains(&action), "{action}");
+        assert!(TOOL_REFERENCE.contains(&format!("- {action}:")), "{action}");
+    }
+    let schema = input_schema();
+    let properties = schema["properties"].as_object().unwrap();
+    assert!(properties.contains_key("confirm_remaining"));
+    assert!(properties["operation"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("refresh")));
+    assert!(!properties.keys().any(|k| k.contains("key")));
+}

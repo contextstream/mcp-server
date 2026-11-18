@@ -436,19 +436,31 @@ impl Ledger {
 
     #[cfg(test)]
     pub(super) fn pin_credential_slots(&self, owner: &Owner) {
-        for n in 0..OWNERS_PER_CREDENTIAL {
+        let frame = Delivery::from_value(&json!({"id":Uuid::new_v4(), "text":"waiting"})).unwrap();
+        for n in 0..8 {
             let key = OwnerKey {
                 namespace: owner.key.namespace.clone(),
                 digest: format!("pinned-slot-{n}"),
             };
-            self.keep(
-                &key,
-                Uuid::new_v4(),
-                Uuid::new_v4(),
-                0,
-                ClaimToken::new("fixture"),
-            );
+            self.remember(&key, &frame, owner.workspace, Uuid::new_v4(), None);
         }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn age_unshown_and_evict(&self, owner: &Owner, run: Uuid, id: Uuid) {
+        self.finish_claims(&owner.key, run).await;
+        let mut owners = self.directory();
+        let mem = owners.by_key.get_mut(&owner.key).unwrap();
+        let entry = mem.shown.get_mut(&id).expect("claim receipt");
+        assert!(entry.pending.is_some());
+        entry.held_at -= Duration::from_secs(299);
+        assert!(mem.pinned(), "frame must survive short interruptions");
+        mem.shown.get_mut(&id).unwrap().held_at -= Duration::from_secs(1);
+        assert!(
+            !mem.pinned(),
+            "five-minute-old receipt must be evictable without a sweep"
+        );
+        owners.by_key.remove(&owner.key);
     }
 
     fn directory(&self) -> std::sync::MutexGuard<'_, Owners> {
@@ -1458,6 +1470,47 @@ mod tests {
     }
 
     #[test]
+    fn round7_cached_tokens_leave_room_for_a_ninth_credential() {
+        let ledger = Ledger::default();
+        let run = Uuid::new_v4();
+        for key in 0..8 {
+            for slot in 0..32 {
+                ledger.keep(
+                    &quota_owner(key, slot).key,
+                    Uuid::new_v4(),
+                    run,
+                    0,
+                    ClaimToken::new("receipt"),
+                );
+            }
+        }
+        assert_eq!(ledger.owner_count(), 256);
+        assert!(ledger.note_report(&quota_owner(8, 0), run).is_some());
+    }
+
+    #[test]
+    fn round7_eight_pins_refuse_only_their_credentials_new_owner() {
+        let ledger = Ledger::default();
+        let run = Uuid::new_v4();
+        let frame = delivery(json!({"id":Uuid::new_v4(), "text":"waiting"}));
+        for slot in 0..8 {
+            let owner = quota_owner(0, slot);
+            ledger.remember(&owner.key, &frame, owner.workspace, run, None);
+        }
+        assert!(ledger.note_report(&quota_owner(0, 8), run).is_none());
+        assert!(ledger.note_report(&quota_owner(1, 0), run).is_some());
+        assert!(ledger.note_report(&quota_owner(0, 0), run).is_some());
+        assert_eq!(
+            ledger
+                .take_frames(&quota_owner(0, 0).key, run, TOOL, 1)
+                .shown
+                .len(),
+            1
+        );
+        assert!(ledger.note_report(&quota_owner(0, 8), run).is_some());
+    }
+
+    #[test]
     fn round6_other_credentials_keep_their_frames_and_tokens_at_capacity() {
         let ledger = Ledger::default();
         let run = Uuid::new_v4();
@@ -1496,19 +1549,18 @@ mod tests {
     fn round6_global_eviction_counts_pinned_slots_and_breaks_ties_by_lru() {
         let ledger = Ledger::default();
         let run = Uuid::new_v4();
-        let msg = Uuid::new_v4();
-        let held = ClaimToken::new("held");
-        // The two largest credentials each have 32 slots, but just one
+        let frame = delivery(json!({"id":Uuid::new_v4(), "text":"waiting"}));
+        // The two largest credentials each have 9 slots, but just one
         // evictable owner. Smaller credentials have older, unpinned owners.
-        for n in 0..MAX_OWNERS - 64 {
+        for n in 0..MAX_OWNERS - 18 {
             ledger.note_report(&quota_owner(2 + n, 0), run);
         }
         for key in [1, 0] {
-            for slot in 0..OWNERS_PER_CREDENTIAL {
+            for slot in 0..9 {
                 let owner = quota_owner(key, slot);
                 ledger.note_report(&owner, run);
                 if slot != 0 {
-                    ledger.keep(&owner.key, msg, run, 0, held.clone());
+                    ledger.remember(&owner.key, &frame, owner.workspace, run, None);
                 }
             }
         }
@@ -1537,8 +1589,10 @@ mod tests {
         let run = Uuid::new_v4();
         let msg = Uuid::new_v4();
         let held = ClaimToken::new("held");
+        let frame = delivery(json!({"id":msg, "text":"waiting"}));
         for n in 0..MAX_OWNERS {
-            ledger.keep(&quota_owner(n, 0).key, msg, run, 0, held.clone());
+            let owner = quota_owner(n, 0);
+            ledger.remember(&owner.key, &frame, owner.workspace, run, held.clone());
         }
         let newcomer = quota_owner(MAX_OWNERS, 0);
         assert!(ledger.note_report(&newcomer, run).is_none());
@@ -1556,7 +1610,7 @@ mod tests {
         let ledger = Arc::new(Ledger::default());
         let run = Uuid::new_v4();
         let message = delivery(json!({"id": Uuid::new_v4(), "text": "queued"}));
-        for slot in 0..OWNERS_PER_CREDENTIAL {
+        for slot in 0..8 {
             let owner = quota_owner(0, slot);
             ledger.remember(&owner.key, &message, owner.workspace, run, None);
         }
@@ -1585,15 +1639,15 @@ mod tests {
         assert!(!ledger.saw_report(&newcomer, run));
 
         // Taking a tokenless frame releases just that owner's pin.
-        let released = quota_owner(0, OWNERS_PER_CREDENTIAL - 1);
+        let released = quota_owner(0, 7);
         assert_eq!(
             ledger.take_frames(&released.key, run, TOOL, 1).shown.len(),
             1
         );
         ledger.note_report(&newcomer, run);
         assert!(ledger.saw_report(&newcomer, run));
-        assert_eq!(ledger.owner_count(), OWNERS_PER_CREDENTIAL);
-        for slot in 0..OWNERS_PER_CREDENTIAL - 1 {
+        assert_eq!(ledger.owner_count(), 9);
+        for slot in 0..8 - 1 {
             assert_eq!(
                 ledger
                     .take_frames(&quota_owner(0, slot).key, run, TOOL, 1)
@@ -1605,7 +1659,7 @@ mod tests {
     }
 
     #[test]
-    fn round5_pinned_owners_survive_while_an_expired_token_makes_room() {
+    fn round5_pinned_owners_survive_while_the_oldest_token_makes_room() {
         let ledger = Ledger::default();
         let run = Uuid::new_v4();
         let message = delivery(json!({"id": Uuid::new_v4(), "text": "pending"}));
@@ -1643,7 +1697,7 @@ mod tests {
         assert_eq!(ledger.take_frames(&frame.key, run, TOOL, 1).shown.len(), 1);
         assert_eq!(worker.receiver_count(), 1, "the live reservation was lost");
         for slot in 2..OWNERS_PER_CREDENTIAL {
-            if slot != expired_slot {
+            if slot != expired_slot && slot != 2 {
                 assert_eq!(
                     ledger.claimed_as(&quota_owner(0, slot).key, message.id),
                     Some((run, Some(token.clone())))

@@ -2887,3 +2887,87 @@ async fn round4_spaced_report_refreshes_a_404_after_cooldown() {
     assert_eq!(sent(&api, "GET", "/deliveries").len(), 2);
     assert_eq!(sent(&api, "POST", "/claim").len(), 1);
 }
+
+#[tokio::test]
+async fn round7_released_frame_is_recovered_once_after_eviction() {
+    let f = Fixture::new();
+    let d = f.message();
+    let api = Api::start_with(
+        vec![
+            f.recorded("working"),
+            offered(vec![d.clone()]),
+            (CLAIM, 200, held_with("claimed", &d, TOKEN)),
+            (
+                "GET /api/v1/run-progress/runs/",
+                200,
+                json!({"data":f.run_view("working",json!({}))}),
+            ),
+        ],
+        true,
+        Some((CLAIM, Duration::from_millis(100))),
+    )
+    .await;
+    let mut tool = f.tool(&api);
+    tool.deliveries = Arc::default();
+    let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
+    assert!(owner.bind(f.run, None, 0, None).await);
+    let get = json!({"action":"get", "run_id":f.run});
+    tokio::select! {
+        _ = tool.execute(get.clone()) => panic!("expected a claim in flight"),
+        _ = async { while sent(&api,"POST","/claim").is_empty() { tokio::time::sleep(Duration::from_millis(1)).await; } } => {}
+    }
+    tool.deliveries
+        .age_unshown_and_evict(&owner, f.run, f.delivery)
+        .await;
+    let original = owner.claim(f.delivery).expect("claim survives eviction");
+    let mut replica = f.tool(&api);
+    replica.deliveries = Arc::default();
+    let (a, b) = tokio::join!(tool.execute(get.clone()), replica.execute(get.clone()));
+    assert_eq!(
+        [a.unwrap(), b.unwrap()]
+            .iter()
+            .filter(|r| text_of(r).contains(&message_block(&f)))
+            .count(),
+        1
+    );
+    assert!(!text_of(&replica.execute(get).await.unwrap()).contains("[PERSON"));
+    assert_eq!(owner.claim(f.delivery).unwrap().2, original.2);
+    assert_eq!(
+        sent(&api, "POST", "/claim").len(),
+        2,
+        "original plus one recovery"
+    );
+}
+
+#[tokio::test]
+async fn round7_existing_report_slot_cannot_start_a_ninth_pinned_owner() {
+    with_caller(mcp_client::run_with_mcp_session_id(
+        "pin-cap".into(),
+        || async {
+            let f = Fixture::new();
+            let d = f.message();
+            let api = Api::start(vec![
+                offered(vec![d.clone()]),
+                (CLAIM, 200, held_with("claimed", &d, TOKEN)),
+                (
+                    "GET /api/v1/run-progress/runs/",
+                    200,
+                    json!({"data":f.run_view("working", json!({}))}),
+                ),
+            ])
+            .await;
+            let mut tool = f.hosted_tool(&api);
+            tool.deliveries = Arc::default();
+            let owner = tool.delivery_owner(f.workspace, true).await.unwrap();
+            tool.deliveries.note_report(&owner, f.run);
+            tool.deliveries.pin_credential_slots(&owner);
+            let result = tool
+                .execute(json!({"action":"get","run_id":f.run}))
+                .await
+                .unwrap();
+            assert!(text_of(&result).lines().any(|line| line == PAUSED_LINE));
+            assert!(sent(&api, "POST", "/claim").is_empty());
+        },
+    ))
+    .await;
+}

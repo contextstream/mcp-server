@@ -325,6 +325,14 @@ fn contacts_api() -> Responder {
                 audience(PROOF, "Proof", Some("test"), 3, 3),
             ]))),
             ("PATCH", path) if path == format!("/create/email/contacts/{CONTACT}") => {
+                if request.body.get("addAudienceIds").is_some()
+                    || request.body.get("removeAudienceIds").is_some()
+                {
+                    return Some(unknown_field(
+                        "addAudienceIds",
+                        "`workspaceId`, `audienceIds`",
+                    ));
+                }
                 Some(Answer::ok(patched_contact(&request.body)))
             }
             ("PATCH", path) if path.starts_with("/create/email/contacts/") => Some(Answer::error(
@@ -355,9 +363,9 @@ async fn a_contacts_fields_and_membership_are_changed() {
     let text = text_of(&result);
     assert!(!result.is_error, "{text}");
     let patches = stub.calls_to("PATCH", &path);
-    assert_eq!(patches.len(), 1);
+    assert_eq!(patches.len(), 2);
     assert_eq!(
-        patches[0].body,
+        patches[1].body,
         json!({
             "workspaceId": WORKSPACE, "firstName": "Ada B", "lastName": null,
             "tags": ["vip", "wholesale"], "audienceIds": [PROOF],
@@ -378,7 +386,7 @@ async fn a_contacts_fields_and_membership_are_changed() {
     .await;
     assert!(!result.is_error, "{}", text_of(&result));
     assert_eq!(
-        stub.calls_to("PATCH", &path)[1].body,
+        stub.calls_to("PATCH", &path)[2].body,
         json!({"workspaceId": WORKSPACE, "tags": []})
     );
     assert_eq!(stub.calls_to("GET", "/create/email/contacts").len(), before);
@@ -388,13 +396,10 @@ async fn a_contacts_fields_and_membership_are_changed() {
         text_of(&result)
     );
 
-    // A membership change starts from the audiences the contact is in, which only its
-    // address finds.
+    // An older API cannot apply a delta by id. There must be no partial write.
+    let by_id = run(&stub, json!({"action":"email_contacts","operation":"update","contact_id":CONTACT,"add_to":[PROOF]})).await;
+    assert!(by_id.is_error && text_of(&by_id).contains("email"));
     for (input, said) in [
-        (
-            json!({"action": "email_contacts", "operation": "update", "contact_id": CONTACT, "add_to": [PROOF]}),
-            "add_to and remove_from need email",
-        ),
         (
             json!({"action": "email_contacts", "operation": "update", "email": "ada@northwind.example"}),
             "needs something to change",
@@ -411,7 +416,7 @@ async fn a_contacts_fields_and_membership_are_changed() {
         let refused = stub.tool().execute(input).await.unwrap_err();
         assert!(refused.to_string().contains(said), "{refused}");
     }
-    assert_eq!(stub.calls_to("PATCH", &path).len(), 2);
+    assert_eq!(stub.calls_to("PATCH", &path).len(), 4);
 
     let nobody = run(
         &stub,
@@ -431,6 +436,32 @@ async fn a_contacts_fields_and_membership_are_changed() {
         text_of(&gone),
         "Not changed: There is no such contact in this workspace (email_contacts lists them)."
     );
+}
+
+#[tokio::test]
+async fn newer_contacts_apply_membership_deltas_by_id_in_one_write() {
+    let stub = Stub::start(over(|r| {
+        (r.method == "PATCH" && r.path == format!("/create/email/contacts/{CONTACT}")).then(|| {
+            let mut contact = patched_contact(&r.body);
+            contact["audienceIds"] = json!([PROOF]);
+            Answer::ok(contact)
+        })
+    }))
+    .await;
+    let updated = run(
+        &stub,
+        json!({"action":"email_contacts", "operation":"update", "contact_id":CONTACT,
+        "add_to":[PROOF], "remove_from":[AUDIENCE], "first_name":"Ada B"}),
+    )
+    .await;
+    assert!(!updated.is_error);
+    let patches = stub.calls_to("PATCH", &format!("/create/email/contacts/{CONTACT}"));
+    assert_eq!(patches.len(), 1);
+    assert_eq!(
+        patches[0].body,
+        json!({"workspaceId":WORKSPACE,"addAudienceIds":[PROOF],"removeAudienceIds":[AUDIENCE],"firstName":"Ada B"})
+    );
+    assert!(stub.calls_to("GET", "/create/email/contacts").is_empty());
 }
 
 /// What `POST /contacts/import/preview` answers on today's main.
@@ -705,6 +736,8 @@ async fn an_import_tells_a_newer_create_what_the_person_saw() {
     assert!(!imported.is_error, "{}", text_of(&imported));
     let posts = stub.calls_to("POST", "/create/email/contacts/import");
     assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["consentSource"], "form");
+    assert_eq!(posts[0].body["consentNote"], NOTE);
     assert_eq!(posts[0].body["expectedEligible"], 114);
     assert_eq!(posts[0].body["expectedDigest"], "5f2c9a");
     assert_eq!(posts[0].body["tags"], json!(["spring-2026"]));

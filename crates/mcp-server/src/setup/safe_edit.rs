@@ -1357,7 +1357,9 @@ fn prepare_backup(
     // it with an atomic no-replace hard link. Writing directly to the final
     // `.bak` path could leave a truncated-but-trusted recovery file if the
     // process crashed halfway through the copy.
-    let private = private || format.requires_private(content, false);
+    // A key added by setup changes the live file's mode. A keyless snapshot
+    // keeps the original mode so exact uninstall restores its sharing policy.
+    let private = format.requires_private(content, private);
     let permissions = std::fs::metadata(path)?.permissions();
     #[cfg(unix)]
     let permissions = if private {

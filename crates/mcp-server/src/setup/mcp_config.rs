@@ -8415,7 +8415,11 @@ CONTEXTSTREAM_API_KEY = "test-key"
             use std::os::unix::fs::PermissionsExt;
             let path = temp.path().join(".gemini/config/mcp_config.json");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, "{}").unwrap();
+            std::fs::write(
+                &path,
+                r#"{"mcpServers":{"other":{"env":{"API_KEY":"fixture"}}}}"#,
+            )
+            .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
         write_mcp_config_force_remote_with_auth(

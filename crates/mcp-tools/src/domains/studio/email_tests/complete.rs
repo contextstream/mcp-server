@@ -2892,16 +2892,14 @@ async fn a_go_asked_for_one_audience_isnt_taken_for_another() {
     )
     .await
     .unwrap();
-    let state = first.take_input_required().unwrap()["requestState"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let question = first.take_input_required().unwrap();
+    let state = question["requestState"].as_str().unwrap().to_string();
 
     // The campaign is pointed at another audience of the same size while the person is
     // asked: their yes was for the first one.
     *now.lock().unwrap() = PROOF;
     let stale = CallPeer::new(client, None, false).with_inline_input(&json!({
-        "inputResponses": {"confirm-send": {"action": "accept", "content": {"confirm": true}}},
+        "inputResponses": {(question["inputRequests"].as_object().unwrap().keys().next().unwrap()): {"action": "accept", "content": {"confirm": true}}},
         "requestState": state,
     }));
     let result = run_with_call_peer(
@@ -3101,7 +3099,33 @@ async fn a_send_rechecks_the_reviewed_sender_and_count_before_scheduling() {
     let first = run(&stub, json!({"action":"email_send","campaign_id":CAMPAIGN})).await;
     let confirmation = structured(&first)["confirm_with"].clone();
     assert!(confirmation["confirm_review"].is_string());
+    let client = Arc::new(FakeClient::default());
+    let call = json!({"action":"email_send","campaign_id":CAMPAIGN});
+    let peer = CallPeer::new(client.clone(), None, false).with_inline_input(&json!({}));
+    run_with_call_peer(peer.clone(), stub.tool().execute(call.clone()))
+        .await
+        .unwrap();
+    let question = peer.take_input_required().unwrap();
+    let request_id = question["inputRequests"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap();
+
     changed.store(true, std::sync::atomic::Ordering::Relaxed);
+    let peer = CallPeer::new(client, None, false).with_inline_input(&json!({
+        "requestState":question["requestState"],
+        "inputResponses":{request_id:{"action":"accept","content":{"confirm":true}}}
+    }));
+    run_with_call_peer(peer.clone(), stub.tool().execute(call))
+        .await
+        .unwrap();
+    let fresh = peer
+        .take_input_required()
+        .expect("sender changed: ask again");
+    assert!(fresh["inputRequests"].get(request_id).is_none());
+
     let result = run(&stub, confirmation).await;
     assert!(text_of(&result).contains("Other <other@northwind.example>"));
     let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");

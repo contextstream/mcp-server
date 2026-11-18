@@ -203,6 +203,7 @@ pub struct StudioInput {
     pub send_at: Option<String>,
     pub time_zone: Option<String>,
     pub confirm_recipients: Option<i64>,
+    pub confirm_review: Option<String>,
     pub to: Option<Value>,
     pub status: Option<String>,
     pub days: Option<i64>,
@@ -2597,6 +2598,7 @@ pub(crate) fn input_schema() -> Value {
             }),
             false,
         )
+        .string("confirm_review", "Return the value from email_send confirm_with to verify the exact review the person approved.", false)
         .string("send_at", "When email_send sends: \"now\" (default) or a local time like 2026-11-02T09:00, read in time_zone", false)
         .string("time_zone", "The person's IANA time zone for send_at, e.g. Europe/London (email_send)", false)
         .integer(

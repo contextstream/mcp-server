@@ -891,7 +891,7 @@ async fn a_stateless_client_is_asked_through_the_calls_result() {
         .is_empty());
 
     let accepted = CallPeer::new(client, None, false).with_inline_input(&json!({
-        "inputResponses": {"confirm-send": {"action": "accept", "content": {"confirm": true}}},
+        "inputResponses": {(question["inputRequests"].as_object().unwrap().keys().next().unwrap()): {"action": "accept", "content": {"confirm": true}}},
         "requestState": state,
     }));
     let sent = run_with_call_peer(
@@ -1536,10 +1536,8 @@ async fn a_go_given_for_an_older_revision_isnt_taken() {
     )
     .await
     .unwrap();
-    let state = first.take_input_required().unwrap()["requestState"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let question = first.take_input_required().unwrap();
+    let state = question["requestState"].as_str().unwrap().to_string();
     assert_eq!(
         state,
         format!("studio-email-send:{CAMPAIGN}:4:37:now:UTC:{AUDIENCE}:-")
@@ -1548,7 +1546,7 @@ async fn a_go_given_for_an_older_revision_isnt_taken() {
     // The campaign is edited while the person is asked: their go was for revision 4.
     *revision.lock().unwrap() = 5;
     let stale = CallPeer::new(client, None, false).with_inline_input(&json!({
-        "inputResponses": {"confirm-send": {"action": "accept", "content": {"confirm": true}}},
+        "inputResponses": {(question["inputRequests"].as_object().unwrap().keys().next().unwrap()): {"action": "accept", "content": {"confirm": true}}},
         "requestState": state,
     }));
     let result = run_with_call_peer(

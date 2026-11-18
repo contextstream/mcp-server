@@ -21,6 +21,29 @@ fn tool() -> CachedTool {
     }
 }
 
+// The API's pattern for one family of commands is as long as the family has launchers and shapes: its lint and type-check
+// family is several thousand characters. A limit of 512 kept three of its seven families and dropped the rest unsaid.
+#[test]
+fn a_pattern_as_long_as_the_apis_longest_is_used() {
+    let launchers: Vec<String> = (0..400).map(|i| format!("launcher{i:03} ")).collect();
+    let long = format!("^({})?eslint( [A-Za-z0-9._/-]+)*$", launchers.join("|"));
+    assert!((4000..=8192).contains(&long.len()), "{}", long.len());
+    let over = format!("^({})?tsc$", "x|".repeat(5000));
+    assert!(over.len() > 8192);
+    let definition = json!({"name": "check", "command_hints": {"argument": "command", "patterns": [long, over, "^cargo check$"]}});
+    let hints = Hints::from_definition(&definition).unwrap();
+    assert_eq!(
+        hints.patterns.len(),
+        2,
+        "the one over the limit is not used"
+    );
+    assert!(hints.matches("launcher399 eslint src"));
+    assert!(hints.matches("eslint src/a.ts"));
+    assert!(hints.matches("cargo check"));
+    assert!(!hints.matches("tsc"));
+    assert!(!hints.matches("eslint; rm -rf x"));
+}
+
 #[test]
 fn hints_are_read_from_a_definition() {
     let hints = Hints::from_definition(&definition()).unwrap();

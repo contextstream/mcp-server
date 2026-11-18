@@ -74,6 +74,23 @@ fn a_tools_answer_is_its_first_non_blank_line() {
     assert_eq!(first_line(b"  \n\t\n"), None);
     // Bytes that are not text do not break it.
     assert_eq!(first_line(b"v1\xff\n").as_deref(), Some("v1\u{fffd}"));
+    // A tool that starts with a banner is read past it, to its first line with a number: Gradle's rule of dashes.
+    assert_eq!(
+        first_line(b"\n------------------------------------------------------------\nGradle 9.9.1\n------\n\nBuild time: 2026-10-01\n")
+            .as_deref(),
+        Some("Gradle 9.9.1")
+    );
+    assert_eq!(
+        first_line(b"\nWelcome to Gradle 9.9.1!\n\nHere are the highlights\n").as_deref(),
+        Some("Welcome to Gradle 9.9.1!")
+    );
+    // No number in the first nine lines: the first line, as before.
+    assert_eq!(
+        first_line(b"a tool that names no version\nand says nothing more\n").as_deref(),
+        Some("a tool that names no version")
+    );
+    let far = format!("banner\n{}version 3.1\n", "words only\n".repeat(12));
+    assert_eq!(first_line(far.as_bytes()).as_deref(), Some("banner"));
 }
 
 #[test]

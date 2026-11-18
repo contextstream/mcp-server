@@ -34,7 +34,13 @@ pub const ENV_SWITCH: &str = "CONTEXTSTREAM_HOSTED_TOOLS";
 
 const CACHE_VERSION: u32 = 1;
 const MAX_PATTERNS: usize = 64;
-const MAX_PATTERN_LEN: usize = 512;
+/// A pattern longer than this is not used. The API's own are a few hundred
+/// characters for one family of commands and several thousand for the family
+/// with the most launchers (lint and type checks): at 512, the limit until
+/// 1.0.82, four of its seven families were dropped without a word and their
+/// commands never routed. What bounds a pattern's cost is `compile`'s size
+/// limit, not its length.
+const MAX_PATTERN_LEN: usize = 8192;
 /// Commands longer than this are never matched.
 const MAX_COMMAND_LEN: usize = 8192;
 const MAX_TOOLS: usize = 16;

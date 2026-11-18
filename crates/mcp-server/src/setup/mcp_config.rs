@@ -4294,22 +4294,7 @@ fn write_project_mcp_config_with_transport_mode(
 
 /// Preserved credentials may belong to another server or an earlier setup.
 fn contains_auth_field(value: &Value) -> bool {
-    match value {
-        Value::Object(entries) => entries.iter().any(|(key, value)| {
-            let key = key.to_ascii_lowercase().replace('-', "_");
-            ((key == "authorization"
-                || key.ends_with("api_key")
-                || key.ends_with("token")
-                || key.ends_with("password")
-                || key.ends_with("secret"))
-                && value.as_str().is_some_and(|v| {
-                    !v.is_empty() && !v.starts_with("${") && !v.starts_with("{env:")
-                }))
-                || contains_auth_field(value)
-        }),
-        Value::Array(entries) => entries.iter().any(contains_auth_field),
-        _ => false,
-    }
+    safe_edit::contains_auth_field(value)
 }
 
 fn refresh_json_entry_headers_api_key(entry: &mut Value, api_key: &str) -> bool {
@@ -4872,8 +4857,12 @@ fn remove_contextstream_from_codex_toml(path: &Path) -> Result<()> {
         if let Some((backup_content, _)) = backup.filter(|_| backup_is_wholly_managed) {
             safe_edit::remove_owned_file_if_unchanged(&backup_path, &backup_content)?;
         }
-    } else {
+    } else if safe_edit::text_holds_auth_field(path, &output)
+        || safe_edit::text_holds_auth_field(path, &content)
+    {
         safe_edit::write_private_text(path, &output, Some(&content), true)?;
+    } else {
+        safe_edit::write_if_unchanged(path, &output, Some(&content))?;
     }
 
     Ok(())
@@ -5560,7 +5549,11 @@ fn remove_contextstream_from_json_path(
             safe_edit::remove_owned_file_if_unchanged(path, &loaded.raw)?;
         } else {
             let removed_keys = removed_root.into_iter().collect::<Vec<_>>();
-            safe_edit::commit_with_removals(path, &loaded, &config, &removed_keys)?;
+            if contains_auth_field(&config) || contains_auth_field(&loaded.value) {
+                safe_edit::commit_with_removals(path, &loaded, &config, &removed_keys)?;
+            } else {
+                safe_edit::commit_public_with_removals(path, &loaded, &config, &removed_keys)?;
+            }
         }
         if backup_is_wholly_managed {
             if let Some(backup) = backup {

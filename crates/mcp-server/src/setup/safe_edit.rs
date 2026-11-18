@@ -698,10 +698,131 @@ fn chmod(file: &File, permissions: std::fs::Permissions) -> std::io::Result<()> 
     file.set_permissions(permissions)
 }
 
+#[derive(Debug)]
+struct CannotKeepPrivate(PathBuf);
+
+impl std::fmt::Display for CannotKeepPrivate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cannot write {} because this location cannot keep the file private.",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for CannotKeepPrivate {}
+
+fn find_cannot_keep_private(error: &anyhow::Error) -> Option<&CannotKeepPrivate> {
+    for cause in error.chain() {
+        if let Some(unprivate) = cause.downcast_ref::<CannotKeepPrivate>() {
+            return Some(unprivate);
+        }
+        if let Some(unprivate) = cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io_err| io_err.get_ref())
+            .and_then(|inner| inner.downcast_ref::<CannotKeepPrivate>())
+        {
+            return Some(unprivate);
+        }
+    }
+    None
+}
+
+fn with_private_aware_context(
+    error: anyhow::Error,
+    context: impl FnOnce() -> String,
+) -> anyhow::Error {
+    if let Some(unprivate) = find_cannot_keep_private(&error) {
+        return anyhow::anyhow!("{unprivate}");
+    }
+    error.context(context())
+}
+
+fn is_auth_key_name(raw_key: &str) -> bool {
+    let key = raw_key.to_ascii_lowercase().replace('-', "_");
+    key == "authorization"
+        || key.ends_with("api_key")
+        || key.ends_with("apikey")
+        || key.ends_with("token")
+        || key.ends_with("password")
+        || key.ends_with("secret")
+}
+
+fn is_literal_credential_value(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    !trimmed.is_empty() && !trimmed.starts_with("${") && !trimmed.starts_with("{env:")
+}
+
+/// Preserved credentials may belong to another server or an earlier setup.
+pub(crate) fn contains_auth_field(value: &Value) -> bool {
+    match value {
+        Value::Object(entries) => entries.iter().any(|(key, value)| {
+            (is_auth_key_name(key) && value.as_str().is_some_and(is_literal_credential_value))
+                || contains_auth_field(value)
+        }),
+        Value::Array(entries) => entries.iter().any(contains_auth_field),
+        _ => false,
+    }
+}
+
+fn toml_value_contains_auth_field(value: &toml_edit::Value) -> bool {
+    match value {
+        toml_edit::Value::InlineTable(table) => table.iter().any(|(key, child)| {
+            (is_auth_key_name(key) && child.as_str().is_some_and(is_literal_credential_value))
+                || toml_value_contains_auth_field(child)
+        }),
+        toml_edit::Value::Array(items) => items.iter().any(toml_value_contains_auth_field),
+        _ => false,
+    }
+}
+
+fn toml_item_contains_auth_field(item: &toml_edit::Item) -> bool {
+    if let Some(table) = item.as_table_like() {
+        return table.iter().any(|(key, child)| {
+            (is_auth_key_name(key)
+                && child
+                    .as_value()
+                    .and_then(toml_edit::Value::as_str)
+                    .is_some_and(is_literal_credential_value))
+                || toml_item_contains_auth_field(child)
+        });
+    }
+    if let Some(tables) = item.as_array_of_tables() {
+        return tables.iter().any(|table| {
+            table.iter().any(|(key, child)| {
+                (is_auth_key_name(key)
+                    && child
+                        .as_value()
+                        .and_then(toml_edit::Value::as_str)
+                        .is_some_and(is_literal_credential_value))
+                    || toml_item_contains_auth_field(child)
+            })
+        });
+    }
+    if let Some(value) = item.as_value() {
+        return toml_value_contains_auth_field(value);
+    }
+    false
+}
+
+pub(crate) fn text_holds_auth_field(path: &Path, content: &str) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("json" | "jsonc") => {
+            let input = content.strip_prefix('\u{feff}').unwrap_or(content);
+            try_parse_json_like(input).is_ok_and(|value| contains_auth_field(&value))
+        }
+        Some("toml") => content
+            .parse::<toml_edit::DocumentMut>()
+            .is_ok_and(|doc| toml_item_contains_auth_field(doc.as_item())),
+        _ => false,
+    }
+}
+
 /// Set permissions on the opened inode before writing its first byte.
 fn set_staged_permissions(
     file: &File,
-    staged: &Path,
+    target: &Path,
     wanted: std::fs::Permissions,
     private: bool,
 ) -> std::io::Result<()> {
@@ -710,26 +831,41 @@ fn set_staged_permissions(
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = file.metadata()?.permissions().mode() & 0o7777;
+        let is_private = mode & 0o077 == 0;
+        let refused = |e: &std::io::Error| {
+            e.raw_os_error().is_some_and(|code| {
+                code == libc::EPERM || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+            })
+        };
         match result {
             Ok(()) if mode == wanted.mode() & 0o7777 => Ok(()),
+            Ok(()) if private && !is_private => Err(std::io::Error::other(CannotKeepPrivate(
+                target.to_path_buf(),
+            ))),
             Ok(()) => Err(std::io::Error::other(format!(
                 "file system reported success changing permissions on {}, but mode is {mode:04o}",
-                staged.display()
+                target.display()
             ))),
             Err(e)
-                if e.raw_os_error().is_some_and(|code| {
-                    code == libc::EPERM || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
-                }) && (mode == wanted.mode() & 0o7777 || private) =>
+                if refused(&e)
+                    && if private {
+                        is_private
+                    } else {
+                        mode == wanted.mode() & 0o7777
+                    } =>
             {
-                warn_chmod_refused(staged, mode, private && mode != 0o600);
+                warn_chmod_refused(target, mode);
                 Ok(())
             }
+            Err(e) if refused(&e) && private => Err(std::io::Error::other(CannotKeepPrivate(
+                target.to_path_buf(),
+            ))),
             Err(e) => Err(e),
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = (staged, private);
+        let _ = (target, private);
         result
     }
 }
@@ -790,28 +926,23 @@ fn creation_mode(_wanted: &std::fs::Permissions) -> u32 {
 /// Say once per process that a mount refuses chmod, naming the first
 /// directory it happened in; every file there is handled the same way.
 #[cfg(unix)]
-fn warn_chmod_refused(staged: &Path, mode: u32, exposed: bool) {
-    let directory = staged.parent().unwrap_or(staged);
-    let message = if exposed {
-        format!("Warning: this mount does not let {} be made private. Its permissions are {mode:04o} and the configuration may be readable by other users.", directory.display())
-    } else {
-        format!("The file system of {} refuses permission changes. The file already has the requested permissions {mode:04o}.", directory.display())
-    };
+fn warn_chmod_refused(target: &Path, mode: u32) {
+    let directory = target.parent().unwrap_or(target);
+    let message = format!(
+        "Warning: the file system of {} refuses permission changes; keeping existing permissions {mode:04o}.",
+        directory.display()
+    );
 
     #[cfg(not(test))]
     {
-        static MATCHED: std::sync::Once = std::sync::Once::new();
-        static EXPOSED: std::sync::Once = std::sync::Once::new();
-        if exposed { &EXPOSED } else { &MATCHED }.call_once(|| eprintln!("{message}"));
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| eprintln!("{message}"));
     }
 
     #[cfg(test)]
     TEST_CHMOD_WARNINGS.with(|said| {
         let mut said = said.borrow_mut();
-        if !said
-            .iter()
-            .any(|prior| prior.starts_with("Warning:") == exposed)
-        {
+        if said.is_empty() {
             said.push(message);
         }
     });
@@ -1064,9 +1195,7 @@ pub(crate) fn restore_text_first_backup(
     let backup_permissions = validate_recovery_file(&backup)?
         .ok_or_else(|| anyhow::anyhow!("Recovery backup disappeared: {}", backup.display()))?
         .permissions();
-    let private = path
-        .extension()
-        .is_some_and(|ext| ext == "json" || ext == "jsonc" || ext == "toml");
+    let private = text_holds_auth_field(path, backup_content);
     let changed = write_if_changed_impl_with_permissions(
         path,
         backup_content,
@@ -1105,9 +1234,13 @@ fn create_backup_if_absent(path: &Path, content: &[u8], private: bool) -> Result
     let check_existing = || -> Result<()> {
         #[cfg(unix)]
         if private {
-            return make_existing_private(&backup).with_context(|| {
-                format!("Could not protect recovery backup {}", backup.display())
-            });
+            return make_existing_private(&backup)
+                .map_err(anyhow::Error::from)
+                .map_err(|error| {
+                    with_private_aware_context(error, || {
+                        format!("Could not protect recovery backup {}", backup.display())
+                    })
+                });
         }
         File::open(&backup)
             .with_context(|| format!("Could not open recovery backup {}", backup.display()))?;
@@ -1141,15 +1274,16 @@ fn create_backup_if_absent(path: &Path, content: &[u8], private: bool) -> Result
     };
     let (temporary, mut file) = create_unique_temp_with_mode(&backup, creation_mode(&permissions))?;
     let result = (|| -> Result<()> {
-        set_staged_permissions(&file, &temporary, permissions, private)?;
+        set_staged_permissions(&file, &backup, permissions, private)?;
         file.write_all(content)?;
         file.sync_all()?;
         Ok(())
     })();
     if let Err(error) = result {
         let _ = std::fs::remove_file(&temporary);
-        return Err(error)
-            .with_context(|| format!("Could not back up {} before writing", path.display()));
+        return Err(with_private_aware_context(error, || {
+            format!("Could not back up {} before writing", path.display())
+        }));
     }
 
     verify_staged_identity(&file, &temporary)?;
@@ -1544,7 +1678,7 @@ fn write_if_changed_impl_full(
     let (tmp, mut file) = create_unique_temp_with_mode(path, initial_temp_mode)?;
     let prepare_result = (|| -> Result<()> {
         if let Some(permissions) = wanted_permissions {
-            set_staged_permissions(&file, &tmp, permissions, force_private_permissions)?;
+            set_staged_permissions(&file, path, permissions, force_private_permissions)?;
         }
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
@@ -1552,8 +1686,9 @@ fn write_if_changed_impl_full(
     })();
     if let Err(error) = prepare_result {
         let _ = std::fs::remove_file(&tmp);
-        return Err(error)
-            .with_context(|| format!("Could not prepare replacement for {}", path.display()));
+        return Err(with_private_aware_context(error, || {
+            format!("Could not prepare replacement for {}", path.display())
+        }));
     }
 
     // Narrow the lost-update window to the final rename. The editor may have

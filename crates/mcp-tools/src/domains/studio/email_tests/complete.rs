@@ -1305,3 +1305,360 @@ fn segments_and_recipients_are_listed_described_and_in_the_schema() {
         .unwrap()
         .contains(&json!("preview")));
 }
+
+// ============================================================================
+// email_diagnostics and the unsubscribe report
+// ============================================================================
+
+/// `GET /webhook/diagnostics` as today's main answers it.
+fn diagnostics(status: &str, sent: i64, applied: i64, last_applied: Option<&str>) -> Value {
+    json!({
+        "endpoint": format!("https://api.contextstream.io/api/v1/create/email/webhooks/{WORKSPACE}"),
+        "mode": "auto", "secretSet": true,
+        "lastDeliveryAt": "2026-11-17T09:05:00Z", "lastAppliedAt": last_applied,
+        "days": 7,
+        "outcomes": {"applied": applied, "duplicate": 3, "not_ours": 120, "test": 1,
+                     "refused_signature": 2, "refused_late": 0, "malformed": 0, "no_secret": 0},
+        "coverage": {"sent": sent, "eventsPerSend": 1.3, "status": status},
+        "recent": [
+            {"receivedAt": "2026-11-17T09:05:00Z", "type": "email.opened", "outcome": "applied", "detail": null, "svixId": "msg_1"},
+            {"receivedAt": "2026-11-17T09:00:00Z", "type": "email.delivered", "outcome": "applied", "detail": null, "svixId": "msg_2"},
+            {"receivedAt": "2026-11-17T08:59:00Z", "type": "email.delivered", "outcome": "applied", "detail": null, "svixId": "msg_3"},
+        ],
+        "resend": {"checked": true, "found": true, "endpointMatches": true, "enabled": true, "missingEvents": [], "problem": null},
+    })
+}
+
+fn diagnostics_api(answer: Value) -> Responder {
+    over(move |request| {
+        (request.path == "/create/email/webhook/diagnostics").then(|| Answer::ok(answer.clone()))
+    })
+}
+
+#[tokio::test]
+async fn the_webhook_is_read_with_one_plain_verdict() {
+    let stub = Stub::start(diagnostics_api(diagnostics(
+        "healthy",
+        40,
+        52,
+        Some("2026-11-17T09:05:00Z"),
+    )))
+    .await;
+    let result = run(&stub, json!({"action": "email_diagnostics"})).await;
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    let asked = stub.calls_to("GET", "/create/email/webhook/diagnostics");
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].query.contains("days=7"), "{}", asked[0].query);
+    assert!(
+        text.starts_with("The webhook over the last 7 days, as of now.\nVerdict: events are arriving: 52 applied for 40 emails sent in the last 7 days, the last on 2026-11-17 09:05 UTC."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Set up by Create, with its signing secret; in Resend it is registered and enabled, with every event."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Deliveries: 52 applied, 3 repeats, 120 for other mail on this Resend account, 1 test."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Refused: 2 with a bad signature, 0 too late, 0 malformed, 0 while no signing secret was set."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- By type, over the last 3 deliveries read: delivered 2, opened 1."),
+        "{text}"
+    );
+    let out = structured(&result);
+    assert_eq!(out["verdict"]["status"], "arriving");
+    assert_eq!(out["outcomes"]["refused_signature"], 2);
+    assert!(
+        !text.contains("api.contextstream.io"),
+        "the URL names the workspace: not in the words"
+    );
+
+    let refused = stub
+        .tool()
+        .execute(json!({"action": "email_diagnostics", "days": 31}))
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("days is 1 to 30"), "{refused}");
+}
+
+#[tokio::test]
+async fn events_that_stopped_arriving_are_said_as_possibly_missing() {
+    let stub = Stub::start(diagnostics_api(diagnostics(
+        "missing",
+        40,
+        0,
+        Some("2026-11-10T09:00:00Z"),
+    )))
+    .await;
+    let text = text_of(&run(&stub, json!({"action": "email_diagnostics", "days": 14})).await);
+    assert!(
+        text.contains("Verdict: events are possibly missing: none arrived in the last 14 days although 40 emails were sent (the last one arrived on 2026-11-10 09:00 UTC): opens, clicks, bounces and complaints may be missing."),
+        "{text}"
+    );
+
+    // Fewer than one event an email.
+    let stub = Stub::start(diagnostics_api(diagnostics(
+        "low",
+        40,
+        24,
+        Some("2026-11-17T09:05:00Z"),
+    )))
+    .await;
+    let text = text_of(&run(&stub, json!({"action": "email_diagnostics"})).await);
+    assert!(
+        text.contains("Verdict: events may be missing: 24 arrived for 40 emails sent in the last 7 days, fewer than one an email (the last on 2026-11-17 09:05 UTC): some opens, clicks, bounces and complaints may be missing."),
+        "{text}"
+    );
+
+    // Nothing sent: nothing to compare, and no number is made up.
+    let stub = Stub::start(diagnostics_api(diagnostics("idle", 0, 0, None))).await;
+    let result = run(&stub, json!({"action": "email_diagnostics"})).await;
+    let text = text_of(&result);
+    assert!(
+        text.contains("Verdict: nothing was sent in the last 7 days, so there is nothing to compare; no event has been applied yet."),
+        "{text}"
+    );
+    assert_eq!(structured(&result)["verdict"]["status"], "idle");
+
+    // No signing secret: nothing can be verified, whatever the counts.
+    let mut unset = diagnostics("healthy", 40, 52, Some("2026-11-17T09:05:00Z"));
+    unset["secretSet"] = json!(false);
+    unset["mode"] = json!("manual");
+    unset["resend"] = json!({"checked": false, "problem": "Create didn't make this webhook (it was set up by hand), so it can't check it."});
+    let stub = Stub::start(diagnostics_api(unset)).await;
+    let text = text_of(&run(&stub, json!({"action": "email_diagnostics"})).await);
+    assert!(
+        text.contains("Verdict: events are possibly missing: the webhook has no signing secret, so no event can be verified."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Set up by hand, with no signing secret (the team pastes it in the studio: https://ctxproduct.com/studio/email/settings); whether Resend has it is not answered: Create didn't make this webhook (it was set up by hand), so it can't check it."),
+        "{text}"
+    );
+
+    // A status this tool doesn't know is not read as good news.
+    let mut odd = diagnostics("sideways", 40, 52, None);
+    odd["coverage"] = json!({});
+    let stub = Stub::start(diagnostics_api(odd)).await;
+    let text = text_of(&run(&stub, json!({"action": "email_diagnostics"})).await);
+    assert!(text.contains("Verdict: not answered."), "{text}");
+}
+
+#[tokio::test]
+async fn a_newer_creates_own_verdict_and_event_types_are_used() {
+    let mut newer = diagnostics("healthy", 40, 52, Some("2026-11-17T09:05:00Z"));
+    newer["verdict"] = json!({
+        "status": "missing",
+        "sentence": "No events since 2026-11-10T09:00:00Z although 40 emails were sent after it: opens, bounces and complaints may be missing.",
+        "lastEventAt": "2026-11-10T09:00:00Z", "sent": 40, "sentSinceLastEvent": 40,
+    });
+    newer["events"] = json!({"sent": 40, "delivered": 38, "delivery_delayed": 0, "opened": 20, "clicked": 6, "bounced": 1, "complained": 0, "failed": 0, "suppressed": 0});
+    newer["lastEvent"] = json!({"type": "email.opened", "at": "2026-11-10T09:00:00Z"});
+    let stub = Stub::start(diagnostics_api(newer)).await;
+    let result = run(&stub, json!({"action": "email_diagnostics"})).await;
+    let text = text_of(&result);
+    assert!(
+        text.contains("Verdict: No events since 2026-11-10T09:00:00Z although 40 emails were sent after it: opens, bounces and complaints may be missing."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- By type: sent 40, delivered 38, opened 20, clicked 6, bounced 1."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Last event: opened, on 2026-11-10 09:00 UTC."),
+        "{text}"
+    );
+    assert_eq!(structured(&result)["verdict"]["status"], "missing");
+}
+
+#[tokio::test]
+async fn diagnostics_without_a_connection_say_so() {
+    let stub = Stub::start(over(|request| {
+        (request.path == "/create/email/webhook/diagnostics")
+            .then(|| Answer::error(404, "NOT_FOUND", "Not found: Resend isn't connected."))
+    }))
+    .await;
+    let result = run(&stub, json!({"action": "email_diagnostics"})).await;
+    assert!(result.is_error);
+    assert_eq!(
+        text_of(&result),
+        "Resend isn't connected yet, so there is no webhook and no event can arrive: the team connects it in the studio (https://ctxproduct.com/studio/email/settings)."
+    );
+}
+
+fn summary() -> Value {
+    json!({
+        "days": 30, "total": 7,
+        "byReason": {"unsubscribed": 4, "bounced": 2, "complained": 1, "manual": 0},
+        "bySource": {"one_click": 3, "page": 1, "webhook": 3, "manual": 0, "api": 0},
+        "feedback": {"too_many": 2, "not_relevant": 1, "never_signed_up": 0, "other": 0, "none": 1},
+        "series": [],
+        "campaigns": [
+            {"id": CAMPAIGN, "name": "Winter sale", "sent": 37, "unsubscribed": 3, "complained": 1, "rate": 0.0811},
+            {"id": COPY, "name": "Autumn news", "sent": 40, "unsubscribed": 1, "complained": 0, "rate": 0.025},
+        ],
+        "resubscribed": 1,
+    })
+}
+
+#[tokio::test]
+async fn the_unsubscribe_report_keeps_its_numbers_apart_and_says_whether_to_trust_them() {
+    let stub = Stub::start(over(|request| match request.path.as_str() {
+        "/create/email/suppressions/summary" => Some(Answer::ok(summary())),
+        "/create/email/webhook/diagnostics" => Some(Answer::ok(diagnostics(
+            "missing",
+            77,
+            0,
+            Some("2026-11-10T09:00:00Z"),
+        ))),
+        _ => None,
+    }))
+    .await;
+    let result = run(
+        &stub,
+        json!({"action": "email_unsubscribes", "operation": "report"}),
+    )
+    .await;
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    assert!(
+        text.starts_with("Opt-outs over the last 30 days, as of now:\n- Unsubscribed 4 · bounced 2 · spam complaints 1 · added by hand 0; 1 resubscribed."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Why they left: too many emails 2, not relevant 1, no reason given 1."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- By campaign: “Winter sale” 3 unsubscribed, 1 spam complaint, of 37 sent (8.1%); “Autumn news” 1 unsubscribed, of 40 sent (2.5%)."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Can they be trusted? Unsubscribes are recorded by ContextStream's own unsubscribe link, so they don't depend on Resend's events. Bounces and complaints arrive through Resend's webhook: events are possibly missing: none arrived in the last 30 days although 77 emails were sent (the last one arrived on 2026-11-10 09:00 UTC): opens, clicks, bounces and complaints may be missing."),
+        "{text}"
+    );
+    let out = structured(&result);
+    assert_eq!(out["by_reason"]["bounced"], 2);
+    assert_eq!(out["verdict"]["status"], "missing");
+    assert!(
+        stub.calls_to("GET", "/create/email/suppressions/summary")[0]
+            .query
+            .contains("days=30")
+    );
+    assert!(stub.calls_to("GET", "/create/email/webhook/diagnostics")[0]
+        .query
+        .contains("days=30"));
+    assert!(stub.requests().iter().all(|r| r.method == "GET"), "a read");
+
+    // A longer report still asks the webhook about the 30 days it keeps.
+    run(
+        &stub,
+        json!({"action": "email_unsubscribes", "operation": "report", "days": 90}),
+    )
+    .await;
+    assert!(
+        stub.calls_to("GET", "/create/email/suppressions/summary")[1]
+            .query
+            .contains("days=90")
+    );
+    assert!(stub.calls_to("GET", "/create/email/webhook/diagnostics")[1]
+        .query
+        .contains("days=30"));
+}
+
+/// Today's main ignores `campaignId` on the summary: a campaign's numbers are then its own
+/// report's, never the workspace's passed off as the campaign's.
+#[tokio::test]
+async fn a_campaigns_unsubscribe_report_is_never_the_workspaces() {
+    let stub = Stub::start(over(|request| match request.path.as_str() {
+        "/create/email/suppressions/summary" => Some(Answer::ok(summary())),
+        "/create/email/webhook/diagnostics" => Some(Answer::ok(diagnostics(
+            "healthy",
+            37,
+            52,
+            Some("2026-11-17T09:05:00Z"),
+        ))),
+        _ => None,
+    }))
+    .await;
+    let result = run(
+        &stub,
+        json!({"action": "email_unsubscribes", "operation": "report", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    // The campaign's own report (the usual stub): 1 unsubscribed, 1 bounced, 1 complaint.
+    assert!(
+        text.starts_with("Opt-outs from “Winter sale”, as of now:\n- Unsubscribed 1 · bounced 1 · spam complaints 1, of 37 sent."),
+        "{text}"
+    );
+    assert!(
+        text.contains("- Why they left: too many emails 1."),
+        "{text}"
+    );
+    assert!(!text.contains("Unsubscribed 4"), "{text}");
+    let listed = stub.calls_to("GET", "/create/email/suppressions");
+    assert!(listed[0].query.contains(&format!("campaignId={CAMPAIGN}")));
+    assert!(listed[0].query.contains("reason=unsubscribed"));
+    assert_eq!(structured(&result)["campaign_id"], CAMPAIGN);
+}
+
+#[tokio::test]
+async fn a_newer_create_narrows_the_report_and_gives_the_verdict_itself() {
+    let stub = Stub::start(over(|request| {
+        (request.path == "/create/email/suppressions/summary").then(|| {
+            let mut narrowed = summary();
+            narrowed["byReason"] = json!({"unsubscribed": 3, "bounced": 0, "complained": 1, "manual": 0});
+            narrowed["feedback"] = json!({"too_many": 2, "not_relevant": 0, "never_signed_up": 0, "other": 0, "none": 1});
+            narrowed["sent"] = json!(37);
+            narrowed["lastOptOutAt"] = json!("2026-11-12T10:00:00Z");
+            narrowed["webhook"] = json!({
+                "status": "arriving", "sentence": "Events are arriving: the last one at 2026-11-17T09:05:00Z.",
+                "lastEventAt": "2026-11-17T09:05:00Z", "sent": 37, "sentSinceLastEvent": 0,
+            });
+            Answer::ok(narrowed)
+        })
+    }))
+    .await;
+    let result = run(
+        &stub,
+        json!({"action": "email_unsubscribes", "operation": "report", "campaign_id": CAMPAIGN, "days": 14}),
+    )
+    .await;
+    let text = text_of(&result);
+    assert!(
+        text.starts_with("Opt-outs from “Winter sale” over the last 14 days, as of now:\n- Unsubscribed 3 · bounced 0 · spam complaints 1 · added by hand 0, of 37 sent; the last on 2026-11-12 10:00 UTC."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Bounces and complaints arrive through Resend's webhook: Events are arriving: the last one at 2026-11-17T09:05:00Z."),
+        "{text}"
+    );
+    let asked = stub.calls_to("GET", "/create/email/suppressions/summary");
+    assert!(asked[0].query.contains(&format!("campaignId={CAMPAIGN}")));
+    assert!(asked[0].query.contains("days=14"));
+    assert!(
+        stub.calls_to("GET", "/create/email/webhook/diagnostics")
+            .is_empty(),
+        "the summary already says"
+    );
+}
+
+#[test]
+fn diagnostics_and_the_report_are_listed_described_and_in_the_schema() {
+    assert!(EMAIL_ACTIONS.contains(&"email_diagnostics"));
+    assert!(VALID_ACTIONS.contains(&"email_diagnostics"));
+    assert!(TOOL_REFERENCE.contains("- email_diagnostics:"));
+    assert!(TOOL_REFERENCE.contains("report (days, campaign_id"));
+    assert!(input_schema()["properties"]["operation"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("report")));
+}

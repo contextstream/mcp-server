@@ -3954,3 +3954,204 @@ async fn legacy_campaign_unsubscribe_report_says_all_time_instead_of_tagging_day
     assert_eq!(out["days"], Value::Null);
     assert_eq!(out["window"], "all_time");
 }
+
+#[test]
+fn schema_descriptions_name_every_caller_of_audience_segment_variant_and_tags() {
+    assert!(DESCRIPTION.chars().count() <= 1024);
+    assert!(DESCRIPTION.len() <= 1024);
+    let schema = input_schema();
+    let props = schema["properties"].as_object().unwrap();
+
+    let aud = props["audience_id"]["description"].as_str().unwrap();
+    for caller in [
+        "email_draft",
+        "email_templates",
+        "email_send",
+        "email_audiences",
+        "email_contacts",
+        "email_segments",
+    ] {
+        assert!(aud.contains(caller), "audience_id missing {caller}: {aud}");
+    }
+
+    let seg = props["segment_id"]["description"].as_str().unwrap();
+    for caller in [
+        "email_draft",
+        "email_templates",
+        "email_send",
+        "email_segments",
+    ] {
+        assert!(seg.contains(caller), "segment_id missing {caller}: {seg}");
+    }
+
+    let var = props["variant"]["description"].as_str().unwrap();
+    for caller in ["email_preview", "email_test"] {
+        assert!(var.contains(caller), "variant missing {caller}: {var}");
+    }
+
+    let tags = props["tags"]["description"].as_str().unwrap();
+    for caller in ["update", "import_preview", "import"] {
+        assert!(tags.contains(caller), "tags missing {caller}: {tags}");
+    }
+}
+
+#[tokio::test]
+async fn exact_address_lookups_page_past_fifty_substring_matches_for_contacts_and_suppressions() {
+    let stub = Stub::start(over(|request| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/create/email/contacts") => {
+                if request.query.contains("cursor=50") {
+                    Some(Answer::ok(json!({
+                        "contacts": [{
+                            "id": CONTACT,
+                            "email": "ada@northwind.example",
+                            "firstName": "Ada",
+                            "lastName": "Lovelace",
+                            "tags": [],
+                            "audienceIds": [AUDIENCE],
+                        }],
+                        "nextCursor": null,
+                        "total": 51,
+                    })))
+                } else {
+                    let decoys: Vec<Value> = (0..50)
+                        .map(|i| {
+                            json!({
+                                "id": format!("55555555-5555-4555-8555-{i:012}"),
+                                "email": format!("prefix-{i}-ada@northwind.example"),
+                                "audienceIds": [],
+                            })
+                        })
+                        .collect();
+                    Some(Answer::ok(json!({
+                        "contacts": decoys,
+                        "nextCursor": "50",
+                        "total": 51,
+                    })))
+                }
+            }
+            ("PATCH", path) if path == format!("/create/email/contacts/{CONTACT}") => {
+                Some(Answer::ok(patched_contact(&request.body)))
+            }
+            ("GET", "/create/email/suppressions") => {
+                if request.query.contains("cursor=50") {
+                    Some(Answer::ok(json!({
+                        "suppressions": [{
+                            "email": "ada@northwind.example",
+                            "reason": "bounced",
+                            "source": "webhook",
+                            "detail": "550 Unknown",
+                            "createdAt": "2026-10-19T08:00:00Z",
+                        }],
+                        "nextCursor": null,
+                        "total": 51,
+                    })))
+                } else {
+                    let decoys: Vec<Value> = (0..50)
+                        .map(|i| {
+                            json!({
+                                "email": format!("prefix-{i}-ada@northwind.example"),
+                                "reason": "bounced",
+                                "source": "webhook",
+                            })
+                        })
+                        .collect();
+                    Some(Answer::ok(json!({
+                        "suppressions": decoys,
+                        "nextCursor": "50",
+                        "total": 51,
+                    })))
+                }
+            }
+            ("POST", "/create/email/suppressions/remove") => {
+                Some(Answer::ok(json!({"removed": true})))
+            }
+            _ => None,
+        }
+    }))
+    .await;
+
+    let updated = run(
+        &stub,
+        json!({
+            "action": "email_contacts", "operation": "update",
+            "email": "ada@northwind.example", "first_name": "Augusta",
+        }),
+    )
+    .await;
+    assert!(!updated.is_error, "{}", text_of(&updated));
+    assert_eq!(
+        stub.calls_to("PATCH", &format!("/create/email/contacts/{CONTACT}"))
+            .len(),
+        1
+    );
+
+    let removed = run(
+        &stub,
+        json!({
+            "action": "email_unsubscribes", "operation": "remove",
+            "email": "ada@northwind.example", "confirm_email": "ada@northwind.example",
+        }),
+    )
+    .await;
+    assert!(!removed.is_error, "{}", text_of(&removed));
+    assert_eq!(
+        stub.calls_to("POST", "/create/email/suppressions/remove")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn email_draft_and_email_test_send_deterministic_idempotency_keys() {
+    let stub = Stub::start(usual()).await;
+    let draft_call = json!({
+        "action": "email_draft",
+        "prompt": "announce our winter sale to customers",
+        "audience_id": AUDIENCE,
+    });
+    run(&stub, draft_call.clone()).await;
+    run(&stub, draft_call).await;
+    run(
+        &stub,
+        json!({
+            "action": "email_draft",
+            "prompt": "announce our spring sale to customers",
+            "audience_id": AUDIENCE,
+        }),
+    )
+    .await;
+    let drafts = stub.calls_to("POST", "/create/email/campaigns/draft");
+    assert_eq!(drafts.len(), 3);
+    let draft_key = drafts[0].header("idempotency-key").expect("draft key");
+    assert!(draft_key.starts_with("email-draft-"), "{draft_key}");
+    assert!(draft_key.len() <= 200);
+    assert_eq!(drafts[1].header("idempotency-key"), Some(draft_key));
+    assert_ne!(drafts[2].header("idempotency-key"), Some(draft_key));
+
+    let test_call = json!({
+        "action": "email_test",
+        "campaign_id": CAMPAIGN,
+        "to": "delivered@resend.dev",
+        "variant": 1,
+    });
+    run(&stub, test_call.clone()).await;
+    run(&stub, test_call).await;
+    run(
+        &stub,
+        json!({
+            "action": "email_test",
+            "campaign_id": CAMPAIGN,
+            "to": "delivered@resend.dev",
+            "variant": 0,
+        }),
+    )
+    .await;
+    let tests = stub.calls_to("POST", &format!("/create/email/campaigns/{CAMPAIGN}/test"));
+    assert_eq!(tests.len(), 3);
+    let test_key = tests[0].header("idempotency-key").expect("test key");
+    assert!(test_key.starts_with("email-test-"), "{test_key}");
+    assert!(test_key.len() <= 200);
+    assert_eq!(tests[1].header("idempotency-key"), Some(test_key));
+    assert_ne!(tests[2].header("idempotency-key"), Some(test_key));
+}

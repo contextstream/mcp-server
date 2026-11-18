@@ -316,6 +316,10 @@ struct Shown {
 }
 
 impl Shown {
+    fn within_lease(&self) -> bool {
+        self.held_at.elapsed() < Duration::from_secs(super::delivery_bindings::CLAIM_SECONDS as u64)
+    }
+
     fn new(run_id: Uuid, previous_claims: usize, token: Option<ClaimToken>) -> Self {
         Self {
             run_id,
@@ -349,10 +353,18 @@ struct Memory {
 }
 
 impl Memory {
+    fn pinned(&self) -> bool {
+        self.in_flight
+            .values()
+            .any(|f| f.done.has_changed().is_ok())
+            || self
+                .shown
+                .values()
+                .any(|s| s.pending.is_some() || (s.token.is_some() && s.within_lease()))
+    }
+
     fn prune(&mut self) {
-        self.shown.retain(|_, s| {
-            s.held_at.elapsed().as_secs() < super::delivery_bindings::CLAIM_SECONDS as u64
-        });
+        self.shown.retain(|_, s| s.within_lease());
         self.reports.retain(|_, at| at.elapsed() < REPORT_TTL);
         self.polls.retain(|_, p| p.started.elapsed() < REPORT_TTL);
         self.in_flight.retain(|_, f| f.done.has_changed().is_ok());
@@ -420,17 +432,19 @@ impl Ledger {
                 .by_key
                 .iter()
                 .filter(|(k, _)| k.namespace == owner.namespace);
-            let victim = if same_key.clone().count() >= OWNERS_PER_CREDENTIAL {
-                same_key.min_by_key(|(_, mem)| mem.last_used)
+            if same_key.clone().count() >= OWNERS_PER_CREDENTIAL {
+                let Some(key) = same_key
+                    .filter(|(_, mem)| !mem.pinned())
+                    .min_by_key(|(_, mem)| mem.last_used)
+                    .map(|(k, _)| k.clone())
+                else {
+                    return T::default();
+                };
+                owners.by_key.remove(&key);
             } else if owners.by_key.len() >= MAX_OWNERS {
                 // The global limit refuses growth; another credential's slots
                 // are never available to this owner.
                 return T::default();
-            } else {
-                None
-            };
-            if let Some(key) = victim.map(|(k, _)| k.clone()) {
-                owners.by_key.remove(&key);
             }
         }
         let mem = owners.by_key.entry(owner.clone()).or_default();
@@ -441,7 +455,8 @@ impl Ledger {
 
     // A get can follow its report before the first read has finished. Keep
     // this evidence in memory until a successful read warrants a disk book.
-    pub(super) fn note_report(&self, owner: &Owner, run: Uuid) -> Option<Instant> {
+    // Return whether the reports were spaced apart, or None if the owner was refused.
+    pub(super) fn note_report(&self, owner: &Owner, run: Uuid) -> Option<bool> {
         self.with(&owner.key, |mem| {
             let previous = mem.reports.insert(run, Instant::now());
             if mem.reports.len() > MAX_REMEMBERED {
@@ -454,7 +469,7 @@ impl Ledger {
                     mem.reports.remove(&oldest);
                 }
             }
-            previous
+            Some(previous.is_some_and(|last| last.elapsed() >= OFFER_FRESH_FOR))
         })
     }
 
@@ -659,10 +674,14 @@ pub(super) async fn poll(
 ) -> Offered {
     let tool = tool_for(agent.get("client").and_then(Value::as_str));
     let deadline = tokio::time::Instant::now() + OFFER_FRESH_FOR;
-    let spaced = !wait
-        && ledger
-            .note_report(owner, run_id)
-            .is_some_and(|last| last.elapsed() >= OFFER_FRESH_FOR);
+    let spaced = if wait {
+        false
+    } else {
+        let Some(spaced) = ledger.note_report(owner, run_id) else {
+            return Offered::default();
+        };
+        spaced
+    };
     let notice = |waiting: bool| {
         waiting.then(|| format!(
         "A person's answer or message waits for this run: read it with {tool}(action=\"get\", run_id=\"{run_id}\")"

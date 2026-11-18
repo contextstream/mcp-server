@@ -3226,3 +3226,432 @@ async fn email_api_responses_never_expose_a_key_in_free_text() {
         Err(error) => assert!(!error.to_string().contains(&secret)),
     }
 }
+
+/// Runs `call` across a stateless client, a live client that never answers, and no client.
+async fn across_non_answering_callers(stub: &Stub, call: Value) -> [ToolResult; 3] {
+    let tool = stub.tool();
+    let stateless =
+        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}));
+    let on_stateless = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_with_call_peer(stateless.clone(), tool.execute(call.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        stateless.take_input_required().is_none(),
+        "a count-only call answers the review instead of hanging a stateless client"
+    );
+
+    let silent = Arc::new(FakeClient::default());
+    let on_unanswered_live = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_with_call_peer(
+            CallPeer::new(silent.clone(), None, true),
+            tool.execute(call.clone()),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        silent.sent.lock().unwrap().len(),
+        1,
+        "a live client is still asked first"
+    );
+
+    let on_no_client = tokio::time::timeout(Duration::from_secs(5), tool.execute(call))
+        .await
+        .unwrap()
+        .unwrap();
+
+    [on_stateless, on_unanswered_live, on_no_client]
+}
+
+#[tokio::test]
+async fn count_only_send_never_sends_an_edited_campaign_at_the_same_count() {
+    let rev = Arc::new(std::sync::atomic::AtomicI64::new(4));
+    let rev_seen = rev.clone();
+    let base = send_api((PROOF, "Proof", Some("test")), None, "Winter sale", 3, true);
+    let stub = Stub::start(Arc::new(move |request: &Recorded| {
+        let path = format!("/create/email/campaigns/{CAMPAIGN}");
+        let r = rev_seen.load(std::sync::atomic::Ordering::Relaxed);
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", p) if p == path => {
+                let mut answer = base(request);
+                answer.body["data"]["revision"] = json!(r);
+                if r == 5 {
+                    answer.body["data"]["subject"] = json!("Different offer altogether");
+                }
+                answer
+            }
+            ("GET", p) if p == format!("{path}/preview") => {
+                let mut answer = base(request);
+                if r == 5 {
+                    answer.body["data"]["subject"] = json!("Different offer altogether");
+                    answer.body["data"]["from"] = json!("Other <other@news.northwind.example>");
+                }
+                answer
+            }
+            _ => base(request),
+        }
+    }))
+    .await;
+    let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
+
+    // Person reviews rev 4 scheduled for 2026-11-20T09:00 Europe/London.
+    let reviewed = run(
+        &stub,
+        json!({
+            "action": "email_send", "campaign_id": CAMPAIGN,
+            "send_at": "2026-11-20T09:00", "time_zone": "Europe/London",
+        }),
+    )
+    .await;
+    let stale_confirm = structured(&reviewed)["confirm_with"].clone();
+    assert!(stale_confirm["confirm_review"].is_string());
+
+    // Campaign is edited to rev 5 (same 3 recipients) and agent calls with confirm_recipients=3 alone.
+    rev.store(5, std::sync::atomic::Ordering::Relaxed);
+    let count_only = json!({
+        "action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 3,
+    });
+    for (mode, result) in ["stateless", "live_unanswered", "no_client"]
+        .into_iter()
+        .zip(across_non_answering_callers(&stub, count_only).await)
+    {
+        let text = text_of(&result);
+        assert!(
+            text.starts_with("Not sent yet:"),
+            "{mode}: expected Not sent yet, got: {text}"
+        );
+        assert!(
+            text.contains("Different offer altogether"),
+            "{mode}: {text}"
+        );
+        assert!(text.contains("confirm_review"), "{mode}: {text}");
+        assert_eq!(structured(&result)["sent"], false, "{mode}");
+        assert!(
+            structured(&result)["confirm_with"]["confirm_review"].is_string(),
+            "{mode}"
+        );
+    }
+    assert!(stub.calls_to("POST", &schedule).is_empty());
+
+    // Passing the rev 4 token refuses and shows the rev 5 review.
+    let stale = run(&stub, stale_confirm).await;
+    assert!(
+        text_of(&stale).starts_with("Not sent: the campaign changed since review."),
+        "{}",
+        text_of(&stale)
+    );
+    assert!(stub.calls_to("POST", &schedule).is_empty());
+
+    // Approving with the rev 5 confirm_with dispatches using the token's revision and count.
+    let fresh_confirm = structured(&stale)["confirm_with"].clone();
+    let sent = run(&stub, fresh_confirm).await;
+    assert!(!sent.is_error, "{}", text_of(&sent));
+    let posts = stub.calls_to("POST", &schedule);
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["revision"], 5);
+    assert_eq!(posts[0].body["expectedRecipients"], 3);
+}
+
+#[tokio::test]
+async fn count_only_send_never_sends_to_another_audience_of_the_same_size() {
+    let target = Arc::new(Mutex::new((PROOF, "Proof", "test")));
+    let target_seen = target.clone();
+    let base = send_api((PROOF, "Proof", Some("test")), None, "Winter sale", 3, true);
+    let stub = Stub::start(Arc::new(move |request: &Recorded| {
+        let path = format!("/create/email/campaigns/{CAMPAIGN}");
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", p) if p == path => {
+                let (id, name, purpose) = *target_seen.lock().unwrap();
+                let mut answer = base(request);
+                answer.body["data"]["audienceId"] = json!(id);
+                answer.body["data"]["audience"] =
+                    json!({"id": id, "name": name, "purpose": purpose});
+                answer.body["data"]["revision"] = json!(if id == PROOF { 4 } else { 5 });
+                answer
+            }
+            ("GET", "/create/email/audiences") => Answer::ok(json!([
+                audience(AUDIENCE, "VIPs", Some("production"), 3, 3),
+                audience(PROOF, "Proof", Some("test"), 3, 3),
+            ])),
+            _ => base(request),
+        }
+    }))
+    .await;
+    let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
+
+    let reviewed = run(
+        &stub,
+        json!({"action": "email_send", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    assert!(text_of(&reviewed).contains("“Proof” (test)"));
+    let proof_token = structured(&reviewed)["confirm_with"]["confirm_review"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Campaign moves from test audience "Proof" (3) to production audience "VIPs" (also 3).
+    *target.lock().unwrap() = (AUDIENCE, "VIPs", "production");
+    let count_only = json!({
+        "action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 3,
+    });
+    for (mode, result) in ["stateless", "live_unanswered", "no_client"]
+        .into_iter()
+        .zip(across_non_answering_callers(&stub, count_only).await)
+    {
+        let text = text_of(&result);
+        assert!(
+            text.starts_with("Not sent yet:"),
+            "{mode}: expected Not sent yet, got: {text}"
+        );
+        assert!(text.contains("“VIPs” (production)"), "{mode}: {text}");
+        assert!(text.contains("confirm_review"), "{mode}: {text}");
+    }
+    let with_stale_token = run(
+        &stub,
+        json!({
+            "action": "email_send", "campaign_id": CAMPAIGN,
+            "confirm_recipients": 3, "confirm_review": proof_token,
+        }),
+    )
+    .await;
+    assert!(text_of(&with_stale_token).starts_with("Not sent:"));
+    assert!(text_of(&with_stale_token).contains("“VIPs” (production)"));
+    assert!(stub.calls_to("POST", &schedule).is_empty());
+}
+
+#[tokio::test]
+async fn count_only_import_never_imports_a_changed_csv_at_the_same_eligible_count() {
+    let stub = Stub::start(over(|request| {
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/create/email/contacts/import/preview") => {
+                let csv = request.body["csv"].as_str().unwrap_or("");
+                let digest = if csv.contains("ada@example.com") {
+                    "digest-ada-bo"
+                } else {
+                    "digest-dee-eve"
+                };
+                Some(Answer::ok(json!({
+                    "columns": [{"index": 0, "header": "email"}],
+                    "mapping": {"email": 0, "firstName": null, "lastName": null, "name": null, "tags": null, "attributes": {}},
+                    "rows": 3, "valid": 3, "invalidCount": 0, "invalid": [],
+                    "duplicatesInFile": 0, "existing": 0, "new": 3, "suppressed": 1,
+                    "eligible": 2, "digest": digest,
+                    "sample": [{"email": if csv.contains("ada@example.com") { "ada@example.com" } else { "dee@example.com" }}],
+                })))
+            }
+            ("POST", "/create/email/contacts/import") => Some(Answer::ok(json!({
+                "created": 2, "updated": 0, "added": 2, "invalidCount": 0,
+                "duplicatesInFile": 0, "suppressed": 1, "eligible": 2,
+            }))),
+            _ => None,
+        }
+    }))
+    .await;
+    let folder = tempfile::tempdir().unwrap();
+    let leads = folder.path().join("leads.csv");
+    std::fs::write(
+        &leads,
+        "email\nada@example.com\nbo@example.com\ncy@example.com\n",
+    )
+    .unwrap();
+
+    let preview = run(
+        &stub,
+        json!({
+            "action": "email_contacts", "operation": "import_preview",
+            "csv_path": leads.to_str().unwrap(), "audience_id": AUDIENCE,
+            "consent_source": "form", "consent_note": NOTE,
+        }),
+    )
+    .await;
+    let first_token = structured(&preview)["confirm_with"]["confirm_review"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Overwrite leads.csv with different people, keeping eligible == 2.
+    std::fs::write(
+        &leads,
+        "email\ndee@example.com\neve@example.com\ncy@example.com\n",
+    )
+    .unwrap();
+    let count_only = json!({
+        "action": "email_contacts", "operation": "import",
+        "csv_path": leads.to_str().unwrap(), "audience_id": AUDIENCE,
+        "consent_source": "form", "consent_note": NOTE, "confirm_rows": 2,
+    });
+    for (mode, result) in ["stateless", "live_unanswered", "no_client"]
+        .into_iter()
+        .zip(across_non_answering_callers(&stub, count_only.clone()).await)
+    {
+        let text = text_of(&result);
+        assert!(
+            text.starts_with("Not imported yet:"),
+            "{mode}: expected Not imported yet, got: {text}"
+        );
+        assert!(text.contains("confirm_review"), "{mode}: {text}");
+        assert_eq!(structured(&result)["imported"], false, "{mode}");
+    }
+    assert!(stub
+        .calls_to("POST", "/create/email/contacts/import")
+        .is_empty());
+
+    // Stale preview token refuses and shows the new review.
+    let mut stale = count_only.clone();
+    stale["confirm_review"] = json!(first_token);
+    let refused = run(&stub, stale).await;
+    assert!(text_of(&refused).starts_with("Not imported:"));
+    assert!(text_of(&refused).contains("preview again"));
+    assert!(stub
+        .calls_to("POST", "/create/email/contacts/import")
+        .is_empty());
+
+    // Confirming with the new review's confirm_with sends the token's expectedDigest and expectedEligible.
+    let mut approved = structured(&refused)["confirm_with"].clone();
+    approved["csv_path"] = json!(leads.to_str().unwrap());
+    let imported = run(&stub, approved).await;
+    assert!(!imported.is_error, "{}", text_of(&imported));
+    let posts = stub.calls_to("POST", "/create/email/contacts/import");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["expectedEligible"], 2);
+    assert_eq!(posts[0].body["expectedDigest"], "digest-dee-eve");
+}
+
+#[tokio::test]
+async fn resume_requires_confirm_review_rechecks_after_live_ask_and_notes_legacy_counts() {
+    let state = Arc::new(Mutex::new((
+        2_i64,
+        PROOF,
+        "Proof",
+        "hello@news.northwind.example",
+    )));
+    let state_seen = state.clone();
+    let base = flight_api("paused", 0, false);
+    let stub = Stub::start(Arc::new(move |request: &Recorded| {
+        let path = format!("/create/email/campaigns/{CAMPAIGN}");
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", p) if p == path => {
+                let (rev, aud_id, aud_name, from_email) = *state_seen.lock().unwrap();
+                let mut answer = base(request);
+                answer.body["data"]["revision"] = json!(rev);
+                answer.body["data"]["audienceId"] = json!(aud_id);
+                answer.body["data"]["audience"] = json!({"id": aud_id, "name": aud_name});
+                answer.body["data"]["sender"] =
+                    json!({"fromName": "Northwind", "fromEmail": from_email, "replyTo": null});
+                answer
+            }
+            ("GET", p) if p == format!("{path}/preview") => {
+                let (_, _, _, from_email) = *state_seen.lock().unwrap();
+                let mut answer = base(request);
+                answer.body["data"]["recipients"] = json!(3);
+                answer.body["data"]["from"] = json!(format!("Northwind <{from_email}>"));
+                answer
+            }
+            _ => base(request),
+        }
+    }))
+    .await;
+    let resume = format!("/create/email/campaigns/{CAMPAIGN}/resume");
+
+    let review = run(
+        &stub,
+        json!({"action": "email_resume", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    let stale_confirm = structured(&review)["confirm_with"].clone();
+    assert!(stale_confirm["confirm_review"].is_string());
+
+    // Campaign's sender and 3-person audience change and it is paused again at rev 4 (remaining 3).
+    *state.lock().unwrap() = (4, AUDIENCE, "VIPs", "other@news.northwind.example");
+    let count_only = json!({
+        "action": "email_resume", "campaign_id": CAMPAIGN, "confirm_remaining": 3,
+    });
+    for (mode, result) in ["stateless", "live_unanswered", "no_client"]
+        .into_iter()
+        .zip(across_non_answering_callers(&stub, count_only).await)
+    {
+        let text = text_of(&result);
+        assert!(
+            text.starts_with("Not resumed yet:"),
+            "{mode}: expected Not resumed yet, got: {text}"
+        );
+        assert!(text.contains("confirm_review"), "{mode}: {text}");
+        assert_eq!(structured(&result)["resumed"], false, "{mode}");
+    }
+    let stale = run(&stub, stale_confirm).await;
+    assert!(
+        text_of(&stale).starts_with("Not resumed: the campaign changed since review."),
+        "{}",
+        text_of(&stale)
+    );
+    assert!(stub.calls_to("POST", &resume).is_empty());
+
+    // Post-elicitation re-read catches a change during the live confirmation window.
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reads_seen = reads.clone();
+    let state_for_live = state.clone();
+    let live_stub = Stub::start(Arc::new(move |request: &Recorded| {
+        let path = format!("/create/email/campaigns/{CAMPAIGN}");
+        if request.method == "GET" && request.path == path {
+            if reads_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+                let mut answer = (flight_api("paused", 0, false))(request);
+                answer.body["data"]["revision"] = json!(5);
+                return answer;
+            }
+        }
+        let (rev, aud_id, aud_name, from_email) = *state_for_live.lock().unwrap();
+        let mut answer = (flight_api("paused", 0, false))(request);
+        if request.path == path {
+            answer.body["data"]["revision"] = json!(rev);
+            answer.body["data"]["audienceId"] = json!(aud_id);
+            answer.body["data"]["audience"] = json!({"id": aud_id, "name": aud_name});
+            answer.body["data"]["sender"] =
+                json!({"fromName": "Northwind", "fromEmail": from_email, "replyTo": null});
+        } else if request.path == format!("{path}/preview") {
+            answer.body["data"]["recipients"] = json!(3);
+        }
+        answer
+    }))
+    .await;
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() =
+        Some(json!({"action": "accept", "content": {"confirm": true}}));
+    let changed_live = run_with_call_peer(
+        CallPeer::new(client, None, true),
+        live_stub
+            .tool()
+            .execute(json!({"action": "email_resume", "campaign_id": CAMPAIGN})),
+    )
+    .await
+    .unwrap();
+    assert!(
+        text_of(&changed_live)
+            .starts_with("Not resumed: the campaign changed during confirmation."),
+        "{}",
+        text_of(&changed_live)
+    );
+    assert!(live_stub.calls_to("POST", &resume).is_empty());
+
+    // Valid rev 4 confirm_with resumes against legacy main and discloses unanswered live count check.
+    let fresh_confirm = structured(&stale)["confirm_with"].clone();
+    let resumed = run(&stub, fresh_confirm).await;
+    let text = text_of(&resumed);
+    assert!(!resumed.is_error, "{text}");
+    assert!(
+        text.contains("Remaining recipients at resume time: not answered by this API."),
+        "{text}"
+    );
+    let posts = stub.calls_to("POST", &resume);
+    assert_eq!(posts.len(), 1);
+    assert_eq!(
+        posts[0].header("idempotency-key"),
+        Some(format!("email-resume-{CAMPAIGN}-r4").as_str())
+    );
+}

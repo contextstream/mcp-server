@@ -42,6 +42,9 @@ use super::{parse_id, StudioInput, StudioTool, ELICIT_TIMEOUT, MAX_PROMPT_CHARS,
 use crate::domains::destructive::DELETE_TOOL;
 use crate::peer::{self, Elicited};
 
+mod contacts;
+mod go;
+
 /// The email actions, as `VALID_ACTIONS` lists them.
 pub(crate) const EMAIL_ACTIONS: &[&str] = &[
     "email_audiences",
@@ -120,7 +123,14 @@ const MAX_NAME_CHARS: usize = 80;
 const MAX_DESCRIPTION_CHARS: usize = 500;
 /// Said for what Create did not answer: never 0, never "none".
 const NOT_ANSWERED: &str = "not answered";
-const CONTACT_OPERATIONS: &[&str] = &["list", "add", "unsubscribe"];
+const CONTACT_OPERATIONS: &[&str] = &[
+    "list",
+    "add",
+    "unsubscribe",
+    "update",
+    "import_preview",
+    "import",
+];
 const SUPPRESSION_OPERATIONS: &[&str] = &["list", "add", "remove"];
 const CONSENT_SOURCES: &[&str] = &["manual", "form", "api"];
 const SUPPRESSION_REASONS: &[&str] = &["unsubscribed", "bounced", "complained", "manual"];
@@ -181,6 +191,7 @@ fn digest(value: &str) -> String {
 pub(crate) enum Topic {
     Campaign,
     Audience,
+    Contact,
     Other,
 }
 
@@ -189,6 +200,7 @@ impl Topic {
         match self {
             Self::Campaign => "There is no such campaign in this workspace (a campaign is the campaign_id email_draft or email_campaigns returned).",
             Self::Audience => "There is no such audience or segment in this workspace (email_audiences lists them).",
+            Self::Contact => "There is no such contact in this workspace (email_contacts lists them).",
             Self::Other => "Create couldn't find that in this workspace.",
         }
     }
@@ -567,6 +579,34 @@ pub(crate) fn contacts_of(input: &StudioInput) -> Result<(Vec<NewContact>, Vec<S
         )));
     }
     Ok((contacts, invalid))
+}
+
+/// How and where people agreed to hear from the team (`consent_source`, `consent_note`),
+/// both required to `what` ("add contacts", "import contacts").
+fn consent_of(input: &StudioInput, what: &str) -> Result<(String, String)> {
+    let source = given(input.consent_source.as_deref())
+        .map(str::to_lowercase)
+        .ok_or_else(|| {
+            Error::Validation(format!(
+                "consent_source is required to {what}: manual (the person added them), form (they signed up on a form) or api"
+            ))
+        })?;
+    if !CONSENT_SOURCES.contains(&source.as_str()) {
+        return Err(Error::Validation(
+            "consent_source is manual, form or api".to_string(),
+        ));
+    }
+    let note = given(input.consent_note.as_deref()).ok_or_else(|| {
+        Error::Validation(format!(
+            "consent_note is required to {what}: where these people agreed to hear from the team, e.g. \"Signed up at the Spring market\""
+        ))
+    })?;
+    if note.chars().count() > MAX_NOTE_CHARS {
+        return Err(Error::Validation(format!(
+            "consent_note can be up to {MAX_NOTE_CHARS} characters."
+        )));
+    }
+    Ok((source, note.to_string()))
 }
 
 /// A note for a suppression change, bounded as Create keeps it.
@@ -982,6 +1022,31 @@ impl StudioTool {
         } else {
             Err(email_refusal(&answer, Topic::Campaign))
         })
+    }
+
+    /// The audiences as Create lists them now, when they can be read.
+    async fn audiences_now(&self, workspace_id: Uuid) -> Option<Vec<Value>> {
+        self.email_call(
+            "GET",
+            &format!("/audiences?workspaceId={workspace_id}"),
+            None,
+            None,
+        )
+        .await
+        .ok()
+        .filter(StudioAnswer::is_success)?
+        .data
+        .as_array()
+        .cloned()
+    }
+
+    /// The audience `id` as Create lists it now (its name, purpose and counts), when it
+    /// can be read.
+    async fn audience(&self, workspace_id: Uuid, id: &str) -> Option<Value> {
+        self.audiences_now(workspace_id)
+            .await?
+            .into_iter()
+            .find(|audience| text(audience, "id").as_deref() == Some(id))
     }
 
     /// The campaign as it would go: who it goes to and what to check (`/preview`), or why it
@@ -2493,6 +2558,9 @@ impl StudioTool {
         )?;
         match operation.as_str() {
             "add" => self.add_contacts(workspace_id, input).await,
+            "update" => self.update_contact(workspace_id, input).await,
+            "import_preview" => self.import_preview(workspace_id, input).await,
+            "import" => self.import_contacts(workspace_id, input).await,
             "unsubscribe" => {
                 let email = one_address(input, "email_contacts with operation unsubscribe")?;
                 self.suppress(workspace_id, input, vec![email]).await
@@ -2670,36 +2738,7 @@ impl StudioTool {
                 format!("None of these is an email address: {}", invalid.join(", "))
             }));
         }
-        let source = input
-            .consent_source
-            .as_deref()
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                Error::Validation(
-                    "consent_source is required to add contacts: manual (the person added them), form (they signed up on a form) or api".to_string(),
-                )
-            })?;
-        if !CONSENT_SOURCES.contains(&source.as_str()) {
-            return Err(Error::Validation(
-                "consent_source is manual, form or api".to_string(),
-            ));
-        }
-        let note = input
-            .consent_note
-            .as_deref()
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .ok_or_else(|| {
-                Error::Validation(
-                    "consent_note is required to add contacts: where these people agreed to hear from the team, e.g. \"Signed up at the Spring market\"".to_string(),
-                )
-            })?;
-        if note.chars().count() > MAX_NOTE_CHARS {
-            return Err(Error::Validation(format!(
-                "consent_note can be up to {MAX_NOTE_CHARS} characters."
-            )));
-        }
+        let (source, note) = consent_of(input, "add contacts")?;
         let mut body = json!({
             "workspaceId": workspace_id,
             "consentSource": source,

@@ -89,6 +89,13 @@ fn sample_of(sample: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Only the address and reason are part of an excluded-recipient sample.
+fn exclusions(rows: &[Value], reason_path: &str) -> Vec<Value> {
+    rows.iter().take(20).filter_map(|row| {
+        Some(json!({"email": text(row, "email")?, "reason": row.pointer(reason_path).and_then(Value::as_str)}))
+    }).collect()
+}
+
 /// "12 contacts, 10 subscribed", with what Create didn't answer said as such.
 fn reach_words(holder: &Value) -> String {
     format!(
@@ -113,7 +120,8 @@ struct Reach {
     left_out_count: Option<i64>,
     /// Why the reasons aren't known, or what they were counted over.
     left_out_note: Option<String>,
-    sample: Vec<String>,
+    sample: Option<Vec<String>>,
+    left_out_sample: Option<Vec<Value>>,
 }
 
 impl Reach {
@@ -129,10 +137,10 @@ impl Reach {
         if let Some(by_reason) = &self.left_out {
             let parts: Vec<String> = REASONS
                 .iter()
-                .filter_map(|(key, words)| {
-                    number(by_reason, key)
-                        .filter(|n| *n > 0)
-                        .map(|n| format!("{} {words}", credits(n)))
+                .filter_map(|(key, words)| match number(by_reason, key) {
+                    Some(0) => None,
+                    Some(n) => Some(format!("{} {words}", credits(n))),
+                    None => Some(format!("{words} {NOT_ANSWERED}")),
                 })
                 .collect();
             let note = self
@@ -430,19 +438,22 @@ impl StudioTool {
         let status = text(&campaign, "status").unwrap_or_default();
         // Create's own answer where it has one; a Create without it (the campaign reads,
         // the route doesn't) is asked for the parts.
-        let answered = self
+        let answer = self
             .email_call(
                 "GET",
                 &format!("/campaigns/{campaign_id}/reach?workspaceId={workspace_id}"),
                 None,
                 None,
             )
-            .await
-            .ok()
-            .filter(StudioAnswer::is_success)
-            .map(|answer| answer.data);
-        let reach = match answered {
-            Some(reach) => Reach {
+            .await?;
+        let reach = if answer.is_success() {
+            let reach = answer.data;
+            if !reach.is_object() || reach.get("audience").is_none() {
+                return Ok(ToolResult::error(
+                    "Who this campaign would reach was not answered. Read the campaign again.",
+                ));
+            }
+            Reach {
                 basis: text(&reach, "basis").unwrap_or_else(|| "audience".to_string()),
                 audience: reach.get("audience").filter(|a| a.is_object()).cloned(),
                 segment: reach.get("segment").filter(|s| s.is_object()).cloned(),
@@ -451,12 +462,19 @@ impl StudioTool {
                 left_out: reach.get("leftOut").filter(|l| l.is_object()).cloned(),
                 left_out_count: None,
                 left_out_note: None,
-                sample: sample_of(reach.get("sample")),
-            },
-            None => {
-                self.reach_from_parts(workspace_id, campaign_id, &campaign)
-                    .await
+                sample: reach
+                    .get("sample")
+                    .filter(|v| v.is_array())
+                    .map(|v| sample_of(Some(v))),
+                left_out_sample: reach["leftOutSample"]
+                    .as_array()
+                    .map(|rows| exclusions(rows, "/reason")),
             }
+        } else if answer.status == 404 {
+            self.reach_from_parts(workspace_id, campaign_id, &campaign)
+                .await
+        } else {
+            return Ok(ToolResult::error(email_refusal(&answer, Topic::Campaign)));
         };
 
         let mut lines = Vec::new();
@@ -485,8 +503,29 @@ impl StudioTool {
                 ),
             });
             lines.push(reach.left_out_line());
-            if !reach.sample.is_empty() {
-                lines.push(format!("Sample: {}.", reach.sample.join(", ")));
+            match &reach.left_out_sample {
+                Some(rows) if !rows.is_empty() => {
+                    let samples: Vec<String> = rows
+                        .iter()
+                        .map(|row| {
+                            format!(
+                                "{} ({})",
+                                row["email"].as_str().unwrap_or(NOT_ANSWERED),
+                                row["reason"].as_str().unwrap_or(NOT_ANSWERED)
+                            )
+                        })
+                        .collect();
+                    lines.push(format!("Excluded sample: {}.", samples.join(", ")));
+                }
+                None => lines.push(format!("Excluded addresses: {NOT_ANSWERED}.")),
+                _ => {}
+            }
+            match &reach.sample {
+                Some(rows) if !rows.is_empty() => {
+                    lines.push(format!("Sample: {}.", rows.join(", ")))
+                }
+                None => lines.push(format!("Recipient sample: {NOT_ANSWERED}.")),
+                _ => {}
             }
         }
         Ok(ToolResult::with_structured(
@@ -504,6 +543,7 @@ impl StudioTool {
                 "left_out": reach.left_out,
                 "left_out_count": reach.left_out_count,
                 "sample": reach.sample,
+                "left_out_sample": reach.left_out_sample,
             }),
         ))
     }
@@ -535,7 +575,8 @@ impl StudioTool {
                 left_out: None,
                 left_out_count: None,
                 left_out_note: None,
-                sample: Vec::new(),
+                sample: None,
+                left_out_sample: None,
             };
         };
         // As Create lists it now (with its purpose, where it has one), else as the campaign
@@ -563,7 +604,8 @@ impl StudioTool {
                 left_out: None,
                 left_out_count: number(&progress, "skipped"),
                 left_out_note: None,
-                sample: Vec::new(),
+                sample: None,
+                left_out_sample: None,
             };
         }
 
@@ -585,7 +627,8 @@ impl StudioTool {
                     .map(|(contacts, subscribed)| (contacts - subscribed).max(0))
             }),
             left_out_note: None,
-            sample: Vec::new(),
+            sample: None,
+            left_out_sample: None,
         };
         let segment_id = segment.as_ref().and_then(|s| text(s, "id"));
         if let Some(segment_id) = segment_id {
@@ -630,8 +673,7 @@ impl StudioTool {
                     .await
                     .ok()
                     .filter(StudioAnswer::is_success)
-                    .map(|answer| sample_of(answer.data.get("sample")))
-                    .unwrap_or_default();
+                    .and_then(|answer| answer.data.get("sample").filter(|v| v.is_array()).map(|v| sample_of(Some(v))));
             }
             return reach;
         }
@@ -644,7 +686,11 @@ impl StudioTool {
             .ok()
             .filter(StudioAnswer::is_success)
         {
-            reach.sample = sample_of(page.data.get("contacts"));
+            reach.sample = page
+                .data
+                .get("contacts")
+                .filter(|v| v.is_array())
+                .map(|v| sample_of(Some(v)));
         }
         if let Some(page) = self
             .email_call("GET", &contacts("suppressed", LEFT_OUT_READ), None, None)
@@ -652,12 +698,10 @@ impl StudioTool {
             .ok()
             .filter(StudioAnswer::is_success)
         {
-            let rows = page
-                .data
-                .get("contacts")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+            let Some(rows) = page.data["contacts"].as_array() else {
+                return reach;
+            };
+            reach.left_out_sample = Some(exclusions(rows, "/suppressed/reason"));
             let mut by_reason = json!({});
             for (key, _) in REASONS {
                 let n = rows
@@ -668,10 +712,10 @@ impl StudioTool {
                     .count();
                 by_reason[key] = json!(n);
             }
-            let total = number(&page.data, "total").unwrap_or(rows.len() as i64);
+            let total = number(&page.data, "total");
             reach.left_out = Some(by_reason);
-            reach.left_out_count = Some(total);
-            if total > rows.len() as i64 {
+            reach.left_out_count = total;
+            if let Some(total) = total.filter(|n| *n > rows.len() as i64) {
                 reach.left_out_note = Some(format!(
                     "the first {} of {} left out",
                     rows.len(),

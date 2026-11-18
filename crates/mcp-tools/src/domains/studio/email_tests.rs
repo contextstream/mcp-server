@@ -555,7 +555,7 @@ async fn audiences_list_their_segments_and_the_connection() {
     assert!(text.contains("Resend is connected (key ending Qa7x), sending as Northwind <hello@news.northwind.example>."), "{text}");
     assert!(
         text.contains(&format!(
-            "- Coffee club: 40 contacts, 37 subscribed (audience_id {AUDIENCE})"
+            "- Coffee club (purpose not answered): 40 contacts, 37 subscribed, 3 suppressed (audience_id {AUDIENCE})"
         )),
         "{text}"
     );
@@ -2915,3 +2915,10 @@ fn a_sequences_state_and_rules_are_said_from_the_apis_fields() {
         "9. Later: day 16.5; 0/0/0; 0/0/0; not published, so it is not sent"
     );
 }
+
+// ============================================================================
+// The rest of Create's email: audiences with a purpose, imports, segments, reports,
+// templates, A/B subjects, pause and resume, the connection
+// ============================================================================
+
+mod complete;

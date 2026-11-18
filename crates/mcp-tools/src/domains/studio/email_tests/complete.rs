@@ -1103,6 +1103,7 @@ fn reach(basis: &str) -> Value {
         "audience": {"id": AUDIENCE, "name": "Coffee club", "purpose": "production"},
         "segment": null, "basis": basis, "contacts": 40, "eligible": if basis == "sends" { 25 } else { 37 },
         "leftOut": {"unsubscribed": 2, "bounced": 1, "complained": 0, "manual": 0},
+        "leftOutSample": [{"email": "grace@northwind.example", "reason": "unsubscribed"}],
         "sample": [
             {"email": "ada@northwind.example", "firstName": "Ada"},
             {"email": "bob@northwind.example", "firstName": null},
@@ -1140,6 +1141,11 @@ async fn who_a_send_would_reach_is_read_from_create() {
     assert_eq!(out["eligible"], 37);
     assert_eq!(out["audience"]["purpose"], "production");
     assert_eq!(out["left_out"]["unsubscribed"], 2);
+    assert_eq!(
+        out["left_out_sample"][0],
+        json!({"email":"grace@northwind.example", "reason":"unsubscribed"})
+    );
+    assert!(text.contains("grace@northwind.example (unsubscribed)"));
     assert!(stub.requests().iter().all(|r| r.method == "GET"), "a read");
 
     // A campaign that has started: who still waits, of those it was written for.
@@ -1160,6 +1166,35 @@ async fn who_a_send_would_reach_is_read_from_create() {
         .execute(json!({"action": "email_recipients"}))
         .await;
     assert!(matches!(missing, Err(Error::Validation(_))));
+}
+
+#[tokio::test]
+async fn reach_falls_back_only_on_a_missing_route_and_preserves_unknown_counts() {
+    let forbidden = Stub::start(over(|r| {
+        r.path
+            .ends_with("/reach")
+            .then(|| Answer::error(403, "FORBIDDEN", "Workspace access required."))
+    }))
+    .await;
+    let input = json!({"action":"email_recipients","campaign_id":CAMPAIGN});
+    let result = run(&forbidden, input.clone()).await;
+    assert!(result.is_error);
+    assert!(forbidden
+        .calls_to("GET", "/create/email/contacts")
+        .is_empty());
+    let partial = Stub::start(over(|r| {
+        r.path.ends_with("/reach").then(|| {
+            let mut answer = reach("audience");
+            answer["leftOut"] = json!({});
+            answer.as_object_mut().unwrap().remove("leftOutSample");
+            Answer::ok(answer)
+        })
+    }))
+    .await;
+    let result = run(&partial, input).await;
+    assert!(text_of(&result).contains("not answered"));
+    assert!(!text_of(&result).contains("No one in it is left out"));
+    assert!(structured(&result)["left_out_sample"].is_null());
 }
 
 fn api_with_reach(basis: &'static str) -> Responder {

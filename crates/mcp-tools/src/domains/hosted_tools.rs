@@ -777,6 +777,15 @@ pub async fn drive_stream(
     if call.protocol != Some(frames::PROTOCOL) {
         return Err("its stream is of a kind this client does not know".to_string());
     }
+    // A variable that changes the command and never leaves this machine: the
+    // stream is not opened, and the caller runs the command here.
+    if let Some(name) = frames::set_here(call.request, |variable| {
+        std::env::var_os(variable).is_some()
+    }) {
+        return Err(format!(
+            "this session sets {name}, which changes what the command does and is never sent"
+        ));
+    }
     let env = frames::forwarded_env(call.request, |variable| std::env::var(variable).ok());
     let hello = frames::hello(call.request, snapshot.request_fields(), env, delivery)?;
     let deadline = frames::deadline_of(call.request);

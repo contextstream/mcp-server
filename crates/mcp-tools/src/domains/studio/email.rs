@@ -44,6 +44,7 @@ use crate::peer::{self, Elicited};
 
 mod contacts;
 mod go;
+mod segments;
 
 /// The email actions, as `VALID_ACTIONS` lists them.
 pub(crate) const EMAIL_ACTIONS: &[&str] = &[
@@ -59,6 +60,8 @@ pub(crate) const EMAIL_ACTIONS: &[&str] = &[
     "email_duplicate",
     "email_contacts",
     "email_unsubscribes",
+    "email_segments",
+    "email_recipients",
 ];
 
 /// Erasing a contact, which `delete` calls (`studio.email_contact_erase`). It cannot be
@@ -917,6 +920,8 @@ impl StudioTool {
             "email_duplicate" => self.email_duplicate(workspace_id, input).await,
             "email_contacts" => self.email_contacts(workspace_id, input).await,
             "email_unsubscribes" => self.email_unsubscribes(workspace_id, input).await,
+            "email_segments" => self.email_segments(workspace_id, input).await,
+            "email_recipients" => self.email_recipients(workspace_id, input).await,
             ERASE_ACTION => self.erase_contact(workspace_id, input).await,
             other => Err(Error::Validation(format!("Unknown email action: {other}"))),
         }

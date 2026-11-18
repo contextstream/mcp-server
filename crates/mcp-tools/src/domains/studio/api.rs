@@ -190,8 +190,9 @@ impl Create<'_> {
         .await
     }
 
-    /// The voices a making can speak in: the curated ones, then the studio's own and the
-    /// shared library's, for `search` (all of them when it is empty).
+    /// The voices a making can speak in: the picked ones (the curated voices, then the
+    /// studio's own) that fit `search` (all of them when it is empty). Create searches no
+    /// voice library; any other voice is taken only by its id.
     pub async fn voices(
         &self,
         workspace_id: Uuid,

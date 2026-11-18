@@ -856,12 +856,11 @@ async fn what_the_api_refuses_is_said_in_its_own_words_without_an_error() {
 
 #[tokio::test]
 async fn an_api_that_cannot_be_reached_is_answered_calmly() {
-    // A port nothing listens on.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let address = closed.local_addr().expect("address");
-    drop(closed);
+    // A port nothing listens on: the discard port, which no test can bind. A port freed by dropping a listener
+    // could be taken by another test's mock server before the call, which then answers 404 (release run
+    // 20261118T233600Z-5ccb).
     let fixture = Fixture::new();
-    let tool = fixture.tool(&format!("http://{address}"));
+    let tool = fixture.tool("http://127.0.0.1:9");
     for arguments in [
         json!({"step": "Running the tests"}),
         json!({"status": "completed", "summary": "Done."}),

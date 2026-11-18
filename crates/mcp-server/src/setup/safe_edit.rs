@@ -216,7 +216,7 @@ pub(crate) fn commit_public_with_removals(
     removed_keys: &[&str],
 ) -> Result<bool> {
     let content = render_with_removals(loaded, updated, removed_keys)?;
-    write_if_changed_from_snapshot_full(path, &content, loaded, false, true, true)
+    write_if_changed_from_snapshot(path, &content, loaded, WriteMode::Public, true)
 }
 
 /// Commit a secret-bearing JSON document with owner-only permissions already
@@ -230,7 +230,7 @@ pub(crate) fn commit_private(
     removed_keys: &[&str],
 ) -> Result<bool> {
     let content = render_with_removals(loaded, updated, removed_keys)?;
-    write_if_changed_from_snapshot_with_options(path, &content, loaded, true, false)
+    write_if_changed_from_snapshot(path, &content, loaded, WriteMode::Private, false)
 }
 
 /// Commit a complete parsed document while explicitly authorizing a bounded
@@ -243,7 +243,7 @@ pub fn commit_with_removals(
     removed_keys: &[&str],
 ) -> Result<bool> {
     let content = render_with_removals(loaded, updated, removed_keys)?;
-    write_if_changed_from_snapshot_with_options(path, &content, loaded, true, true)
+    write_if_changed_from_snapshot(path, &content, loaded, WriteMode::Private, true)
 }
 
 /// Render a complete updated document using the same surgical splice logic as
@@ -561,7 +561,7 @@ fn remove_file_if_unchanged_bytes(path: &Path, expected: &[u8]) -> Result<bool> 
         return Ok(true);
     }
 
-    let backup_created = create_backup_if_absent(path, expected, true)?;
+    let backup_created = prepare_backup(path, Some(expected), ConfigFormat::for_path(path), true)?;
 
     let current = match std::fs::read(path)
         .with_context(|| format!("Could not re-read {} before deleting it", path.display()))
@@ -806,17 +806,55 @@ fn toml_item_contains_auth_field(item: &toml_edit::Item) -> bool {
     false
 }
 
-pub(crate) fn text_holds_auth_field(path: &Path, content: &str) -> bool {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("json" | "jsonc") => {
-            let input = content.strip_prefix('\u{feff}').unwrap_or(content);
-            try_parse_json_like(input).is_ok_and(|value| contains_auth_field(&value))
+#[derive(Clone, Copy)]
+enum ConfigFormat {
+    Json,
+    Toml,
+    Other,
+}
+
+impl ConfigFormat {
+    fn for_path(path: &Path) -> Self {
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("json" | "jsonc") => Self::Json,
+            Some("toml") => Self::Toml,
+            _ => Self::Other,
         }
-        Some("toml") => content
-            .parse::<toml_edit::DocumentMut>()
-            .is_ok_and(|doc| toml_item_contains_auth_field(doc.as_item())),
-        _ => false,
     }
+
+    fn holds_credentials(self, content: &str) -> Option<bool> {
+        match self {
+            Self::Json => {
+                let input = content.strip_prefix('\u{feff}').unwrap_or(content);
+                if input.trim().is_empty() {
+                    return Some(false);
+                }
+                try_parse_json_like(input)
+                    .ok()
+                    .map(|value| contains_auth_field(&value))
+            }
+            Self::Toml => content
+                .parse::<toml_edit::DocumentMut>()
+                .ok()
+                .map(|doc| toml_item_contains_auth_field(doc.as_item())),
+            Self::Other => None,
+        }
+    }
+
+    fn requires_private(self, content: &[u8], fallback: bool) -> bool {
+        match self {
+            Self::Other => fallback,
+            // Keep unreadable or malformed config snapshots private as well.
+            _ => std::str::from_utf8(content)
+                .ok()
+                .and_then(|text| self.holds_credentials(text))
+                .unwrap_or(true),
+        }
+    }
+}
+
+pub(crate) fn text_holds_auth_field(path: &Path, content: &str) -> bool {
+    ConfigFormat::for_path(path).holds_credentials(content) == Some(true)
 }
 
 /// Set permissions on the opened inode before writing its first byte.
@@ -890,13 +928,19 @@ fn verify_staged_identity(file: &File, path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn make_existing_private(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+fn open_verified_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
     let file = File::options()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     verify_staged_identity(&file, path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn make_existing_private(file: &File, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata = file.metadata()?;
     if metadata.mode() & 0o7777 != 0o600 {
         if metadata.nlink() != 1 {
@@ -904,7 +948,7 @@ fn make_existing_private(path: &Path) -> std::io::Result<()> {
                 "cannot change permissions on a linked config",
             ));
         }
-        set_staged_permissions(&file, path, std::fs::Permissions::from_mode(0o600), true)?;
+        set_staged_permissions(file, path, std::fs::Permissions::from_mode(0o600), true)?;
     }
     Ok(())
 }
@@ -1167,7 +1211,13 @@ pub(crate) fn restore_first_backup(
             path.display()
         );
     }
-    restore_text_first_backup(&resolved_path, &loaded.raw, loaded.existed, backup_content)
+    restore_backup(
+        &resolved_path,
+        &loaded.raw,
+        loaded.existed,
+        backup_content,
+        ConfigFormat::Json,
+    )
 }
 
 /// Text-file variant of [`restore_first_backup`].
@@ -1176,6 +1226,22 @@ pub(crate) fn restore_text_first_backup(
     current_content: &str,
     current_existed: bool,
     backup_content: &str,
+) -> Result<bool> {
+    restore_backup(
+        path,
+        current_content,
+        current_existed,
+        backup_content,
+        ConfigFormat::for_path(path),
+    )
+}
+
+fn restore_backup(
+    path: &Path,
+    current_content: &str,
+    current_existed: bool,
+    backup_content: &str,
+    format: ConfigFormat,
 ) -> Result<bool> {
     let backup = backup_path(path)?;
     let actual_backup = read_recovery_file(&backup)?.ok_or_else(|| {
@@ -1195,14 +1261,14 @@ pub(crate) fn restore_text_first_backup(
     let backup_permissions = validate_recovery_file(&backup)?
         .ok_or_else(|| anyhow::anyhow!("Recovery backup disappeared: {}", backup.display()))?
         .permissions();
-    let private = text_holds_auth_field(path, backup_content);
-    let changed = write_if_changed_impl_with_permissions(
+    let changed = write_if_changed_impl_full(
         path,
         backup_content,
         Some(current_existed.then_some(current_content)),
         true,
-        private,
+        WriteMode::Preserve,
         Some(backup_permissions),
+        format,
     )?;
     if !changed {
         return Ok(false);
@@ -1227,29 +1293,56 @@ pub(crate) fn restore_text_first_backup(
     Ok(true)
 }
 
-/// Keep the first pre-ContextStream snapshot. Later refreshes must never
-/// overwrite the only byte-for-byte recovery copy with an intermediate state.
-fn create_backup_if_absent(path: &Path, content: &[u8], private: bool) -> Result<bool> {
-    let backup = backup_path(path)?;
-    let check_existing = || -> Result<()> {
-        #[cfg(unix)]
-        if private {
-            return make_existing_private(&backup)
-                .map_err(anyhow::Error::from)
-                .map_err(|error| {
-                    with_private_aware_context(error, || {
-                        format!("Could not protect recovery backup {}", backup.display())
-                    })
-                });
-        }
-        File::open(&backup)
-            .with_context(|| format!("Could not open recovery backup {}", backup.display()))?;
-        Ok(())
-    };
-    if validate_recovery_file(&backup)?.is_some() {
-        check_existing()?;
+/// Classify the bytes of the original recovery snapshot, even after the live
+/// document has changed. Inspect and chmod the same open file.
+fn check_existing_backup(backup: &Path, format: ConfigFormat, fallback: bool) -> Result<bool> {
+    if validate_recovery_file(backup)?.is_none() {
         return Ok(false);
     }
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let mut file = open_verified_file(backup)?;
+        if file.metadata()?.permissions().mode() & 0o7777 != 0o600 {
+            let private = match format {
+                ConfigFormat::Other => fallback,
+                _ => {
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes)?;
+                    format.requires_private(&bytes, fallback)
+                }
+            };
+            if private {
+                make_existing_private(&file, backup)?;
+            }
+        }
+        verify_staged_identity(&file, backup)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (format, fallback);
+        File::open(backup)
+            .with_context(|| format!("Could not open recovery backup {}", backup.display()))?;
+    }
+    Ok(true)
+}
+
+/// Keep the first pre-ContextStream snapshot. Later refreshes must never
+/// overwrite the only byte-for-byte recovery copy with an intermediate state.
+fn prepare_backup(
+    path: &Path,
+    content: Option<&[u8]>,
+    format: ConfigFormat,
+    private: bool,
+) -> Result<bool> {
+    let backup = backup_path(path)?;
+    if check_existing_backup(&backup, format, private)? {
+        return Ok(false);
+    }
+    let Some(content) = content else {
+        return Ok(false);
+    };
 
     if let Some(parent) = backup.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
@@ -1264,6 +1357,7 @@ fn create_backup_if_absent(path: &Path, content: &[u8], private: bool) -> Result
     // it with an atomic no-replace hard link. Writing directly to the final
     // `.bak` path could leave a truncated-but-trusted recovery file if the
     // process crashed halfway through the copy.
+    let private = private || format.requires_private(content, false);
     let permissions = std::fs::metadata(path)?.permissions();
     #[cfg(unix)]
     let permissions = if private {
@@ -1295,13 +1389,12 @@ fn create_backup_if_absent(path: &Path, content: &[u8], private: bool) -> Result
         }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             let _ = std::fs::remove_file(&temporary);
-            let Some(_) = validate_recovery_file(&backup)? else {
+            if !check_existing_backup(&backup, format, private)? {
                 bail!(
                     "Recovery backup {} disappeared while ContextStream was validating it.",
                     backup.display()
                 );
-            };
-            check_existing()?;
+            }
             Ok(false)
         }
         Err(error) => {
@@ -1407,7 +1500,15 @@ pub(crate) fn write_private_text(
     expected: Option<&str>,
     backup: bool,
 ) -> Result<bool> {
-    write_if_changed_impl_with_permissions(path, content, Some(expected), backup, true, None)
+    write_if_changed_impl_full(
+        path,
+        content,
+        Some(expected),
+        backup,
+        WriteMode::Private,
+        None,
+        ConfigFormat::for_path(path),
+    )
 }
 
 /// Write a non-secret rules/project text file whose initial creation mode
@@ -1423,9 +1524,9 @@ pub(crate) fn write_public_if_unchanged(
         content,
         Some(expected_existing),
         true,
-        false,
+        WriteMode::Public,
         None,
-        true,
+        ConfigFormat::for_path(path),
     )
 }
 
@@ -1443,9 +1544,9 @@ pub(crate) fn write_public_owned_file_if_unchanged(
         content,
         Some(expected_existing),
         false,
-        false,
+        WriteMode::Public,
         None,
-        true,
+        ConfigFormat::for_path(path),
     )
 }
 
@@ -1459,13 +1560,14 @@ pub(crate) fn write_executable_if_unchanged(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        write_if_changed_impl_with_permissions(
+        write_if_changed_impl_full(
             path,
             content,
             Some(expected_existing),
             true,
-            false,
+            WriteMode::Preserve,
             Some(std::fs::Permissions::from_mode(0o755)),
+            ConfigFormat::Other,
         )
     }
 
@@ -1494,30 +1596,19 @@ pub(crate) fn write_owned_file_if_changed(path: &Path, content: &str) -> Result<
     write_if_changed_impl(path, content, None, false)
 }
 
-fn write_if_changed_from_snapshot_with_options(
-    path: &Path,
-    content: &str,
-    loaded: &LoadedConfig,
-    force_private_permissions: bool,
-    create_backup: bool,
-) -> Result<bool> {
-    write_if_changed_from_snapshot_full(
-        path,
-        content,
-        loaded,
-        force_private_permissions,
-        create_backup,
-        false,
-    )
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    Private,
+    Preserve,
+    Public,
 }
 
-fn write_if_changed_from_snapshot_full(
+fn write_if_changed_from_snapshot(
     path: &Path,
     content: &str,
     loaded: &LoadedConfig,
-    force_private_permissions: bool,
+    mode: WriteMode,
     create_backup: bool,
-    allow_umask_for_new: bool,
 ) -> Result<bool> {
     let resolved_path = resolve_edit_path(path)?;
     if resolved_path != loaded.resolved_path {
@@ -1536,9 +1627,9 @@ fn write_if_changed_from_snapshot_full(
         content,
         expected,
         create_backup,
-        force_private_permissions,
+        mode,
         None,
-        allow_umask_for_new,
+        ConfigFormat::Json,
     )
 }
 
@@ -1552,25 +1643,14 @@ fn write_if_changed_impl(
     expected: Option<Option<&str>>,
     create_backup: bool,
 ) -> Result<bool> {
-    write_if_changed_impl_with_permissions(path, content, expected, create_backup, false, None)
-}
-
-fn write_if_changed_impl_with_permissions(
-    path: &Path,
-    content: &str,
-    expected: Option<Option<&str>>,
-    create_backup: bool,
-    force_private_permissions: bool,
-    replacement_permissions: Option<std::fs::Permissions>,
-) -> Result<bool> {
     write_if_changed_impl_full(
         path,
         content,
         expected,
         create_backup,
-        force_private_permissions,
-        replacement_permissions,
-        false,
+        WriteMode::Preserve,
+        None,
+        ConfigFormat::for_path(path),
     )
 }
 
@@ -1579,12 +1659,13 @@ fn write_if_changed_impl_full(
     content: &str,
     expected: Option<Option<&str>>,
     create_backup: bool,
-    force_private_permissions: bool,
+    mode: WriteMode,
     replacement_permissions: Option<std::fs::Permissions>,
-    allow_umask_for_new: bool,
+    format: ConfigFormat,
 ) -> Result<bool> {
-    #[cfg(not(unix))]
-    let _ = force_private_permissions;
+    let force_private_permissions =
+        mode == WriteMode::Private || format.requires_private(content.as_bytes(), false);
+    let allow_umask_for_new = mode == WriteMode::Public;
 
     let resolved_path = resolve_edit_path(path)?;
     let path = resolved_path.as_path();
@@ -1622,13 +1703,10 @@ fn write_if_changed_impl_full(
     if action == ChangeAction::Unchanged {
         #[cfg(unix)]
         if force_private_permissions {
-            make_existing_private(path)?;
-            if create_backup {
-                let backup = backup_path(path)?;
-                if validate_recovery_file(&backup)?.is_some() {
-                    make_existing_private(&backup)?;
-                }
-            }
+            make_existing_private(&open_verified_file(path)?, path)?;
+        }
+        if create_backup || !matches!(format, ConfigFormat::Other) {
+            check_existing_backup(&backup_path(path)?, format, force_private_permissions)?;
         }
         return Ok(false);
     }
@@ -1702,17 +1780,21 @@ fn write_if_changed_impl_full(
         );
     }
 
-    let backup_created = match (create_backup, existing.as_ref()) {
-        (true, Some(previous)) => {
-            match create_backup_if_absent(path, previous.as_bytes(), force_private_permissions) {
-                Ok(created) => created,
-                Err(error) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(error);
-                }
+    let backup_created = if create_backup || !matches!(format, ConfigFormat::Other) {
+        // Owned files skip creating a snapshot but may have a legacy one to protect.
+        let previous = existing
+            .as_deref()
+            .filter(|_| create_backup)
+            .map(str::as_bytes);
+        match prepare_backup(path, previous, format, force_private_permissions) {
+            Ok(created) => created,
+            Err(error) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(error);
             }
         }
-        _ => false,
+    } else {
+        false
     };
 
     // Backup I/O opens another small race window. Re-check after it so a

@@ -240,7 +240,12 @@ impl Sandbox {
         }
     }
 
-    fn hook(&self, session: &Session, hook: &str, mut input: Value) {
+    fn hook(&self, session: &Session, hook: &str, input: Value) {
+        self.hook_stdout(session, hook, input);
+    }
+
+    /// Run a hook and give back what it printed.
+    fn hook_stdout(&self, session: &Session, hook: &str, mut input: Value) -> String {
         input["session_id"] = session.host_session.into();
         input["cwd"] = self.repo.to_string_lossy().into_owned().into();
         let mut command = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"));
@@ -285,6 +290,7 @@ impl Sandbox {
             "{hook}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
     fn tool_result(&self, session: &Session, tool: &str, tool_input: Value, structured: Value) {
@@ -1519,5 +1525,250 @@ fn a_project_the_key_may_not_write_is_offered_once_and_the_run_stays_alive() {
     for report in after {
         assert!(report.body.get("project_id").is_none(), "{}", report.body);
         assert!(is_heartbeat(&report.body), "{}", report.body);
+    }
+}
+
+// ============================================================================
+// Codex: the hooks setup installs for it are enough for live progress
+// ============================================================================
+
+/// The hook setup installs for Codex's PostToolUse and Stop events.
+const CODEX_EVENT_HOOK: &str = "run-progress";
+/// The hook Codex already runs before every tool call.
+const CODEX_NOTICE_HOOK: &str = "mid-run-notices";
+
+/// A hook input as Codex 0.169 sends it: Claude Code's fields, and the pair
+/// of `turn_id` and `model` that tells Codex from Claude Code.
+fn codex(event: &str, mut input: Value) -> Value {
+    input["hook_event_name"] = event.into();
+    input["turn_id"] = "019a8f3e-turn-1".into();
+    input["model"] = "gpt-5.4".into();
+    input["permission_mode"] = "bypassPermissions".into();
+    input["transcript_path"] = Value::Null;
+    input
+}
+
+/// The agent the hosted server reports a Codex session as ("Codex 3fa9").
+fn codex_agent(session: &Session) -> Value {
+    json!({
+        "id": format!("codex-mcp-client:{}", &session.server_session[..8]),
+        "name": format!("Codex {}", &session.server_session[..4]),
+        "runtime": "mcp",
+        "client": "codex-mcp-client",
+    })
+}
+
+impl Sandbox {
+    /// Codex's PostToolUse for one of ContextStream's tools: the tool's
+    /// arguments, and the MCP result as Codex hands it on (`content` and
+    /// `structuredContent`, no `isError` on a success). Whatever the hook
+    /// prints, Codex must accept: it prints nothing.
+    fn codex_result(&self, session: &Session, tool: &str, tool_input: Value, structured: Value) {
+        let printed = self.hook_stdout(
+            session,
+            CODEX_EVENT_HOOK,
+            codex(
+                "PostToolUse",
+                json!({
+                    "tool_name": format!("mcp__contextstream__{tool}"),
+                    "tool_use_id": "call_1",
+                    "tool_input": tool_input,
+                    "tool_response": {
+                        "content": [{"type": "text", "text": "ok"}],
+                        "structuredContent": structured,
+                    },
+                }),
+            ),
+        );
+        assert_eq!(printed.trim(), "", "Codex PostToolUse output");
+    }
+
+    fn codex_init(&self, session: &Session) {
+        self.codex_result(
+            session,
+            "init",
+            json!({"folder_path": self.repo}),
+            json!({
+                "session_id": "99999999-9999-4999-8999-999999999999",
+                "workspace_id": WORKSPACE,
+                "project_id": PROJECT,
+                "project": {"id": PROJECT, "name": "platform-api"},
+                "run_progress": {"session": session.server_session, "agent": codex_agent(session)},
+            }),
+        );
+    }
+
+    /// Codex's PreToolUse for a shell command, through the hook it already
+    /// runs before every tool call.
+    fn codex_runs(&self, session: &Session, command: &str) {
+        self.hook(
+            session,
+            CODEX_NOTICE_HOOK,
+            codex(
+                "PreToolUse",
+                json!({"tool_name": "Bash", "tool_use_id": "call_2", "tool_input": {"command": command}}),
+            ),
+        );
+    }
+}
+
+#[test]
+fn a_codex_session_stays_live_through_local_work_and_ends_with_its_process() {
+    let api = FakeApi::start();
+    let sandbox = Sandbox::new(&api, &[]);
+    let mut session = Session::new("019a8f3e-codex-thread-a", SESSION_A);
+    let run_id = "44444444-4444-4444-8444-444444444444";
+
+    // The lane starts as its rules say: `init`, then one report of its own.
+    sandbox.codex_init(&session);
+    assert!(
+        api.reports().is_empty(),
+        "knowing who the session is sends nothing"
+    );
+    sandbox.codex_result(
+        &session,
+        "progress",
+        json!({"title": "Round 7 delivery pins", "step": "Verify the checkout"}),
+        json!({
+            "run": {
+                "run_id": run_id,
+                "workspace_id": WORKSPACE,
+                "project_id": PROJECT,
+                "state": "working",
+                "agent": codex_agent(&session),
+            },
+            "session": SESSION_A,
+            "run_key": session_key(&session),
+        }),
+    );
+
+    // It then builds and tests on its own machine: one long command, and no
+    // call to ContextStream for the whole of it. The run is kept alive.
+    sandbox.codex_runs(&session, "cargo test --workspace");
+    std::thread::sleep(Duration::from_secs(7));
+    let signals: Vec<Report> = api
+        .reports()
+        .into_iter()
+        .filter(|report| report.body["run_id"] == run_id)
+        .collect();
+    assert!(
+        signals.len() >= 3,
+        "{} signals in seven seconds of local work",
+        signals.len()
+    );
+    for signal in &signals {
+        assert!(is_heartbeat(&signal.body), "{}", signal.body);
+        assert_eq!(signal.body["agent"], codex_agent(&session));
+        assert_eq!(signal.body["project_id"], PROJECT);
+        assert!(signal.body.get("title").is_none());
+    }
+    // No two of them are further apart than the API allows before it calls
+    // the run stalled.
+    for pair in signals.windows(2) {
+        assert!(pair[1].at.duration_since(pair[0].at) < stalls_after(&pair[0].body));
+    }
+
+    // The turn ends (an interactive session): the run waits on a person.
+    let printed = sandbox.hook_stdout(
+        &session,
+        CODEX_EVENT_HOOK,
+        codex(
+            "Stop",
+            json!({"stop_hook_active": false, "last_assistant_message": "Done."}),
+        ),
+    );
+    assert_eq!(printed.trim(), "", "Codex Stop output");
+    api.wait_for(SOON, |body| {
+        body["run_id"] == run_id && body["status"] == "waiting_input"
+    })
+    .expect("the run waits when the turn ends");
+
+    // The lane's process goes (it finished, or it was killed): the run ends
+    // by a fixed sentence within seconds, and is never left to stall.
+    let keep_alive = sandbox
+        .keep_alive_pid(&session)
+        .expect("the session has a keep-alive");
+    let died = session.die();
+    let ended = api
+        .wait_for(LEAVES_WITHIN, |body| {
+            body["run_id"] == run_id && body["status"] == "stopped"
+        })
+        .expect("a Codex session that is gone ends its run");
+    assert_eq!(
+        ended.body["summary"],
+        "The session's process ended without a final report."
+    );
+    assert!(ended.at.duration_since(died) < LEAVES_WITHIN);
+    assert!(wait_until_gone(keep_alive, LEAVES_WITHIN));
+}
+
+#[test]
+fn a_codex_session_that_never_reports_is_shown_with_its_agent_and_project() {
+    let api = FakeApi::start();
+    let sandbox = Sandbox::new(&api, &[(SESSION_AFTER, "0")]);
+    let session = Session::new("019a8f3e-codex-thread-a", SESSION_A);
+    let key = session_key(&session);
+
+    sandbox.codex_init(&session);
+    sandbox.codex_runs(&session, "cargo build");
+    let started = api
+        .wait_for(SOON, |body| {
+            is_for(body, &key) && body["status"] == "working"
+        })
+        .expect("a Codex session at work with no run gets its own");
+    assert_eq!(started.body["agent"], codex_agent(&session));
+    assert_eq!(started.body["workspace_id"], WORKSPACE);
+    assert_eq!(started.body["project_id"], PROJECT);
+    assert_eq!(started.body["title"], "Working in platform-api");
+    let step = api
+        .wait_for(SOON, |body| {
+            is_for(body, &key) && body.get("step").is_some()
+        })
+        .expect("the kind of work is said");
+    assert_eq!(step.body["step"]["label"], "Running a command");
+}
+
+#[test]
+fn the_codex_hooks_send_and_write_nothing_as_shipped() {
+    for env in [
+        vec![
+            ("CONTEXTSTREAM_RUN_PROGRESS_AUTO", UNSET),
+            (SESSION_AFTER, "0"),
+        ],
+        vec![("CONTEXTSTREAM_RUN_PROGRESS", "off"), (SESSION_AFTER, "0")],
+    ] {
+        let api = FakeApi::start();
+        let sandbox = Sandbox::new(&api, &env);
+        let session = Session::new("019a8f3e-codex-thread-a", SESSION_A);
+
+        sandbox.codex_init(&session);
+        sandbox.codex_result(
+            &session,
+            "progress",
+            json!({"title": "Round 7 delivery pins", "step": "Verify the checkout"}),
+            json!({
+                "run": {
+                    "run_id": "44444444-4444-4444-8444-444444444444",
+                    "workspace_id": WORKSPACE,
+                    "state": "working",
+                    "agent": codex_agent(&session),
+                },
+                "session": SESSION_A,
+                "run_key": session_key(&session),
+            }),
+        );
+        sandbox.codex_runs(&session, "cargo test");
+        sandbox.hook(
+            &session,
+            CODEX_EVENT_HOOK,
+            codex("Stop", json!({"stop_hook_active": false})),
+        );
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            api.reports().is_empty(),
+            "{env:?}: {} reports were sent",
+            api.reports().len()
+        );
+        assert!(!sandbox.state_dir().exists(), "{env:?}: state was written");
     }
 }

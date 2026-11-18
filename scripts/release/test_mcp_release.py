@@ -567,5 +567,35 @@ class Darwin(unittest.TestCase):
                 self.check(name, data)
 
 
+# A file the Rust sources compile in with include_bytes!/include_str! must be in git: a clean checkout (CI, a lane host,
+# the release build) has only tracked files, and a broad .gitignore pattern such as *.pem hides an untracked one locally.
+class CompiledInFilesAreTracked(unittest.TestCase):
+    def test_every_included_file_is_tracked(self):
+        import re
+        import subprocess
+
+        root = Path(__file__).resolve().parents[2]
+        try:
+            tracked = set(subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True)
+                          .stdout.decode().split("\0"))
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("not a git checkout")
+        include = re.compile(r'include_(?:bytes|str)!\(\s*"([^"]+)"\s*\)')
+        checked = 0
+        for source in sorted(root.glob("crates/**/*.rs")):
+            if "target" in source.relative_to(root).parts:
+                continue
+            for name in include.findall(source.read_text(encoding="utf-8", errors="replace")):
+                target = (source.parent / name).resolve()
+                try:
+                    relative = target.relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                checked += 1
+                with self.subTest(source=source.relative_to(root).as_posix(), include=name):
+                    self.assertTrue(relative in tracked, f"{relative} is compiled in but not tracked by git")
+        self.assertGreater(checked, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

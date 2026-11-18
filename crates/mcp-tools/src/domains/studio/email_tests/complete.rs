@@ -2922,3 +2922,95 @@ async fn a_send_without_a_recipient_count_cannot_be_confirmed_as_zero() {
         )
         .is_empty());
 }
+
+#[tokio::test]
+async fn only_the_delete_tool_erases_audiences_segments_and_templates() {
+    let stub = Stub::start(over(|request| {
+        (request.method == "DELETE").then(|| {
+            if request.path.ends_with("builtin:announcement") {
+                Answer::error(
+                    409,
+                    "CONFLICT",
+                    "A built-in template can't be changed; save a copy.",
+                )
+            } else {
+                Answer::ok(json!({"id": request.path.rsplit('/').next(), "deleted": true}))
+            }
+        })
+    }))
+    .await;
+    let mut registry = crate::registry::ToolRegistry::new(&TestFixtures::test_config());
+    registry.register(TOOL_NAME, Arc::new(stub.tool()));
+    crate::domains::destructive::register_delete_tool(&mut registry);
+    assert!(
+        registry.get("delete").is_none(),
+        "a studio-only connector has no delete tool"
+    );
+    registry.register("workspace", Arc::new(Bystander::workspace()));
+    crate::domains::destructive::register_delete_tool(&mut registry);
+    let schema = &registry.get("delete").unwrap().input_schema["properties"];
+    for (kind, list, id) in [
+        ("audience", "audiences", AUDIENCE),
+        ("segment", "segments", SEGMENT),
+        ("template", "templates", TEMPLATE),
+    ] {
+        let erase = format!("email_{kind}_erase");
+        let action = format!("studio.{erase}");
+        let field = format!("{kind}_id");
+        assert!(
+            schema["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(action)),
+            "{action}"
+        );
+        assert!(schema[&field].is_object());
+        let request = json!({"action":action,&field:id});
+        let before = stub.requests().len();
+        for spelling in ["erase", " Delete ", "remove"] {
+            let refusal = registry
+                .execute(
+                    TOOL_NAME,
+                    json!({"action": format!("email_{list}"),"operation":spelling,&field:id}),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                refusal.to_string().contains(&action)
+                    && refusal
+                        .to_string()
+                        .contains("https://ctxproduct.com/studio/email"),
+                "{refusal}"
+            );
+        }
+        assert!(registry
+            .execute(TOOL_NAME, json!({"action":erase,&field:id}))
+            .await
+            .is_err());
+        let refused = mcp_client::run_with_config_override(
+            mcp_types::config::ConfigOverride {
+                go_ahead_asked_only: Some(true),
+                ..Default::default()
+            },
+            || registry.execute("delete", request.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(refused.is_error);
+        assert_eq!(before, stub.requests().len());
+        let erased = registry.execute("delete", request).await.unwrap();
+        assert!(!erased.is_error, "{}", text_of(&erased));
+        assert_eq!(structured(&erased)[&field], id);
+        let calls = stub.calls_to("DELETE", &format!("/create/email/{list}/{id}"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].query, format!("workspaceId={WORKSPACE}"));
+    }
+    let builtin = registry
+        .execute(
+            "delete",
+            json!({"action":"studio.email_template_erase","template_id":"builtin:announcement"}),
+        )
+        .await
+        .unwrap();
+    assert!(builtin.is_error && text_of(&builtin).contains("built-in"));
+}

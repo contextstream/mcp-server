@@ -531,6 +531,31 @@ class Darwin(unittest.TestCase):
         self.assertTrue(facts["signed"])
         self.check("contextstream-mcp-darwin-x64", macho(0x01000007, self.required, (10, 12), False))
 
+    # The machine's trusted certificate authorities are in the keychain, which is read through Security.framework. A
+    # darwin binary without it trusts only the bundled roots again, and nothing else would say so.
+    def test_a_binary_links_security_for_the_keychains_authorities(self):
+        security = "/System/Library/Frameworks/Security.framework/Versions/A/Security"
+        self.assertIs(release.DARWIN_DYLIBS.get(security), True)
+        without = [lib for lib in self.required if lib != security]
+        with self.assertRaises(release.Refused):
+            self.check("contextstream-mcp-darwin-arm64", macho(0x0100000C, without, (11, 0), True))
+
+    # build.sh links against the stubs of scripts/release/macos-link-stubs: a framework that may be linked and has no
+    # stub there, or a stub with another install name, fails the darwin build or records a path macOS does not have.
+    def test_every_framework_a_binary_may_link_has_its_link_stub(self):
+        stubs = Path(release.__file__).resolve().parent / "macos-link-stubs"
+        frameworks = [lib for lib in release.DARWIN_DYLIBS if lib.startswith("/System/Library/Frameworks/")]
+        self.assertEqual(len(frameworks), 4)
+        for lib in frameworks:
+            name = lib.rsplit("/", 1)[1]
+            with self.subTest(framework=name):
+                self.assertEqual(lib, "/System/Library/Frameworks/%s.framework/Versions/A/%s" % (name, name))
+                stub = stubs / "System/Library/Frameworks" / (name + ".framework") / (name + ".tbd")
+                self.assertTrue(stub.is_file(), "no stub %s" % stub)
+                self.assertIn("install-name:    '%s'\n" % lib, stub.read_text())
+        on_disk = sorted(path.name for path in (stubs / "System/Library/Frameworks").iterdir())
+        self.assertEqual(on_disk, sorted(lib.rsplit("/", 1)[1] + ".framework" for lib in frameworks))
+
     def test_refusals(self):
         cases = {
             "wrong architecture": ("contextstream-mcp-darwin-arm64", macho(0x01000007, self.required, (11, 0), True)),

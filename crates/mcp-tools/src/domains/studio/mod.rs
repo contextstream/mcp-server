@@ -1810,8 +1810,6 @@ impl StudioTool {
         if !references.is_empty() {
             request["references"] = json!(references);
         }
-        // A film speaks: it can be planned again in another voice.
-        forms::ask(&mut request, None, &[], voice.as_deref());
         if let Some(topics) = job
             .pointer("/request/topicFeedIds")
             .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
@@ -1828,6 +1826,12 @@ impl StudioTool {
                 " with the change"
             }
         ));
+        let voice = voice.as_deref().or_else(|| {
+            let (id, name) = locked_revision_voice(piece, job.pointer("/make/plan/voice"))?;
+            said.push(format!("Voice kept: {name} (pass voice to change it)."));
+            Some(id)
+        });
+        forms::ask(&mut request, None, &[], voice);
         self.ask_for_plan(workspace_id, project_id, &request, &notes, wait, &mut said)
             .await
     }
@@ -2249,6 +2253,39 @@ fn from_problem(
         }
     }
     None
+}
+
+/// Prefer the made piece's voice, then its planned voice. A plan-wide lock applies to
+/// films and speaking sound forms.
+fn locked_revision_voice<'a>(
+    piece: &'a words::PieceProgress,
+    plan_voice: Option<&'a Value>,
+) -> Option<(&'a str, &'a str)> {
+    let made_voice = piece
+        .made
+        .as_ref()
+        .and_then(|made| made.pointer("/placard/voice"));
+    let planned = &piece.piece;
+    let plan_voice = plan_voice.filter(|_| {
+        planned["medium"] == "video"
+            || planned["form"]
+                .as_str()
+                .and_then(forms::find_form)
+                .is_some_and(|form| form.speaks)
+    });
+    [made_voice, planned.get("voice"), plan_voice]
+        .into_iter()
+        .flatten()
+        .filter(|voice| voice["locked"].as_bool() == Some(true))
+        .find_map(|voice| {
+            let text = |field: &str| {
+                voice[field]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+            };
+            let id = text("key").or_else(|| text("voiceId"))?;
+            Some((id, text("name").unwrap_or(id)))
+        })
 }
 
 /// The prompt for another like a made piece (the web studio's "make another like this"):

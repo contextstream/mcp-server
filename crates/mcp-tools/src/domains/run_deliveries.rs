@@ -36,6 +36,10 @@
 //!   ledger, which delivery it claimed and as which run. It can then claim
 //!   again and send the confirmation with the replacement token. No run id
 //!   or display name read from a refusal or a run view is proof.
+//! - A frame that was claimed and not yet shown is recorded as unshown in
+//!   that ledger. A session that lost it (its slot evicted once the frame
+//!   stopped pinning it, or another replica) claims it again under the same
+//!   attempt, and whichever response clears the record shows it: once.
 //! - Only the credential that reported the run claims what is sent to it.
 //!   ContextStream raises a question for a waiting run, and takes a message
 //!   for it, only where the run was reported under an API key: an answer
@@ -50,7 +54,7 @@
 //!   costs the call nothing; after a 404 or that 503 the API is not asked
 //!   again for a while.
 
-use super::delivery_bindings::{Owner, OwnerKey};
+use super::delivery_bindings::{Owner, OwnerKey, Unshown};
 use mcp_client::deliveries::{
     error_tag, is_malformed, is_no_way_back, is_not_ready, is_not_there, refusal_code, Answer,
     ClaimToken, Delivery, DeliveryActor, DeliveryReader, Refused, DECLINE_REASONS, KIND_ANSWER,
@@ -59,7 +63,7 @@ use mcp_client::deliveries::{
 use mcp_client::ContextStreamClient;
 use mcp_types::{tool::ToolResult, Error, Result};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -92,6 +96,16 @@ const MAX_REMEMBERED: usize = 512;
 const MAX_OWNERS: usize = 256;
 const OWNERS_PER_CREDENTIAL: usize = 32;
 const REPORT_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Most owners of one credential that pin a slot at once. Past it, only that
+/// credential waits: its new owners, and its owners about to claim, are
+/// refused until one of its pins ends ([`Memory::pinned`]).
+const PINNED_PER_CREDENTIAL: usize = 8;
+
+/// How long a frame no response took pins its owner after its claim came
+/// back. The owner can then be evicted; its claim stays with the API and the
+/// private record, which take the frame up again once ([`recover_unshown`]).
+const FRAME_PIN_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// A cached offer and a batch of claim starts share this short validity window.
 const OFFER_FRESH_FOR: Duration = Duration::from_secs(5);
@@ -313,6 +327,10 @@ struct Shown {
     order: u64,
     // Retain the validated, size-limited frame until a tool response takes it.
     pending: Option<(&'static str, String)>,
+    /// The attempt of a claim the private record keeps as unshown: its frame
+    /// is shown only by the response that clears that record, so a replica
+    /// that took the claim up again cannot show it a second time.
+    attempt: Option<Uuid>,
 }
 
 impl Shown {
@@ -328,7 +346,13 @@ impl Shown {
             order: 0,
             held_at: Instant::now(),
             pending: None,
+            attempt: None,
         }
+    }
+
+    /// The record that settles who shows this frame: its claim count and attempt.
+    fn record(&self) -> Option<(usize, Uuid)> {
+        Some((self.previous_claims, self.attempt?))
     }
 }
 
@@ -353,6 +377,10 @@ struct Memory {
 }
 
 impl Memory {
+    /// A claim in flight pins its owner, and so does a frame no response has
+    /// taken, for [`FRAME_PIN_TTL`] after its claim came back; the age is
+    /// read on every admission, so no sweep is waited for. A token never
+    /// pins: the private record recovers it ([`super::delivery_bindings::Owner::claim`]).
     fn pinned(&self) -> bool {
         self.in_flight
             .values()
@@ -360,7 +388,7 @@ impl Memory {
             || self
                 .shown
                 .values()
-                .any(|s| s.pending.is_some() || (s.token.is_some() && s.within_lease()))
+                .any(|s| s.pending.is_some() && s.held_at.elapsed() < FRAME_PIN_TTL)
     }
 
     fn prune(&mut self) {
@@ -390,10 +418,33 @@ struct Owners {
 struct AtCapacity;
 
 impl Owners {
+    /// Whether `owner` may pin: it pins already, or fewer than
+    /// [`PINNED_PER_CREDENTIAL`] other owners of its credential do.
+    fn may_pin(&self, owner: &OwnerKey) -> bool {
+        self.by_key.get(owner).is_some_and(Memory::pinned)
+            || self
+                .by_key
+                .iter()
+                .filter(|(key, mem)| {
+                    key.namespace == owner.namespace && *key != owner && mem.pinned()
+                })
+                .take(PINNED_PER_CREDENTIAL)
+                .count()
+                < PINNED_PER_CREDENTIAL
+    }
+
     /// Inspect admission without reserving a slot. A get without evidence of
     /// ownership must neither allocate a slot nor evict another session.
     fn eviction_for(&self, owner: &OwnerKey) -> std::result::Result<Option<&OwnerKey>, AtCapacity> {
-        if self.by_key.contains_key(owner) || self.by_key.len() < OWNERS_PER_CREDENTIAL {
+        if self.by_key.contains_key(owner) {
+            return Ok(None);
+        }
+        // A credential that pins its share waits for one of its own pins to
+        // end; its new owner takes nothing from another credential.
+        if !self.may_pin(owner) {
+            return Err(AtCapacity);
+        }
+        if self.by_key.len() < OWNERS_PER_CREDENTIAL {
             return Ok(None);
         }
         let same_key = self
@@ -501,7 +552,29 @@ impl Ledger {
         owner: &OwnerKey,
         f: impl FnOnce(&mut Memory) -> T,
     ) -> std::result::Result<T, AtCapacity> {
+        Self::admit(&mut self.directory(), owner, f)
+    }
+
+    /// [`Self::with_slot`] for a claim that pins `owner`. The slot may have
+    /// been held since a report, so the credential's pin limit is checked
+    /// here, under the same lock that registers the claim.
+    fn with_pin<T>(
+        &self,
+        owner: &OwnerKey,
+        f: impl FnOnce(&mut Memory) -> T,
+    ) -> std::result::Result<T, AtCapacity> {
         let mut owners = self.directory();
+        if !owners.may_pin(owner) {
+            return Err(AtCapacity);
+        }
+        Self::admit(&mut owners, owner, f)
+    }
+
+    fn admit<T>(
+        owners: &mut Owners,
+        owner: &OwnerKey,
+        f: impl FnOnce(&mut Memory) -> T,
+    ) -> std::result::Result<T, AtCapacity> {
         if let Some(key) = owners.eviction_for(owner)?.cloned() {
             owners.by_key.remove(&key);
         }
@@ -566,6 +639,7 @@ impl Ledger {
     ) {
         let mut entry = Shown::new(run_id, delivery.previous_claims, token);
         entry.pending = Some((delivery.kind, frame_body(delivery)));
+        entry.attempt = delivery.claim_attempt;
         self.store(session, delivery.id, entry);
     }
 
@@ -598,25 +672,118 @@ impl Ledger {
         });
     }
 
-    // No await after this take: a cancelled batch leaves all its frames here.
-    fn take_frames(&self, owner: &OwnerKey, run: Uuid, tool: &str, limit: usize) -> Offered {
-        self.lookup(owner, |mem| {
+    /// Take up to `limit` frames for `run`, oldest first. A frame under an
+    /// unshown record ([`Shown::attempt`]) is shown only when `settle` cleared
+    /// that record for this response: given the records of the frames chosen,
+    /// it answers the ids it cleared, or `None` when it cannot say now, and
+    /// those frames stay for a later call. A frame whose record another
+    /// response cleared is dropped. No await follows the take: a cancelled
+    /// call leaves every frame it did not return in place.
+    fn take_settled(
+        &self,
+        owner: &OwnerKey,
+        run: Uuid,
+        tool: &str,
+        limit: usize,
+        settle: impl FnOnce(&Unshown) -> Option<HashSet<Uuid>>,
+    ) -> Offered {
+        // Copied, not taken, until settled: a record cleared for this response
+        // still shows its frame if the owner is evicted in between.
+        type Chosen = (Uuid, Option<(usize, Uuid)>, (&'static str, String));
+        let chosen: Vec<Chosen> = self.lookup(owner, |mem| {
             let mut ready: Vec<_> = mem
                 .shown
-                .iter_mut()
+                .iter()
                 .filter(|(_, s)| s.run_id == run && s.pending.is_some())
                 .collect();
             ready.sort_unstable_by_key(|(_, s)| s.order);
-            let mut offered = Offered::default();
-            for (id, entry) in ready.into_iter().take(limit) {
-                if let Some((kind, text)) = entry.pending.take() {
-                    offered
-                        .blocks
-                        .push(format!("{text}\n{}", confirm_line(*id, tool)));
-                    offered.shown.push(json!({"id":id, "kind":kind}));
+            ready
+                .into_iter()
+                .take(limit)
+                .filter_map(|(id, s)| Some((*id, s.record(), s.pending.clone()?)))
+                .collect()
+        });
+        let records: Unshown = chosen
+            .iter()
+            .filter_map(|(id, record, _)| Some((*id, (*record)?)))
+            .collect();
+        let cleared = if records.is_empty() {
+            Some(HashSet::new())
+        } else {
+            settle(&records)
+        };
+        let taken: HashSet<Uuid> = self.lookup(owner, |mem| {
+            let mut taken = HashSet::new();
+            for (id, record, _) in &chosen {
+                let Some(entry) = mem.shown.get_mut(id) else {
+                    continue;
+                };
+                if entry.run_id != run || entry.record() != *record {
+                    continue;
+                }
+                match (record, &cleared) {
+                    (None, _) => {
+                        if entry.pending.take().is_some() {
+                            taken.insert(*id);
+                        }
+                    }
+                    // Settled: shown here when cleared, else where it was.
+                    (Some(_), Some(_)) => entry.pending = None,
+                    (Some(_), None) => {}
                 }
             }
-            offered
+            taken
+        });
+        let mut offered = Offered::default();
+        for (id, record, (kind, text)) in chosen {
+            let show = match record {
+                None => taken.contains(&id),
+                Some(_) => cleared
+                    .as_ref()
+                    .is_some_and(|cleared| cleared.contains(&id)),
+            };
+            if show {
+                offered
+                    .blocks
+                    .push(format!("{text}\n{}", confirm_line(id, tool)));
+                offered.shown.push(json!({"id":id, "kind":kind}));
+            }
+        }
+        offered
+    }
+
+    /// The frames for `run` as one process alone takes them: each record
+    /// counts as cleared by this call.
+    #[cfg(test)]
+    fn take_frames(&self, owner: &OwnerKey, run: Uuid, tool: &str, limit: usize) -> Offered {
+        self.take_settled(owner, run, tool, limit, |records| {
+            Some(records.keys().copied().collect())
+        })
+    }
+
+    /// What this owner holds for `run`, to show now ([`Self::take_settled`]).
+    /// A frame under an unshown record is settled in the shared book, whose
+    /// lock is awaited before anything is taken; then nothing is awaited. A
+    /// book that cannot be locked or written keeps such frames for a later call.
+    async fn show_frames(&self, owner: &Owner, run: Uuid, tool: &str, limit: usize) -> Offered {
+        let recorded = self.lookup(&owner.key, |mem| {
+            mem.shown
+                .values()
+                .any(|s| s.run_id == run && s.pending.is_some() && s.attempt.is_some())
+        });
+        let lock = if recorded {
+            owner.lock().await.ok()
+        } else {
+            None
+        };
+        self.take_settled(&owner.key, run, tool, limit, |records| {
+            match owner.consume_unshown(lock.as_ref()?, run, records) {
+                Ok(cleared) => Some(cleared),
+                Err(error) => {
+                    tracing::debug!("delivery book not settled: {}", error.kind());
+                    None
+                }
+            }
         })
     }
 
@@ -624,7 +791,7 @@ impl Ledger {
     /// Join only claims already sent for this owner and run. Do not read or claim.
     pub(super) async fn terminal_frames(&self, owner: &Owner, run: Uuid, tool: &str) -> Offered {
         let _ = tokio::time::timeout(OFFER_FRESH_FOR, self.finish_claims(&owner.key, run)).await;
-        self.take_frames(&owner.key, run, tool, usize::MAX)
+        self.show_frames(owner, run, tool, usize::MAX).await
     }
 
     async fn finish_claims(&self, owner: &OwnerKey, run: Uuid) {
@@ -638,6 +805,28 @@ impl Ledger {
         for mut done in already_sent {
             let _ = done.changed().await;
         }
+    }
+
+    /// The claim `attempt` on `id` is over and no longer pins its owner.
+    fn finish_flight(&self, owner: &OwnerKey, id: Uuid, attempt: Uuid) {
+        self.lookup(owner, |mem| {
+            if mem
+                .in_flight
+                .get(&id)
+                .is_some_and(|flight| flight.attempt == attempt)
+            {
+                mem.in_flight.remove(&id);
+            }
+        });
+    }
+
+    /// A claim the API limited cools this owner down. Says whether it was one.
+    fn note_refusal(&self, owner: &OwnerKey, error: &Error) -> bool {
+        let Error::RateLimited { retry_after, .. } = error else {
+            return false;
+        };
+        self.cool_down(owner, Duration::from_secs(retry_after.unwrap_or(60)));
+        true
     }
 
     fn claimed_as(&self, session: &OwnerKey, id: Uuid) -> Option<(Uuid, Option<ClaimToken>)> {
@@ -709,6 +898,8 @@ impl Offered {
 struct Batch {
     read_at: Instant,
     deliveries: Vec<Delivery>,
+    /// The owner's unshown claims for the run, as the read asked about them.
+    unshown: Unshown,
 }
 
 #[derive(Debug, PartialEq)]
@@ -779,7 +970,9 @@ pub(super) async fn poll(
     if wait {
         ledger.finish_claims(&owner.key, run_id).await;
     }
-    let ready = ledger.take_frames(&owner.key, run_id, tool, MAX_SHOWN_AT_ONCE);
+    let ready = ledger
+        .show_frames(owner, run_id, tool, MAX_SHOWN_AT_ONCE)
+        .await;
     if !ready.blocks.is_empty() {
         return ready;
     }
@@ -817,12 +1010,7 @@ pub(super) async fn poll(
             );
             let (client, ledger, owner) = (client.clone(), ledger.clone(), owner.clone());
             mcp_client::spawn_with_task_context(async move {
-                let offered = read(&client, &ledger, &owner, run_id)
-                    .await
-                    .map(|deliveries| Batch {
-                        read_at: Instant::now(),
-                        deliveries,
-                    });
+                let offered = read(&client, &ledger, &owner, run_id).await;
                 let _ = result.set(offered);
                 tx.send_replace(true);
             });
@@ -910,7 +1098,9 @@ pub(super) async fn poll(
         }
         false
     };
-    let mut offered = ledger.take_frames(&owner.key, run_id, tool, MAX_SHOWN_AT_ONCE);
+    let mut offered = ledger
+        .show_frames(owner, run_id, tool, MAX_SHOWN_AT_ONCE)
+        .await;
     offered.notice = notice(late && batch.deliveries.len() > offered.shown.len());
     offered
 }
@@ -942,6 +1132,7 @@ pub(super) fn age_poll(ledger: &Ledger, owner: &Owner, run: Uuid, age: Duration)
             poll.result = Arc::new(OnceLock::from(Ok(Batch {
                 read_at: batch.read_at - age,
                 deliveries: batch.deliveries.clone(),
+                unshown: batch.unshown.clone(),
             })));
         }
         *mem.reports.get_mut(&run).unwrap() -= age;
@@ -956,7 +1147,7 @@ async fn read(
     ledger: &Ledger,
     owner: &Owner,
     run_id: Uuid,
-) -> std::result::Result<Vec<Delivery>, ReadFailure> {
+) -> std::result::Result<Batch, ReadFailure> {
     let workspace_id = owner.workspace;
     if ledger.is_not_there(&owner.key) {
         return Err(ReadFailure::Unavailable);
@@ -965,10 +1156,17 @@ async fn read(
         workspace_id,
         run_id: Some(run_id),
     };
-    match client.read_deliveries(&reader).await {
+    // A claim of this owner's whose frame was never shown is read too while
+    // the API still lists it as that claim's, so it can be taken up again.
+    let unshown = owner.unshown(run_id);
+    match client.read_deliveries_with_unshown(&reader, &unshown).await {
         Ok(deliveries) => {
             ledger.with(&owner.key, |mem| mem.last_read = Some(Instant::now()));
-            Ok(deliveries)
+            Ok(Batch {
+                read_at: Instant::now(),
+                deliveries,
+                unshown,
+            })
         }
         Err(error) => {
             if is_not_there(&error) || is_not_ready(&error) {
@@ -1011,13 +1209,21 @@ async fn claim_offers(
         let Ok(reservation) = owner.reserve(delivery.id).await else {
             continue;
         };
-        if owner.already_claimed(delivery.id, delivery.previous_claims) {
+        // A claim of this owner's whose frame no response showed is taken up
+        // again under its own attempt, while the record still says so; any
+        // other claim on record is not made again.
+        let unshown = batch.unshown.get(&delivery.id).copied();
+        if unshown.is_some() {
+            if owner.unshown(run_id).get(&delivery.id) != unshown.as_ref() {
+                continue;
+            }
+        } else if owner.already_claimed(delivery.id, delivery.previous_claims) {
             continue;
         }
         // Reclaiming as the same key/run rotates the token but leaves the
         // original agent unchanged. Distinct attempts must remain distinct
         // even on replicas without a shared filesystem.
-        let attempt = Uuid::new_v4();
+        let attempt = unshown.map_or_else(Uuid::new_v4, |(_, attempt)| attempt);
         let mut labels = agent.clone();
         labels["id"] = json!(attempt);
         let who = DeliveryActor {
@@ -1030,7 +1236,7 @@ async fn claim_offers(
             break;
         }
         let (finished, done) = tokio::sync::watch::channel(());
-        let registered = ledger.with_slot(session, |mem| {
+        let registered = ledger.with_pin(session, |mem| {
             if mem.in_flight.len() >= MAX_REMEMBERED || mem.in_flight.contains_key(&delivery.id) {
                 return false;
             }
@@ -1045,6 +1251,19 @@ async fn claim_offers(
             true
         })?;
         if !registered {
+            continue;
+        }
+        if let Some(record) = unshown {
+            // Cancelling this is safe: the record stays, and the next read
+            // takes the claim up again.
+            let limited =
+                recover_unshown(client, ledger, owner, run_id, agent, delivery.id, record).await;
+            ledger.finish_flight(session, delivery.id, attempt);
+            drop(reservation);
+            drop(finished);
+            if limited {
+                break;
+            }
             continue;
         }
         let (client, ledger, owner, id) =
@@ -1066,12 +1285,15 @@ async fn claim_offers(
             }
             let mut limited = false;
             match claim {
-                Ok(claimed) if claimed.claim_attempt == Some(attempt) => {
+                Ok(mut claimed) if claimed.claim_attempt == Some(attempt) => {
                     if !owner
-                        .bind(run_id, Some(id), claimed.previous_claims, Some(attempt))
+                        .bind_unshown(run_id, id, claimed.previous_claims, attempt)
                         .await
                     {
-                        tracing::warn!("could not save recovery evidence for a shown delivery");
+                        // Without its record nobody can take the claim up
+                        // again, so this session shows the frame on its own.
+                        tracing::warn!("could not save recovery evidence for a claimed delivery");
+                        claimed.claim_attempt = None;
                     }
                     ledger.remember(
                         &owner.key,
@@ -1083,23 +1305,11 @@ async fn claim_offers(
                 }
                 Err(error) => {
                     tracing::debug!("run delivery {} not claimed: {}", id, error_tag(&error));
-                    if let Error::RateLimited { retry_after, .. } = error {
-                        ledger
-                            .cool_down(&owner.key, Duration::from_secs(retry_after.unwrap_or(60)));
-                        limited = true;
-                    }
+                    limited = ledger.note_refusal(&owner.key, &error);
                 }
                 _ => {}
             }
-            ledger.lookup(&owner.key, |mem| {
-                if mem
-                    .in_flight
-                    .get(&id)
-                    .is_some_and(|flight| flight.attempt == attempt)
-                {
-                    mem.in_flight.remove(&id);
-                }
-            });
+            ledger.finish_flight(&owner.key, id, attempt);
             drop(reservation);
             drop(finished);
             limited
@@ -1112,6 +1322,56 @@ async fn claim_offers(
         }
     }
     Ok(())
+}
+
+/// Take up again a claim of this owner's whose frame no response showed: its
+/// owner was evicted after [`FRAME_PIN_TTL`], or another replica made it. The
+/// claim's own attempt (`record`: the claim count and the attempt) asks the
+/// API for its token again ([`ContextStreamClient::recover_delivery`]), and
+/// the frame waits under its record to be shown once ([`Ledger::show_frames`]).
+/// Says whether the API limited the request.
+async fn recover_unshown(
+    client: &ContextStreamClient,
+    ledger: &Ledger,
+    owner: &Owner,
+    run_id: Uuid,
+    agent: &Value,
+    id: Uuid,
+    (generation, attempt): (usize, Uuid),
+) -> bool {
+    let reader = DeliveryReader {
+        workspace_id: owner.workspace,
+        run_id: Some(run_id),
+    };
+    match client
+        .recover_delivery(&reader, id, generation, attempt, agent)
+        .await
+    {
+        Ok(Some(claimed)) => {
+            // Taken up after its lease lapsed, the claim counts one more
+            // lapse; the record follows so a later recovery asks for it.
+            if claimed.previous_claims != generation
+                && !owner
+                    .bind_unshown(run_id, id, claimed.previous_claims, attempt)
+                    .await
+            {
+                tracing::warn!("could not save recovery evidence for a claimed delivery");
+            }
+            ledger.remember(
+                &owner.key,
+                &claimed,
+                owner.workspace,
+                run_id,
+                claimed.claim_token.clone(),
+            );
+            false
+        }
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!("run delivery {} not recovered: {}", id, error_tag(&error));
+            ledger.note_refusal(&owner.key, &error)
+        }
+    }
 }
 
 // ============================================================================

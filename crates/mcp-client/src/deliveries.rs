@@ -46,6 +46,7 @@
 //! refused `applied` or `declined` says which run holds the claim
 //! ([`Refused::held_by_run`]), so a holder can tell that the claim is its own.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
@@ -627,11 +628,33 @@ impl ContextStreamClient {
     /// What is deliverable to the reader's run. Endpoint:
     /// `GET /decision-requests/deliveries?workspace_id=&run_id=`.
     pub async fn read_deliveries(&self, reader: &DeliveryReader) -> Result<Vec<Delivery>> {
+        self.read_deliveries_with_unshown(reader, &HashMap::new())
+            .await
+    }
+
+    /// [`Self::read_deliveries`], and also each delivery the reader claimed
+    /// and never showed, while the API lists it as still claimed under that
+    /// claim: `unshown` maps its id to the claim count and the attempt it was
+    /// claimed with. The caller can then take it up again with that attempt
+    /// ([`Self::recover_delivery`]). Every other claimed delivery stays out.
+    pub async fn read_deliveries_with_unshown(
+        &self,
+        reader: &DeliveryReader,
+        unshown: &HashMap<Uuid, (usize, Uuid)>,
+    ) -> Result<Vec<Delivery>> {
         let answer = self.delivery_views(reader).await?;
         // Only what is still to be delivered, in this workspace, to this run.
         Ok(deliveries_of(&answer)
             .into_iter()
-            .filter(|delivery| delivery.is_in("pending") && delivery.is_for(reader))
+            .filter(|delivery| {
+                delivery.is_for(reader)
+                    && (delivery.is_in("pending")
+                        || (delivery.is_in("claimed")
+                            && unshown.get(&delivery.id).is_some_and(|&(count, attempt)| {
+                                delivery.previous_claims == count
+                                    && delivery.claim_attempt == Some(attempt)
+                            })))
+            })
             .collect())
     }
 
@@ -1242,6 +1265,47 @@ mod tests {
             .expect("read");
         assert_eq!(offered.len(), 1, "{offered:?}");
         assert_eq!(offered[0].id, id);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn round7_a_read_adds_only_claims_the_reader_holds_and_never_showed() {
+        let (workspace, run, attempt) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let claimed = |id: Uuid, holder: Uuid, lapses: usize| {
+            let mut view = answer_view(id, run);
+            view["workspace_id"] = json!(workspace);
+            view["state"] = json!("claimed");
+            view["claimed_by"] = json!({"run_id": run, "agent": {"id": holder}});
+            view["previous_claims"] = json!(vec![json!({"ended": "lapsed"}); lapses]);
+            view
+        };
+        let [mine, lapsed, others, unrecorded] = [(); 4].map(|_| Uuid::new_v4());
+        let listed = json!({"success": true, "data": {"deliveries": [
+            claimed(mine, attempt, 0),
+            // Claimed again after a lapse, held by another attempt, or held
+            // by this attempt with no unshown record of the reader's.
+            claimed(lapsed, attempt, 1),
+            claimed(others, Uuid::new_v4(), 0),
+            claimed(unrecorded, attempt, 0),
+        ]}})
+        .to_string();
+        let (client, server) = client_answered(vec![("200 OK", listed)]).await;
+        let unshown = HashMap::from([
+            (mine, (0, attempt)),
+            (lapsed, (0, attempt)),
+            (others, (0, attempt)),
+        ]);
+        let read = client
+            .read_deliveries_with_unshown(
+                &DeliveryReader {
+                    workspace_id: workspace,
+                    run_id: Some(run),
+                },
+                &unshown,
+            )
+            .await
+            .expect("read");
+        assert_eq!(read.iter().map(|d| d.id).collect::<Vec<_>>(), [mine]);
         server.await.unwrap();
     }
 

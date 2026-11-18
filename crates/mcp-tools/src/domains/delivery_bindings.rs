@@ -2,6 +2,7 @@
 //! digests and timestamps reach disk; never credentials, tokens or messages.
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, HashSet},
     fs, io,
     path::PathBuf,
     time::{Duration, Instant},
@@ -40,6 +41,21 @@ pub(super) struct Binding {
     pub generation: usize,
     #[serde(default)]
     attempt: Option<Uuid>,
+    /// The claim's frame has not been shown yet. The response that clears
+    /// this shows it ([`Owner::consume_unshown`]), so a frame is shown once by
+    /// every process that shares the book. A record written before this field
+    /// existed reads as shown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unshown: bool,
+}
+
+/// The claims of one owner for one run whose frames no response showed:
+/// delivery id → the claim count and the attempt it was claimed with.
+pub(super) type Unshown = HashMap<Uuid, (usize, Uuid)>;
+
+/// The book's lock, held while it is read and rewritten.
+pub(super) struct BookLock {
+    _held: FileLock,
 }
 
 pub(super) const CLAIM_SECONDS: i64 = 3600;
@@ -115,19 +131,48 @@ impl Owner {
     }
 
     fn book<T>(&self, f: impl FnOnce(&mut Vec<Binding>) -> (T, bool)) -> io::Result<T> {
+        let lock = self.lock_book()?;
+        self.rewrite(&lock, f)
+    }
+
+    /// The book's lock, after making its directory. Blocks for at most the
+    /// lock's wait; [`Self::lock`] waits off the async runtime.
+    fn lock_book(&self) -> io::Result<BookLock> {
         let dir = self.store.parent().ok_or(io::ErrorKind::InvalidInput)?;
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(dir)?;
+        Ok(BookLock {
+            _held: FileLock::acquire(self.store.with_extension("lock"))?,
+        })
+    }
+
+    /// Wait for the book's lock off the async runtime. Dropping the future
+    /// releases a lock acquired after it was dropped.
+    pub async fn lock(&self) -> io::Result<BookLock> {
+        let owner = self.clone();
+        tokio::task::spawn_blocking(move || owner.lock_book()).await?
+    }
+
+    /// Read the book, let `f` change it, and replace it atomically when `f`
+    /// says it changed. `_lock` is this book's lock, held by the caller.
+    fn rewrite<T>(
+        &self,
+        _lock: &BookLock,
+        f: impl FnOnce(&mut Vec<Binding>) -> (T, bool),
+    ) -> io::Result<T> {
         let mut options = fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-            builder.mode(0o700);
+            use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        builder.create(dir)?;
-        let _lock = FileLock::acquire(self.store.with_extension("lock"))?;
         let mut entries = self.entries()?;
         let (answer, changed) = f(&mut entries);
         if changed {
@@ -135,7 +180,7 @@ impl Owner {
                 entries.drain(..entries.len() - 1024);
             }
             let tmp = self.store.with_extension("tmp");
-            serde_json::to_writer(options.truncate(true).open(&tmp)?, &entries)?;
+            serde_json::to_writer(options.open(&tmp)?, &entries)?;
             fs::rename(tmp, &self.store)?;
         }
         Ok(answer)
@@ -160,18 +205,57 @@ impl Owner {
         generation: usize,
         attempt: Option<Uuid>,
     ) -> bool {
-        let owner = self.clone();
-        tokio::task::spawn_blocking(move || owner.bind_blocking(run, delivery, generation, attempt))
+        self.write_binding(run, delivery, generation, attempt, false)
             .await
-            .unwrap_or(false)
     }
 
+    /// Record a claim whose frame no response has shown yet: an owner that
+    /// loses the frame can claim it again under `attempt` and show it once.
+    pub async fn bind_unshown(
+        &self,
+        run: Uuid,
+        id: Uuid,
+        generation: usize,
+        attempt: Uuid,
+    ) -> bool {
+        self.write_binding(run, Some(id), generation, Some(attempt), true)
+            .await
+    }
+
+    async fn write_binding(
+        &self,
+        run: Uuid,
+        delivery: Option<Uuid>,
+        generation: usize,
+        attempt: Option<Uuid>,
+        unshown: bool,
+    ) -> bool {
+        let owner = self.clone();
+        tokio::task::spawn_blocking(move || {
+            owner.record(run, delivery, generation, attempt, unshown)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[cfg(test)]
     fn bind_blocking(
         &self,
         run: Uuid,
         delivery: Option<Uuid>,
         generation: usize,
         attempt: Option<Uuid>,
+    ) -> bool {
+        self.record(run, delivery, generation, attempt, false)
+    }
+
+    fn record(
+        &self,
+        run: Uuid,
+        delivery: Option<Uuid>,
+        generation: usize,
+        attempt: Option<Uuid>,
+        unshown: bool,
     ) -> bool {
         self.book(|entries| {
             entries.retain(|e| {
@@ -184,11 +268,55 @@ impl Owner {
                 delivery,
                 generation,
                 attempt,
+                unshown,
                 at: chrono::Utc::now().timestamp(),
             });
             ((), true)
         })
         .is_ok()
+    }
+
+    /// This owner's claims for `run` whose frames no response has shown.
+    pub fn unshown(&self, run: Uuid) -> Unshown {
+        self.entries()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.unshown && e.run == run && e.owner == self.key.digest)
+            .filter_map(|e| Some((e.delivery?, (e.generation, e.attempt?))))
+            .collect()
+    }
+
+    /// Clear the unshown mark of each of `frames` (delivery id → the claim
+    /// count and attempt of the frame in hand) that this owner recorded for
+    /// `run`, under the book's lock: the ids cleared are the frames this
+    /// response shows. A mark another response cleared first stays cleared,
+    /// and its frame is shown there only. A frame claimed again after a lapse
+    /// carries the higher count, which the record takes.
+    pub fn consume_unshown(
+        &self,
+        lock: &BookLock,
+        run: Uuid,
+        frames: &Unshown,
+    ) -> io::Result<HashSet<Uuid>> {
+        self.rewrite(lock, |entries| {
+            let mut cleared = HashSet::new();
+            for e in entries.iter_mut() {
+                if !e.unshown || e.run != run || e.owner != self.key.digest {
+                    continue;
+                }
+                let Some(id) = e.delivery else { continue };
+                let Some(&(generation, attempt)) = frames.get(&id) else {
+                    continue;
+                };
+                if e.attempt == Some(attempt) && e.generation <= generation {
+                    e.unshown = false;
+                    e.generation = generation;
+                    cleared.insert(id);
+                }
+            }
+            let changed = !cleared.is_empty();
+            (cleared, changed)
+        })
     }
 
     pub fn reported(&self, run: Uuid) -> bool {

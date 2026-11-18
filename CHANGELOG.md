@@ -9,15 +9,26 @@
 - A mid-run hook can show a pointer to the delivery and the `get` call that reads it. In local Claude Code, a waiting report can suggest the background command `contextstream-mcp await-answer --run-id=<id> --workspace-id=<id>`. It prints a pointer on arrival (exit 0), times out after four hours by default (124), or exits with 1 if another waiter holds the run, no credentials are available, the credential is not a person’s full API key, or no workspace is supplied or linked. Neither the hook nor the waiter claims anything. Run `contextstream-mcp update-rules --scope=all --only-configured` to install the new guidance.
 - The gateway keeps at most 32 delivery owners per credential and 256 overall. At 32 it replaces only the
   least recently used unpinned owner of the same credential. At 256 it chooses the credentials with the most slots
-  among those that can spare one, then evicts their least recently used unpinned owner. Idle report evidence
-  expires after 10 minutes and never pins a slot. If all eligible slots are pinned, reports still succeed; a report or
-  `get` says “Deliveries are paused for this session; read again later.” With no new claims, allow up to
-  70 minutes from the last claim receipt (one hour for the lease plus up to 10 minutes to sweep unread frames
-  on access). There is no guaranteed maximum wait if new claims keep all eligible slots pinned.
+  among those that can spare one, then evicts their least recently used unpinned owner. Only a claim in flight or
+  a frame not yet shown pins an owner, a frame for at most five minutes after its claim returns; claim tokens and
+  idle report evidence (which expires after 10 minutes) never pin. One credential pins at most eight owners;
+  past that, only its own new owners and claims wait. Reports still succeed, and a paused report or `get` says
+  “Deliveries are paused for this session; read again later.” The wait is bounded: a claim takes at most two
+  five-second requests, so with no new claims every pin ends within about five minutes and ten seconds of the last claim.
+  A credential's new claims extend only its own pause; another credential is paused only while at least 32
+  credentials each hold eight pins.
+- A frame that stops pinning can be evicted before it is shown. Its claim stays with the API, and the binding
+  file marks it unshown (no text or token): when a read lists it again, the session claims it under the same
+  attempt and shows it once, also across replicas that share the directory. The current API lists it again when
+  the claim's lease lapses, within an hour.
+- Hosted reports more than 10 minutes apart: the session's slot expires after 10 idle minutes, and such a report
+  used to start only a read. It now reads and claims inline, within its five-second budget, when the run is the
+  session's own: its default or ticket run, whose key the gateway derives from the caller and the session, or a
+  run named by its ownership record on disk. Local sessions are unchanged.
 - Only personal, full API keys participate. While the API answers 404, progress works as before: no delivery, claim, binding file or wake advice; the deliveries probe backs off for ten minutes.
 - Studio and other raw reads keep their previous network error when a response body stalls. Deliveries still distinguish a timeout so a lost claim response can be recovered.
 - Lost-token recovery first reads the run’s deliveries and reuses the original attempt only when the read supports it. An absent delivery or newer claim returns `no_owned_claim` without re-claiming.
-- Local claim recovery uses `contextstream/deliveries` under the platform state directory (local data directory if unavailable); set `CONTEXTSTREAM_DELIVERY_STATE_DIR` to override it. On the HTTP gateway, deliveries are off unless that directory is explicitly configured. Its files contain IDs, ownership digests, claim counts and timestamps; tokens and message text stay in memory. Waiter locks use `contextstream/waiters` under the platform state directory; hook pointers use `~/.contextstream/mid-run-notices/`.
+- Local claim recovery uses `contextstream/deliveries` under the platform state directory (local data directory if unavailable); set `CONTEXTSTREAM_DELIVERY_STATE_DIR` to override it. On the HTTP gateway, deliveries are off unless that directory is explicitly configured. Its files contain IDs, ownership digests, claim counts, timestamps and whether a claimed delivery was shown yet; tokens and message text stay in memory. Waiter locks use `contextstream/waiters` under the platform state directory; hook pointers use `~/.contextstream/mid-run-notices/`.
 
 ## 1.0.81
 

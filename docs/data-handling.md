@@ -111,25 +111,38 @@ workspaces it is switched on for; for every other workspace the paths answer 404
   or other tool calls goes with these requests.
 - **Local state:** a session's hooks keep the ids of the runs it reported and of the deliveries it was pointed at in
   `~/.contextstream/mid-run-notices/<digest>.json`, removed a day after its last use. The `progress` tool remembers
-  up to 512 tokens per delivery owner in memory for at most one hour. Its bounded local binding file stores ids, digests and
-  timestamps, never tokens or words (in the platform state directory under `contextstream/deliveries`, or
+  up to 512 tokens per delivery owner in memory for at most one hour. Its bounded local binding file stores ids, digests,
+  timestamps and whether a claimed delivery was shown yet, never tokens or words (in the platform state directory under `contextstream/deliveries`, or
   `CONTEXTSTREAM_DELIVERY_STATE_DIR`). The HTTP gateway requires this directory to be set explicitly. Replicas can use a private shared directory supporting file locks and atomic rename. `await-answer` keeps an empty per-run lock file under `contextstream/waiters` in the user's state directory so only one local waiter polls; its lock is released on exit.
 - **Gateway memory limits:** Each gateway process keeps at most 32 delivery owners per credential across its
-  workspaces and sessions, and 256 owners in total. An unshown delivery, a claim in flight or an unexpired
-  claim token pins the owner's slot. At 32, a credential can replace only its own least recently used unpinned
-  owner. At 256, a credential below its own limit can take a slot from the credential with the most slots
-  among those with an unpinned owner. All slots count toward that total. The gateway evicts that credential's
-  least recently used unpinned owner; if credentials tie, it compares their unpinned owners together.
-  An owner with only reports is eligible for eviction immediately; its idle report evidence expires after 10 minutes.
+  workspaces and sessions, and 256 owners in total. Only a claim in flight or an unshown delivery pins the
+  owner's slot, an unshown delivery for at most five minutes after its claim returns; its age is checked on
+  every admission, so no sweep is waited for. Claim tokens never pin: the private binding recovers them. One
+  credential pins at most eight owners at a time; past that, its new owners and its owners about to claim are
+  paused, and no other credential's slot is touched. At 32, a credential can replace only its own least
+  recently used unpinned owner. At 256, a credential below its own limit can take a slot from the credential
+  with the most slots among those with an unpinned owner. All slots count toward that total. The gateway
+  evicts that credential's least recently used unpinned owner; if credentials tie, it compares their unpinned
+  owners together. An owner with only reports is eligible for eviction immediately; its idle report evidence
+  expires after 10 minutes. A later report still reads and claims inline for the session's own run: its
+  default or ticket run, whose key the gateway derives from the caller and the session, or a run its
+  ownership record on disk names.
 
-  When every eligible slot is pinned, the gateway still records progress. The report or `get` says
+  When a session is paused, the gateway still records progress. The report or `get` says
   “Deliveries are paused for this session; read again later.” The gateway logs one warning with an owner
   digest per refusal. If your session has never held a slot, report again to establish ownership.
 
-  A claim token lasts at most one hour. An unread frame can remain pinned until the next sweep after its
-  lease expires. With no new claims, allow up to 70 minutes from the last claim receipt: one hour for the
-  lease and up to 10 minutes for the sweep, which runs on access. If claims keep pinning every eligible
-  slot, there is no guaranteed maximum wait.
+  The wait is bounded. Each delivery request times out after five seconds and a claim is sent at most
+  twice, so a claim in flight ends within about ten seconds, and its unshown delivery stops pinning five
+  minutes later. With no new claims, every pin ends within about five minutes and ten seconds of the last
+  claim. A credential's new claims extend only its own pause; another credential's session is paused only
+  while at least 32 credentials each hold eight pins.
+
+  An unshown delivery whose owner was evicted is neither lost nor shown twice. Its API claim stays, and the
+  private binding marks it unshown; it stores no message text or token. When a read lists the claim again,
+  the session claims it under the same attempt, and only the response that clears the mark shows it, also
+  across replicas that share the binding directory. The current API omits active claims from its list, so
+  the delivery comes back when the claim's lease lapses, within an hour, and is then shown once.
 - **Controls:** `CONTEXTSTREAM_RUN_PROGRESS=off` (nothing is reported, so the tool asks for nothing),
   `CONTEXTSTREAM_MID_RUN_NOTICES=0` (the hooks do not ask). `await-answer` runs only when it is started.
 

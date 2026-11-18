@@ -1,5 +1,6 @@
 //! Evidence from successful reports and validated claims. Only identifiers,
-//! digests and timestamps reach disk; never credentials, tokens or messages.
+//! digests, claim counts, timestamps and whether a claim's frame was shown
+//! reach disk; never credentials, tokens or messages.
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},

@@ -12,7 +12,7 @@ all-features = true
 yanked = "deny"
 unmaintained = "all"
 ignore = [
-    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not a vulnerability; no maintained release to move to yet, a ticket tracks moving off it; review by 2027-02-18" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not a vulnerability; no maintained release to move to yet, ticket 9f87def0 tracks moving off it; review by 2027-02-18 (a lapsed date stops releases)" },
 ]
 
 [licenses]

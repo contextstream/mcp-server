@@ -250,6 +250,19 @@ async fn the_api_client_trusts_an_authority_named_by_ssl_cert_file() {
             .await
             .expect("the authority the machine names is trusted");
         assert_eq!(user.email, "fixture@example.test");
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "build_three_clients_in_child", "--nocapture"])
+            .env("TEST_CERT_CLIENT_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(child.status.success());
+        assert_eq!(String::from_utf8_lossy(&child.stderr), "");
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            stdout.contains("__CLIENT_BUILD_START____CLIENT_BUILD_END__"),
+            "successful CA load must print nothing: {stdout}"
+        );
     }
 }
 
@@ -382,12 +395,104 @@ async fn a_store_that_cannot_be_used_leaves_the_bundled_roots_and_is_said_once()
     }
 }
 
+#[tokio::test]
+async fn store_loading_stops_with_one_warning_when_directory_byte_or_certificate_bounds_are_reached(
+) {
+    let _one_at_a_time = ENVIRONMENT.lock().await;
+    let home = clean_environment();
+    let (authority_pem, url) = serve_behind_a_throwaway_authority().await;
+
+    // 1. Directory file-count bound (> 1,024 PEM files).
+    let many_files_dir = home.path().join("many-files");
+    std::fs::create_dir(&many_files_dir).unwrap();
+    for i in 0..1_030 {
+        std::fs::write(
+            many_files_dir.join(format!("ca-{i:04}.pem")),
+            &authority_pem,
+        )
+        .unwrap();
+    }
+
+    // 2. Total-bytes bound across multiple files (> 32 MiB total, each < 16 MiB per-file limit).
+    let many_bytes_dir = home.path().join("many-bytes");
+    std::fs::create_dir(&many_bytes_dir).unwrap();
+    let mut padded = "comment line before certificate\n".repeat(380_000); // ~12 MiB
+    padded.push_str(&authority_pem);
+    assert!(padded.len() < 16 * 1024 * 1024 && padded.len() * 3 > 32 * 1024 * 1024);
+    for i in 0..3 {
+        std::fs::write(many_bytes_dir.join(format!("part-{i}.pem")), &padded).unwrap();
+    }
+
+    // 3. Total-certificates bound (> 1,024 distinct certificates).
+    let (_, signing_key) = new_key();
+    let basic_constraints_ca = sequence(&[der(0x01, &[0xff])]);
+    let mut many_certs_pem = String::new();
+    for i in 0..1_030 {
+        let label = format!("Bounded test authority {i}");
+        let cert = certificate(
+            (&label, signing_key.as_ref()),
+            (&label, signing_key.as_ref()),
+            &[extension(19, true, &basic_constraints_ca)],
+        );
+        many_certs_pem.push_str("-----BEGIN CERTIFICATE-----\n");
+        many_certs_pem.push_str(&base64::engine::general_purpose::STANDARD.encode(cert.as_ref()));
+        many_certs_pem.push_str("\n-----END CERTIFICATE-----\n");
+    }
+    let many_certs_file = home.path().join("many-certs.pem");
+    std::fs::write(&many_certs_file, &many_certs_pem).unwrap();
+
+    let cases: [(&str, Option<&Path>, Option<&Path>); 3] = [
+        (
+            "too many directory files",
+            None,
+            Some(many_files_dir.as_path()),
+        ),
+        ("too many total bytes", None, Some(many_bytes_dir.as_path())),
+        (
+            "too many certificates",
+            Some(many_certs_file.as_path()),
+            None,
+        ),
+    ];
+
+    for (label, file, dir) in cases {
+        set_or_remove("SSL_CERT_FILE", file);
+        set_or_remove("SSL_CERT_DIR", dir);
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "build_three_clients_in_child", "--nocapture"])
+            .env("TEST_CERT_CLIENT_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "{label}");
+        let stderr = String::from_utf8(child.stderr).unwrap();
+        assert_eq!(stderr.lines().count(), 1, "{label}: {stderr}");
+        assert!(stderr.contains("Bundled roots"), "{label}: {stderr}");
+        let named = file.or(dir).unwrap();
+        assert!(
+            stderr.contains(&*named.to_string_lossy()),
+            "{label}: {stderr}"
+        );
+    }
+
+    // Certificates loaded before the bound remain trusted alongside bundled roots.
+    set_or_remove("SSL_CERT_FILE", None);
+    set_or_remove("SSL_CERT_DIR", Some(many_files_dir.as_path()));
+    let user = api_client(&url)
+        .me()
+        .await
+        .expect("authority loaded before bound remains trusted");
+    assert_eq!(user.email, "fixture@example.test");
+}
+
 #[test]
 fn build_three_clients_in_child() {
     if std::env::var_os("TEST_CERT_CLIENT_CHILD").is_some() {
+        print!("__CLIENT_BUILD_START__");
         for _ in 0..3 {
             mcp_client::http::client();
         }
+        print!("__CLIENT_BUILD_END__");
     }
 }
 

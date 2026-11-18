@@ -196,11 +196,19 @@ fn by_type_line(diagnostics: &Value) -> Option<String> {
                     .map(|n| format!("{word} {}", credits(n)))
             })
             .collect();
-        return Some(if parts.is_empty() {
-            "- By type: no event was applied.".to_string()
-        } else {
-            format!("- By type: {}.", parts.join(", "))
-        });
+        return Some(
+            if parts.is_empty()
+                && EVENT_TYPES
+                    .iter()
+                    .any(|(key, _)| number(events, key).is_none())
+            {
+                format!("- By type: {NOT_ANSWERED}.")
+            } else if parts.is_empty() {
+                "- By type: no event was applied.".to_string()
+            } else {
+                format!("- By type: {}.", parts.join(", "))
+            },
+        );
     }
     let recent = diagnostics.get("recent")?.as_array()?;
     if recent.is_empty() {
@@ -358,7 +366,10 @@ impl StudioTool {
                 (Some(delivery), None) => {
                     format!("- Last delivery on {delivery}; none has been applied to a send yet.")
                 }
-                (None, _) => "- No delivery has arrived yet.".to_string(),
+                (None, _) if diagnostics.get("lastDeliveryAt") == Some(&Value::Null) => {
+                    "- No delivery has arrived yet.".to_string()
+                }
+                (None, _) => format!("- Last delivery: {NOT_ANSWERED}."),
             },
         });
         lines.push(format!(
@@ -428,7 +439,10 @@ impl StudioTool {
         let summary = answer.data;
         // A Create that narrows the summary to a campaign also says when the last opt-out
         // was; one that doesn't ignores `campaignId`, and its summary is the workspace's.
-        let narrowed = summary.get("lastOptOutAt").is_some();
+        let narrowed = match (&campaign, summary.get("campaignId")) {
+            (Some((id, _)), Some(echo)) => echo.as_str() == Some(&id.to_string()),
+            _ => summary.get("lastOptOutAt").is_some(),
+        };
         let mut lines = Vec::new();
         let by_reason;
         let mut feedback = None;
@@ -700,12 +714,15 @@ impl StudioTool {
         if connection.get("connected").and_then(Value::as_bool) == Some(true) {
             let sender = connection.get("sender").cloned().unwrap_or(Value::Null);
             lines.push(format!("- Sender: {}.", sender_words(&sender)));
+            let domains_answered = connection["domains"].is_array();
             let domains = connection
                 .get("domains")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            lines.push(if domains.is_empty() {
+            lines.push(if !domains_answered {
+                format!("- Domains: {NOT_ANSWERED}.")
+            } else if domains.is_empty() {
                 match connection.pointer("/key/access").and_then(Value::as_str) {
                     Some("sending_access") => format!(
                         "- Domains: {NOT_ANSWERED} (a sending-only key can't list them; the from address is checked by its shape only)."
@@ -732,7 +749,10 @@ impl StudioTool {
                     None => "its signing secret not answered",
                 },
                 moment(webhook.get("lastEventAt").and_then(Value::as_str)).map_or_else(
-                    || "no event has arrived yet".to_string(),
+                    || match webhook.get("lastEventAt") {
+                        Some(Value::Null) => "no event has arrived yet".into(),
+                        _ => format!("last event {NOT_ANSWERED}"),
+                    },
                     |at| format!("last event on {at}")
                 )
             ));
@@ -741,7 +761,7 @@ impl StudioTool {
                 "from_email": sender.get("fromEmail"),
                 "reply_to": sender.get("replyTo"),
             });
-            facts["domains"] = json!(domains
+            facts["domains"] = json!(domains_answered.then(|| domains
                 .iter()
                 .map(|domain| json!({
                     "name": domain.get("name"),
@@ -749,7 +769,7 @@ impl StudioTool {
                     "open_tracking": domain.get("openTracking"),
                     "click_tracking": domain.get("clickTracking"),
                 }))
-                .collect::<Vec<_>>());
+                .collect::<Vec<_>>()));
             facts["webhook"] = json!({
                 "mode": webhook.get("mode"),
                 "secret_set": webhook.get("secretSet"),

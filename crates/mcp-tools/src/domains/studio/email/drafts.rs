@@ -125,19 +125,18 @@ impl StudioTool {
         if !answer.is_success() {
             return Ok(ToolResult::error(email_refusal(&answer, Topic::Other)));
         }
-        let templates = answer
-            .data
-            .get("templates")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let Some(templates) = answer.data["templates"].as_array() else {
+            return Ok(ToolResult::error(
+                "Template list not answered. Try email_templates again.",
+            ));
+        };
         let mut lines = vec![format!(
             "{} template{} as of now:",
             templates.len(),
             if templates.len() == 1 { "" } else { "s" }
         )];
         let mut listed = Vec::new();
-        for template in &templates {
+        for template in templates {
             let id = text(template, "id").unwrap_or_default();
             let name = text(template, "name").unwrap_or_else(|| "A template".to_string());
             let about = match (is_built_in(template), text(template, "description")) {
@@ -413,15 +412,17 @@ impl StudioTool {
                 "Not changed: only a draft's subjects can be tested, and “{name}” is {status}. {how}"
             )));
         }
-        let mut body = json!({
-            "workspaceId": workspace_id,
-            "revision": campaign.get("revision").and_then(Value::as_i64).unwrap_or(0),
-        });
+        let Some(revision) = number(&campaign, "revision") else {
+            return Ok(ToolResult::error(
+                "Not changed: campaign revision not answered. Read the draft again.",
+            ));
+        };
+        let mut body = json!({"workspaceId":workspace_id,"revision":revision});
         match asked {
             Some((subjects, settings)) => {
                 // A is the email's own subject: a new A becomes it, in the same change.
                 let (a, others) = subjects.split_first().expect("2 or 3 subjects");
-                if !a.eq_ignore_ascii_case(own_subject.trim()) {
+                if a != own_subject.trim() {
                     body["subject"] = json!(a);
                 }
                 let mut test = settings;

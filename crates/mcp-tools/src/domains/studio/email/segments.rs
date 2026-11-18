@@ -213,7 +213,11 @@ impl StudioTool {
         if !answer.is_success() {
             return Ok(ToolResult::error(email_refusal(&answer, Topic::Audience)));
         }
-        let segments = answer.data.as_array().cloned().unwrap_or_default();
+        let Some(segments) = answer.data.as_array() else {
+            return Ok(ToolResult::error(
+                "Segment list not answered. Try email_segments again.",
+            ));
+        };
         if segments.is_empty() {
             return Ok(ToolResult::with_structured(
                 format!(
@@ -230,7 +234,7 @@ impl StudioTool {
             if segments.len() == 1 { "" } else { "s" }
         )];
         let mut listed = Vec::new();
-        for segment in &segments {
+        for segment in segments {
             let id = text(segment, "id").unwrap_or_default();
             let name = text(segment, "name").unwrap_or_else(|| "A segment".to_string());
             let audience_id = text(segment, "audienceId").unwrap_or_default();

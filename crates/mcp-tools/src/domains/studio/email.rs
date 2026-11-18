@@ -182,6 +182,14 @@ pub(crate) fn holds_resend_key(value: &Value) -> bool {
     }
 }
 
+/// A returned name, warning or error can contain free text just like a tool argument.
+pub(super) fn checked_email_answer(answer: StudioAnswer) -> Result<StudioAnswer> {
+    if holds_resend_key(&answer.body) {
+        return Err(Error::Validation("The API response contained a Resend credential and was withheld. Check the result in the studio.".into()));
+    }
+    Ok(answer)
+}
+
 /// Whether the catalog offers email to this caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Offer {
@@ -779,7 +787,13 @@ fn missing_words(missing: &Value) -> Vec<&'static str> {
 
 /// One line on the Resend connection, and its facts.
 fn connection_line(connection: &Value) -> (String, Value) {
-    if connection.get("connected").and_then(Value::as_bool) != Some(true) {
+    let Some(connected) = connection.get("connected").and_then(Value::as_bool) else {
+        return (
+            format!("Resend connection status: {NOT_ANSWERED}."),
+            json!({"connected":null,"connect_url":CONNECT_URL}),
+        );
+    };
+    if !connected {
         return (
             format!("Resend isn't connected yet: the team connects its own Resend key in the studio ({CONNECT_URL}). An agent never takes the key, which would stay in this chat. Drafts and previews work before then."),
             json!({"connected": false, "connect_url": CONNECT_URL}),
@@ -788,21 +802,27 @@ fn connection_line(connection: &Value) -> (String, Value) {
     let last4 = connection
         .pointer("/key/last4")
         .and_then(Value::as_str)
-        .unwrap_or("????");
-    let ready = connection.get("ready").and_then(Value::as_bool) == Some(true);
-    let missing = connection.get("missing").cloned().unwrap_or(json!([]));
-    let sender = connection.get("sender").cloned().unwrap_or(Value::Null);
-    let line = if ready {
-        let from = match (text(&sender, "fromName"), text(&sender, "fromEmail")) {
+        .filter(|s| s.len() == 4 && s.is_ascii());
+    let label = last4.map_or_else(
+        || "Resend is connected".to_string(),
+        |suffix| format!("Resend is connected (key ending {suffix})"),
+    );
+    let ready = connection.get("ready").and_then(Value::as_bool);
+    let missing = &connection["missing"];
+    let sender = &connection["sender"];
+    let line = if ready == Some(true) {
+        let from = match (text(sender, "fromName"), text(sender, "fromEmail")) {
             (Some(name), Some(email)) => format!(", sending as {name} <{email}>"),
             (None, Some(email)) => format!(", sending as {email}"),
             _ => String::new(),
         };
-        format!("Resend is connected (key ending {last4}){from}.")
+        format!("{label}{from}.")
+    } else if ready.is_none() {
+        format!("{label}. Send readiness: {NOT_ANSWERED}.")
     } else {
-        let words = missing_words(&missing);
+        let words = missing_words(missing);
         format!(
-            "Resend is connected (key ending {last4}), but campaigns can't be sent until the studio has {}: {CONNECT_URL}.",
+            "{label}, but campaigns can't be sent until the studio has {}: {CONNECT_URL}.",
             if words.is_empty() {
                 "its settings finished".to_string()
             } else {
@@ -983,6 +1003,7 @@ impl StudioTool {
             )
             .await
             .map_err(unreachable)
+            .and_then(checked_email_answer)
     }
 
     /// Sends `body`. When Create answers that it does not know one of `newer` (fields a
@@ -1147,8 +1168,7 @@ impl StudioTool {
             .await
             .ok()
             .filter(StudioAnswer::is_success)
-            .and_then(|answer| answer.data.as_array().cloned())
-            .unwrap_or_default();
+            .and_then(|answer| answer.data.as_array().cloned());
 
         let mut lines = Vec::new();
         let mut structured = json!({"workspace_id": workspace_id});
@@ -1157,7 +1177,14 @@ impl StudioTool {
             lines.push(line);
             structured["connection"] = facts;
         }
-        let list = audiences.data.as_array().cloned().unwrap_or_default();
+        let Some(list) = audiences.data.as_array() else {
+            return Ok(ToolResult::error(
+                "Audience list not answered. Try email_audiences again.",
+            ));
+        };
+        if segments.is_none() {
+            lines.push("Segments not answered.".into());
+        }
         if list.is_empty() {
             lines.push(
                 "No audiences as of now: email_audiences with operation create makes one (name and purpose), then email_contacts adds people or imports a CSV."
@@ -1171,7 +1198,7 @@ impl StudioTool {
             ));
         }
         let mut listed = Vec::new();
-        for audience in &list {
+        for audience in list {
             let id = text(audience, "id").unwrap_or_default();
             let name = text(audience, "name").unwrap_or_else(|| "An audience".to_string());
             let contacts = number(audience, "contacts");
@@ -1190,14 +1217,15 @@ impl StudioTool {
             let mut own = Vec::new();
             for segment in segments
                 .iter()
+                .flatten()
                 .filter(|s| text(s, "audienceId").as_deref() == Some(id.as_str()))
             {
                 let segment_id = text(segment, "id").unwrap_or_default();
                 let segment_name = text(segment, "name").unwrap_or_else(|| "A segment".to_string());
-                let reach = count(segment, "/contacts");
+                let reach = number(segment, "contacts");
                 lines.push(format!(
                     "  - segment {segment_name}: {} contacts (segment_id {segment_id})",
-                    credits(reach)
+                    said(reach)
                 ));
                 own.push(
                     json!({"segment_id": segment_id, "name": segment_name, "contacts": reach}),
@@ -1211,7 +1239,7 @@ impl StudioTool {
                 "contacts": contacts,
                 "subscribed": subscribed,
                 "suppressed": suppressed,
-                "segments": own,
+                "segments": segments.as_ref().map(|_| own),
             }));
         }
         structured["audiences"] = json!(listed);

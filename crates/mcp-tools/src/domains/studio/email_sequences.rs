@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::api::{unreachable, CALL_TIMEOUT};
-use super::email::{holds_resend_key, KEY_REFUSED, SIGN_IN};
+use super::email::{checked_email_answer, holds_resend_key, KEY_REFUSED, SIGN_IN};
 use super::words::credits;
 use super::{parse_id, StudioInput, StudioTool};
 
@@ -375,6 +375,7 @@ impl StudioTool {
             .studio_call("GET", path, None, None, CALL_TIMEOUT)
             .await
             .map_err(unreachable)
+            .and_then(checked_email_answer)
     }
 
     fn sequences_refused(answer: &StudioAnswer, missing: &str) -> Result<ToolResult> {

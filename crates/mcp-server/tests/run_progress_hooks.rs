@@ -7,6 +7,10 @@
 //!   sentence, and its keep-alive process leaves.
 //! - Two sessions on one machine have a keep-alive each and never report for
 //!   one another.
+//! - A session that works and never reports is shown all the same: once it
+//!   has worked a while with no run, the hooks open the session's own, with
+//!   its agent and the project `init` resolved, and end it with the session.
+//!   A session whose model reports keeps its own run and title.
 //! - As shipped (`CONTEXTSTREAM_RUN_PROGRESS_AUTO` unset, or `off`), and with
 //!   `CONTEXTSTREAM_RUN_PROGRESS=off`, nothing is sent and nothing is written.
 //!
@@ -305,6 +309,32 @@ impl Sandbox {
                 "project_id": PROJECT,
                 "run_progress": {"session": session.server_session, "agent": session.agent()},
             }),
+        );
+    }
+
+    /// `init` answered as a current server does: who the session is, and the
+    /// workspace and project it works in.
+    fn init_in(&self, session: &Session, project_name: &str) {
+        self.tool_result(
+            session,
+            "init",
+            json!({"folder_path": self.repo}),
+            json!({
+                "session_id": "99999999-9999-4999-8999-999999999999",
+                "workspace_id": WORKSPACE,
+                "project_id": PROJECT,
+                "project": {"id": PROJECT, "name": project_name},
+                "run_progress": {"session": session.server_session, "agent": session.agent()},
+            }),
+        );
+    }
+
+    /// A tool call of the session's own work starts.
+    fn works(&self, session: &Session, tool: &str) {
+        self.hook(
+            session,
+            "pre-tool-use",
+            json!({"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": {"file_path": "/tmp/x"}}),
         );
     }
 
@@ -1167,6 +1197,217 @@ fn a_local_servers_words_are_enough_for_signs_of_life() {
         assert_eq!(
             report.body,
             json!({"workspace_id": WORKSPACE, "run_id": run_id, "agent": session.agent()})
+        );
+    }
+}
+
+/// How long a session works with no run before the hooks open its own; the
+/// tests that watch it start set none.
+const SESSION_AFTER: &str = "CONTEXTSTREAM_RUN_PROGRESS_SESSION_AFTER_SECS";
+
+fn session_key(session: &Session) -> String {
+    format!("{}:session", session.server_session)
+}
+
+#[test]
+fn a_session_that_never_reports_is_shown_with_its_agent_and_project() {
+    let api = FakeApi::start();
+    let sandbox = Sandbox::new(&api, &[(SESSION_AFTER, "0")]);
+    let session = Session::new("host-session-a", SESSION_A);
+    let key = session_key(&session);
+
+    sandbox.init_in(&session, "platform-api");
+    // ContextStream's own calls are bookkeeping, not the work.
+    sandbox.works(&session, "mcp__contextstream__context");
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        api.reports().is_empty(),
+        "knowing who the session is sends nothing"
+    );
+
+    // The session works, and its model says nothing: the session's own run
+    // starts, under the key and the agent the `progress` tool would use.
+    sandbox.works(&session, "Read");
+    let started = api
+        .wait_for(SOON, |body| {
+            is_for(body, &key) && body["status"] == "working"
+        })
+        .expect("a session at work with no run gets its own");
+    assert_eq!(started.body["agent"], session.agent());
+    assert_eq!(started.body["group_id"], session.agent()["id"]);
+    assert_eq!(started.body["workspace_id"], WORKSPACE);
+    assert_eq!(started.body["project_id"], PROJECT);
+    assert_eq!(started.body["title"], "Working in platform-api");
+    assert!(started.body.get("ticket_id").is_none());
+    assert!(started.body.get("step").is_none());
+
+    // The kind of work, in fixed words, from the first tool call on.
+    let step = api
+        .wait_for(SOON, |body| {
+            is_for(body, &key) && body.get("step").is_some()
+        })
+        .expect("the kind of work is said");
+    assert_eq!(
+        step.body["step"],
+        json!({"label": "Reading files", "kind": "read", "status": "started"})
+    );
+
+    // It works on without a word (one long tool call): the run is kept alive.
+    std::thread::sleep(Duration::from_secs(6));
+    let beats = api
+        .reports()
+        .into_iter()
+        .filter(|report| is_for(&report.body, &key) && is_heartbeat(&report.body))
+        .count();
+    assert!(beats >= 2, "{beats} heartbeats in six seconds");
+    assert_eq!(
+        api.reports()
+            .iter()
+            .filter(|report| report.body["status"] == "working")
+            .count(),
+        1,
+        "the run starts once"
+    );
+
+    // The turn ends: the run waits on a person. The session ends: so does it.
+    sandbox.hook(&session, "stop", json!({"hook_event_name": "Stop"}));
+    api.wait_for(SOON, |body| {
+        is_for(body, &key) && body["status"] == "waiting_input"
+    })
+    .expect("the session's run waits when the turn ends");
+    sandbox.hook(
+        &session,
+        "session-end",
+        json!({"hook_event_name": "SessionEnd", "reason": "other"}),
+    );
+    let ended = api
+        .wait_for(SOON, |body| {
+            is_for(body, &key) && body["status"] == "stopped"
+        })
+        .expect("the session's run ends with the session");
+    assert_eq!(
+        ended.body["summary"],
+        "The session ended without a final report."
+    );
+}
+
+#[test]
+fn a_dead_session_that_never_reported_does_not_linger() {
+    let api = FakeApi::start();
+    let sandbox = Sandbox::new(&api, &[(SESSION_AFTER, "0")]);
+    let mut session = Session::new("host-session-a", SESSION_A);
+    let key = session_key(&session);
+
+    sandbox.init_in(&session, "platform-api");
+    sandbox.works(&session, "Bash");
+    api.wait_for(SOON, |body| {
+        is_for(body, &key) && body["status"] == "working"
+    })
+    .expect("the session's own run starts");
+    let keep_alive = sandbox
+        .keep_alive_pid(&session)
+        .expect("the session has a keep-alive");
+
+    // The process dies without a word: the run ends by a fixed sentence.
+    let died = session.die();
+    let ended = api
+        .wait_for(LEAVES_WITHIN, |body| {
+            is_for(body, &key) && body["status"] == "stopped"
+        })
+        .expect("a dead session's run ends");
+    assert_eq!(
+        ended.body["summary"],
+        "The session's process ended without a final report."
+    );
+    assert!(ended.at.duration_since(died) < LEAVES_WITHIN);
+    assert!(wait_until_gone(keep_alive, LEAVES_WITHIN));
+}
+
+#[test]
+fn a_session_at_work_for_a_moment_is_left_to_report_itself() {
+    // As installed: two minutes of work before the hooks speak for a session.
+    let api = FakeApi::start();
+    let sandbox = Sandbox::new(&api, &[]);
+    let session = Session::new("host-session-a", SESSION_A);
+
+    sandbox.init_in(&session, "platform-api");
+    sandbox.works(&session, "Read");
+    sandbox.works(&session, "Bash");
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        api.reports().is_empty(),
+        "{} reports were sent",
+        api.reports().len()
+    );
+}
+
+#[test]
+fn a_session_whose_model_reports_keeps_its_own_run_and_title() {
+    let api = FakeApi::start();
+    let sandbox = Sandbox::new(&api, &[(SESSION_AFTER, "0")]);
+    let session = Session::new("host-session-a", SESSION_A);
+    let key = session_key(&session);
+    let run_id = "44444444-4444-4444-8444-444444444444";
+
+    sandbox.init_in(&session, "platform-api");
+    // The model reports first, as the rules ask: a title and a step of its own.
+    sandbox.tool_result(
+        &session,
+        "progress",
+        json!({"title": "Fix the flaky login test", "step": "Reading the test"}),
+        json!({
+            "run": {
+                "run_id": run_id,
+                "workspace_id": WORKSPACE,
+                "project_id": PROJECT,
+                "state": "working",
+                "agent": session.agent(),
+            },
+            "session": SESSION_A,
+            "run_key": key,
+        }),
+    );
+    sandbox.works(&session, "Read");
+    sandbox.works(&session, "Bash");
+    std::thread::sleep(Duration::from_secs(5));
+
+    // The hooks keep that run alive and say nothing of their own about it.
+    let reports = api.reports();
+    assert!(!reports.is_empty(), "the model's run is kept alive");
+    for report in &reports {
+        assert_eq!(report.body["run_id"], run_id);
+        assert!(is_heartbeat(&report.body), "{}", report.body);
+        assert!(report.body.get("title").is_none());
+    }
+}
+
+#[test]
+fn no_session_run_as_shipped_or_with_signs_of_life_alone() {
+    for env in [
+        vec![
+            ("CONTEXTSTREAM_RUN_PROGRESS_AUTO", UNSET),
+            (SESSION_AFTER, "0"),
+        ],
+        vec![
+            ("CONTEXTSTREAM_RUN_PROGRESS_AUTO", UNSET),
+            ("CONTEXTSTREAM_RUN_PROGRESS_SIGNS", "on"),
+            (SESSION_AFTER, "0"),
+        ],
+        vec![("CONTEXTSTREAM_RUN_PROGRESS", "off"), (SESSION_AFTER, "0")],
+    ] {
+        let api = FakeApi::start();
+        let sandbox = Sandbox::new(&api, &env);
+        let session = Session::new("host-session-a", SESSION_A);
+
+        sandbox.init_in(&session, "platform-api");
+        sandbox.works(&session, "Read");
+        sandbox.works(&session, "Bash");
+        sandbox.hook(&session, "stop", json!({"hook_event_name": "Stop"}));
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            api.reports().is_empty(),
+            "{env:?}: {} reports were sent",
+            api.reports().len()
         );
     }
 }

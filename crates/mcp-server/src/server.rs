@@ -3412,10 +3412,9 @@ mod tests {
             "5f7a6c7923d67648079eeb3b5b70f0863b97f533821b66528a30729de4b6cafc",
         ),
         (
-            // #335 review: `studio.email_contact_erase` (with `email`) joined
-            // the irreversible actions.
+            // The delete surface includes contact, audience, segment and template erasure.
             "delete",
-            "7428355e4acf40066e4bf878df9237967a360febfd007ab24abf2a442fdfdfdd",
+            "0d1dfd3a54dd5ab1205539a3034e80234901de27eb2de41e04585325a4215782",
         ),
         (
             // Advanced for tickets 2c0e695e and 9e5c9232: `target_project`

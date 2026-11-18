@@ -68,7 +68,7 @@ fn api_url() -> String {
 
 /// Start device login flow.
 pub async fn start_device_login() -> Result<DeviceLoginResponse> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let url = format!("{}/api/v1/auth/device/start", api_url());
 
     let response = client
@@ -95,7 +95,7 @@ pub async fn start_device_login() -> Result<DeviceLoginResponse> {
 
 /// Poll for device login completion.
 pub async fn poll_device_login(device_code: &str, interval: u64) -> Result<TokenResponse> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let url = format!("{}/api/v1/auth/device/token", api_url());
     let mut poll_interval = Duration::from_secs(interval);
 
@@ -175,7 +175,7 @@ pub enum DevicePollOutcome {
 
 /// Poll the device-login endpoint exactly once.
 pub async fn poll_device_login_once(device_code: &str) -> Result<DevicePollOutcome> {
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(Duration::from_secs(20))
         .build()?;
     let url = format!("{}/api/v1/auth/device/token", api_url());
@@ -335,7 +335,7 @@ pub struct SignupCompleteResponse {
 }
 
 fn signup_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    Ok(crate::http::client_builder()
         .timeout(Duration::from_secs(25))
         .build()?)
 }

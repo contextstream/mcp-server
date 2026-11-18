@@ -28,6 +28,7 @@ pub mod frames;
 pub mod harness_readiness;
 pub mod harness_remote;
 pub mod hosted_tools;
+pub mod http;
 pub mod ingest_guard;
 pub mod json;
 pub mod parity;

@@ -329,7 +329,7 @@ pub async fn connect(
     http_url
         .set_scheme(scheme)
         .map_err(|_| ExchangeError::Protocol("the stream address cannot be used".to_string()))?;
-    let http = reqwest::Client::builder()
+    let http = crate::http::client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .http1_only()
         .connect_timeout(CONNECT_TIMEOUT)

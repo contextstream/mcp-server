@@ -1176,7 +1176,7 @@ pub(crate) struct HttpRegistry {
 
 impl HttpRegistry {
     pub(crate) fn new() -> Self {
-        let client = reqwest::Client::builder()
+        let client = mcp_client::http::client_builder()
             .timeout(Duration::from_millis(3_000))
             .user_agent("contextstream-package-bouncer (https://contextstream.io)")
             .build()

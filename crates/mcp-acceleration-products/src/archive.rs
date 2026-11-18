@@ -22,10 +22,10 @@ pub struct ContextStreamArchiveProvider {
 
 impl ContextStreamArchiveProvider {
     pub fn new(acceleration_api_url: String, job_api_token: String) -> Self {
-        let client = reqwest::Client::builder()
+        let client = mcp_client::http::client_builder()
             .timeout(DEFAULT_TIMEOUT)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| mcp_client::http::client());
         Self {
             client,
             acceleration_api_url: normalize_acceleration_api_url(&acceleration_api_url),

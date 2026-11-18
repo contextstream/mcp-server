@@ -6067,7 +6067,7 @@ pub async fn report_setup_telemetry(
     }
     const MCP_HEALTH_URL: &str = "https://mcp.contextstream.io/health";
 
-    let http = match reqwest::Client::builder()
+    let http = match mcp_client::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {

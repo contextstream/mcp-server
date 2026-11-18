@@ -1882,7 +1882,7 @@ async fn check_version_manifest() {
     const LATEST_VERSION_URL: &str =
         "https://pub-68429b9f7857416c9484b75bf1887b96.r2.dev/mcp/latest/version.json";
 
-    let client = match reqwest::Client::builder()
+    let client = match mcp_client::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {

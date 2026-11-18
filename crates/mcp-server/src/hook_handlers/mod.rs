@@ -560,11 +560,15 @@ fn build_api_http_client() -> reqwest::Client {
     let fallback = format!("contextstream-mcp-rust/{}", VERSION);
     let user_agent = configured.unwrap_or_else(|| fallback.clone());
 
-    reqwest::Client::builder()
+    mcp_client::http::client_builder()
         .user_agent(&user_agent)
         .build()
-        .or_else(|_| reqwest::Client::builder().user_agent(fallback).build())
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .or_else(|_| {
+            mcp_client::http::client_builder()
+                .user_agent(fallback)
+                .build()
+        })
+        .unwrap_or_else(|_| mcp_client::http::client())
 }
 
 /// Legacy hooks from older ContextStream installs that should be ignored safely.

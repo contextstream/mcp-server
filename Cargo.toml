@@ -22,12 +22,12 @@ publish = false
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
 
-# HTTP client. Two sets of trusted roots: the ones bundled into the binary
-# ("rustls-tls"), so a container with no certificate store still connects, and
-# the machine's own ("rustls-tls-native-roots": its store, or SSL_CERT_FILE and
-# SSL_CERT_DIR), so a TLS-inspecting proxy's authority is trusted where the
-# machine trusts it.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "gzip"] }
+# HTTP client, with the roots bundled into the binary ("rustls-tls"), so a
+# container with no certificate store still connects. The machine's own roots
+# (its store, or SSL_CERT_FILE and SSL_CERT_DIR) are added in
+# crates/mcp-client/src/http.rs, where every client is made: reqwest's
+# "rustls-tls-native-roots" would fail the client on a store it cannot use.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

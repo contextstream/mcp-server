@@ -452,7 +452,7 @@ async fn redeem_token(token: &str) -> Result<SetupProfilePayload> {
         "existing_credentials": read_saved_credentials()?.api_key.is_some(),
     });
 
-    let client = reqwest::Client::builder()
+    let client = mcp_client::http::client_builder()
         .timeout(REDEEM_TIMEOUT)
         .build()
         .context("building HTTP client")?;
@@ -710,7 +710,7 @@ async fn revoke_minted_key(payload: &SetupProfilePayload, authed_key: &str, api_
         api_url.trim_end_matches('/'),
         payload.api_key.id
     );
-    let client = match reqwest::Client::builder()
+    let client = match mcp_client::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {

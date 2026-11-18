@@ -2687,7 +2687,7 @@ async fn run_about() {
     println!();
     println!("  {}", style("Connectivity").bold());
 
-    let client = reqwest::Client::builder()
+    let client = mcp_client::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap();
@@ -3545,7 +3545,7 @@ async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
     // Fetch latest version manifest
     update_step("Version check");
     update_detail("Fetching latest release metadata");
-    let client = reqwest::Client::builder()
+    let client = mcp_client::http::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 

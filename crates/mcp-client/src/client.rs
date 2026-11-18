@@ -4072,7 +4072,7 @@ impl ContextStreamClient {
 
     /// Create a new client with the given configuration.
     pub fn new(config: Config) -> Self {
-        let http = Client::builder()
+        let http = crate::http::client_builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .pool_max_idle_per_host(10)
@@ -18111,7 +18111,7 @@ impl ContextStreamClient {
             // Step 2: Upload file to presigned URL
             let file_content = std::fs::read(file_path)?;
 
-            let upload_client = reqwest::Client::new();
+            let upload_client = crate::http::client();
             let mut upload_request = upload_client.put(upload_url);
             for (name, value) in upload_headers {
                 if let Some(value) = value.as_str() {
@@ -24134,7 +24134,7 @@ mod api_forwarder_secret_tests {
     #[test]
     fn without_the_variable_no_header_is_added() {
         // The test process does not set CONTEXTSTREAM_API_FORWARDER_SECRET.
-        let request = with_api_forwarder_header(reqwest::Client::new().get("http://127.0.0.1:9/x"))
+        let request = with_api_forwarder_header(crate::http::client().get("http://127.0.0.1:9/x"))
             .build()
             .unwrap();
         assert!(request.headers().get(API_FORWARDER_SECRET_HEADER).is_none());

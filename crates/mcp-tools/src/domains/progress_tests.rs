@@ -121,7 +121,7 @@ fn progress_requests(api: &Api) -> Vec<Seen> {
 #[should_panic(expected = "unexpected delivery write")]
 async fn review10_progress_request_checks_reject_delivery_writes() {
     let api = Api::start(vec![]).await;
-    reqwest::Client::new()
+    mcp_client::http::client()
         .post(format!(
             "{}/api/v1/decision-requests/deliveries/{}/claim",
             api.base_url,

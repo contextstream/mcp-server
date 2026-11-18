@@ -10,6 +10,10 @@ publish.workspace = true
 [dependencies]
 mcp-types = { workspace = true }
 reqwest = { workspace = true }
+# The certificate authorities the machine trusts, read and checked in src/http.rs
+# (see there why reqwest does not read them itself). Both are in the tree through reqwest.
+rustls-native-certs = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

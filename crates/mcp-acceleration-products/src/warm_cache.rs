@@ -42,10 +42,10 @@ impl ContextStreamWarmCacheProvider {
 }
 
 fn build_timeout_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
+    mcp_client::http::client_builder()
         .timeout(timeout)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .unwrap_or_else(|_| mcp_client::http::client())
 }
 
 #[derive(Debug, Serialize)]

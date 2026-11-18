@@ -200,8 +200,9 @@ fn is_program(file: &Path) -> bool {
     file.is_file()
 }
 
-/// What `<program> --version` printed: its first non-empty line (standard
-/// output, else standard error), cleaned by [`redact`]. `None` when it is not
+/// What `<program> --version` printed: its first non-empty line, or past a
+/// banner the first with a number in it (standard output, else standard
+/// error; see [`first_line`]), cleaned by [`redact`]. `None` when it is not
 /// there, fails, prints nothing, is nothing but paths or is not done in `limit`.
 async fn version_of(
     program: &OsStr,
@@ -246,13 +247,27 @@ async fn read_some(mut pipe: impl AsyncRead + Unpin) -> Vec<u8> {
     kept
 }
 
-/// The first line of `output` that is not blank, trimmed.
+/// The line of `output` that says a version, trimmed: the first line that is
+/// not blank, or, when that one holds no digit, the first of the eight after
+/// it that does. Gradle starts with a rule of dashes and names itself on the
+/// next line; every other tool asked says it on its first.
 pub fn first_line(output: &[u8]) -> Option<String> {
-    String::from_utf8_lossy(output)
+    let text = String::from_utf8_lossy(output);
+    let mut lines = text
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
+        .filter(|line| !line.is_empty())
+        .take(9);
+    let first = lines.next()?;
+    if first.bytes().any(|b| b.is_ascii_digit()) {
+        return Some(first.to_string());
+    }
+    Some(
+        lines
+            .find(|line| line.bytes().any(|b| b.is_ascii_digit()))
+            .unwrap_or(first)
+            .to_string(),
+    )
 }
 
 /// A tool's line as it may be sent: every word that looks like a path is left

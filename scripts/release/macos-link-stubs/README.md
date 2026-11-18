@@ -14,11 +14,12 @@ The stubs (`.tbd`) are written for this repository; they are not copied from App
 - the library's install name and versions, exactly as a binary built on a Mac records them (`otool -L`);
 - the symbols the server imports from that library (`nm -m -u` on a binary built on a Mac).
 
-`Security` is the exception. The server links it since 1.0.83, to read the certificate authorities the Mac trusts
-from the keychain, and no binary of ours was built on a Mac with it. Its stub names the four functions the server
-calls (the link's own list of undefined symbols), the framework's install name and its compatibility version, 1. Its
-current version is the one of macOS 14.0, the SDK version `build.sh` declares, not one read with `otool -L`; macOS
-does not compare the current version when it loads a framework.
+`Security` was added for 1.0.83: the server reads the certificate authorities the Mac trusts from the keychain. No
+binary of ours was built on a Mac with it, so its stub was not written from one. It names the four functions the
+server calls (the link's own list of undefined symbols), and the install name and versions of the macOS 27.0 SDK's
+`Security.tbd`, read on a Mac with Xcode 27.0: current version 62460.1.2, and no compatibility version, which means 1
+(`otool -L` of a system binary shows 1.0.0). That is the SDK whose CoreFoundation, CoreServices and
+SystemConfiguration versions the other stubs carry.
 
 At run time macOS loads the real system framework, as it does for a binary linked on a Mac.
 `scripts/release/mcp_release.py macho-check` verifies every darwin build before it can be published: the exact

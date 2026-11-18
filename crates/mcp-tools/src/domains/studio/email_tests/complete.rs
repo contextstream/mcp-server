@@ -3759,6 +3759,36 @@ async fn template_update_says_plainly_when_the_api_leaves_a_field_unchanged() {
     assert!(text_of(&unchanged_set)
         .contains("the description was not changed: this API did not take it"));
 
+    // When name is ignored by the API but description IS updated, never label the new description "Still".
+    let name_ignored_stub = Stub::start(over(move |request| {
+        let one = format!("/create/email/templates/{TEMPLATE}");
+        (request.method == "PATCH" && request.path == one).then(|| {
+            let mut row = template(TEMPLATE, "Sale layout", false);
+            row["description"] = request
+                .body
+                .get("description")
+                .cloned()
+                .unwrap_or(Value::Null);
+            Answer::ok(row)
+        })
+    }))
+    .await;
+    let name_ignored = run(
+        &name_ignored_stub,
+        json!({
+            "action": "email_templates", "operation": "update",
+            "template_id": TEMPLATE, "name": "Ignored name", "description": "Fresh description",
+        }),
+    )
+    .await;
+    let text = text_of(&name_ignored);
+    assert!(!name_ignored.is_error, "{text}");
+    assert!(
+        text.contains("the name was not changed: this API did not take it"),
+        "{text}"
+    );
+    assert!(!text.contains("Still “Fresh description”"), "{text}");
+
     clears_null.store(true, std::sync::atomic::Ordering::Relaxed);
     let cleared = run(
         &stub,
@@ -4155,4 +4185,36 @@ async fn email_draft_and_email_test_send_deterministic_idempotency_keys() {
     assert!(test_key.len() <= 200);
     assert_eq!(tests[1].header("idempotency-key"), Some(test_key));
     assert_ne!(tests[2].header("idempotency-key"), Some(test_key));
+
+    // Revising a campaign must rotate email_test's idempotency key so a post-revision test
+    // actually sends instead of replaying the 24-hour cached test from the prior revision.
+    let rev = Arc::new(std::sync::atomic::AtomicI64::new(4));
+    let rev_seen = rev.clone();
+    let rev_stub = Stub::start(over(move |request| {
+        let one = format!("/create/email/campaigns/{CAMPAIGN}");
+        (request.method == "GET" && request.path == one).then(|| {
+            let mut row = campaign("draft");
+            row["revision"] = json!(rev_seen.load(std::sync::atomic::Ordering::Relaxed));
+            Answer::ok(row)
+        })
+    }))
+    .await;
+    let same_test = json!({
+        "action": "email_test",
+        "campaign_id": CAMPAIGN,
+        "to": "delivered@resend.dev",
+    });
+    run(&rev_stub, same_test.clone()).await;
+    run(&rev_stub, same_test.clone()).await;
+    rev.store(5, std::sync::atomic::Ordering::Relaxed);
+    run(&rev_stub, same_test).await;
+    let rev_tests = rev_stub.calls_to("POST", &format!("/create/email/campaigns/{CAMPAIGN}/test"));
+    assert_eq!(rev_tests.len(), 3);
+    let r4_key = rev_tests[0].header("idempotency-key").expect("r4 key");
+    let r4_retry = rev_tests[1].header("idempotency-key").expect("r4 retry");
+    let r5_key = rev_tests[2].header("idempotency-key").expect("r5 key");
+    assert!(r4_key.contains("-r4-"), "{r4_key}");
+    assert_eq!(r4_key, r4_retry);
+    assert!(r5_key.contains("-r5-"), "{r5_key}");
+    assert_ne!(r4_key, r5_key);
 }

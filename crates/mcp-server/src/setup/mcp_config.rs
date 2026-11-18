@@ -2064,7 +2064,7 @@ fn repair_deleted_binary_path_in_codex_toml(path: &Path) -> Result<bool> {
     *command_item = replacement;
 
     let output = render_codex_toml(&document, &content)?;
-    safe_edit::write_if_unchanged(path, &output, Some(&content))?;
+    safe_edit::write_private_text(path, &output, Some(&content), true)?;
     Ok(true)
 }
 
@@ -3269,7 +3269,7 @@ fn write_codex_config(
         };
         parse_codex_toml(&new_block, &path)
             .context("Internal error: generated Codex configuration is invalid")?;
-        safe_edit::write_if_unchanged(&path, &new_block, None)?;
+        safe_edit::write_private_text(&path, &new_block, None, true)?;
         return Ok(());
     }
 
@@ -3318,7 +3318,7 @@ fn write_codex_config(
     };
 
     let result = upsert_contextstream_toml(existing, &new_block, &path)?;
-    safe_edit::write_if_unchanged(&path, &result, Some(&raw_existing))?;
+    safe_edit::write_private_text(&path, &result, Some(&raw_existing), true)?;
     Ok(())
 }
 
@@ -3349,11 +3349,7 @@ pub fn ensure_codex_project_trust(project_path: &std::path::Path) -> Result<()> 
         return Ok(());
     }
 
-    if wholly_managed {
-        safe_edit::write_owned_file_if_unchanged(&config_path, &updated, Some(&content))?;
-    } else {
-        safe_edit::write_if_unchanged(&config_path, &updated, Some(&content))?;
-    }
+    safe_edit::write_private_text(&config_path, &updated, Some(&content), !wholly_managed)?;
     Ok(())
 }
 
@@ -4285,7 +4281,7 @@ fn write_project_mcp_config_with_transport_mode(
 
     insert_contextstream_server(&mut config, server_path, server)?;
 
-    if carries_key {
+    if carries_key || contains_auth_field(&config) || contains_auth_field(&loaded.value) {
         safe_edit::commit(&mcp_path, &loaded, &config)?;
         keep_secret_config_out_of_git(project_path, &mcp_path);
     } else {
@@ -4294,6 +4290,26 @@ fn write_project_mcp_config_with_transport_mode(
     record_configured_evidence(editor);
 
     Ok(())
+}
+
+/// Preserved credentials may belong to another server or an earlier setup.
+fn contains_auth_field(value: &Value) -> bool {
+    match value {
+        Value::Object(entries) => entries.iter().any(|(key, value)| {
+            let key = key.to_ascii_lowercase().replace('-', "_");
+            ((key == "authorization"
+                || key.ends_with("api_key")
+                || key.ends_with("token")
+                || key.ends_with("password")
+                || key.ends_with("secret"))
+                && value.as_str().is_some_and(|v| {
+                    !v.is_empty() && !v.starts_with("${") && !v.starts_with("{env:")
+                }))
+                || contains_auth_field(value)
+        }),
+        Value::Array(entries) => entries.iter().any(contains_auth_field),
+        _ => false,
+    }
 }
 
 fn refresh_json_entry_headers_api_key(entry: &mut Value, api_key: &str) -> bool {
@@ -4435,7 +4451,7 @@ fn refresh_codex_toml_file_embedded_api_key(path: &Path, api_key: &str) -> Resul
         return Ok(false);
     }
     let updated = document.to_string();
-    safe_edit::write_if_unchanged(path, &updated, Some(&raw_existing))
+    safe_edit::write_private_text(path, &updated, Some(&raw_existing), true)
 }
 
 /// Surgically refresh embedded ContextStream API keys in existing global and
@@ -4857,7 +4873,7 @@ fn remove_contextstream_from_codex_toml(path: &Path) -> Result<()> {
             safe_edit::remove_owned_file_if_unchanged(&backup_path, &backup_content)?;
         }
     } else {
-        safe_edit::write_if_unchanged(path, &output, Some(&content))?;
+        safe_edit::write_private_text(path, &output, Some(&content), true)?;
     }
 
     Ok(())
@@ -6985,7 +7001,10 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
             use std::os::unix::fs::PermissionsExt;
             let path = temp.path().join(".mcp.json");
             for file in [path.clone(), safe_edit::backup_path(&path).unwrap()] {
-                assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+                assert_eq!(
+                    std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
             }
         }
         let config_path = temp.path().join(".mcp.json");
@@ -8250,7 +8269,10 @@ CONTEXTSTREAM_API_KEY = "test-key"
             use std::os::unix::fs::PermissionsExt;
             let path = temp.path().join(".gemini/config/mcp_config.json");
             for file in [path.clone(), safe_edit::backup_path(&path).unwrap()] {
-                assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+                assert_eq!(
+                    std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
             }
         }
         let ag_path = temp

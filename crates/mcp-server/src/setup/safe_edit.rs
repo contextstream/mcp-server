@@ -243,7 +243,7 @@ pub fn commit_with_removals(
     removed_keys: &[&str],
 ) -> Result<bool> {
     let content = render_with_removals(loaded, updated, removed_keys)?;
-    write_if_changed_from_snapshot(path, &content, loaded)
+    write_if_changed_from_snapshot_with_options(path, &content, loaded, true, true)
 }
 
 /// Render a complete updated document using the same surgical splice logic as
@@ -561,7 +561,7 @@ fn remove_file_if_unchanged_bytes(path: &Path, expected: &[u8]) -> Result<bool> 
         return Ok(true);
     }
 
-    let backup_created = create_backup_if_absent(path, expected)?;
+    let backup_created = create_backup_if_absent(path, expected, true)?;
 
     let current = match std::fs::read(path)
         .with_context(|| format!("Could not re-read {} before deleting it", path.display()))
@@ -675,48 +675,102 @@ thread_local! {
     // The errno every chmod of a staged file fails with on this test thread:
     // a mount that maps all users to one owner, without needing a real one.
     static TEST_CHMOD_REFUSAL: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    #[cfg(unix)]
+    static TEST_MAPPED_CREATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // What was said about a refused chmod on this test thread.
     static TEST_CHMOD_WARNINGS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn chmod(path: &Path, permissions: std::fs::Permissions) -> std::io::Result<()> {
+fn chmod(file: &File, permissions: std::fs::Permissions) -> std::io::Result<()> {
     #[cfg(test)]
     if let Some(errno) = TEST_CHMOD_REFUSAL.get() {
+        #[cfg(unix)]
+        if TEST_MAPPED_CREATION.get() {
+            assert_eq!(
+                file.metadata()?.len(),
+                0,
+                "secret bytes written before permission check"
+            );
+        }
         return Err(std::io::Error::from_raw_os_error(errno));
     }
-    std::fs::set_permissions(path, permissions)
+    file.set_permissions(permissions)
 }
 
-/// Give a staged file the permissions it must have before it is renamed into
-/// place.
-///
-/// A mount that maps every user to one owner (virtiofs, 9p, a Windows drive
-/// under WSL, NFS with root_squash) refuses chmod even on a file this process
-/// created a moment ago. A staged file is created with the mode it is meant
-/// to end with, so there the refusal changes nothing: it is said once and the
-/// write goes on. Any other error fails the write, and so does a refusal on a
-/// file whose mode is not the one asked: no file is left more open, or less
-/// usable, than asked without an error.
-fn set_staged_permissions(staged: &Path, wanted: std::fs::Permissions) -> std::io::Result<()> {
-    let Err(error) = chmod(staged, wanted.clone()) else {
-        return Ok(());
-    };
+/// Set permissions on the opened inode before writing its first byte.
+fn set_staged_permissions(
+    file: &File,
+    staged: &Path,
+    wanted: std::fs::Permissions,
+    private: bool,
+) -> std::io::Result<()> {
+    let result = chmod(file, wanted.clone());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let refused = error.raw_os_error().is_some_and(|code| {
-            code == libc::EPERM || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
-        });
-        if refused {
-            let mode = std::fs::metadata(staged)?.permissions().mode() & 0o7777;
-            if mode == wanted.mode() & 0o7777 {
-                warn_chmod_refused(staged, mode);
-                return Ok(());
+        let mode = file.metadata()?.permissions().mode() & 0o7777;
+        match result {
+            Ok(()) if mode == wanted.mode() & 0o7777 => Ok(()),
+            Ok(()) => Err(std::io::Error::other(format!(
+                "file system reported success changing permissions on {}, but mode is {mode:04o}",
+                staged.display()
+            ))),
+            Err(e)
+                if e.raw_os_error().is_some_and(|code| {
+                    code == libc::EPERM || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+                }) && (mode == wanted.mode() & 0o7777 || private) =>
+            {
+                warn_chmod_refused(staged, mode, private && mode != 0o600);
+                Ok(())
             }
+            Err(e) => Err(e),
         }
     }
-    Err(error)
+    #[cfg(not(unix))]
+    {
+        let _ = (staged, private);
+        result
+    }
+}
+
+/// Keep the staging handle open through publication. A renamed sibling must
+/// still refer to the file whose bytes and permissions we prepared.
+fn verify_staged_identity(file: &File, path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        let named = std::fs::symlink_metadata(path)?;
+        if !named.is_file() || (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+            return Err(std::io::Error::other(
+                "staged file changed before publication",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (file, path);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_existing_private(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let file = File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    verify_staged_identity(&file, path)?;
+    let metadata = file.metadata()?;
+    if metadata.mode() & 0o7777 != 0o600 {
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::other(
+                "cannot change permissions on a linked config",
+            ));
+        }
+        set_staged_permissions(&file, path, std::fs::Permissions::from_mode(0o600), true)?;
+    }
+    Ok(())
 }
 
 /// The mode to create a staged file with so that it already has `wanted`:
@@ -736,26 +790,28 @@ fn creation_mode(_wanted: &std::fs::Permissions) -> u32 {
 /// Say once per process that a mount refuses chmod, naming the first
 /// directory it happened in; every file there is handled the same way.
 #[cfg(unix)]
-fn warn_chmod_refused(staged: &Path, mode: u32) {
+fn warn_chmod_refused(staged: &Path, mode: u32, exposed: bool) {
     let directory = staged.parent().unwrap_or(staged);
-    let message = format!(
-        "The file system of {} does not allow changing a file's permissions \
-         (virtiofs, 9p, a Windows drive under WSL and NFS with root_squash do this). \
-         The file was created with mode {mode:03o}, which is the mode asked for, so it is \
-         written as it is. Other files on that file system are handled the same way.",
-        directory.display()
-    );
+    let message = if exposed {
+        format!("Warning: this mount does not let {} be made private. Its permissions are {mode:04o} and the configuration may be readable by other users.", directory.display())
+    } else {
+        format!("The file system of {} refuses permission changes. The file already has the requested permissions {mode:04o}.", directory.display())
+    };
 
     #[cfg(not(test))]
     {
-        static SAID: std::sync::Once = std::sync::Once::new();
-        SAID.call_once(|| tracing::warn!("{message}"));
+        static MATCHED: std::sync::Once = std::sync::Once::new();
+        static EXPOSED: std::sync::Once = std::sync::Once::new();
+        if exposed { &EXPOSED } else { &MATCHED }.call_once(|| eprintln!("{message}"));
     }
 
     #[cfg(test)]
     TEST_CHMOD_WARNINGS.with(|said| {
         let mut said = said.borrow_mut();
-        if said.is_empty() {
+        if !said
+            .iter()
+            .any(|prior| prior.starts_with("Warning:") == exposed)
+        {
             said.push(message);
         }
     });
@@ -781,7 +837,14 @@ fn create_unique_temp_with_mode(path: &Path, initial_mode: u32) -> Result<(PathB
             options.mode(initial_mode);
         }
         match options.open(&candidate) {
-            Ok(file) => return Ok((candidate, file)),
+            Ok(file) => {
+                #[cfg(all(unix, test))]
+                if TEST_MAPPED_CREATION.get() {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+                }
+                return Ok((candidate, file));
+            }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -999,14 +1062,17 @@ pub(crate) fn restore_text_first_backup(
         );
     }
     let backup_permissions = validate_recovery_file(&backup)?
-        .expect("recovery backup was just read")
+        .ok_or_else(|| anyhow::anyhow!("Recovery backup disappeared: {}", backup.display()))?
         .permissions();
+    let private = path
+        .extension()
+        .is_some_and(|ext| ext == "json" || ext == "jsonc" || ext == "toml");
     let changed = write_if_changed_impl_with_permissions(
         path,
         backup_content,
         Some(current_existed.then_some(current_content)),
         true,
-        false,
+        private,
         Some(backup_permissions),
     )?;
     if !changed {
@@ -1034,16 +1100,21 @@ pub(crate) fn restore_text_first_backup(
 
 /// Keep the first pre-ContextStream snapshot. Later refreshes must never
 /// overwrite the only byte-for-byte recovery copy with an intermediate state.
-fn create_backup_if_absent(path: &Path, content: &[u8]) -> Result<bool> {
+fn create_backup_if_absent(path: &Path, content: &[u8], private: bool) -> Result<bool> {
     let backup = backup_path(path)?;
+    let check_existing = || -> Result<()> {
+        #[cfg(unix)]
+        if private {
+            return make_existing_private(&backup).with_context(|| {
+                format!("Could not protect recovery backup {}", backup.display())
+            });
+        }
+        File::open(&backup)
+            .with_context(|| format!("Could not open recovery backup {}", backup.display()))?;
+        Ok(())
+    };
     if validate_recovery_file(&backup)?.is_some() {
-        File::open(&backup).with_context(|| {
-            format!(
-                "Refusing to modify {} because recovery backup {} is unreadable",
-                path.display(),
-                backup.display()
-            )
-        })?;
+        check_existing()?;
         return Ok(false);
     }
 
@@ -1060,28 +1131,28 @@ fn create_backup_if_absent(path: &Path, content: &[u8]) -> Result<bool> {
     // it with an atomic no-replace hard link. Writing directly to the final
     // `.bak` path could leave a truncated-but-trusted recovery file if the
     // process crashed halfway through the copy.
-    // The copy keeps the mode of the file it copies, and is created with it
-    // (see `set_staged_permissions`): it holds nothing that file did not.
-    let permissions = std::fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let (temporary, mut file) =
-        create_unique_temp_with_mode(&backup, permissions.as_ref().map_or(0o600, creation_mode))?;
+    let permissions = std::fs::metadata(path)?.permissions();
+    #[cfg(unix)]
+    let permissions = if private {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(0o600)
+    } else {
+        permissions
+    };
+    let (temporary, mut file) = create_unique_temp_with_mode(&backup, creation_mode(&permissions))?;
     let result = (|| -> Result<()> {
+        set_staged_permissions(&file, &temporary, permissions, private)?;
         file.write_all(content)?;
-        if let Some(permissions) = permissions {
-            set_staged_permissions(&temporary, permissions)?;
-        }
         file.sync_all()?;
         Ok(())
     })();
-    drop(file);
     if let Err(error) = result {
         let _ = std::fs::remove_file(&temporary);
         return Err(error)
             .with_context(|| format!("Could not back up {} before writing", path.display()));
     }
 
+    verify_staged_identity(&file, &temporary)?;
     match std::fs::hard_link(&temporary, &backup) {
         Ok(()) => {
             let _ = std::fs::remove_file(&temporary);
@@ -1096,13 +1167,7 @@ fn create_backup_if_absent(path: &Path, content: &[u8]) -> Result<bool> {
                     backup.display()
                 );
             };
-            File::open(&backup).with_context(|| {
-                format!(
-                    "Refusing to modify {} because recovery backup {} is unreadable",
-                    path.display(),
-                    backup.display()
-                )
-            })?;
+            check_existing()?;
             Ok(false)
         }
         Err(error) => {
@@ -1201,6 +1266,16 @@ pub fn write_if_unchanged(
     write_if_changed_impl(path, content, Some(expected_existing), true)
 }
 
+/// Text configurations such as Codex TOML can contain plaintext credentials.
+pub(crate) fn write_private_text(
+    path: &Path,
+    content: &str,
+    expected: Option<&str>,
+    backup: bool,
+) -> Result<bool> {
+    write_if_changed_impl_with_permissions(path, content, Some(expected), backup, true, None)
+}
+
 /// Write a non-secret rules/project text file whose initial creation mode
 /// should respect the caller's `umask` (`0o666 & !umask`) rather than `0600`.
 /// Existing files preserve their current permissions.
@@ -1283,29 +1358,6 @@ pub(crate) fn write_owned_file_if_unchanged(
 pub(crate) fn write_owned_file_if_changed(path: &Path, content: &str) -> Result<bool> {
     refuse_symlink_deletion(path)?;
     write_if_changed_impl(path, content, None, false)
-}
-
-fn write_if_changed_from_snapshot(
-    path: &Path,
-    content: &str,
-    loaded: &LoadedConfig,
-) -> Result<bool> {
-    write_if_changed_from_snapshot_with_permissions(path, content, loaded, false)
-}
-
-fn write_if_changed_from_snapshot_with_permissions(
-    path: &Path,
-    content: &str,
-    loaded: &LoadedConfig,
-    force_private_permissions: bool,
-) -> Result<bool> {
-    write_if_changed_from_snapshot_with_options(
-        path,
-        content,
-        loaded,
-        force_private_permissions,
-        true,
-    )
 }
 
 fn write_if_changed_from_snapshot_with_options(
@@ -1434,6 +1486,16 @@ fn write_if_changed_impl_full(
     }
 
     if action == ChangeAction::Unchanged {
+        #[cfg(unix)]
+        if force_private_permissions {
+            make_existing_private(path)?;
+            if create_backup {
+                let backup = backup_path(path)?;
+                if validate_recovery_file(&backup)?.is_some() {
+                    make_existing_private(&backup)?;
+                }
+            }
+        }
         return Ok(false);
     }
 
@@ -1481,10 +1543,10 @@ fn write_if_changed_impl_full(
     };
     let (tmp, mut file) = create_unique_temp_with_mode(path, initial_temp_mode)?;
     let prepare_result = (|| -> Result<()> {
-        file.write_all(content.as_bytes())?;
         if let Some(permissions) = wanted_permissions {
-            set_staged_permissions(&tmp, permissions)?;
+            set_staged_permissions(&file, &tmp, permissions, force_private_permissions)?;
         }
+        file.write_all(content.as_bytes())?;
         file.sync_all()?;
         Ok(())
     })();
@@ -1493,7 +1555,6 @@ fn write_if_changed_impl_full(
         return Err(error)
             .with_context(|| format!("Could not prepare replacement for {}", path.display()));
     }
-    drop(file);
 
     // Narrow the lost-update window to the final rename. The editor may have
     // changed the file while serialization or temp-file I/O was in progress.
@@ -1507,7 +1568,15 @@ fn write_if_changed_impl_full(
     }
 
     let backup_created = match (create_backup, existing.as_ref()) {
-        (true, Some(previous)) => create_backup_if_absent(path, previous.as_bytes())?,
+        (true, Some(previous)) => {
+            match create_backup_if_absent(path, previous.as_bytes(), force_private_permissions) {
+                Ok(created) => created,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(error);
+                }
+            }
+        }
         _ => false,
     };
 
@@ -1535,7 +1604,10 @@ fn write_if_changed_impl_full(
         );
     }
 
-    if let Err(error) = replace_with_temp(path, &tmp) {
+    if let Err(error) = verify_staged_identity(&file, &tmp)
+        .map_err(anyhow::Error::from)
+        .and_then(|_| replace_with_temp(path, &tmp))
+    {
         if let Some(ref previous) = existing {
             if read_existing_text(path).ok().flatten().as_deref() == Some(previous.as_str()) {
                 discard_new_backup_if_unchanged(path, previous.as_bytes(), backup_created);
@@ -2787,6 +2859,7 @@ mod tests {
     impl Drop for ChmodRefused {
         fn drop(&mut self) {
             TEST_CHMOD_REFUSAL.set(None);
+            TEST_MAPPED_CREATION.set(false);
         }
     }
 
@@ -2873,6 +2946,31 @@ mod tests {
         assert_eq!(ChmodRefused::warnings().len(), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_that_forces_public_mode_warns_before_secret_and_backup_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        for errno in [libc::EPERM, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            let _mount = ChmodRefused::with(errno);
+            TEST_MAPPED_CREATION.set(true);
+            let folder = tempfile::tempdir_in(dir.path()).unwrap();
+            let path = folder.path().join("hooks.json");
+            std::fs::write(&path, "{}").unwrap();
+            let loaded = read_for_edit(&path, JsonDialect::Strict).unwrap();
+            assert!(commit(&path, &loaded, &json!({"key":"fixture"})).unwrap());
+            assert_eq!(mode_of(&path), 0o644);
+            assert_eq!(
+                std::fs::read_to_string(backup_path(&path).unwrap()).unwrap(),
+                "{}"
+            );
+            let warnings = ChmodRefused::warnings();
+            assert_eq!(warnings.len(), 1);
+            assert!(
+                warnings[0].contains("does not let") && warnings[0].contains("be made private")
+            );
+        }
+    }
+
     // Where the staged file does not already have the mode that was asked,
     // a refused chmod is an error: a file is never left with another mode
     // than asked without one.
@@ -2894,8 +2992,13 @@ mod tests {
         let _mount = ChmodRefused::with(libc::EPERM);
         // More open than asked, and less open than asked.
         for asked in [0o600, 0o755] {
-            let error = set_staged_permissions(&staged, std::fs::Permissions::from_mode(asked))
-                .expect_err("the mode is not the one asked");
+            let error = set_staged_permissions(
+                &File::open(&staged).unwrap(),
+                &staged,
+                std::fs::Permissions::from_mode(asked),
+                false,
+            )
+            .expect_err("the mode is not the one asked");
             assert_eq!(error.raw_os_error(), Some(libc::EPERM));
         }
         assert_eq!(mode_of(&staged), 0o644);

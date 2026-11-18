@@ -97,9 +97,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
       unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX; \
     fi && \
     JOBS=${CARGO_BUILD_JOBS:-$(nproc)} && \
+    rm -f target/release/contextstream-mcp && \
     echo "Building contextstream-mcp remote HTTP gateway with ${JOBS} parallel jobs..." && \
     cargo build --release --jobs ${JOBS} -p mcp-server --bin contextstream-mcp --features remote-acceleration && \
-    sccache --show-stats 2>/dev/null || true
+    sccache --show-stats 2>/dev/null
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 

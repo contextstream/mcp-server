@@ -5,8 +5,8 @@
 use super::email::{
     address_of, contacts_of, email_refusal, erase_refusal, holds_resend_key,
     is_resend_test_address, looks_like_resend_key, operation_of, outline, percent, send_at_of,
-    send_key, send_state, suppression_words, test_recipients, time_zone_of, variant_of, when_words,
-    Topic, CONNECT_URL, EMAIL_ACTIONS, KEY_REFUSED, NOT_OFFERED, SIGN_IN,
+    send_key, suppression_words, test_recipients, time_zone_of, variant_of, when_words, Topic,
+    CONNECT_URL, EMAIL_ACTIONS, KEY_REFUSED, NOT_OFFERED, SIGN_IN,
 };
 use super::*;
 use crate::peer::{run_with_call_peer, CallPeer, PeerChannel};
@@ -650,7 +650,7 @@ async fn a_send_needs_the_persons_go_and_the_count_they_saw() {
         text.starts_with("Not sent yet: the person's go is needed first."),
         "{text}"
     );
-    assert!(text.contains("“Winter sale” (subject “Our winter sale starts today”, from Northwind <hello@news.northwind.example>) to 37 people now"), "{text}");
+    assert!(text.contains("“Winter sale” (subject “Our winter sale starts today”, from Northwind <hello@news.northwind.example>) to 37 people in the audience “Coffee club” (purpose not answered) now"), "{text}");
     assert!(text.contains("confirm_recipients 37"), "{text}");
     assert_eq!(
         structured(&unasked)["confirm_with"]["confirm_recipients"],
@@ -675,7 +675,7 @@ async fn a_send_needs_the_persons_go_and_the_count_they_saw() {
         .unwrap();
     assert!(!sent.is_error, "{}", text_of(&sent));
     assert!(
-        text_of(&sent).starts_with("Sending “Winter sale” to 37 people now"),
+        text_of(&sent).starts_with("Sending “Winter sale” to 37 people in the audience “Coffee club” (purpose not answered) now"),
         "{}",
         text_of(&sent)
     );
@@ -793,7 +793,7 @@ async fn a_send_asks_the_person_when_the_client_can() {
     let message = asked.1["message"].as_str().unwrap();
     assert!(message.contains("Send “Winter sale”"), "{message}");
     assert!(
-        message.contains("to 37 people at 2026-11-02 09:00 (Europe/London)?"),
+        message.contains("to 37 people in the audience “Coffee club” (purpose not answered) at 2026-11-02 09:00 (Europe/London)?"),
         "{message}"
     );
 
@@ -848,7 +848,7 @@ async fn a_send_asks_the_person_when_the_client_can() {
             .unwrap();
     let text = text_of(&scheduled);
     assert!(!scheduled.is_error, "{text}");
-    assert!(text.starts_with("Scheduled “Winter sale” to 37 people at 2026-11-02 09:00 (Europe/London), that is 2026-11-02 09:00 UTC."), "{text}");
+    assert!(text.starts_with("Scheduled “Winter sale” to 37 people in the audience “Coffee club” (purpose not answered) at 2026-11-02 09:00 (Europe/London), that is 2026-11-02 09:00 UTC."), "{text}");
     assert!(
         text.contains("The person said go when the client asked them."),
         "{text}"
@@ -878,7 +878,11 @@ async fn a_stateless_client_is_asked_through_the_calls_result() {
     );
     let question = first.take_input_required().expect("input_required");
     let state = question["requestState"].as_str().unwrap().to_string();
-    assert_eq!(state, format!("studio-email-send:{CAMPAIGN}:4:37:now:UTC"));
+    // What the go is for: the campaign, its revision, the count, the time, and who it goes to.
+    assert_eq!(
+        state,
+        format!("studio-email-send:{CAMPAIGN}:4:37:now:UTC:{AUDIENCE}:-")
+    );
     assert!(stub
         .calls_to(
             "POST",
@@ -1538,7 +1542,7 @@ async fn a_go_given_for_an_older_revision_isnt_taken() {
         .to_string();
     assert_eq!(
         state,
-        send_state(Uuid::parse_str(CAMPAIGN).unwrap(), 4, 37, "now", "UTC")
+        format!("studio-email-send:{CAMPAIGN}:4:37:now:UTC:{AUDIENCE}:-")
     );
 
     // The campaign is edited while the person is asked: their go was for revision 4.
@@ -1561,7 +1565,7 @@ async fn a_go_given_for_an_older_revision_isnt_taken() {
     let asked_again = stale.take_input_required().unwrap();
     assert_eq!(
         asked_again["requestState"],
-        format!("studio-email-send:{CAMPAIGN}:5:37:now:UTC")
+        format!("studio-email-send:{CAMPAIGN}:5:37:now:UTC:{AUDIENCE}:-")
     );
     assert!(stub
         .calls_to(

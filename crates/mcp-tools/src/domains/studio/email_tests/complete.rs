@@ -2569,3 +2569,356 @@ fn pause_resume_and_the_connection_are_listed_described_and_in_the_schema() {
         .contains(&json!("refresh")));
     assert!(!properties.keys().any(|k| k.contains("key")));
 }
+
+// ============================================================================
+// email_send: the review, and a go for exactly what the person saw
+// ============================================================================
+
+/// The campaign as a draft that goes to `audience` (id, name, purpose) and maybe a segment.
+/// `newer` is a Create that answers `remaining` and takes `expectedRecipients`.
+fn send_api(
+    audience_of: (&'static str, &'static str, Option<&'static str>),
+    segment_of: Option<(&'static str, &'static str)>,
+    name: &'static str,
+    recipients: i64,
+    newer: bool,
+) -> Responder {
+    let base = api(Arc::new(Mutex::new("draft".to_string())), recipients);
+    Arc::new(move |request: &Recorded| {
+        let path = format!("/create/email/campaigns/{CAMPAIGN}");
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", p) if p == path => {
+                let (id, audience_name, purpose) = audience_of;
+                let mut campaign = campaign("draft");
+                campaign["name"] = json!(name);
+                campaign["audienceId"] = json!(id);
+                campaign["audience"] = json!({"id": id, "name": audience_name});
+                if let Some((segment_id, segment_name)) = segment_of {
+                    campaign["segmentId"] = json!(segment_id);
+                    campaign["segment"] = json!({"id": segment_id, "name": segment_name});
+                }
+                if newer {
+                    campaign["audience"]["purpose"] = json!(purpose);
+                    campaign["remaining"] = json!(recipients);
+                }
+                Answer::ok(campaign)
+            }
+            ("GET", "/create/email/audiences") => Answer::ok(json!([
+                audience(AUDIENCE, "Coffee club", Some("production"), 40, 37),
+                audience(PROOF, "Proof", Some("test"), 3, 3),
+            ])),
+            ("POST", p) if p == format!("{path}/schedule") => {
+                if request.body.get("expectedRecipients").is_some() && !newer {
+                    return unknown_field(
+                        "expectedRecipients",
+                        "`workspaceId`, `sendAt`, `timeZone`, `revision`",
+                    );
+                }
+                if request.body.get("expectedRecipients") == Some(&json!(999)) {
+                    return Answer::error(422, "email_recipients_changed", "This would now go to 12 people, not 999. Nothing was scheduled; show who it reaches again and ask again.");
+                }
+                base(request)
+            }
+            _ => base(request),
+        }
+    })
+}
+
+#[tokio::test]
+async fn the_send_review_names_the_audience_its_purpose_and_what_to_check() {
+    // A test audience named for a real send.
+    let stub = Stub::start(send_api(
+        (PROOF, "Proof", Some("test")),
+        None,
+        "Winter sale",
+        3,
+        true,
+    ))
+    .await;
+    let review = run(
+        &stub,
+        json!({"action": "email_send", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    let text = text_of(&review);
+    assert!(
+        text.starts_with("Not sent yet: the person's go is needed first. Show them: “Winter sale” (subject “Our winter sale starts today”, from Northwind <hello@news.northwind.example>) to 3 people in the audience “Proof” (test) now."),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "Check: “Proof” is a test audience: this is a real send to the 3 people in it."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("Check: The image “Beans in the snow” has no link."),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "call email_send again with campaign_id {CAMPAIGN}, send_at now, time_zone UTC, audience_id {PROOF} and confirm_recipients 3."
+        )),
+        "{text}"
+    );
+    let out = structured(&review);
+    assert_eq!(out["audience"]["purpose"], "test");
+    assert_eq!(out["confirm_with"]["audience_id"], PROOF);
+    assert_eq!(out["warnings"].as_array().unwrap().len(), 2);
+    // Its purpose came with the campaign: the audiences aren't read again.
+    assert!(stub.calls_to("GET", "/create/email/audiences").is_empty());
+
+    // A production audience for what reads as a test. Today's main: the purpose is the
+    // audience list's.
+    let stub = Stub::start(send_api(
+        (AUDIENCE, "Coffee club", Some("production")),
+        None,
+        "Layout test",
+        37,
+        false,
+    ))
+    .await;
+    let text = text_of(
+        &run(
+            &stub,
+            json!({"action": "email_send", "campaign_id": CAMPAIGN}),
+        )
+        .await,
+    );
+    assert!(
+        text.contains("to 37 people in the audience “Coffee club” (production) now."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Check: this reads as a test (its name or subject says “test”), and “Coffee club” is a production audience: 37 people would get it."),
+        "{text}"
+    );
+    assert_eq!(stub.calls_to("GET", "/create/email/audiences").len(), 1);
+
+    // A segment is named with its audience, and the person is asked the same words.
+    let stub = Stub::start(send_api(
+        (AUDIENCE, "Coffee club", Some("production")),
+        Some((SEGMENT, "Regulars")),
+        "Winter sale",
+        10,
+        true,
+    ))
+    .await;
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));
+    run_with_call_peer(
+        CallPeer::new(client.clone(), None, true),
+        stub.tool()
+            .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN})),
+    )
+    .await
+    .unwrap();
+    let message = client.sent.lock().unwrap()[0].1["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        message.starts_with("Send “Winter sale” (subject “Our winter sale starts today”, from Northwind <hello@news.northwind.example>) to 10 people in the segment “Regulars” of the audience “Coffee club” (production) now?"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Check: The image “Beans in the snow” has no link."),
+        "{message}"
+    );
+    assert!(
+        message.ends_with("Once it goes, it can't be unsent."),
+        "{message}"
+    );
+    let peer =
+        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}));
+    run_with_call_peer(
+        peer.clone(),
+        stub.tool()
+            .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        peer.take_input_required().unwrap()["requestState"],
+        format!("studio-email-send:{CAMPAIGN}:4:10:now:UTC:{AUDIENCE}:{SEGMENT}")
+    );
+}
+
+#[tokio::test]
+async fn a_go_is_for_the_audience_the_person_saw() {
+    let stub = Stub::start(send_api(
+        (AUDIENCE, "Coffee club", Some("production")),
+        None,
+        "Winter sale",
+        37,
+        false,
+    ))
+    .await;
+    let tool = stub.tool();
+    let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
+
+    // The count is right, the audience is not the one the person agreed to: nothing goes.
+    let other = tool
+        .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN, "audience_id": PROOF, "confirm_recipients": 37}))
+        .await
+        .unwrap();
+    let text = text_of(&other);
+    assert!(
+        text.starts_with("Not sent: “Winter sale” now goes to the audience “Coffee club” (production), not the audience the person agreed to."),
+        "{text}"
+    );
+    assert!(text.contains(&format!("audience_id {AUDIENCE}")), "{text}");
+    let segmented = tool
+        .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN, "audience_id": AUDIENCE, "segment_id": SEGMENT, "confirm_recipients": 37}))
+        .await
+        .unwrap();
+    assert!(
+        text_of(&segmented).starts_with("Not sent: “Winter sale” now goes to the audience “Coffee club” (production), not the segment the person agreed to."),
+        "{}",
+        text_of(&segmented)
+    );
+    assert!(stub.calls_to("POST", &schedule).is_empty());
+
+    // The audience they saw, and its count: sent. Today's main is told no count.
+    let sent = tool
+        .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN, "audience_id": AUDIENCE, "confirm_recipients": 37}))
+        .await
+        .unwrap();
+    assert!(!sent.is_error, "{}", text_of(&sent));
+    let posts = stub.calls_to("POST", &schedule);
+    assert_eq!(posts.len(), 1);
+    assert!(posts[0].body.get("expectedRecipients").is_none());
+    assert!(
+        text_of(&sent).starts_with(
+            "Sending “Winter sale” to 37 people in the audience “Coffee club” (production) now"
+        ),
+        "{}",
+        text_of(&sent)
+    );
+}
+
+#[tokio::test]
+async fn a_go_asked_for_one_audience_isnt_taken_for_another() {
+    let now = Arc::new(Mutex::new(AUDIENCE));
+    let current = now.clone();
+    let base = usual();
+    let stub = Stub::start(Arc::new(move |request: &Recorded| {
+        if request.method == "GET" && request.path == format!("/create/email/campaigns/{CAMPAIGN}")
+        {
+            let id = *current.lock().unwrap();
+            let mut campaign = campaign("draft");
+            campaign["audienceId"] = json!(id);
+            campaign["audience"] =
+                json!({"id": id, "name": if id == AUDIENCE { "Coffee club" } else { "Proof" }});
+            return Answer::ok(campaign);
+        }
+        base(request)
+    }))
+    .await;
+    let tool = stub.tool();
+    let client = Arc::new(FakeClient::default());
+    let first = CallPeer::new(client.clone(), None, false).with_inline_input(&json!({}));
+    run_with_call_peer(
+        first.clone(),
+        tool.execute(json!({"action": "email_send", "campaign_id": CAMPAIGN})),
+    )
+    .await
+    .unwrap();
+    let state = first.take_input_required().unwrap()["requestState"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The campaign is pointed at another audience of the same size while the person is
+    // asked: their yes was for the first one.
+    *now.lock().unwrap() = PROOF;
+    let stale = CallPeer::new(client, None, false).with_inline_input(&json!({
+        "inputResponses": {"confirm-send": {"action": "accept", "content": {"confirm": true}}},
+        "requestState": state,
+    }));
+    let result = run_with_call_peer(
+        stale.clone(),
+        tool.execute(json!({"action": "email_send", "campaign_id": CAMPAIGN})),
+    )
+    .await
+    .unwrap();
+    assert!(
+        text_of(&result).starts_with("Asking the person"),
+        "{}",
+        text_of(&result)
+    );
+    assert_eq!(
+        stale.take_input_required().unwrap()["requestState"],
+        format!("studio-email-send:{CAMPAIGN}:4:37:now:UTC:{PROOF}:-")
+    );
+    assert!(stub
+        .calls_to(
+            "POST",
+            &format!("/create/email/campaigns/{CAMPAIGN}/schedule")
+        )
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_send_tells_a_newer_create_the_count_the_person_saw() {
+    let stub = Stub::start(send_api(
+        (AUDIENCE, "Coffee club", Some("production")),
+        None,
+        "Winter sale",
+        37,
+        true,
+    ))
+    .await;
+    let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
+    let sent = run(
+        &stub,
+        json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37}),
+    )
+    .await;
+    assert!(!sent.is_error, "{}", text_of(&sent));
+    let posts = stub.calls_to("POST", &schedule);
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["expectedRecipients"], 37);
+    assert_eq!(posts[0].body["revision"], 4);
+
+    // Create's own refusal of a count that changed is kept, with what to do next.
+    let changed = Stub::start(send_api(
+        (AUDIENCE, "Coffee club", Some("production")),
+        None,
+        "Winter sale",
+        999,
+        true,
+    ))
+    .await;
+    let refused = run(
+        &changed,
+        json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 999}),
+    )
+    .await;
+    assert_eq!(
+        text_of(&refused),
+        "Not sent: This would now go to 12 people, not 999. Nothing was scheduled; show who it reaches again and ask again."
+    );
+}
+
+#[tokio::test]
+async fn a_send_without_a_recipient_count_cannot_be_confirmed_as_zero() {
+    let stub = Stub::start(over(|r| {
+        r.path.ends_with("/preview").then(|| {
+            Answer::ok(json!({"subject": "Sale", "from": "hello@example.com", "warnings": []}))
+        })
+    }))
+    .await;
+    let result = run(
+        &stub,
+        json!({"action":"email_send","campaign_id":CAMPAIGN,"confirm_recipients":0}),
+    )
+    .await;
+    assert!(text_of(&result).contains("not answered"));
+    assert!(stub
+        .calls_to(
+            "POST",
+            &format!("/create/email/campaigns/{CAMPAIGN}/schedule")
+        )
+        .is_empty());
+}

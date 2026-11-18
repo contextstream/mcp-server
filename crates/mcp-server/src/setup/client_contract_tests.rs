@@ -350,8 +350,13 @@ fn detection_matrix() -> Value {
         ".config/amp/",
         ".config/crush/",
     ];
-    // Install directories outside HOME and PATH, relative to `/`.
-    const SYSTEM_PATHS: &[&str] = &["opt/antigravity/"];
+    // Install paths outside HOME and PATH, relative to `/`: a regular file, an
+    // empty directory, and a populated directory.
+    const SYSTEM_PATHS: &[&str] = &[
+        "opt/antigravity",
+        "opt/antigravity/",
+        "opt/antigravity/entry",
+    ];
     let detect = |setup: &dyn Fn(&Sandbox)| {
         let sandbox = Sandbox::new();
         let _env = IsolatedEnv::new(&sandbox);
@@ -401,7 +406,13 @@ fn detection_matrix() -> Value {
         matrix.insert(
             format!("system:/{relative}"),
             detect(&|sandbox| {
-                std::fs::create_dir_all(sandbox.system.join(relative)).expect("system dir");
+                let path = sandbox.system.join(relative);
+                if relative.ends_with('/') {
+                    std::fs::create_dir_all(&path).expect("system dir");
+                } else {
+                    std::fs::create_dir_all(path.parent().unwrap()).expect("system parent");
+                    std::fs::write(&path, "").expect("system file");
+                }
             }),
         );
     }
@@ -458,9 +469,10 @@ fn host_probing_editors_are_detected_by_their_own_evidence() {
 
 /// A fresh Antigravity cloud VM has no `antigravity` or `agy` on PATH and no
 /// `~/.gemini` state yet; `/opt/antigravity` is always there. `setup --yes`
-/// must configure Antigravity on it without `--editors=antigravity`.
+/// must configure Antigravity when `/opt/antigravity` is a non-empty directory,
+/// without guessing internal launcher paths.
 #[test]
-fn antigravity_requires_an_installed_launcher_in_the_system_directory() {
+fn antigravity_is_detected_by_a_non_empty_install_directory() {
     let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
     let sandbox = Sandbox::new();
     let _env = IsolatedEnv::new(&sandbox);
@@ -473,19 +485,23 @@ fn antigravity_requires_an_installed_launcher_in_the_system_directory() {
     let install = sandbox.system.join("opt/antigravity");
     std::fs::create_dir_all(install.parent().unwrap()).unwrap();
     std::fs::write(&install, "unrelated").unwrap();
-    assert!(!detected().contains(&Editor::Antigravity));
+    assert!(
+        !detected().contains(&Editor::Antigravity),
+        "a regular file at /opt/antigravity must not count"
+    );
+
     std::fs::remove_file(&install).unwrap();
-    std::fs::create_dir_all(install.join("bin")).unwrap();
-    assert!(!detected().contains(&Editor::Antigravity));
-    let launcher = install.join("bin/agy");
-    std::fs::write(&launcher, "").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(!detected().contains(&Editor::Antigravity));
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(&install).unwrap();
+    assert!(
+        !detected().contains(&Editor::Antigravity),
+        "an empty /opt/antigravity directory must not count"
+    );
+
+    let marker = install.join("manifest.json");
+    std::fs::write(&marker, "{}").unwrap();
     assert!(
         detected().contains(&Editor::Antigravity),
-        "Antigravity not detected from /opt/antigravity"
+        "Antigravity not detected from non-empty /opt/antigravity"
     );
     let (editors, provenance) = super::super::resolve_setup_editors(None).expect("setup editors");
     assert_eq!(

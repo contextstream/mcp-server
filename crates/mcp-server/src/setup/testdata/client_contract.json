@@ -414,9 +414,21 @@
       "all": [],
       "setup": []
     },
+    "system:/opt/antigravity": {
+      "all": [],
+      "setup": []
+    },
     "system:/opt/antigravity/": {
       "all": [],
       "setup": []
+    },
+    "system:/opt/antigravity/entry": {
+      "all": [
+        "antigravity"
+      ],
+      "setup": [
+        "antigravity"
+      ]
     }
   },
   "editors": {

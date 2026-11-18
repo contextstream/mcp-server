@@ -9,7 +9,7 @@ use uuid::Uuid;
 use super::go::{persons_go, Go, Question, ASKED_NOTE};
 use super::{
     address_of, consent_of, digest, email_refusal, given, number, purpose_words, said, strings,
-    text, Topic, AUDIENCES_URL,
+    text, unknown_field, Topic, AUDIENCES_URL,
 };
 use crate::domains::studio::words::credits;
 use crate::domains::studio::{parse_id, StudioInput, StudioTool};
@@ -236,19 +236,19 @@ impl StudioTool {
                 "{call} needs something to change: first_name, last_name, tags, add_to or remove_from"
             )));
         }
-        if membership && email.is_none() {
+        if add_to.iter().any(|id| remove_from.contains(id)) {
             return Err(Error::Validation(
-                "add_to and remove_from need email: Create finds a contact by its address, and a membership change starts from the audiences it is in now"
-                    .to_string(),
+                "An audience cannot appear in both add_to and remove_from.".into(),
             ));
         }
-        // By address the contact is read first: its id, and the audiences it is in, since
-        // Create takes the whole set.
         let (id, audiences_now) = match &email {
             Some(email) => match self.contact_by_address(workspace_id, email).await? {
                 Ok(Some(contact)) => (
                     parse_id(&text(&contact, "id").unwrap_or_default(), "contact id")?,
-                    strings(contact.get("audienceIds")),
+                    contact
+                        .get("audienceIds")
+                        .filter(|ids| ids.is_array())
+                        .cloned(),
                 ),
                 Ok(None) => {
                     return Ok(ToolResult::error(format!(
@@ -259,9 +259,14 @@ impl StudioTool {
             },
             None => (
                 contact_id.expect("checked above: one of the two is given"),
-                Vec::new(),
+                None,
             ),
         };
+        if contact_id.is_some_and(|given| given != id) {
+            return Err(Error::Validation(
+                "email and contact_id must identify the same contact.".into(),
+            ));
+        }
         let mut body = json!({"workspaceId": workspace_id});
         if let Some(name) = &first_name {
             body["firstName"] = json!(name);
@@ -272,22 +277,40 @@ impl StudioTool {
         if let Some(tags) = &tags {
             body["tags"] = json!(tags);
         }
-        if membership {
-            let leaving: Vec<String> = remove_from.iter().map(Uuid::to_string).collect();
-            let mut set: Vec<String> = audiences_now
-                .into_iter()
-                .filter(|id| !leaving.contains(id))
-                .collect();
-            for id in add_to.iter().map(Uuid::to_string) {
+        if !add_to.is_empty() {
+            body["addAudienceIds"] = json!(add_to);
+        }
+        if !remove_from.is_empty() {
+            body["removeAudienceIds"] = json!(remove_from);
+        }
+        let path = format!("/contacts/{id}");
+        let mut answer = self.email_call("PATCH", &path, Some(&body), None).await?;
+        if membership
+            && (unknown_field(&answer, "addAudienceIds")
+                || unknown_field(&answer, "removeAudienceIds"))
+        {
+            // Legacy servers accept only a whole membership list. Never build one from
+            // missing data or drop the requested membership change to apply just the fields.
+            let Some(current) = audiences_now else {
+                return Ok(ToolResult::error("Not changed: membership was not answered by this API. Retry with the contact's email or use the studio."));
+            };
+            let mut set: Vec<Uuid> = serde_json::from_value(current).map_err(|_| {
+                Error::Validation(
+                    "Current audience ids were not answered. Read the contact again.".into(),
+                )
+            })?;
+            set.retain(|id| !remove_from.contains(id));
+            for id in add_to {
                 if !set.contains(&id) {
                     set.push(id);
                 }
             }
+            let fields = body.as_object_mut().expect("contact patch is an object");
+            fields.remove("addAudienceIds");
+            fields.remove("removeAudienceIds");
             body["audienceIds"] = json!(set);
+            answer = self.email_call("PATCH", &path, Some(&body), None).await?;
         }
-        let answer = self
-            .email_call("PATCH", &format!("/contacts/{id}"), Some(&body), None)
-            .await?;
         if !answer.is_success() {
             return Ok(ToolResult::error(format!(
                 "Not changed: {}",
@@ -322,12 +345,16 @@ impl StudioTool {
         } else {
             format!("Changed {address} ({full_name}).")
         }];
-        said.push(if now_tags.is_empty() {
+        said.push(if !contact["tags"].is_array() {
+            "Tags not answered.".to_string()
+        } else if now_tags.is_empty() {
             "No tags.".to_string()
         } else {
             format!("Tags: {}.", now_tags.join(", "))
         });
-        said.push(if now_in.is_empty() {
+        said.push(if !contact["audienceIds"].is_array() {
+            "Membership not answered.".to_string()
+        } else if now_in.is_empty() {
             "In no audience.".to_string()
         } else if names.len() == now_in.len() {
             format!("In: {}.", names.join(", "))
@@ -346,8 +373,8 @@ impl StudioTool {
                 "email": address,
                 "first_name": contact.get("firstName"),
                 "last_name": contact.get("lastName"),
-                "tags": now_tags,
-                "audience_ids": now_in,
+                "tags": contact.get("tags"),
+                "audience_ids": contact.get("audienceIds"),
             }),
         ))
     }
@@ -433,6 +460,9 @@ impl StudioTool {
         }
         let tags = string_list(input.tags.as_ref(), "tags")?.filter(|tags| !tags.is_empty());
         let csv = self.csv_text(input).await?;
+        if super::looks_like_resend_key(&csv) {
+            return Err(Error::Validation(super::KEY_REFUSED.to_string()));
+        }
         let mut body = json!({"workspaceId": workspace_id, "csv": csv});
         if let Some(audience_id) = audience_id {
             body["audienceId"] = json!(audience_id);
@@ -640,7 +670,7 @@ impl StudioTool {
                 does: format!("Imports them into “{audience_name}”."),
                 state: format!(
                     "studio-email-import:{audience_id}:{}:{eligible}",
-                    digest(&import.csv)
+                    digest(&json!([digest(&import.csv), import.preview.get("digest"), import.source, import.note, import.tags]).to_string())
                 ),
             },
             input.confirm_rows == Some(eligible),
@@ -703,25 +733,17 @@ impl StudioTool {
             }
         }
 
-        // Create records an import's contacts with the source `import`; how these people
-        // agreed is kept in the note, so it isn't lost.
+        let legacy_note = format!("{} (consent source: {})", import.note, import.source);
         let mut body = json!({
             "workspaceId": workspace_id,
             "audienceId": audience_id,
             "csv": import.csv,
             "mapping": import.preview.get("mapping"),
-            "consentNote": format!("{} (consent source: {})", import.note, import.source),
+            "consentNote": legacy_note,
         });
         if let Some(tags) = &import.tags {
             body["tags"] = json!(tags);
         }
-        let key = format!(
-            "email-import-{}",
-            digest(&format!(
-                "{audience_id}\n{}\n{}\n{}",
-                import.source, import.note, import.csv
-            ))
-        );
         // A Create that answers the count and a digest of who it would add also takes them
         // back, and refuses an import that is no longer what the person saw.
         let mut newer: Vec<&str> = Vec::new();
@@ -733,9 +755,29 @@ impl StudioTool {
             body["expectedDigest"] = json!(seen);
             newer.push("expectedDigest");
         }
-        let (answer, _) = self
+        if !newer.is_empty() {
+            body["consentSource"] = json!(import.source);
+            body["consentNote"] = json!(import.note);
+        }
+        // Different writes carry different keys, including their tags and preview digest.
+        let key = format!("email-import-{}", digest(&body.to_string()));
+        let (mut answer, kept) = self
             .email_call_newer("POST", "/contacts/import", &body, &newer, Some(&key))
             .await?;
+        if unknown_field(&answer, "consentSource") {
+            body.as_object_mut()
+                .expect("import is an object")
+                .remove("consentSource");
+            body["consentNote"] = json!(legacy_note);
+            let key = format!("email-import-{}", digest(&body.to_string()));
+            answer = self
+                .email_call_newer("POST", "/contacts/import", &body, &newer, Some(&key))
+                .await?
+                .0;
+        }
+        if !kept || newer.is_empty() {
+            notes.push("Eligible recipients at import time: not answered by this API.".into());
+        }
         if !answer.is_success() {
             return Ok(ToolResult::error(format!(
                 "Not imported: {}",

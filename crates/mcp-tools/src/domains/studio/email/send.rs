@@ -1,6 +1,6 @@
 //! Review and confirmation for sending now or scheduling at a local time.
 
-use super::go::{persons_go, Go, Question, ASKED_NOTE};
+use super::go::{persons_go, Go, Question, SendToken, ASKED_NOTE};
 use super::{
     campaign_url, digest, email_refusal, given, moment, number, people, purpose_words, send_at_of,
     send_key, strings, text, time_zone_of, when_words, Topic, NOT_ANSWERED,
@@ -23,6 +23,7 @@ pub(super) fn target_words(audience: &Value, segment: Option<&Value>) -> String 
 }
 
 struct SendReview {
+    workspace_id: Uuid,
     campaign_id: Uuid,
     name: String,
     subject: Option<String>,
@@ -55,13 +56,16 @@ impl SendReview {
 
     fn token(&self, send_at: &str, zone: &str) -> String {
         // The sender can change in email settings without changing the campaign revision.
-        digest(
+        let mac = digest(
             &json!([
+                self.workspace_id,
                 self.campaign_id,
                 self.revision,
                 self.name,
                 self.subject,
                 self.from,
+                self.audience_id,
+                self.segment_id,
                 self.audience,
                 self.segment,
                 self.recipients,
@@ -70,7 +74,12 @@ impl SendReview {
                 self.warnings
             ])
             .to_string(),
-        )
+        );
+        SendToken {
+            revision: self.revision,
+            recipients: self.recipients,
+        }
+        .encode(&mac)
     }
 
     fn checks(&self, previous: Option<i64>) -> Vec<String> {
@@ -88,10 +97,11 @@ impl SendReview {
         let warnings = self.checks(previous);
         let checks = check_lines(&warnings);
         let what = self.description(&when_words(send_at, zone));
+        let token = self.token(send_at, zone);
         let mut confirm = json!({
             "action": "email_send", "campaign_id": self.campaign_id, "send_at": send_at,
             "time_zone": zone, "audience_id": self.audience_id, "confirm_recipients": self.recipients,
-            "confirm_review": self.token(send_at, zone),
+            "confirm_review": token,
         });
         let mut ids = format!("audience_id {}", self.audience_id);
         if let Some(id) = &self.segment_id {
@@ -99,7 +109,7 @@ impl SendReview {
             ids.push_str(&format!(", segment_id {id}"));
         }
         ToolResult::with_structured(
-            format!("{reason} Show them: {what}.{checks} If they agree, use the arguments in confirm_with to call email_send again with campaign_id {}, send_at {send_at}, time_zone {zone}, {ids} and confirm_recipients {}.", self.campaign_id, self.recipients),
+            format!("{reason} Show them: {what}.{checks} If they agree, use the arguments in confirm_with to call email_send again with campaign_id {}, send_at {send_at}, time_zone {zone}, {ids}, confirm_recipients {} and confirm_review {token}.", self.campaign_id, self.recipients),
             json!({
                 "sent": false, "campaign_id": self.campaign_id, "revision": self.revision,
                 "audience": self.audience, "segment": self.segment, "recipients": self.recipients,
@@ -224,6 +234,7 @@ impl StudioTool {
         }
         warnings.extend(strings(preview.get("warnings")));
         Ok(Ok(SendReview {
+            workspace_id,
             campaign_id,
             name,
             subject,
@@ -276,15 +287,20 @@ impl StudioTool {
             )));
         }
         let token = review.token(&send_at, &time_zone);
-        if input
-            .confirm_review
-            .as_ref()
-            .is_some_and(|seen| seen != &token)
-        {
-            return Ok(show(
-                "Not sent: the campaign changed since review. Ask the person again.",
-            ));
-        }
+        let seen_token = match given(input.confirm_review.as_deref()) {
+            Some(raw) => match SendToken::parse(raw).filter(|_| raw == token) {
+                Some(seen) => input
+                    .confirm_recipients
+                    .is_none_or(|n| n == seen.recipients)
+                    .then_some(seen),
+                None => {
+                    return Ok(show(
+                        "Not sent: the campaign changed since review. Ask the person again.",
+                    ));
+                }
+            },
+            None => None,
+        };
         let what = review.description(&when_words(&send_at, &time_zone));
         let count = people(review.recipients);
         let checks = check_lines(&review.checks(input.confirm_recipients));
@@ -305,7 +321,8 @@ impl StudioTool {
         };
         let go = persons_go(
             question,
-            input.confirm_recipients == Some(review.recipients),
+            seen_token.is_some(),
+            input.confirm_recipients.is_some(),
         )
         .await;
         let mut notes = Vec::new();
@@ -337,8 +354,18 @@ impl StudioTool {
             }
             Go::Needed { unanswered } => {
                 let reason = match input.confirm_recipients {
-                    Some(confirmed) => format!("Not sent: it now goes to {count}, not the {} the person agreed to.", credits(confirmed)),
-                    None if unanswered => "Not sent yet: the person was asked through the client and gave no answer in time.".into(),
+                    Some(confirmed) if confirmed != review.recipients => {
+                        format!(
+                            "Not sent: it now goes to {count}, not the {} the person agreed to.",
+                            credits(confirmed)
+                        )
+                    }
+                    _ if unanswered => {
+                        "Not sent yet: the person was asked through the client and gave no answer in time.".into()
+                    }
+                    Some(_) => {
+                        "Not sent yet: confirm_review from showing this review is needed; a count alone is not a go.".into()
+                    }
                     None => "Not sent yet: the person's go is needed first.".into(),
                 };
                 return Ok(show(&reason));
@@ -361,13 +388,17 @@ impl StudioTool {
                 _ => {}
             }
         }
-        let recipients = review.recipients;
-        let key = send_key(campaign_id, review.revision, &send_at, &time_zone);
+        let agreed = seen_token.unwrap_or(SendToken {
+            revision: review.revision,
+            recipients: review.recipients,
+        });
+        let recipients = agreed.recipients;
+        let key = send_key(campaign_id, agreed.revision, &send_at, &time_zone);
         let mut body = json!({
             "workspaceId": workspace_id,
             "sendAt": send_at,
             "timeZone": time_zone,
-            "revision": review.revision,
+            "revision": agreed.revision,
         });
         // Older servers do not have the atomic count check. Both API features shipped together.
         if review.checks_count {

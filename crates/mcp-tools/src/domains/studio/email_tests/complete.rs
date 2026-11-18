@@ -678,8 +678,18 @@ async fn an_import_needs_the_persons_go_for_the_eligible_count() {
     );
     assert!(stub.calls_to("POST", import).is_empty());
 
-    let mut go = import_input("import");
-    go["confirm_rows"] = json!(114);
+    let mut count_only = import_input("import");
+    count_only["confirm_rows"] = json!(114);
+    let need_token = tool.execute(count_only).await.unwrap();
+    assert!(
+        text_of(&need_token).starts_with("Not imported yet:"),
+        "{}",
+        text_of(&need_token)
+    );
+    assert!(stub.calls_to("POST", import).is_empty());
+
+    let mut go = structured(&unasked)["confirm_with"].clone();
+    go["csv"] = json!(CSV);
     let imported = tool.execute(go.clone()).await.unwrap();
     let text = text_of(&imported);
     assert!(!imported.is_error, "{text}");
@@ -729,9 +739,11 @@ async fn an_import_needs_the_persons_go_for_the_eligible_count() {
 async fn an_import_tells_a_newer_create_what_the_person_saw() {
     let stub = Stub::start(import_api(true)).await;
     let tool = stub.tool();
-    let mut go = import_input("import");
-    go["confirm_rows"] = json!(114);
-    go["tags"] = json!(["spring-2026"]);
+    let mut preview_in = import_input("import_preview");
+    preview_in["tags"] = json!(["spring-2026"]);
+    let preview = tool.execute(preview_in).await.unwrap();
+    let mut go = structured(&preview)["confirm_with"].clone();
+    go["csv"] = json!(CSV);
     let imported = tool.execute(go).await.unwrap();
     assert!(!imported.is_error, "{}", text_of(&imported));
     let posts = stub.calls_to("POST", "/create/email/contacts/import");
@@ -778,9 +790,10 @@ async fn an_import_asks_the_person_where_the_client_can() {
     let client = Arc::new(FakeClient::default());
 
     // Asked live: their no stands, whatever the agent confirms.
+    let previewed = tool.execute(import_input("import_preview")).await.unwrap();
     *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));
-    let mut confirmed = import_input("import");
-    confirmed["confirm_rows"] = json!(114);
+    let mut confirmed = structured(&previewed)["confirm_with"].clone();
+    confirmed["csv"] = json!(CSV);
     let declined = run_with_call_peer(
         CallPeer::new(client.clone(), None, true),
         tool.execute(confirmed.clone()),
@@ -2350,10 +2363,21 @@ async fn a_paused_send_resumes_only_with_the_persons_go_for_who_still_waits() {
     );
     assert!(stub.calls_to("POST", &resume).is_empty());
 
-    let resumed = tool
+    let count_only = tool
         .execute(
             json!({"action": "email_resume", "campaign_id": CAMPAIGN, "confirm_remaining": 25}),
         )
+        .await
+        .unwrap();
+    assert!(
+        text_of(&count_only).starts_with("Not resumed yet:"),
+        "{}",
+        text_of(&count_only)
+    );
+    assert!(stub.calls_to("POST", &resume).is_empty());
+
+    let resumed = tool
+        .execute(structured(&unasked)["confirm_with"].clone())
         .await
         .unwrap();
     let text = text_of(&resumed);
@@ -2393,11 +2417,12 @@ async fn a_paused_send_resumes_only_with_the_persons_go_for_who_still_waits() {
 async fn a_resume_tells_a_newer_create_the_count_the_person_saw() {
     let stub = Stub::start(flight_api("paused", 12, true)).await;
     let resume = format!("/create/email/campaigns/{CAMPAIGN}/resume");
-    let resumed = run(
+    let review = run(
         &stub,
-        json!({"action": "email_resume", "campaign_id": CAMPAIGN, "confirm_remaining": 25}),
+        json!({"action": "email_resume", "campaign_id": CAMPAIGN}),
     )
     .await;
+    let resumed = run(&stub, structured(&review)["confirm_with"].clone()).await;
     assert!(!resumed.is_error, "{}", text_of(&resumed));
     assert_eq!(
         stub.calls_to("POST", &resume)[0].body,
@@ -2416,11 +2441,7 @@ async fn a_resume_tells_a_newer_create_the_count_the_person_saw() {
         "{}",
         text_of(&review)
     );
-    let resumed = run(
-        &scheduled,
-        json!({"action": "email_resume", "campaign_id": CAMPAIGN, "confirm_remaining": 37}),
-    )
-    .await;
+    let resumed = run(&scheduled, structured(&review)["confirm_with"].clone()).await;
     assert!(
         text_of(&resumed).starts_with(
             "Resumed “Winter sale”: it is scheduled again, for 2026-11-20 09:00 UTC, to 37 people."
@@ -2435,8 +2456,11 @@ async fn a_resume_asks_the_person_where_the_client_can() {
     let stub = Stub::start(flight_api("paused", 12, false)).await;
     let tool = stub.tool();
     let resume = format!("/create/email/campaigns/{CAMPAIGN}/resume");
-    let confirmed =
-        json!({"action": "email_resume", "campaign_id": CAMPAIGN, "confirm_remaining": 25});
+    let unasked = tool
+        .execute(json!({"action": "email_resume", "campaign_id": CAMPAIGN}))
+        .await
+        .unwrap();
+    let confirmed = structured(&unasked)["confirm_with"].clone();
 
     // Where only the person's own yes counts, the agent's count resumes nothing.
     let asked_only = || mcp_types::config::ConfigOverride {
@@ -2752,7 +2776,7 @@ async fn the_send_review_names_the_audience_its_purpose_and_what_to_check() {
     );
     assert!(
         text.contains(&format!(
-            "call email_send again with campaign_id {CAMPAIGN}, send_at now, time_zone UTC, audience_id {PROOF} and confirm_recipients 3."
+            "call email_send again with campaign_id {CAMPAIGN}, send_at now, time_zone UTC, audience_id {PROOF}, confirm_recipients 3 and confirm_review send1.4.3."
         )),
         "{text}"
     );
@@ -2874,9 +2898,9 @@ async fn a_go_is_for_the_audience_the_person_saw() {
     );
     assert!(stub.calls_to("POST", &schedule).is_empty());
 
-    // The audience they saw, and its count: sent. Today's main is told no count.
+    // The audience they saw, and its review token: sent. Today's main is told no count.
     let sent = tool
-        .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN, "audience_id": AUDIENCE, "confirm_recipients": 37}))
+        .execute(structured(&other)["confirm_with"].clone())
         .await
         .unwrap();
     assert!(!sent.is_error, "{}", text_of(&sent));
@@ -2963,11 +2987,12 @@ async fn a_send_tells_a_newer_create_the_count_the_person_saw() {
     ))
     .await;
     let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
-    let sent = run(
+    let review = run(
         &stub,
-        json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37}),
+        json!({"action": "email_send", "campaign_id": CAMPAIGN}),
     )
     .await;
+    let sent = run(&stub, structured(&review)["confirm_with"].clone()).await;
     assert!(!sent.is_error, "{}", text_of(&sent));
     let posts = stub.calls_to("POST", &schedule);
     assert_eq!(posts.len(), 1);
@@ -2983,9 +3008,14 @@ async fn a_send_tells_a_newer_create_the_count_the_person_saw() {
         true,
     ))
     .await;
+    let changed_review = run(
+        &changed,
+        json!({"action": "email_send", "campaign_id": CAMPAIGN}),
+    )
+    .await;
     let refused = run(
         &changed,
-        json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 999}),
+        structured(&changed_review)["confirm_with"].clone(),
     )
     .await;
     assert_eq!(

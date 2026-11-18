@@ -319,6 +319,13 @@ impl CallPeer {
         self.inline.is_some()
     }
 
+    /// Whether this stateless call carries an inline elicitation response (`inputResponses`).
+    pub fn carries_inline_answer(&self) -> bool {
+        self.inline
+            .as_ref()
+            .is_some_and(|inline| !inline.responses.is_empty())
+    }
+
     /// Report progress (`total` when known, for example 100 for a percentage). A value not
     /// above the last one sent is raised just above it, since MCP asks each to increase.
     /// Nothing is sent when the call carried no progress token.

@@ -6,7 +6,7 @@ use mcp_types::{tool::ToolResult, Error, Result};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::go::{persons_go, Go, Question, ASKED_NOTE};
+use super::go::{persons_go, Go, ImportToken, Question, ASKED_NOTE};
 use super::{
     address_of, consent_of, digest, email_refusal, given, number, purpose_words, said, strings,
     text, unknown_field, Topic, AUDIENCES_URL,
@@ -154,6 +154,7 @@ impl Counts {
 
 /// An import as the person is shown it and asked about it.
 struct Import {
+    workspace_id: Uuid,
     csv: String,
     audience_id: Option<Uuid>,
     audience: Option<Value>,
@@ -186,36 +187,80 @@ impl Import {
         )
     }
 
-    fn review_token(&self) -> String {
-        digest(
+    fn review_token(&self) -> Option<String> {
+        let audience_id = self.audience_id?;
+        let eligible = self.counts.eligible?;
+        let preview_digest = text(&self.preview, "digest");
+        let mac = digest(
             &json!([
-                self.audience_id,
+                self.workspace_id,
+                audience_id,
                 digest(&self.csv),
-                self.preview.get("digest"),
-                self.counts.eligible,
+                preview_digest,
+                eligible,
                 self.source,
                 self.note,
                 self.tags
             ])
             .to_string(),
+        );
+        Some(
+            ImportToken {
+                eligible,
+                digest: preview_digest,
+            }
+            .encode(&mac),
         )
     }
 
     /// The call that imports it, once the person agrees.
     fn confirm_with(&self) -> Value {
+        let (Some(audience_id), Some(eligible), Some(token)) =
+            (self.audience_id, self.counts.eligible, self.review_token())
+        else {
+            return Value::Null;
+        };
         let mut args = json!({
             "action": "email_contacts",
             "operation": "import",
-            "audience_id": self.audience_id,
+            "audience_id": audience_id,
             "consent_source": self.source,
             "consent_note": self.note,
-            "confirm_rows": self.counts.eligible,
-            "confirm_review": self.review_token(),
+            "confirm_rows": eligible,
+            "confirm_review": token,
         });
         if let Some(tags) = &self.tags {
             args["tags"] = json!(tags);
         }
         args
+    }
+
+    fn show(&self, reason: &str) -> ToolResult {
+        let audience_id = self
+            .audience_id
+            .expect("show is called on an import with an audience");
+        let eligible = self
+            .counts
+            .eligible
+            .expect("show is called on an import with an eligible count");
+        let token = self
+            .review_token()
+            .expect("show is called on an import with a token");
+        let what = self.what();
+        ToolResult::with_structured(
+            format!(
+                "{reason} Show them: {what}. If they agree, use the arguments in confirm_with to call email_contacts again with operation import, the same file, audience_id {audience_id}, consent_source {}, the same consent_note, confirm_rows {eligible} and confirm_review {token}.",
+                self.source
+            ),
+            json!({
+                "imported": false,
+                "audience_id": audience_id,
+                "eligible": eligible,
+                "valid": self.counts.valid,
+                "suppressed": self.counts.suppressed,
+                "confirm_with": self.confirm_with(),
+            }),
+        )
     }
 }
 
@@ -521,6 +566,7 @@ impl StudioTool {
             None => None,
         };
         Ok(Ok(Import {
+            workspace_id,
             csv,
             audience_id,
             audience,
@@ -619,13 +665,13 @@ impl StudioTool {
             lines.push(format!("Sample: {}.", sample.join(", ")));
         }
         lines.push(format!("Consent: {}, “{}”.", import.source, import.note));
-        lines.push(match (import.audience_id, counts.eligible) {
-            (Some(audience_id), Some(eligible)) => format!(
-                "To import it: show the person this preview and, once they agree, call email_contacts with operation import, the same csv (or csv_path), audience_id {audience_id}, consent_source {}, the same consent_note and confirm_rows {eligible}.",
+        lines.push(match (import.audience_id, counts.eligible, import.review_token()) {
+            (Some(audience_id), Some(eligible), Some(token)) => format!(
+                "To import it: show the person this preview and, once they agree, use confirm_with to call email_contacts with operation import, the same csv (or csv_path), audience_id {audience_id}, consent_source {}, the same consent_note, confirm_rows {eligible} and confirm_review {token}.",
                 import.source
             ),
-            (None, _) => "To import it, an audience is needed: email_audiences lists them (operation create makes one), then preview again with audience_id.".to_string(),
-            (Some(_), None) => "Create did not answer how many could be sent to, so there is no count for the person to agree to: import it in the studio.".to_string(),
+            (None, _, _) => "To import it, an audience is needed: email_audiences lists them (operation create makes one), then preview again with audience_id.".to_string(),
+            (Some(_), _, _) => "Create did not answer how many could be sent to, so there is no count for the person to agree to: import it in the studio.".to_string(),
         });
         Ok(ToolResult::with_structured(
             lines.join("\n"),
@@ -681,19 +727,29 @@ impl StudioTool {
                     .to_string(),
             ));
         };
-        let token = import.review_token();
-        if input
-            .confirm_review
-            .as_ref()
-            .is_some_and(|seen| seen != &token)
-        {
-            return Ok(ToolResult::error("Not imported: the file, audience, consent or eligible recipients changed. Run the preview again and confirm it."));
-        }
+        let token = import
+            .review_token()
+            .expect("audience_id and eligible were checked above");
+        let seen_token = match given(input.confirm_review.as_deref()) {
+            Some(raw) => match ImportToken::parse(raw).filter(|_| raw == token) {
+                Some(seen) => input
+                    .confirm_rows
+                    .is_none_or(|n| n == seen.eligible)
+                    .then_some(seen),
+                None => {
+                    return Ok(import.show(
+                        "Not imported: the file, audience, consent or eligible recipients changed since preview; preview again and confirm it.",
+                    ));
+                }
+            },
+            None => None,
+        };
         let what = import.what();
+        let question_key = format!("confirm-import-{token}");
         let mut notes: Vec<String> = Vec::new();
         let go = persons_go(
             Question {
-                key: "confirm-import",
+                key: &question_key,
                 message: format!(
                     "Import {what}? Each is added, or updated by its address; an import isn't undone in one step."
                 ),
@@ -701,7 +757,8 @@ impl StudioTool {
                 does: format!("Imports them into “{audience_name}”."),
                 state: format!("studio-email-import:{audience_id}:{token}:{eligible}"),
             },
-            input.confirm_rows == Some(eligible),
+            seen_token.is_some(),
+            input.confirm_rows.is_some(),
         )
         .await;
         match go {
@@ -734,33 +791,42 @@ impl StudioTool {
                 ))
             }
             Go::Needed { unanswered } => {
-                let mut said = match input.confirm_rows {
-                    Some(confirmed) => format!(
+                let reason = match input.confirm_rows {
+                    Some(confirmed) if confirmed != eligible => format!(
                         "Not imported: the file now has {} who can be sent to, not the {} the person agreed to.",
                         super::people(eligible),
                         credits(confirmed)
                     ),
-                    None if unanswered => "Not imported yet: the person was asked through the client and gave no answer in time.".to_string(),
+                    _ if unanswered => {
+                        "Not imported yet: the person was asked through the client and gave no answer in time."
+                            .to_string()
+                    }
+                    Some(_) => {
+                        "Not imported yet: confirm_review from import_preview is needed; a count alone is not a go."
+                            .to_string()
+                    }
                     None => "Not imported yet: the person's go is needed first.".to_string(),
                 };
-                said.push_str(&format!(
-                    " Show them: {what}. If they agree, call email_contacts again with operation import, the same file, audience_id {audience_id}, consent_source {}, the same consent_note and confirm_rows {eligible}.",
-                    import.source
-                ));
-                return Ok(ToolResult::with_structured(
-                    said,
-                    json!({
-                        "imported": false,
-                        "audience_id": audience_id,
-                        "eligible": eligible,
-                        "valid": import.counts.valid,
-                        "suppressed": import.counts.suppressed,
-                        "confirm_with": import.confirm_with(),
-                    }),
-                ));
+                return Ok(import.show(&reason));
             }
         }
 
+        if crate::peer::current().is_some_and(|p| p.can_elicit() && !p.asks_through_the_result()) {
+            match self.read_import(workspace_id, input, true).await? {
+                Ok(now) if now.review_token().as_deref() != Some(token.as_str()) => {
+                    return Ok(now.show(
+                        "Not imported: the file or eligible recipients changed during confirmation; preview again and confirm it.",
+                    ));
+                }
+                Err(refused) => return Ok(ToolResult::error(format!("Not imported: {refused}"))),
+                _ => {}
+            }
+        }
+
+        let agreed = seen_token.unwrap_or_else(|| ImportToken {
+            eligible,
+            digest: text(&import.preview, "digest"),
+        });
         let legacy_note = format!("{} (consent source: {})", import.note, import.source);
         let mut body = json!({
             "workspaceId": workspace_id,
@@ -776,10 +842,10 @@ impl StudioTool {
         // back, and refuses an import that is no longer what the person saw.
         let mut newer: Vec<&str> = Vec::new();
         if number(&import.preview, "eligible").is_some() {
-            body["expectedEligible"] = json!(eligible);
+            body["expectedEligible"] = json!(agreed.eligible);
             newer.push("expectedEligible");
         }
-        if let Some(seen) = text(&import.preview, "digest") {
+        if let Some(seen) = agreed.digest {
             body["expectedDigest"] = json!(seen);
             newer.push("expectedDigest");
         }

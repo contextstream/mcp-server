@@ -669,8 +669,19 @@ async fn a_send_needs_the_persons_go_and_the_count_they_saw() {
     );
     assert!(stub.calls_to("POST", &schedule).is_empty());
 
-    let sent = tool
+    let count_only = tool
         .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37}))
+        .await
+        .unwrap();
+    assert!(
+        text_of(&count_only).starts_with("Not sent yet:"),
+        "{}",
+        text_of(&count_only)
+    );
+    assert!(stub.calls_to("POST", &schedule).is_empty());
+
+    let sent = tool
+        .execute(structured(&unasked)["confirm_with"].clone())
         .await
         .unwrap();
     assert!(!sent.is_error, "{}", text_of(&sent));
@@ -703,7 +714,11 @@ async fn where_only_the_persons_own_go_ahead_counts_the_agents_confirmation_send
         go_ahead_asked_only: Some(true),
         ..Default::default()
     };
-    let send = json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37});
+    let review = tool
+        .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN}))
+        .await
+        .unwrap();
+    let send = structured(&review)["confirm_with"].clone();
     let unasked = mcp_client::run_with_config_override(asked_only(), || async {
         tool.execute(send.clone()).await.unwrap()
     })
@@ -811,13 +826,11 @@ async fn a_send_asks_the_person_when_the_client_can() {
     assert!(text_of(&still_no).starts_with("Not sent"));
     assert_eq!(client.sent.lock().unwrap().len(), 2, "asked again");
     // A client asked live shows its person the form: they are asked first even when the
-    // agent confirms the right count, and their no wins over it.
+    // agent confirms the review token, and their no wins over it.
+    let reviewed = tool.execute(ask.clone()).await.unwrap();
     let no_wins = run_with_call_peer(
         CallPeer::new(client.clone(), None, true),
-        tool.execute(json!({
-            "action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37,
-            "send_at": "2026-11-02T09:00", "time_zone": "Europe/London",
-        })),
+        tool.execute(structured(&reviewed)["confirm_with"].clone()),
     )
     .await
     .unwrap();
@@ -922,7 +935,11 @@ async fn on_a_stateless_call_the_agents_confirmation_is_the_go_and_no_question_i
     let stub = Stub::start(usual()).await;
     let tool = stub.tool();
     let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
-    let send = json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37});
+    let review = tool
+        .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN}))
+        .await
+        .unwrap();
+    let send = structured(&review)["confirm_with"].clone();
     let stateless = || {
         CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}))
     };
@@ -1207,9 +1224,14 @@ async fn a_send_is_refused_plainly_when_it_cant_go() {
         }
     }))
     .await;
+    let refusing_review = refusing
+        .tool()
+        .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN}))
+        .await
+        .unwrap();
     let refused = refusing
         .tool()
-        .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37}))
+        .execute(structured(&refusing_review)["confirm_with"].clone())
         .await
         .unwrap();
     assert!(refused.is_error);
@@ -1362,9 +1384,14 @@ async fn a_schedule_answered_as_a_draft_is_never_called_sent() {
         }
     }))
     .await;
+    let review = stub
+        .tool()
+        .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN}))
+        .await
+        .unwrap();
     let result = stub
         .tool()
-        .execute(json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37}))
+        .execute(structured(&review)["confirm_with"].clone())
         .await
         .unwrap();
     assert!(result.is_error);

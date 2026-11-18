@@ -5,8 +5,8 @@ use mcp_types::{tool::ToolResult, Result};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::go::{persons_go, Go, Question, ASKED_NOTE};
-use super::{campaign_url, email_refusal, moment, number, people, text, Topic};
+use super::go::{persons_go, Go, Question, ResumeToken, ASKED_NOTE};
+use super::{campaign_url, digest, email_refusal, given, moment, number, people, text, Topic};
 use crate::domains::studio::words::credits;
 use crate::domains::studio::{StudioInput, StudioTool};
 
@@ -36,6 +36,108 @@ fn sent(campaign: &Value) -> Option<i64> {
 /// When a campaign is scheduled for, in words.
 fn scheduled_for(campaign: &Value) -> Option<String> {
     moment(campaign.pointer("/schedule/sendAt").and_then(Value::as_str))
+}
+
+struct ResumeReview {
+    workspace_id: Uuid,
+    campaign_id: Uuid,
+    name: String,
+    subject: String,
+    revision: i64,
+    begun: bool,
+    remaining: i64,
+    went: Option<i64>,
+    when: Option<String>,
+    sender: Value,
+    audience_id: Option<String>,
+    audience: Value,
+    segment_id: Option<String>,
+    segment: Value,
+    schedule: Value,
+    checks_remaining: bool,
+}
+
+impl ResumeReview {
+    fn what(&self) -> String {
+        if self.begun {
+            let progress = match self.went {
+                Some(went) => format!(
+                    "{} of {} sent so far",
+                    credits(went),
+                    credits(went + self.remaining)
+                ),
+                None => format!("sent so far: {}", super::NOT_ANSWERED),
+            };
+            format!(
+                "“{}” (subject “{}”) to the {} still waiting ({progress})",
+                self.name,
+                self.subject,
+                people(self.remaining),
+            )
+        } else {
+            format!(
+                "“{}” (subject “{}”) back on its schedule{} to {}",
+                self.name,
+                self.subject,
+                self.when
+                    .as_ref()
+                    .map_or(String::new(), |at| format!(" ({at})")),
+                people(self.remaining)
+            )
+        }
+    }
+
+    fn token(&self) -> String {
+        let mac = digest(
+            &json!([
+                self.workspace_id,
+                self.campaign_id,
+                self.revision,
+                self.begun,
+                self.remaining,
+                self.went,
+                self.name,
+                self.subject,
+                self.sender,
+                self.audience_id,
+                self.audience,
+                self.segment_id,
+                self.segment,
+                self.schedule,
+            ])
+            .to_string(),
+        );
+        ResumeToken {
+            revision: self.revision,
+            remaining: self.remaining,
+        }
+        .encode(&mac)
+    }
+
+    fn show(&self, reason: &str) -> ToolResult {
+        let what = self.what();
+        let token = self.token();
+        ToolResult::with_structured(
+            format!(
+                "{reason} Show them: {what}. If they agree, use the arguments in confirm_with to call email_resume again with campaign_id {}, confirm_remaining {} and confirm_review {token}.",
+                self.campaign_id, self.remaining
+            ),
+            json!({
+                "resumed": false,
+                "campaign_id": self.campaign_id,
+                "revision": self.revision,
+                "remaining": self.remaining,
+                "sent": self.went,
+                "subject": self.subject,
+                "confirm_with": {
+                    "action": "email_resume",
+                    "campaign_id": self.campaign_id,
+                    "confirm_remaining": self.remaining,
+                    "confirm_review": token,
+                },
+            }),
+        )
+    }
 }
 
 impl StudioTool {
@@ -97,16 +199,14 @@ impl StudioTool {
     // email_resume
     // ------------------------------------------------------------------------------------
 
-    /// Resumes a paused send, only with the person's go for who still waits.
-    pub(super) async fn email_resume(
+    async fn resume_review(
         &self,
         workspace_id: Uuid,
-        input: &StudioInput,
-    ) -> Result<ToolResult> {
-        let campaign_id = Self::campaign_id(input, "email_resume")?;
+        campaign_id: Uuid,
+    ) -> Result<std::result::Result<ResumeReview, String>> {
         let campaign = match self.read_campaign(workspace_id, campaign_id).await? {
             Ok(campaign) => campaign,
-            Err(refused) => return Ok(ToolResult::error(format!("Not resumed: {refused}"))),
+            Err(refused) => return Ok(Err(format!("Not resumed: {refused}"))),
         };
         let name = text(&campaign, "name").unwrap_or_else(|| "The campaign".to_string());
         let status = text(&campaign, "status").unwrap_or_default();
@@ -116,11 +216,16 @@ impl StudioTool {
                 "sending" | "testing" => "It is going out now; email_report follows it.",
                 _ => "email_duplicate makes a draft copy to send again.",
             };
-            return Ok(ToolResult::error(format!(
+            return Ok(Err(format!(
                 "Not resumed: only a paused campaign can be resumed, and “{name}” is {status}. {how}"
             )));
         }
-        let revision = number(&campaign, "revision").unwrap_or(0);
+        let Some(revision) = number(&campaign, "revision") else {
+            return Ok(Err(
+                "Not resumed: campaign revision not answered. Read the campaign again before confirming."
+                    .into(),
+            ));
+        };
         let begun = started(&campaign);
         // Who it would reach: its own count of who waits; a campaign paused before it
         // started goes back on its schedule, to whoever its audience holds then.
@@ -134,40 +239,76 @@ impl StudioTool {
             None => None,
         };
         let Some(remaining) = remaining else {
-            return Ok(ToolResult::error(format!(
+            return Ok(Err(format!(
                 "Not resumed: Create did not answer how many people still wait for “{name}”, so there is no count for the person to agree to. They can resume it in the studio: {}",
                 campaign_url(&campaign_id.to_string())
             )));
         };
-        let subject = text(&campaign, "subject").unwrap_or_default();
-        let when = scheduled_for(&campaign);
-        let what = if begun {
-            let went = sent(&campaign).unwrap_or(0);
-            format!(
-                "“{name}” (subject “{subject}”) to the {} still waiting ({} of {} sent so far)",
-                people(remaining),
-                credits(went),
-                credits(went + remaining)
-            )
-        } else {
-            format!(
-                "“{name}” (subject “{subject}”) back on its schedule{} to {}",
-                when.as_ref().map_or(String::new(), |at| format!(" ({at})")),
-                people(remaining)
-            )
-        };
+        let subject = text(&campaign, "subject").unwrap_or_else(|| super::NOT_ANSWERED.to_string());
+        Ok(Ok(ResumeReview {
+            workspace_id,
+            campaign_id,
+            name,
+            subject,
+            revision,
+            begun,
+            remaining,
+            went: sent(&campaign),
+            when: scheduled_for(&campaign),
+            sender: campaign.get("sender").cloned().unwrap_or(Value::Null),
+            audience_id: text(&campaign, "audienceId")
+                .or_else(|| text(&campaign["audience"], "id")),
+            audience: campaign.get("audience").cloned().unwrap_or(Value::Null),
+            segment_id: text(&campaign, "segmentId").or_else(|| text(&campaign["segment"], "id")),
+            segment: campaign.get("segment").cloned().unwrap_or(Value::Null),
+            schedule: campaign.get("schedule").cloned().unwrap_or(Value::Null),
+            checks_remaining: number(&campaign, "remaining").is_some(),
+        }))
+    }
 
+    /// Resumes a paused send, only with the person's go for who still waits.
+    pub(super) async fn email_resume(
+        &self,
+        workspace_id: Uuid,
+        input: &StudioInput,
+    ) -> Result<ToolResult> {
+        let campaign_id = Self::campaign_id(input, "email_resume")?;
+        let review = match self.resume_review(workspace_id, campaign_id).await? {
+            Ok(review) => review,
+            Err(why) => return Ok(ToolResult::error(why)),
+        };
+        let token = review.token();
+        let seen_token = match given(input.confirm_review.as_deref()) {
+            Some(raw) => match ResumeToken::parse(raw).filter(|_| raw == token) {
+                Some(seen) => input
+                    .confirm_remaining
+                    .is_none_or(|n| n == seen.remaining)
+                    .then_some(seen),
+                None => {
+                    return Ok(review.show(
+                        "Not resumed: the campaign changed since review. Ask the person again.",
+                    ));
+                }
+            },
+            None => None,
+        };
+        let what = review.what();
+        let question_key = format!("confirm-resume-{token}");
         let mut notes: Vec<String> = Vec::new();
         let go = persons_go(
             Question {
-                key: "confirm-resume",
+                key: &question_key,
                 message: format!("Resume {what}? Once it goes, it can't be unsent."),
                 title: "Resume it",
-                does: format!("Sends to {}.", people(remaining)),
+                does: format!("Sends to {}.", people(review.remaining)),
                 // A go for another pause of it, or another count, is not taken.
-                state: format!("studio-email-resume:{campaign_id}:{revision}:{remaining}"),
+                state: format!(
+                    "studio-email-resume:{campaign_id}:{}:{}",
+                    review.revision, review.remaining
+                ),
             },
-            input.confirm_remaining == Some(remaining),
+            seen_token.is_some(),
+            input.confirm_remaining.is_some(),
         )
         .await;
         match go {
@@ -200,46 +341,51 @@ impl StudioTool {
                 ))
             }
             Go::Needed { unanswered } => {
-                let mut said = match input.confirm_remaining {
-                    Some(confirmed) => format!(
+                let reason = match input.confirm_remaining {
+                    Some(confirmed) if confirmed != review.remaining => format!(
                         "Not resumed: {} still wait now, not the {} the person agreed to.",
-                        people(remaining),
+                        people(review.remaining),
                         credits(confirmed)
                     ),
-                    None if unanswered => "Not resumed yet: the person was asked through the client and gave no answer in time.".to_string(),
+                    _ if unanswered => {
+                        "Not resumed yet: the person was asked through the client and gave no answer in time."
+                            .to_string()
+                    }
+                    Some(_) => {
+                        "Not resumed yet: confirm_review from showing this review is needed; a count alone is not a go."
+                            .to_string()
+                    }
                     None => "Not resumed yet: the person's go is needed first.".to_string(),
                 };
-                said.push_str(&format!(
-                    " Show them: {what}. If they agree, call email_resume again with campaign_id {campaign_id} and confirm_remaining {remaining}."
-                ));
-                return Ok(ToolResult::with_structured(
-                    said,
-                    json!({
-                        "resumed": false,
-                        "campaign_id": campaign_id,
-                        "remaining": remaining,
-                        "sent": sent(&campaign),
-                        "subject": subject,
-                        "confirm_with": {
-                            "action": "email_resume",
-                            "campaign_id": campaign_id,
-                            "confirm_remaining": remaining,
-                        },
-                    }),
-                ));
+                return Ok(review.show(&reason));
             }
         }
 
+        if crate::peer::current().is_some_and(|p| p.can_elicit() && !p.asks_through_the_result()) {
+            match self.resume_review(workspace_id, campaign_id).await? {
+                Ok(now) if now.token() != token => return Ok(now.show(
+                    "Not resumed: the campaign changed during confirmation. Ask the person again.",
+                )),
+                Err(why) => return Ok(ToolResult::error(why)),
+                _ => {}
+            }
+        }
+
+        let agreed = seen_token.unwrap_or(ResumeToken {
+            revision: review.revision,
+            remaining: review.remaining,
+        });
+        let remaining = agreed.remaining;
         // One key per pause: each pause moves the revision on, so a retried resume is one
         // resume. A Create that answers `remaining` also takes the count the person saw.
-        let key = format!("email-resume-{campaign_id}-r{revision}");
+        let key = format!("email-resume-{campaign_id}-r{}", agreed.revision);
         let mut body = json!({"workspaceId": workspace_id});
         let mut newer: Vec<&str> = Vec::new();
-        if number(&campaign, "remaining").is_some() {
+        if review.checks_remaining {
             body["expectedRemaining"] = json!(remaining);
             newer.push("expectedRemaining");
         }
-        let (answer, _) = self
+        let (answer, kept) = self
             .email_call_newer(
                 "POST",
                 &format!("/campaigns/{campaign_id}/resume"),
@@ -248,11 +394,15 @@ impl StudioTool {
                 Some(&key),
             )
             .await?;
+        if !kept || body.get("expectedRemaining").is_none() {
+            notes.push("Remaining recipients at resume time: not answered by this API.".into());
+        }
         if !answer.is_success() {
             let refused = email_refusal(&answer, Topic::Campaign);
             return Ok(ToolResult::error(format!("Not resumed: {refused}")));
         }
         let resumed = answer.data;
+        let name = &review.name;
         let now = text(&resumed, "status").unwrap_or_default();
         let mut lines = vec![match now.as_str() {
             "sending" | "testing" | "sent" => format!(
@@ -262,7 +412,7 @@ impl StudioTool {
             "scheduled" => format!(
                 "Resumed “{name}”: it is scheduled again{}, to {}.",
                 scheduled_for(&resumed)
-                    .or(when)
+                    .or(review.when)
                     .map_or(String::new(), |at| format!(", for {at}")),
                 people(remaining)
             ),

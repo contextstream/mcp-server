@@ -2454,8 +2454,11 @@ impl ToolHandler for StudioTool {
             "products" => self.products(&input).await,
             "voices" => self.voices(&input).await,
             email_sequences::SEQUENCES_ACTION => self.email_sequences(&input).await,
-            // `email_contact_erase` comes only from `delete`: the registry refuses it here.
-            email if email::EMAIL_ACTIONS.contains(&email) || email == email::ERASE_ACTION => {
+            // The registry routes irreversible email actions through the delete tool.
+            email
+                if email::EMAIL_ACTIONS.contains(&email)
+                    || crate::domains::destructive::separated(TOOL_NAME, email).is_some() =>
+            {
                 self.email(email, &input).await
             }
             _ => Err(Error::Validation(format!(

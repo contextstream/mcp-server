@@ -468,17 +468,29 @@ fn description_of(input: &StudioInput) -> Result<Option<Option<String>>> {
     }
 }
 
-/// The refusal for `email_contacts` asked to erase a contact, worded as #334's refusals are:
-/// it cannot be undone, so it runs only through `delete`.
+/// Direct erase requests point to the destructive tool, or the studio on a connector.
 pub(crate) fn erase_refusal(input: &StudioInput) -> Option<String> {
     let operation = input.operation.as_deref()?.trim().to_lowercase();
-    ERASE_OPERATIONS.contains(&operation.as_str()).then(|| {
-        format!(
-            "email_contacts(operation=\"{operation}\") cannot be undone, so it runs only through the `{DELETE_TOOL}` tool: \
-             call {DELETE_TOOL} with action=\"{TOOL_NAME}.{ERASE_ACTION}\" and the same email, after confirming with the person. \
-             Where there is no `{DELETE_TOOL}` tool (the ContextStudio connector), the person erases the contact in the studio: {AUDIENCES_URL}"
-        )
-    })
+    if !ERASE_OPERATIONS.contains(&operation.as_str()) {
+        return None;
+    }
+    let action = input.action.trim().to_lowercase();
+    let (kind, field, page) = match action.as_str() {
+        "email_contacts" => ("contact", "email", AUDIENCES_URL),
+        "email_audiences" => ("audience", "audience_id", AUDIENCES_URL),
+        "email_segments" => ("segment", "segment_id", AUDIENCES_URL),
+        "email_templates" => (
+            "template",
+            "template_id",
+            "https://ctxproduct.com/studio/email",
+        ),
+        _ => return None,
+    };
+    Some(format!(
+        "{action}(operation=\"{operation}\") cannot be undone, so it runs only through the `{DELETE_TOOL}` tool: \
+         call {DELETE_TOOL} with action=\"{TOOL_NAME}.email_{kind}_erase\" and the same {field}, after confirming with the person. \
+         Where there is no `{DELETE_TOOL}` tool (the ContextStudio connector), the person erases the {kind} in the studio: {page}"
+    ))
 }
 
 /// The one address a call is about (`email`); `call` names it.
@@ -891,10 +903,8 @@ impl StudioTool {
     pub(super) async fn email(&self, action: &str, input: &StudioInput) -> Result<ToolResult> {
         // Erasing can't be undone, so it runs only through `delete`: refused before anything
         // is asked of anyone.
-        if action == "email_contacts" {
-            if let Some(refusal) = erase_refusal(input) {
-                return Err(Error::Validation(refusal));
-            }
+        if let Some(refusal) = erase_refusal(input) {
+            return Err(Error::Validation(refusal));
         }
         // Before anything is asked of anyone: a key never travels, not even to Create.
         if serde_json::to_value(input).is_ok_and(|raw| holds_resend_key(&raw)) {
@@ -927,6 +937,9 @@ impl StudioTool {
             "email_pause" => self.email_pause(workspace_id, input).await,
             "email_resume" => self.email_resume(workspace_id, input).await,
             "email_connection" => self.email_connection(workspace_id, input).await,
+            "email_audience_erase" | "email_segment_erase" | "email_template_erase" => {
+                self.erase_email_item(workspace_id, action, input).await
+            }
             ERASE_ACTION => self.erase_contact(workspace_id, input).await,
             other => Err(Error::Validation(format!("Unknown email action: {other}"))),
         }
@@ -2614,6 +2627,71 @@ impl StudioTool {
                     .find(|c| text(c, "email").map(|e| e.to_lowercase()).as_deref() == Some(email))
                     .cloned()
             })))
+    }
+
+    async fn erase_email_item(
+        &self,
+        workspace_id: Uuid,
+        action: &str,
+        input: &StudioInput,
+    ) -> Result<ToolResult> {
+        let call = format!("{DELETE_TOOL}(action=\"{TOOL_NAME}.{action}\")");
+        let required_id = |raw: Option<&str>, field: &str| -> Result<String> {
+            let raw = given(raw)
+                .ok_or_else(|| Error::Validation(format!("{field} is required for {call}")))?;
+            Ok(parse_id(raw, field)?.to_string())
+        };
+        let (kind, collection, field, id, topic) = match action {
+            "email_audience_erase" => (
+                "audience",
+                "audiences",
+                "audience_id",
+                required_id(input.audience_id.as_deref(), "audience_id")?,
+                Topic::Audience,
+            ),
+            "email_segment_erase" => (
+                "segment",
+                "segments",
+                "segment_id",
+                required_id(input.segment_id.as_deref(), "segment_id")?,
+                Topic::Audience,
+            ),
+            "email_template_erase" => (
+                "template",
+                "templates",
+                "template_id",
+                drafts::template_id_of(input, &call)?,
+                Topic::Template,
+            ),
+            _ => return Err(Error::Validation("Unknown email erase action".into())),
+        };
+        let answer = self
+            .email_call(
+                "DELETE",
+                &format!("/{collection}/{id}?workspaceId={workspace_id}"),
+                None,
+                None,
+            )
+            .await?;
+        if !answer.is_success() {
+            return Ok(ToolResult::error(format!(
+                "Not erased: {}",
+                email_refusal(&answer, topic)
+            )));
+        }
+        if answer.data["deleted"] != true || answer.data["id"] != id {
+            return Ok(ToolResult::error(format!(
+                "Erasure of the {kind} was not answered. Read the list again before retrying."
+            )));
+        }
+        let mut message = format!("Erased the {kind} {id}.");
+        if kind == "audience" {
+            message.push_str(" Its contacts stay in this workspace.");
+        }
+        Ok(ToolResult::with_structured(
+            message,
+            json!({"workspace_id":workspace_id, "erased":true, field:id}),
+        ))
     }
 
     /// Erases a contact: `delete` with `studio.email_contact_erase`, after the person's go.

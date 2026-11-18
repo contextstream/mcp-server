@@ -24,7 +24,7 @@ const PLACEHOLDERS: &str =
     "Words in [square brackets] are placeholders: email_revise fills them in on the draft.";
 
 /// A template's id as Create takes it in a path: a UUID, or a built-in's `builtin:<name>`.
-fn template_id_of(input: &StudioInput, call: &str) -> Result<String> {
+pub(super) fn template_id_of(input: &StudioInput, call: &str) -> Result<String> {
     let raw = given(input.template_id.as_deref()).ok_or_else(|| {
         Error::Validation(format!(
             "template_id is required for {call} (email_templates lists them)"

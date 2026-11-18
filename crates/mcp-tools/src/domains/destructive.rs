@@ -170,6 +170,21 @@ pub const SEPARATED_ACTIONS: &[SeparatedAction] = &[
         "email_contact_erase",
         &["email", "workspace_id", "project_id"],
     ),
+    removal(
+        "studio",
+        "email_audience_erase",
+        &["audience_id", "workspace_id", "project_id"],
+    ),
+    removal(
+        "studio",
+        "email_segment_erase",
+        &["segment_id", "workspace_id", "project_id"],
+    ),
+    removal(
+        "studio",
+        "email_template_erase",
+        &["template_id", "workspace_id", "project_id"],
+    ),
 ];
 
 /// Tools that claimed `destructiveHint` without an irreversible action: their
@@ -354,7 +369,8 @@ const ACTION_GUIDE: &str = "<tool>.<action> to run. Ids by action: memory.delete
     source_project_id, the project merged away); vcs.delete_repo and vcs.unregister_webhook \
     owner and repo; vcs.delete_link link_id; vcs.delete_automation automation_id; \
     workspace.delete workspace_id; studio.email_contact_erase email (the contact's address; an \
-    unsubscribe stays on the suppression list).";
+    unsubscribe stays on the suppression list); studio.email_audience_erase audience_id, \
+    studio.email_segment_erase segment_id, studio.email_template_erase template_id.";
 
 struct DeleteTool {
     actions: Vec<(&'static SeparatedAction, Arc<dyn ToolHandler>)>,

@@ -1445,9 +1445,18 @@ fn initial_task_summary(input: &Value, cwd: &str) -> Option<String> {
 /// which keeps no ContextStream enforcement hooks. Shows waiting notices as
 /// `additionalContext` (Codex accepts the Claude Code shape) and otherwise
 /// prints an empty result.
+///
+/// It is the one hook of ContextStream's that Codex runs before a tool call,
+/// so a run this session has open hears here that a tool call starts (no
+/// network; nothing where live progress from the hooks is off).
 pub async fn handle_notice_hook() -> anyhow::Result<()> {
     let input = super::read_stdin_json()?;
     let cwd = common::extract_cwd(&input);
+    let tool = input
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    super::run_progress::tool_started(&input, &cwd, tool);
     if let Some(args) = input.get("tool_input") {
         observe_tool_args(&input, &cwd, args);
     }

@@ -149,6 +149,8 @@ the session works and ends with it, without the agent having to report) is off
 by default. Turn it on for yourself with
 `CONTEXTSTREAM_RUN_PROGRESS_AUTO=on` in the environment your editor starts
 with; [what it sends](docs/data-handling.md#live-run-progress-from-the-hooks).
+For Codex, run `contextstream-mcp update-hooks` with it set and approve the
+two hooks it adds with `/hooks` in Codex CLI.
 
 <details>
 <summary><strong>Other installation options and troubleshooting</strong></summary>

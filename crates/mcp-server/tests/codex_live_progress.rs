@@ -9,6 +9,9 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+use mcp_server::setup::codex_hooks::{
+    codex_hook_identity_hash_for_event, codex_hook_identity_hash_for_platform,
+};
 use serde_json::{json, Value};
 
 const MARKER: &str = "--contextstream-managed-hook=v1";
@@ -295,4 +298,102 @@ fn uninstall_takes_the_live_progress_hooks_out_too() {
     // A hook that points at a binary uninstall may have removed would fail
     // on every tool call; a person's own hook is theirs to keep.
     assert_eq!(commands(&doc, "Stop"), ["echo bye"]);
+}
+
+/// What Codex writes to `~/.codex/config.toml` when a person approves the
+/// hooks under `events` in `/hooks`: each handler's fingerprint, keyed by
+/// the hooks file, the event and the handler's place in it.
+fn approve(home: &Home, events: &[(&str, &str)]) {
+    let doc = home.hooks();
+    let mut config = String::new();
+    for (event, label) in events {
+        let groups = doc["hooks"][*event].as_array().expect("event groups");
+        for (group_index, group) in groups.iter().enumerate() {
+            for (handler_index, handler) in group["hooks"].as_array().unwrap().iter().enumerate() {
+                if !handler["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains(MARKER))
+                {
+                    continue;
+                }
+                let hash = if *event == "PreToolUse" {
+                    codex_hook_identity_hash_for_platform(group, handler, cfg!(windows))
+                } else {
+                    codex_hook_identity_hash_for_event(group, handler, cfg!(windows), event)
+                }
+                .expect("fingerprint");
+                config.push_str(&format!(
+                    "[hooks.state.\"{}:{label}:{group_index}:{handler_index}\"]\ntrusted_hash = \"{hash}\"\n\n",
+                    home.hooks_path().display()
+                ));
+            }
+        }
+    }
+    std::fs::write(home.home.join(".codex").join("config.toml"), config).unwrap();
+}
+
+fn doctor_hooks_check(home: &Home) -> Value {
+    let output = home.run(
+        &[
+            "doctor",
+            "--json",
+            "--scope",
+            "global",
+            "--editors",
+            "codex",
+        ],
+        &ON,
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    report["editors"][0]["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["surface"] == "hooks")
+        .expect("hooks check")
+        .clone()
+}
+
+#[test]
+fn approval_is_asked_for_until_codex_has_it_and_doctor_says_which_hooks_wait() {
+    let home = Home::new();
+    home.update_hooks(&ON);
+
+    // Only the hook Codex always had is approved: the two new ones are
+    // written and Codex does not run them. Setup and doctor both say so.
+    approve(&home, &[("PreToolUse", "pre_tool_use")]);
+    let said = home.update_hooks(&ON);
+    assert!(said.contains("/hooks"), "{said}");
+    assert!(said.contains("PostToolUse and Stop"), "{said}");
+    let check = doctor_hooks_check(&home);
+    assert_eq!(check["status"], "warn", "{check:#}");
+    let detail = check.to_string();
+    assert!(detail.contains("PostToolUse and Stop"), "{detail}");
+    assert!(detail.contains("/hooks"), "{detail}");
+
+    // One of the two is approved: the other is named alone.
+    approve(
+        &home,
+        &[
+            ("PreToolUse", "pre_tool_use"),
+            ("PostToolUse", "post_tool_use"),
+        ],
+    );
+    let said = home.update_hooks(&ON);
+    assert!(said.contains("under Stop"), "{said}");
+    assert!(!said.contains("PostToolUse"), "{said}");
+
+    // All three approved: nothing more is asked, and doctor passes.
+    approve(
+        &home,
+        &[
+            ("PreToolUse", "pre_tool_use"),
+            ("PostToolUse", "post_tool_use"),
+            ("Stop", "stop"),
+        ],
+    );
+    let said = home.update_hooks(&ON);
+    assert!(!said.contains("/hooks"), "{said}");
+    let check = doctor_hooks_check(&home);
+    assert_eq!(check["status"], "pass", "{check:#}");
 }

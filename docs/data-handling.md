@@ -56,6 +56,19 @@ uses. Workspace members who can read the run's project see it live, on the ticke
   2 s for the session's own process and leaves within 30 s of that process ending, after ending the session's runs. It
   also leaves when the session ends, a minute after the last run closed, when the API refuses, or when the API cannot
   be reached five times in a row.
+- **Codex:** Codex runs a hook only after you approve it, and as shipped setup writes one hook for it, the mid-run
+  notices before a tool call. Where `CONTEXTSTREAM_RUN_PROGRESS_AUTO=on` (or `CONTEXTSTREAM_RUN_PROGRESS_SIGNS=on`) is
+  set in the environment `contextstream-mcp setup` or `update-hooks` runs in, setup also writes
+  `contextstream-mcp hook run-progress` under `PostToolUse` and `Stop` in `~/.codex/hooks.json`. Approve both with
+  `/hooks` in Codex CLI and reload the session: Codex skips an unapproved hook without a word, so setup says which
+  ones wait on every update and `doctor` warns until Codex has them. That hook does live progress and nothing else:
+  it reads the answers of `init`, `progress` and a ticket's status change, notes that a tool call or a turn ended,
+  prints nothing and never touches the network. The mid-run notices hook notes that a tool call starts; its command
+  is unchanged, so its approval stands. What is sent is the table above, with two differences: after a turn ended, a
+  Codex run says `working` again with the next tool call (not with the prompt), and a Codex session's end is told
+  from its process ending. With both switches off the next `update-hooks` takes the two hooks out, and `uninstall`
+  always does; your own Codex hooks are never touched. Until you turn it on and approve them, a Codex session gets
+  none of this section, as before.
 - **Windows:** the session's process cannot be watched there. A session that crashes is shown as stalled and later as
   lost, not as ended, and the keep-alive process leaves 10 minutes after the last hook event (60 minutes when a tool
   call never reported back).

@@ -32,6 +32,25 @@ use super::hooks::{
 };
 
 pub const CODEX_HOOK_TIMEOUT_SECS: u64 = 5;
+
+/// The hook that gives a Codex session live progress, beside the mid-run
+/// notices hook that notes its tool calls (`hook run-progress`).
+pub const CODEX_LIVE_PROGRESS_HOOK: &str = crate::hook_handlers::run_progress::EVENT_HOOK;
+
+/// The Codex events the live-progress hook is written under: a tool call's
+/// answer (who the server says the session is, a run the model reported) and
+/// the turn's end. Codex runs each only after a person approved it.
+pub const CODEX_LIVE_PROGRESS_EVENTS: [&str; 2] = ["PostToolUse", "Stop"];
+
+/// The name Codex keys an event by in `[hooks.state]` and in a hook's
+/// fingerprint (`hook_event_key_label`).
+fn codex_event_key_label(event: &str) -> &'static str {
+    match event {
+        "PostToolUse" => "post_tool_use",
+        "Stop" => "stop",
+        _ => "pre_tool_use",
+    }
+}
 const CODEX_DEFAULT_TIMEOUT_SECS: u64 = 600;
 const CODEX_DEFAULT_ADDITIONAL_CONTEXT_LIMIT: u64 = 2500;
 const DOCTOR_PROBE_SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440001";
@@ -393,6 +412,16 @@ pub fn is_owned_codex_notice_handler_for_platform(
     managed_binary: &Path,
     windows: bool,
 ) -> bool {
+    is_owned_codex_handler_named(handler, managed_binary, windows, CODEX_NOTICE_HOOK)
+}
+
+/// Whether `handler` is ContextStream's own handler for the hook `hook_name`.
+fn is_owned_codex_handler_named(
+    handler: &Value,
+    managed_binary: &Path,
+    windows: bool,
+    hook_name: &str,
+) -> bool {
     let Some(object) = handler.as_object() else {
         return false;
     };
@@ -406,7 +435,7 @@ pub fn is_owned_codex_notice_handler_for_platform(
                     owned_codex_hook_name_in_command_for_platform(cmd, managed_binary, windows)
                 })
                 .as_deref()
-                == Some(CODEX_NOTICE_HOOK)
+                == Some(hook_name)
         })
 }
 
@@ -436,6 +465,22 @@ pub fn codex_notice_hook_handler_for_platform(
     windows: bool,
     preserved_posix_windows_override: Option<&str>,
 ) -> Value {
+    codex_hook_handler_for_platform(
+        binary,
+        CODEX_NOTICE_HOOK,
+        windows,
+        preserved_posix_windows_override,
+    )
+}
+
+/// The handler object for one of ContextStream's Codex hooks: the same shape
+/// for each, so each runs the same way in every shell Codex may pick.
+fn codex_hook_handler_for_platform(
+    binary: &str,
+    hook_name: &str,
+    windows: bool,
+    preserved_posix_windows_override: Option<&str>,
+) -> Value {
     let emit_windows = windows || looks_like_windows_path(binary);
     let command_binary = if emit_windows {
         normalize_windows_executable_path(binary)
@@ -448,14 +493,14 @@ pub fn codex_notice_hook_handler_for_platform(
         "command".to_string(),
         Value::String(hook_command_for_platform(
             &command_binary,
-            CODEX_NOTICE_HOOK,
+            hook_name,
             emit_windows,
         )),
     );
     if emit_windows {
         handler.insert(
             "commandWindows".to_string(),
-            Value::String(codex_windows_hook_command(binary, CODEX_NOTICE_HOOK)),
+            Value::String(codex_windows_hook_command(binary, hook_name)),
         );
     } else if let Some(override_cmd) = preserved_posix_windows_override {
         handler.insert(
@@ -496,12 +541,21 @@ fn existing_canonical_windows_override_in(
     managed_binary: &Path,
     windows: bool,
 ) -> Option<String> {
+    existing_canonical_windows_override_named(groups, managed_binary, windows, CODEX_NOTICE_HOOK)
+}
+
+fn existing_canonical_windows_override_named(
+    groups: &[Value],
+    managed_binary: &Path,
+    windows: bool,
+    wanted: &str,
+) -> Option<String> {
     for group in groups {
         let Some(handlers) = group.get("hooks").and_then(Value::as_array) else {
             continue;
         };
         for handler in handlers {
-            if !is_owned_codex_notice_handler_for_platform(handler, managed_binary, windows) {
+            if !is_owned_codex_handler_named(handler, managed_binary, windows, wanted) {
                 continue;
             }
             if let Some(cmd_win) = handler
@@ -510,7 +564,7 @@ fn existing_canonical_windows_override_in(
                 .and_then(Value::as_str)
             {
                 if let Some((_, hook_name)) = parse_canonical_codex_windows_hook_command(cmd_win) {
-                    if hook_name == CODEX_NOTICE_HOOK {
+                    if hook_name == wanted {
                         return Some(cmd_win.to_string());
                     }
                 }
@@ -522,12 +576,37 @@ fn existing_canonical_windows_override_in(
 
 /// Add or migrate ContextStream's `mid-run-notices` hook in a Codex `hooks.json`
 /// document while preserving all unrelated events, groups, and user handlers.
+/// The live-progress hooks are left as they are.
 pub fn update_codex_hooks_document_for_platform(
     existing: &Value,
     path: &Path,
     binary: &str,
     managed_binary: &Path,
     windows: bool,
+) -> Result<(Value, CodexHookUpdateKind)> {
+    update_codex_hooks_document_with_live_progress(
+        existing,
+        path,
+        binary,
+        managed_binary,
+        windows,
+        None,
+    )
+}
+
+/// The same, and the live-progress hooks ([`CODEX_LIVE_PROGRESS_EVENTS`]) as
+/// `live_progress` says: `Some(true)` writes them, for a person who turned
+/// live progress from the hooks on; `Some(false)` takes ContextStream's own
+/// out; `None` leaves them as they are. A handler that is already as it
+/// would be written stays where it is: Codex keys a person's approval by a
+/// handler's place in its event, so moving it would ask for approval again.
+pub fn update_codex_hooks_document_with_live_progress(
+    existing: &Value,
+    path: &Path,
+    binary: &str,
+    managed_binary: &Path,
+    windows: bool,
+    live_progress: Option<bool>,
 ) -> Result<(Value, CodexHookUpdateKind)> {
     let mut root = match existing {
         Value::Object(map) => map.clone(),
@@ -581,6 +660,73 @@ pub fn update_codex_hooks_document_for_platform(
         Some(_) => unreachable!("validated above"),
     }
 
+    if let Some(wanted) = live_progress {
+        for event in CODEX_LIVE_PROGRESS_EVENTS {
+            let groups = match hooks.get(event) {
+                Some(Value::Array(groups)) => groups.clone(),
+                Some(Value::Null) | None => Vec::new(),
+                Some(_) => anyhow::bail!(
+                    "Refusing to modify {}: \"{event}\" is not an array.",
+                    path.display()
+                ),
+            };
+            let preserved = (!windows && !looks_like_windows_path(binary))
+                .then(|| {
+                    existing_canonical_windows_override_named(
+                        &groups,
+                        managed_binary,
+                        windows,
+                        CODEX_LIVE_PROGRESS_HOOK,
+                    )
+                })
+                .flatten();
+            let group = json!({
+                "hooks": [codex_hook_handler_for_platform(
+                    binary,
+                    CODEX_LIVE_PROGRESS_HOOK,
+                    windows,
+                    preserved.as_deref(),
+                )]
+            });
+            let ours = groups
+                .iter()
+                .filter(|group| {
+                    group
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .is_some_and(|handlers| {
+                            handlers.iter().any(|handler| {
+                                is_owned_codex_handler_named(
+                                    handler,
+                                    managed_binary,
+                                    windows,
+                                    CODEX_LIVE_PROGRESS_HOOK,
+                                )
+                            })
+                        })
+                })
+                .count();
+            // Already as it would be written: it stays where it is.
+            if wanted && ours == 1 && groups.contains(&group) {
+                continue;
+            }
+            let mut next = strip_owned_codex_handlers(
+                &groups,
+                managed_binary,
+                windows,
+                CODEX_LIVE_PROGRESS_HOOK,
+            );
+            if wanted {
+                next.push(group);
+            }
+            if next.is_empty() {
+                hooks.remove(event);
+            } else {
+                hooks.insert(event.to_string(), Value::Array(next));
+            }
+        }
+    }
+
     root.insert("hooks".to_string(), Value::Object(hooks));
     let updated = Value::Object(root);
     let kind = if &updated == existing {
@@ -598,6 +744,17 @@ fn strip_owned_codex_notice_handlers(
     managed_binary: &Path,
     windows: bool,
 ) -> Vec<Value> {
+    strip_owned_codex_handlers(groups, managed_binary, windows, CODEX_NOTICE_HOOK)
+}
+
+/// `groups` without ContextStream's own handlers for the hook `hook_name`; a
+/// group they were alone in goes with them.
+fn strip_owned_codex_handlers(
+    groups: &[Value],
+    managed_binary: &Path,
+    windows: bool,
+    hook_name: &str,
+) -> Vec<Value> {
     let mut out = Vec::with_capacity(groups.len());
     for group in groups {
         let Some(mut group_obj) = group.as_object().cloned() else {
@@ -612,7 +769,7 @@ fn strip_owned_codex_notice_handlers(
         let kept: Vec<Value> = handlers
             .into_iter()
             .filter(|handler| {
-                !is_owned_codex_notice_handler_for_platform(handler, managed_binary, windows)
+                !is_owned_codex_handler_named(handler, managed_binary, windows, hook_name)
             })
             .collect();
         let removed_owned = kept.len() != before;
@@ -625,8 +782,9 @@ fn strip_owned_codex_notice_handlers(
     out
 }
 
-/// Remove only ContextStream's `mid-run-notices` hook from a Codex `hooks.json`
-/// document, leaving unrelated user hooks intact.
+/// Remove only ContextStream's own hooks from a Codex `hooks.json` document
+/// (`mid-run-notices`, and the live-progress hook under whatever event it
+/// stands), leaving unrelated user hooks intact.
 pub fn remove_codex_notice_hooks_from_document_for_platform(
     existing: &Value,
     path: &Path,
@@ -656,6 +814,24 @@ pub fn remove_codex_notice_hooks_from_document_for_platform(
             hooks.remove("PreToolUse");
         } else {
             hooks.insert("PreToolUse".to_string(), Value::Array(stripped));
+        }
+    }
+    // A hook left behind would point at a binary uninstall may remove, and
+    // fail on every tool call.
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    for event in events {
+        let Some(Value::Array(groups)) = hooks.get(&event).cloned() else {
+            continue;
+        };
+        let stripped =
+            strip_owned_codex_handlers(&groups, managed_binary, windows, CODEX_LIVE_PROGRESS_HOOK);
+        if stripped == groups {
+            continue;
+        }
+        if stripped.is_empty() {
+            hooks.remove(&event);
+        } else {
+            hooks.insert(event, Value::Array(stripped));
         }
     }
     root.insert("hooks".to_string(), Value::Object(hooks));
@@ -791,6 +967,16 @@ pub fn codex_hook_identity_hash_for_platform(
     handler: &Value,
     windows: bool,
 ) -> Option<String> {
+    codex_hook_identity_hash_for_event(group, handler, windows, "PreToolUse")
+}
+
+/// The same fingerprint for a handler under `event`: the event is part of it.
+pub fn codex_hook_identity_hash_for_event(
+    group: &Value,
+    handler: &Value,
+    windows: bool,
+    event: &str,
+) -> Option<String> {
     let obj = handler.as_object()?;
     let effective_command = effective_codex_hook_command_for_platform(handler, windows)?.trim();
     if effective_command.is_empty() {
@@ -824,7 +1010,10 @@ pub fn codex_hook_identity_hash_for_platform(
 
     let handler_value = serde_json::to_value(normalized_handler).ok()?;
     let mut normalized_identity: BTreeMap<&'static str, Value> = BTreeMap::new();
-    normalized_identity.insert("event_name", Value::String("pre_tool_use".to_string()));
+    normalized_identity.insert(
+        "event_name",
+        Value::String(codex_event_key_label(event).to_string()),
+    );
     normalized_identity.insert("hooks", Value::Array(vec![handler_value]));
     if let Some(matcher) = group.get("matcher").and_then(Value::as_str) {
         normalized_identity.insert("matcher", Value::String(matcher.to_string()));
@@ -859,8 +1048,16 @@ pub fn codex_config_toml_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".codex").join("config.toml"))
 }
 
-fn candidate_state_keys(hooks_path: &Path, group_idx: usize, handler_idx: usize) -> Vec<String> {
-    let suffix = format!(":pre_tool_use:{group_idx}:{handler_idx}");
+fn candidate_state_keys_for_event(
+    hooks_path: &Path,
+    event: &str,
+    group_idx: usize,
+    handler_idx: usize,
+) -> Vec<String> {
+    let suffix = format!(
+        ":{}:{group_idx}:{handler_idx}",
+        codex_event_key_label(event)
+    );
     let mut keys = vec![format!("{}{suffix}", hooks_path.display())];
     if let Ok(canonical) = std::fs::canonicalize(hooks_path) {
         let normalized = normalize_windows_executable_path(&canonical.to_string_lossy());
@@ -885,7 +1082,79 @@ pub fn inspect_codex_hook_trust_for_platform(
         find_installed_codex_notice_handler(hooks_doc, managed_binary, windows)?;
     let current_hash = codex_hook_identity_hash_for_platform(group, handler, windows)
         .ok_or_else(|| "could not fingerprint Codex mid-run-notices hook".to_string())?;
+    codex_hook_trust_at(
+        hooks_path,
+        config_toml_path,
+        "PreToolUse",
+        group_idx,
+        handler_idx,
+        current_hash,
+        windows,
+    )
+}
 
+/// The Codex events whose live-progress hook is written and waits for a
+/// person's approval: Codex runs a hook only once it is approved (`/hooks`),
+/// and says nothing of one it skips. Empty when none is written, when each is
+/// approved, and when their state cannot be read.
+pub fn codex_live_progress_hooks_awaiting_approval(
+    hooks_path: &Path,
+    hooks_doc: &Value,
+    config_toml_path: Option<&Path>,
+    managed_binary: &Path,
+    windows: bool,
+) -> Vec<&'static str> {
+    let mut waiting = Vec::new();
+    for event in CODEX_LIVE_PROGRESS_EVENTS {
+        let groups = hooks_doc
+            .get("hooks")
+            .and_then(|hooks| hooks.get(event))
+            .and_then(Value::as_array);
+        for (group_idx, group) in groups.into_iter().flatten().enumerate() {
+            let handlers = group.get("hooks").and_then(Value::as_array);
+            for (handler_idx, handler) in handlers.into_iter().flatten().enumerate() {
+                if !is_owned_codex_handler_named(
+                    handler,
+                    managed_binary,
+                    windows,
+                    CODEX_LIVE_PROGRESS_HOOK,
+                ) {
+                    continue;
+                }
+                let trusted = codex_hook_identity_hash_for_event(group, handler, windows, event)
+                    .and_then(|current_hash| {
+                        codex_hook_trust_at(
+                            hooks_path,
+                            config_toml_path,
+                            event,
+                            group_idx,
+                            handler_idx,
+                            current_hash,
+                            windows,
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|state| matches!(state, CodexHookTrustState::Trusted { .. }));
+                if !trusted && !waiting.contains(&event) {
+                    waiting.push(event);
+                }
+            }
+        }
+    }
+    waiting
+}
+
+/// What `~/.codex/config.toml` says of the handler at this place under
+/// `event`, whose fingerprint is `current_hash`.
+fn codex_hook_trust_at(
+    hooks_path: &Path,
+    config_toml_path: Option<&Path>,
+    event: &str,
+    group_idx: usize,
+    handler_idx: usize,
+    current_hash: String,
+    windows: bool,
+) -> std::result::Result<CodexHookTrustState, String> {
     let Some(config_path) = config_toml_path.filter(|path| path.exists()) else {
         return Ok(CodexHookTrustState::Untrusted { current_hash });
     };
@@ -918,7 +1187,7 @@ pub fn inspect_codex_hook_trust_for_platform(
         .and_then(|hooks| hooks.get("state"))
         .and_then(toml_edit::Item::as_table_like);
 
-    let keys = candidate_state_keys(hooks_path, group_idx, handler_idx);
+    let keys = candidate_state_keys_for_event(hooks_path, event, group_idx, handler_idx);
     let matched_entry = state_table.and_then(|table| {
         keys.iter()
             .find_map(|key| table.get(key).and_then(toml_edit::Item::as_table_like))
@@ -1298,6 +1567,44 @@ pub fn probe_installed_codex_hook_for_doctor(
 /// User-facing guidance when `setup`, `update-hooks`, or `doctor --repair`
 /// installs or migrates Codex's `~/.codex/hooks.json`.
 pub fn codex_post_update_guidance(
+    hooks_path: &Path,
+    updated_doc: &Value,
+    update_kind: CodexHookUpdateKind,
+    managed_binary: &Path,
+    dry_run: bool,
+) -> Option<String> {
+    let notice = codex_notice_update_guidance(
+        hooks_path,
+        updated_doc,
+        update_kind,
+        managed_binary,
+        dry_run,
+    );
+    // Said on every update while they wait: Codex skips an unapproved hook
+    // without a word, so live progress would stay off and nobody would know.
+    let waiting = codex_live_progress_hooks_awaiting_approval(
+        hooks_path,
+        updated_doc,
+        codex_config_toml_path().as_deref(),
+        managed_binary,
+        cfg!(windows),
+    );
+    let live_progress = (!waiting.is_empty()).then(|| {
+        format!(
+            "Live progress for Codex takes ContextStream's hook under {} in {} (`hook {CODEX_LIVE_PROGRESS_HOOK}`), and Codex runs a hook only after you approve it: run /hooks in Codex CLI, approve {}, and reload your Codex session. Until then a Codex session is not kept alive, shown or ended in live progress.",
+            waiting.join(" and "),
+            hooks_path.display(),
+            if waiting.len() == 1 { "it" } else { "them" },
+        )
+    });
+    match (notice, live_progress) {
+        (Some(notice), Some(live_progress)) => Some(format!("{notice} {live_progress}")),
+        (notice, live_progress) => notice.or(live_progress),
+    }
+}
+
+/// The note about the mid-run notices hook after an update.
+fn codex_notice_update_guidance(
     hooks_path: &Path,
     updated_doc: &Value,
     update_kind: CodexHookUpdateKind,

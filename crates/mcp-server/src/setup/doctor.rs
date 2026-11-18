@@ -1128,13 +1128,36 @@ fn check_codex_hooks_at(
                 managed_binary,
                 cfg!(windows),
             ) {
-                Ok(super::codex_hooks::CodexHookTrustState::Trusted { .. }) => SurfaceCheck::pass(
-                    SURFACE,
-                    format!(
-                        "{count} current managed hook entries installed; shell execution verified; trusted in Codex"
-                    ),
-                    Some(path),
-                ),
+                Ok(super::codex_hooks::CodexHookTrustState::Trusted { .. }) => {
+                    // Codex skips an unapproved hook without a word: the
+                    // live-progress hooks would be written and never run.
+                    let waiting = super::codex_hooks::codex_live_progress_hooks_awaiting_approval(
+                        path,
+                        &parsed,
+                        config_toml_path,
+                        managed_binary,
+                        cfg!(windows),
+                    );
+                    if waiting.is_empty() {
+                        SurfaceCheck::pass(
+                            SURFACE,
+                            format!(
+                                "{count} current managed hook entries installed; shell execution verified; trusted in Codex"
+                            ),
+                            Some(path),
+                        )
+                    } else {
+                        SurfaceCheck::warning(
+                            SURFACE,
+                            format!(
+                                "hook execution verified, but the live-progress hook under {} is not approved in Codex, so Codex does not run it and a Codex session is not kept alive, shown or ended in live progress; run /hooks in Codex CLI to review/approve and reload your Codex session",
+                                waiting.join(" and ")
+                            ),
+                            Some(path),
+                            None,
+                        )
+                    }
+                }
                 Ok(super::codex_hooks::CodexHookTrustState::Modified { .. }) => {
                     SurfaceCheck::warning(
                         SURFACE,

@@ -1268,6 +1268,12 @@ fn root_object_for_edit(loaded: &safe_edit::LoadedConfig, path: &Path) -> Result
 /// Add (or migrate/refresh) ContextStream's `mid-run-notices` hook in Codex's
 /// `hooks.json`, preserving all unrelated entries and returning any required
 /// `/hooks` trust-review or reload note when the hook changed.
+///
+/// The live-progress hooks (PostToolUse and Stop) are written only for a
+/// person who turned live progress from the hooks on, in the environment
+/// this runs in, and taken out again when it is off: each is one more hook
+/// to approve in Codex and one more process after every tool call, for
+/// something that is off as shipped.
 fn install_codex_hooks_with_guidance() -> Result<Option<String>> {
     let path =
         codex_hooks_path().ok_or_else(|| anyhow::anyhow!("Could not determine the hooks path"))?;
@@ -1275,12 +1281,14 @@ fn install_codex_hooks_with_guidance() -> Result<Option<String>> {
     warn_on_nonstandard_syntax(&loaded, &path);
     let binary = find_binary_path();
     let managed = managed_binary_path();
-    let (updated, kind) = super::codex_hooks::update_codex_hooks_document_for_platform(
+    let live_progress = crate::hook_handlers::run_progress::Settings::from_env();
+    let (updated, kind) = super::codex_hooks::update_codex_hooks_document_with_live_progress(
         &loaded.value,
         &path,
         &binary,
         &managed,
         cfg!(windows),
+        Some(live_progress.enabled || live_progress.signs),
     )?;
     safe_edit::commit(&path, &loaded, &updated)?;
     Ok(super::codex_hooks::codex_post_update_guidance(

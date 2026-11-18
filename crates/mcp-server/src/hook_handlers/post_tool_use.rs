@@ -884,6 +884,32 @@ fn parse_project_binding_from_config(
     Some((project_id, workspace_id))
 }
 
+/// What a finished tool call means for this session's live runs (no
+/// network): who the server says the session is, a run the model reported, a
+/// ticket taken up, or only that the call is over. This is all the
+/// `run-progress` hook does after a tool call, for a host that runs none of
+/// ContextStream's other PostToolUse work (Codex).
+pub(crate) fn note_live_progress(input: &Value, cwd: &str) {
+    let tool_name = extract_tool_name(input);
+    let tool_input = extract_tool_input(input);
+    let tool_response = extract_tool_response(input);
+    let normalized_tool_name = normalize_contextstream_tool_name(&tool_name);
+    let answer_json = response_json(&tool_response);
+    let answer_text = response_text(&tool_response);
+    super::run_progress::tool_finished(
+        input,
+        cwd,
+        is_contextstream_server_call(&extract_mcp_server_name(input), &tool_name)
+            .then_some(normalized_tool_name.as_str()),
+        &tool_input,
+        super::run_progress::Answer {
+            succeeded: tool_call_succeeded(&tool_response),
+            json: answer_json.as_ref(),
+            text: answer_text.as_deref(),
+        },
+    );
+}
+
 /// Handle the PostToolUse hook.
 pub async fn handle() -> Result<()> {
     let input = read_stdin_json()?;
@@ -896,6 +922,7 @@ pub async fn handle() -> Result<()> {
 
     // What the call means for this session's live runs (no network): who the
     // server says the session is, a run the model reported, a ticket taken up.
+    note_live_progress(&input, &cwd);
     let answer_json = response_json(&tool_response);
     let answer_text = response_text(&tool_response);
     let answer = super::run_progress::Answer {
@@ -903,14 +930,6 @@ pub async fn handle() -> Result<()> {
         json: answer_json.as_ref(),
         text: answer_text.as_deref(),
     };
-    super::run_progress::tool_finished(
-        &input,
-        &cwd,
-        is_contextstream_server_call(&mcp_server_name, &tool_name)
-            .then_some(normalized_tool_name.as_str()),
-        &tool_input,
-        answer,
-    );
 
     if is_contextstream_server_call(&mcp_server_name, &tool_name) {
         // Notices a `context`/`init` result showed are not shown again mid-run.

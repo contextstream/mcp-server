@@ -115,6 +115,11 @@ const BEAT_SECS_ENV: &str = "CONTEXTSTREAM_RUN_PROGRESS_BEAT_SECS";
 /// Hook name of the detached keep-alive process.
 pub(crate) const BEAT_HOOK: &str = "run-progress-beat";
 
+/// Hook name of the event hook: live progress and nothing else, for a host
+/// whose other hook events ContextStream does not use. Setup installs it for
+/// Codex ([`handle_event_hook`]).
+pub(crate) const EVENT_HOOK: &str = "run-progress";
+
 const DEFAULT_BEAT_SECS: u64 = 30;
 /// A run that waits on a person is signalled this many beats apart.
 const WAITING_BEATS: u64 = 20;
@@ -1446,6 +1451,34 @@ fn process_alive(_pid: u32, _start: Option<u64>) -> bool {
 // ============================================================================
 // What the hooks call
 // ============================================================================
+
+/// `contextstream-mcp hook run-progress`: what one hook event means for the
+/// session's live runs, and nothing else of what ContextStream's hooks do.
+///
+/// Codex runs a hook only after a person approved it, and setup installs one
+/// hook for it (the mid-run notices, before every tool call). That hook
+/// notes a tool call's start; this one is the rest of what live progress
+/// takes: the answers of `init` and `progress` and a tool call's end
+/// (PostToolUse), and the turn's end (Stop). The event is the one the input
+/// names, so one command serves every event it is registered for.
+///
+/// It prints nothing, which every host takes for "nothing to say" (Codex
+/// refuses any field an event does not list), and never touches the network.
+pub async fn handle_event_hook() -> anyhow::Result<()> {
+    let Ok(input) = super::read_stdin_json() else {
+        return Ok(());
+    };
+    let cwd = common::extract_cwd(&input);
+    let event = text(&input, "hook_event_name").unwrap_or_default();
+    match event.as_str() {
+        "PostToolUse" => super::post_tool_use::note_live_progress(&input, &cwd),
+        "PreToolUse" => tool_started(&input, &cwd, &text(&input, "tool_name").unwrap_or_default()),
+        "UserPromptSubmit" => prompt_submitted(&input, &cwd),
+        "Stop" => turn_ended(&input, &cwd),
+        _ => {}
+    }
+    Ok(())
+}
 
 /// PreToolUse: a tool call starts. Never touches the network.
 pub(crate) fn tool_started(input: &Value, cwd: &str, tool: &str) {

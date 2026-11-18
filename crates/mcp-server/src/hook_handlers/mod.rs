@@ -606,9 +606,10 @@ pub async fn dispatch_hook(name: &str) -> Result<()> {
             // (`CONTEXTSTREAM_GIT_CAPTURE=off` / `.contextstream/config.json`).
             "git-post-commit" | "git-pre-push" | "git-post-checkout" | "git-post-merge" => {}
             // Silent/detached editor hooks emit nothing on stdout.
-            "codex-notify" | mid_run_notices::BACKGROUND_POLL_HOOK | run_progress::BEAT_HOOK => {
-                return Ok(())
-            }
+            "codex-notify"
+            | mid_run_notices::BACKGROUND_POLL_HOOK
+            | run_progress::BEAT_HOOK
+            | run_progress::EVENT_HOOK => return Ok(()),
             // Known JSON-stdout editor lifecycle hooks immediately no-op (`{}`).
             "user-prompt-submit"
             | "pre-tool-use"
@@ -691,6 +692,8 @@ pub async fn dispatch_hook(name: &str) -> Result<()> {
         mid_run_notices::BACKGROUND_POLL_HOOK => mid_run_notices::run_background_poll().await,
         // Detached keep-alive of a session's runs, started by a hook.
         run_progress::BEAT_HOOK => run_progress::run_beater().await,
+        // Codex `PostToolUse` and `Stop`: live progress only.
+        run_progress::EVENT_HOOK => run_progress::handle_event_hook().await,
         "permission-request" => permission_request::handle().await,
         "pre-compact" => pre_compact::handle().await,
         "post-compact" => post_compact::handle().await,

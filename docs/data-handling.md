@@ -115,10 +115,21 @@ workspaces it is switched on for; for every other workspace the paths answer 404
   timestamps, never tokens or words (in the platform state directory under `contextstream/deliveries`, or
   `CONTEXTSTREAM_DELIVERY_STATE_DIR`). The HTTP gateway requires this directory to be set explicitly. Replicas can use a private shared directory supporting file locks and atomic rename. `await-answer` keeps an empty per-run lock file under `contextstream/waiters` in the user's state directory so only one local waiter polls; its lock is released on exit.
 - **Gateway memory limits:** Each gateway process keeps at most 32 delivery owners per credential across its
-  workspaces and sessions, and 256 owners in total. At 32, a new owner can reuse the least recently used slot
-  under its own credential that has no unshown delivery, claim in flight or unexpired claim token. It can never
-  take another credential's slot. If all 32 are protected, or a new slot would exceed 256, the report is
-  recorded as usual and silently skips delivery work for that call.
+  workspaces and sessions, and 256 owners in total. An unshown delivery, a claim in flight or an unexpired
+  claim token pins the owner's slot. At 32, a credential can replace only its own least recently used unpinned
+  owner. At 256, a credential below its own limit can take a slot from the credential with the most slots
+  among those with an unpinned owner. All slots count toward that total. The gateway evicts that credential's
+  least recently used unpinned owner; if credentials tie, it compares their unpinned owners together.
+  An owner with only reports is eligible for eviction immediately; its idle report evidence expires after 10 minutes.
+
+  When every eligible slot is pinned, the gateway still records progress. The report or `get` says
+  “Deliveries are paused for this session; read again later.” The gateway logs one warning with an owner
+  digest per refusal. If your session has never held a slot, report again to establish ownership.
+
+  A claim token lasts at most one hour. An unread frame can remain pinned until the next sweep after its
+  lease expires. With no new claims, allow up to 70 minutes from the last claim receipt: one hour for the
+  lease and up to 10 minutes for the sweep, which runs on access. If claims keep pinning every eligible
+  slot, there is no guaranteed maximum wait.
 - **Controls:** `CONTEXTSTREAM_RUN_PROGRESS=off` (nothing is reported, so the tool asks for nothing),
   `CONTEXTSTREAM_MID_RUN_NOTICES=0` (the hooks do not ask). `await-answer` runs only when it is started.
 

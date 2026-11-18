@@ -359,6 +359,7 @@ impl StudioTool {
         let actual_desc = text(&template, "description");
         let mut applied = 0usize;
         let mut unapplied: Vec<&'static str> = Vec::new();
+        let mut desc_unapplied = false;
         if let Some(asked_name) = &name {
             if actual_name.as_deref() == Some(asked_name.as_str()) {
                 applied += 1;
@@ -369,15 +370,26 @@ impl StudioTool {
         if let Some(asked_desc) = &description {
             match asked_desc {
                 None if actual_desc.is_none() => applied += 1,
-                None => unapplied.push("the description was not cleared: this API did not take it"),
+                None => {
+                    desc_unapplied = true;
+                    unapplied.push("the description was not cleared: this API did not take it");
+                }
                 Some(wanted) if actual_desc.as_deref() == Some(wanted.as_str()) => applied += 1,
                 Some(_) => {
-                    unapplied.push("the description was not changed: this API did not take it")
+                    desc_unapplied = true;
+                    unapplied.push("the description was not changed: this API did not take it");
                 }
             }
         }
         let shown_name = actual_name.as_deref().unwrap_or(super::NOT_ANSWERED);
         let changed = applied > 0;
+        let still_desc = if desc_unapplied {
+            actual_desc
+                .as_deref()
+                .map_or(String::new(), |d| format!(" Still “{d}”."))
+        } else {
+            String::new()
+        };
         let message = if unapplied.is_empty() {
             format!(
                 "Changed the template: “{shown_name}” (template_id {id}).{}",
@@ -387,19 +399,13 @@ impl StudioTool {
             )
         } else if !changed {
             format!(
-                "Not changed on “{shown_name}” (template_id {id}): {}.{}",
+                "Not changed on “{shown_name}” (template_id {id}): {}.{still_desc}",
                 unapplied.join("; "),
-                actual_desc
-                    .as_deref()
-                    .map_or(String::new(), |d| format!(" Still “{d}”."))
             )
         } else {
             format!(
-                "Updated “{shown_name}” (template_id {id}), except {}.{}",
+                "Updated “{shown_name}” (template_id {id}), except {}.{still_desc}",
                 unapplied.join("; "),
-                actual_desc
-                    .as_deref()
-                    .map_or(String::new(), |d| format!(" Still “{d}”."))
             )
         };
         let mut out = ToolResult::with_structured(

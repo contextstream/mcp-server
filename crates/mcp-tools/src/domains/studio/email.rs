@@ -1518,7 +1518,7 @@ impl StudioTool {
         let url = campaign_url(&campaign_id.to_string());
         lines.push(format!("Edit and preview it in the studio: {url}"));
         lines.push(format!(
-            "Next, with campaign_id {campaign_id}: email_preview shows it in Gmail, Outlook and Apple Mail (a link to share); email_revise changes it from plain words; email_test sends a test to the person; email_send only when they say go: show them the campaign, its sender and its recipient count, then pass that count as confirm_recipients."
+            "Next, with campaign_id {campaign_id}: email_preview shows it in Gmail, Outlook and Apple Mail (a link to share); email_revise changes it from plain words; email_test sends a test to the person; email_send only when they say go: call email_send to show them the review, then pass the arguments in confirm_with."
         ));
         Ok(ToolResult::with_structured(
             lines.join("\n"),
@@ -1662,7 +1662,19 @@ impl StudioTool {
         if let Some(variant) = variant_of(input.variant)? {
             body["variant"] = json!(variant);
         }
-        let key = format!("email-test-{campaign_id}-{}", digest(&body.to_string()));
+        let revision = self
+            .read_campaign(workspace_id, campaign_id)
+            .await
+            .ok()
+            .and_then(std::result::Result::ok)
+            .and_then(|campaign| number(&campaign, "revision"));
+        let key = match revision {
+            Some(revision) => format!(
+                "email-test-{campaign_id}-r{revision}-{}",
+                digest(&body.to_string())
+            ),
+            None => format!("email-test-{campaign_id}-{}", digest(&body.to_string())),
+        };
         let answer = self
             .email_call(
                 "POST",

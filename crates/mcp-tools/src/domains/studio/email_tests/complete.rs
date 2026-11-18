@@ -3082,3 +3082,53 @@ async fn only_the_delete_tool_erases_audiences_segments_and_templates() {
         .unwrap();
     assert!(builtin.is_error && text_of(&builtin).contains("built-in"));
 }
+
+#[tokio::test]
+async fn a_send_rechecks_the_reviewed_sender_and_count_before_scheduling() {
+    let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let current = changed.clone();
+    let stub = Stub::start(over(move |request| {
+        if request.path.ends_with("/preview") && current.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let mut response = (usual())(request);
+            response.body["data"]["from"] = json!("Other <other@northwind.example>");
+            Some(response)
+        } else {
+            None
+        }
+    }))
+    .await;
+    let first = run(&stub, json!({"action":"email_send","campaign_id":CAMPAIGN})).await;
+    let confirmation = structured(&first)["confirm_with"].clone();
+    assert!(confirmation["confirm_review"].is_string());
+    changed.store(true, std::sync::atomic::Ordering::Relaxed);
+    let result = run(&stub, confirmation).await;
+    assert!(text_of(&result).contains("Other <other@northwind.example>"));
+    let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
+    assert!(stub.calls_to("POST", &schedule).is_empty());
+
+    // On a legacy API even the live question can outlast the count it showed.
+    let previews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stub = Stub::start(over(move |request| {
+        if !request.path.ends_with("/preview") {
+            return None;
+        }
+        let mut response = (usual())(request);
+        if previews.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+            response.body["data"]["recipients"] = json!(36);
+        }
+        Some(response)
+    }))
+    .await;
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() = Some(json!({"action":"accept","content":{"confirm":true}}));
+    let result = run_with_call_peer(
+        CallPeer::new(client, None, true),
+        stub.tool()
+            .execute(json!({"action":"email_send","campaign_id":CAMPAIGN})),
+    )
+    .await
+    .unwrap();
+    assert!(text_of(&result).contains("again"));
+    assert!(stub.calls_to("POST", &schedule).is_empty());
+}

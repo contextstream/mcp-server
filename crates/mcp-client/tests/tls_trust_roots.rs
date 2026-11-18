@@ -253,6 +253,20 @@ async fn the_api_client_trusts_an_authority_named_by_ssl_cert_file() {
     }
 }
 
+#[tokio::test]
+async fn update_downloads_reject_a_ca_accepted_for_api_calls() {
+    let _lock = ENVIRONMENT.lock().await;
+    let home = clean_environment();
+    let (pem, url) = serve_behind_a_throwaway_authority().await;
+    let ca = home.path().join("proxy-ca.pem");
+    std::fs::write(&ca, pem).unwrap();
+    std::env::set_var("SSL_CERT_FILE", &ca);
+    assert!(api_client(&url).me().await.is_ok());
+    let error = mcp_client::http::update_client_builder().build().unwrap()
+        .get(&url).send().await.expect_err("update must reject a private API CA");
+    assert!(format!("{error:?}").contains("UnknownIssuer"), "{error:?}");
+}
+
 // 1.0.82 ignored SSL_CERT_FILE. Reading it must not turn a variable that
 // names nothing usable into a client that cannot be made: that was a panic
 // ("zero valid certificates found in native root store") in every hook and

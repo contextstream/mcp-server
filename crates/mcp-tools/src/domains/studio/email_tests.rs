@@ -797,17 +797,19 @@ async fn a_send_asks_the_person_when_the_client_can() {
         "{message}"
     );
 
-    // A count the agent passes doesn't outweigh the person's no.
+    // A count that isn't the campaign's is no go for it: the person is asked, and their no
+    // stands.
     let still_no = run_with_call_peer(
         CallPeer::new(client.clone(), None, true),
         tool.execute(json!({
-            "action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37,
+            "action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 36,
             "send_at": "2026-11-02T09:00", "time_zone": "Europe/London",
         })),
     )
     .await
     .unwrap();
     assert!(text_of(&still_no).starts_with("Not sent"));
+    assert_eq!(client.sent.lock().unwrap().len(), 2, "asked again");
 
     // Accepting without ticking "Send it" isn't a go.
     *client.answer.lock().unwrap() =
@@ -848,9 +850,7 @@ async fn a_stateless_client_is_asked_through_the_calls_result() {
     let first = CallPeer::new(client.clone(), None, false).with_inline_input(&json!({}));
     let asked = run_with_call_peer(
         first.clone(),
-        tool.execute(
-            json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37}),
-        ),
+        tool.execute(json!({"action": "email_send", "campaign_id": CAMPAIGN})),
     )
     .await
     .unwrap();
@@ -888,6 +888,63 @@ async fn a_stateless_client_is_asked_through_the_calls_result() {
         .len(),
         1
     );
+}
+
+/// The agent's go (mcp-server ticket 875b09b7): the recipient count, or the address, the agent
+/// confirms after showing the person is their go as the agent gives it, so the client is not
+/// asked again. Some clients say they can ask and never show the question (a Claude Code cloud
+/// session): there a question waited until the client gave up on the call, and nothing could
+/// ever be sent or taken off the list.
+#[tokio::test]
+async fn the_agents_confirmation_is_the_go_and_the_person_is_not_asked_again() {
+    let stub = Stub::start(usual()).await;
+    let tool = stub.tool();
+    let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
+    let send = json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37});
+
+    // A stateless client: sent at once, with no question in the call's result.
+    let stateless =
+        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}));
+    let sent = run_with_call_peer(stateless.clone(), tool.execute(send.clone()))
+        .await
+        .unwrap();
+    assert!(!sent.is_error, "{}", text_of(&sent));
+    assert!(stateless.take_input_required().is_none(), "nobody is asked");
+    assert_eq!(stub.calls_to("POST", &schedule).len(), 1);
+
+    // A live client, whose person would have said no: not asked.
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));
+    let sent = run_with_call_peer(
+        CallPeer::new(client.clone(), None, true),
+        tool.execute(send),
+    )
+    .await
+    .unwrap();
+    assert!(!sent.is_error, "{}", text_of(&sent));
+    assert!(client.sent.lock().unwrap().is_empty(), "nobody is asked");
+    assert_eq!(stub.calls_to("POST", &schedule).len(), 2);
+
+    // Off the suppression list on the address the agent confirms, in either client.
+    let remove = "/create/email/suppressions/remove";
+    let off = json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example", "confirm_email": "grace@northwind.example"});
+    let removed = run_with_call_peer(
+        CallPeer::new(client.clone(), None, true),
+        tool.execute(off.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(!removed.is_error, "{}", text_of(&removed));
+    assert!(client.sent.lock().unwrap().is_empty(), "nobody is asked");
+    assert_eq!(stub.calls_to("POST", remove).len(), 1);
+    let stateless =
+        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}));
+    let removed = run_with_call_peer(stateless.clone(), tool.execute(off))
+        .await
+        .unwrap();
+    assert!(!removed.is_error, "{}", text_of(&removed));
+    assert!(stateless.take_input_required().is_none(), "nobody is asked");
+    assert_eq!(stub.calls_to("POST", remove).len(), 2);
 }
 
 #[tokio::test]
@@ -1858,7 +1915,7 @@ async fn unsubscribes_are_listed_with_why_and_a_remove_needs_the_persons_go() {
     *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));
     let declined = run_with_call_peer(
         CallPeer::new(client.clone(), None, true),
-        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example", "confirm_email": "grace@northwind.example"})),
+        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example"})),
     )
     .await
     .unwrap();

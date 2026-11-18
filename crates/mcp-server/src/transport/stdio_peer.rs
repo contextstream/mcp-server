@@ -287,12 +287,35 @@ mod tests {
 
     #[tokio::test]
     async fn an_unanswered_question_times_out_and_is_forgotten() {
-        let (server_out, _client_in) = tokio::io::duplex(64 * 1024);
+        let (server_out, mut client_in) = tokio::io::duplex(64 * 1024);
         let peer = StdioPeer::new(Arc::new(LineWriter::new(server_out)));
         let answer = peer
             .request("elicitation/create", json!({}), Duration::from_millis(50))
             .await;
         assert!(answer.unwrap_err().contains("no answer"));
         assert!(peer.pending().lock().unwrap().is_empty());
+
+        // The client is told the server stopped waiting, so it can take the question down
+        // rather than leave the person answering into nothing.
+        let mut seen = vec![0u8; 4096];
+        let mut written = String::new();
+        while written.lines().count() < 2 {
+            let read = tokio::time::timeout(Duration::from_secs(2), client_in.read(&mut seen))
+                .await
+                .unwrap_or_else(|_| panic!("the client was told nothing more: {written}"))
+                .unwrap();
+            assert!(read > 0, "the client got: {written}");
+            written.push_str(std::str::from_utf8(&seen[..read]).unwrap());
+        }
+        let lines: Vec<Value> = written
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines[0]["method"], "elicitation/create");
+        assert_eq!(lines[1]["method"], "notifications/cancelled");
+        assert_eq!(lines[1]["params"]["requestId"], lines[0]["id"]);
+        assert!(lines[1]["params"]["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()));
     }
 }

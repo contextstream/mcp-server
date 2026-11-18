@@ -380,6 +380,8 @@ mod tests {
     struct Recorder {
         sent: Mutex<Vec<(String, Value)>>,
         answer: Mutex<Option<std::result::Result<Value, String>>>,
+        /// How long each request was given to be answered.
+        waits: Mutex<Vec<Duration>>,
     }
 
     #[async_trait]
@@ -392,9 +394,10 @@ mod tests {
             &self,
             method: &str,
             params: Value,
-            _timeout: Duration,
+            timeout: Duration,
         ) -> std::result::Result<Value, String> {
             self.sent.lock().unwrap().push((method.to_string(), params));
+            self.waits.lock().unwrap().push(timeout);
             self.answer
                 .lock()
                 .unwrap()
@@ -428,6 +431,32 @@ mod tests {
             .collect();
         assert!(values.windows(2).all(|w| w[1] > w[0]), "{values:?}");
         assert!(sent[2].1.get("message").is_none());
+    }
+
+    /// A live question waits for the person no longer than a client commonly gives a whole
+    /// tool call (60 s), whatever its caller asks: past the client's limit the call's answer is
+    /// lost, and an unanswered question must still come back as an answer the agent can act on
+    /// (mcp-server ticket 875b09b7).
+    #[tokio::test]
+    async fn a_live_question_waits_less_than_a_client_gives_a_tool_call() {
+        let recorder = Arc::new(Recorder::default());
+        let peer = CallPeer::new(recorder.clone(), None, true);
+        let answer = peer
+            .elicit(
+                "Spend up to 300 credits?",
+                json!({"type": "object", "properties": {}}),
+                Duration::from_secs(300),
+            )
+            .await;
+        assert!(matches!(answer, Elicited::Unanswered(_)), "{answer:?}");
+        let short = peer
+            .elicit("Go?", json!({"type": "object"}), Duration::from_secs(5))
+            .await;
+        assert!(matches!(short, Elicited::Unanswered(_)), "{short:?}");
+        let waits = recorder.waits.lock().unwrap().clone();
+        assert_eq!(waits.len(), 2);
+        assert!(waits[0] < Duration::from_secs(60), "{waits:?}");
+        assert_eq!(waits[1], Duration::from_secs(5), "a shorter wait is kept");
     }
 
     #[tokio::test]

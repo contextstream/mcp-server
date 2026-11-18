@@ -337,6 +337,8 @@ fn structured(result: &ToolResult) -> Value {
 struct FakeClient {
     sent: Mutex<Vec<(String, Value)>>,
     answer: Mutex<Option<Value>>,
+    /// How long each question was given to be answered.
+    waits: Mutex<Vec<Duration>>,
 }
 
 #[async_trait]
@@ -349,9 +351,10 @@ impl PeerChannel for FakeClient {
         &self,
         method: &str,
         params: Value,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> std::result::Result<Value, String> {
         self.sent.lock().unwrap().push((method.to_string(), params));
+        self.waits.lock().unwrap().push(timeout);
         self.answer
             .lock()
             .unwrap()
@@ -678,6 +681,27 @@ async fn where_only_the_persons_own_go_ahead_counts_an_accepted_price_makes_noth
     not_made(&unanswered);
     assert_eq!(silent.sent.lock().unwrap().len(), 1, "the person was asked");
     assert!(stub.posts_to("/create/jobs").is_empty());
+    // A stateless client is asked through the call's result, the agent's price
+    // notwithstanding.
+    let stateless =
+        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}));
+    let asking = mcp_client::run_with_config_override(asked_only(), || {
+        run_with_call_peer(
+            stateless.clone(),
+            tool.execute(
+                json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 412}),
+            ),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        text_of(&asking).starts_with("Asking the person"),
+        "{}",
+        text_of(&asking)
+    );
+    assert!(stateless.take_input_required().is_some());
+    assert!(stub.posts_to("/create/jobs").is_empty());
     // Asked, and the person says yes: made.
     let client = Arc::new(FakeClient::default());
     *client.answer.lock().unwrap() =
@@ -833,14 +857,16 @@ async fn make_asks_the_person_when_the_client_can() {
     );
     assert!(message.contains("up to 412 credits"), "{message}");
 
-    // A decline wins over an accepted price the agent passes.
+    // A price under the plan's is no go-ahead for it: the person is asked the plan's price,
+    // and their no stands.
     let still_no = run_with_call_peer(
         CallPeer::new(client.clone(), None, true),
-        tool.execute(json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 412})),
+        tool.execute(json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 300})),
     )
     .await
     .unwrap();
     assert!(text_of(&still_no).contains("the person said no"));
+    assert_eq!(client.sent.lock().unwrap().len(), 2, "asked again");
     assert!(stub.posts_to("/create/jobs").is_empty());
 
     *client.answer.lock().unwrap() =
@@ -862,11 +888,12 @@ async fn a_stateless_client_is_asked_through_the_calls_result() {
     let tool = stub.tool();
     let client = Arc::new(FakeClient::default());
 
-    // First call: the question goes back as the result; nothing is made.
+    // First call, with no go-ahead from the agent: the question goes back as the result;
+    // nothing is made.
     let first = CallPeer::new(client.clone(), None, false).with_inline_input(&json!({}));
     let asked = run_with_call_peer(
         first.clone(),
-        tool.execute(json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 412})),
+        tool.execute(json!({"action": "make", "plan_id": QUOTE})),
     )
     .await
     .unwrap();
@@ -917,6 +944,68 @@ async fn a_stateless_client_is_asked_through_the_calls_result() {
     .unwrap();
     assert!(!made.is_error, "{}", text_of(&made));
     assert_eq!(stub.posts_to("/create/jobs").len(), 1);
+}
+
+/// The agent's go-ahead (mcp-server ticket 875b09b7): a price the agent passes that covers the
+/// plan is the person's go-ahead as the agent gives it (they agreed in the conversation), so
+/// the client is not asked again. Some clients say they can ask and never show the question
+/// (a Claude Code cloud session): there a question in the call's result waited until the
+/// client gave up on the call, every time, and nothing could ever be made.
+#[tokio::test]
+async fn an_accepted_price_is_the_go_ahead_and_the_person_is_not_asked_again() {
+    let stub = Stub::start(api(Arc::new(Mutex::new(("queued".into(), false))))).await;
+    let tool = stub.tool();
+
+    // A stateless client: made at once, with no question in the call's result.
+    let stateless =
+        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}));
+    let made = run_with_call_peer(
+        stateless.clone(),
+        tool.execute(json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 412})),
+    )
+    .await
+    .unwrap();
+    assert!(!made.is_error, "{}", text_of(&made));
+    assert_eq!(structured(&made)["make_id"], JOB);
+    assert!(stateless.take_input_required().is_none(), "nobody is asked");
+    assert_eq!(stub.posts_to("/create/jobs").len(), 1);
+
+    // A live client, whose person would have said no: not asked, and a price above the
+    // plan's covers it too.
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));
+    let made = run_with_call_peer(
+        CallPeer::new(client.clone(), None, true),
+        tool.execute(json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 500})),
+    )
+    .await
+    .unwrap();
+    assert!(!made.is_error, "{}", text_of(&made));
+    assert!(client.sent.lock().unwrap().is_empty(), "nobody is asked");
+    assert_eq!(stub.posts_to("/create/jobs").len(), 2);
+}
+
+/// A live price question waits for the person less than a client commonly gives the whole
+/// call (60 s), and unanswered it comes back as the usual "Not made yet" with the price to
+/// accept (mcp-server ticket 875b09b7).
+#[tokio::test]
+async fn the_price_question_waits_less_than_a_client_gives_a_tool_call() {
+    let stub = Stub::start(api(Arc::new(Mutex::new(("queued".into(), false))))).await;
+    let tool = stub.tool();
+    let silent = Arc::new(FakeClient::default());
+    let unanswered = run_with_call_peer(
+        CallPeer::new(silent.clone(), None, true),
+        tool.execute(json!({"action": "make", "plan_id": QUOTE})),
+    )
+    .await
+    .unwrap();
+    let text = text_of(&unanswered);
+    assert!(text.starts_with("Not made yet"), "{text}");
+    assert!(text.contains("accepted_price_credits 412"), "{text}");
+    let waits = silent.waits.lock().unwrap().clone();
+    assert_eq!(waits.len(), 1, "asked once");
+    assert!(waits[0] < Duration::from_secs(60), "{waits:?}");
+    assert!(stub.posts_to("/create/jobs").is_empty());
 }
 
 #[tokio::test]

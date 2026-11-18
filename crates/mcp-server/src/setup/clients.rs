@@ -225,8 +225,20 @@ pub enum Evidence {
     XdgConfigPath(&'static [&'static str]),
     /// A VS Code extension id prefix is installed.
     VsCodeExtension(&'static str),
+    /// An absolute path outside HOME exists (a system install directory).
+    SystemPath(&'static str),
     /// Platform-specific probing (app bundles, system install paths).
     Check(fn() -> bool),
+}
+
+/// The directory a [`Evidence::SystemPath`] is looked up under: `/`. The
+/// test sandbox moves it, so the host's own installs stay out of the tests.
+fn system_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("CONTEXTSTREAM_TEST_SYSTEM_ROOT") {
+        return PathBuf::from(root);
+    }
+    PathBuf::from("/")
 }
 
 impl Evidence {
@@ -243,6 +255,7 @@ impl Evidence {
                 xdg_config_home().is_some_and(|root| join_all(root, parts).exists())
             }
             Evidence::VsCodeExtension(id) => vscode_extension_installed(id),
+            Evidence::SystemPath(path) => system_root().join(path.trim_start_matches('/')).exists(),
             Evidence::Check(check) => check(),
         }
     }
@@ -659,11 +672,14 @@ static ANTIGRAVITY: ClientDescriptor = ClientDescriptor {
         ..NO_RULES_LEGACY
     },
     // A bare ~/.gemini may belong to Gemini CLI alone, so it is not evidence.
+    // A new Antigravity cloud VM has none of the first four: nothing on PATH
+    // and no state under ~/.gemini yet. Its install directory is always there.
     detect: &[
         Evidence::Binary("antigravity"),
         Evidence::Binary("agy"),
         Evidence::HomePath(&[".gemini", "antigravity"]),
         Evidence::HomePath(&[".gemini", "config", "mcp_config.json"]),
+        Evidence::SystemPath("/opt/antigravity"),
     ],
     reload_instruction: "Fully quit and reopen Antigravity, then open the intended checkout.",
     status: ClientStatus::Supported,
@@ -1225,6 +1241,7 @@ impl Evidence {
             Evidence::HomeDir(parts) => format!("~/{}/", parts.join("/")),
             Evidence::XdgConfigPath(parts) => format!("~/.config/{}", parts.join("/")),
             Evidence::VsCodeExtension(id) => format!("VS Code extension {id}"),
+            Evidence::SystemPath(path) => (*path).to_string(),
             Evidence::Check(_) => "platform install location".to_string(),
         }
     }

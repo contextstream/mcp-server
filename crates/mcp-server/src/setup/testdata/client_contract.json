@@ -413,6 +413,14 @@
     "home:Applications/windsurf.AppImage": {
       "all": [],
       "setup": []
+    },
+    "system:/opt/antigravity/": {
+      "all": [
+        "antigravity"
+      ],
+      "setup": [
+        "antigravity"
+      ]
     }
   },
   "editors": {

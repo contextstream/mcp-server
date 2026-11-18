@@ -22,6 +22,11 @@ const CONTRACT_PATH: &str = concat!(
 );
 const BLESS_ENV: &str = "CONTEXTSTREAM_BLESS_CLIENT_CONTRACT";
 
+/// Where the sandbox keeps what a real machine has outside HOME and PATH
+/// (`/opt/antigravity`): detection looks for absolute install paths under
+/// this directory instead of `/`, so the host's own installs stay hidden.
+const SYSTEM_ROOT_ENV: &str = "CONTEXTSTREAM_TEST_SYSTEM_ROOT";
+
 /// Clears every `CONTEXTSTREAM_*` variable plus HOME/XDG/PATH for the
 /// duration of a contract run, restoring the exact previous environment.
 struct IsolatedEnv {
@@ -29,12 +34,13 @@ struct IsolatedEnv {
 }
 
 impl IsolatedEnv {
-    fn new(home: &Path, path_dir: &Path) -> Self {
+    fn new(sandbox: &Sandbox) -> Self {
+        let (home, path_dir) = (&sandbox.home, &sandbox.bin);
         let mut keys: Vec<OsString> = std::env::vars_os()
             .map(|(key, _)| key)
             .filter(|key| key.to_string_lossy().starts_with("CONTEXTSTREAM_"))
             .collect();
-        for key in ["HOME", "XDG_CONFIG_HOME", "PATH"] {
+        for key in ["HOME", "XDG_CONFIG_HOME", "PATH", SYSTEM_ROOT_ENV] {
             keys.push(OsString::from(key));
         }
         let saved = keys
@@ -51,6 +57,7 @@ impl IsolatedEnv {
         std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
         std::env::set_var("PATH", path_dir);
         std::env::set_var("CONTEXTSTREAM_API_URL", mcp_types::config::DEFAULT_API_URL);
+        std::env::set_var(SYSTEM_ROOT_ENV, &sandbox.system);
         Self { saved }
     }
 }
@@ -71,6 +78,8 @@ struct Sandbox {
     home: PathBuf,
     project: PathBuf,
     bin: PathBuf,
+    /// Stands in for `/` (see [`SYSTEM_ROOT_ENV`]).
+    system: PathBuf,
 }
 
 impl Sandbox {
@@ -79,7 +88,8 @@ impl Sandbox {
         let home = root.path().join("home");
         let project = root.path().join("project");
         let bin = root.path().join("bin");
-        for dir in [&home, &project, &bin] {
+        let system = root.path().join("system");
+        for dir in [&home, &project, &bin, &system] {
             std::fs::create_dir_all(dir).expect("sandbox dir");
         }
         // Setup installs the managed helper before writing configs. Without
@@ -93,6 +103,7 @@ impl Sandbox {
             home,
             project,
             bin,
+            system,
         }
     }
 
@@ -179,14 +190,14 @@ fn editor_contract(editor: &Editor) -> Value {
     let identity = ManagedConfigIdentity::for_write().expect("test identity");
     let run = |scenario: &dyn Fn(&Sandbox) -> Result<()>| {
         let sandbox = Sandbox::new();
-        let _env = IsolatedEnv::new(&sandbox.home, &sandbox.bin);
+        let _env = IsolatedEnv::new(&sandbox);
         let result = scenario(&sandbox);
         outcome(result, &sandbox)
     };
 
     let paths = {
         let sandbox = Sandbox::new();
-        let _env = IsolatedEnv::new(&sandbox.home, &sandbox.bin);
+        let _env = IsolatedEnv::new(&sandbox);
         let project = sandbox.project.as_path();
         json!({
             "mcp_config": sandbox.display(editor.mcp_config_path()),
@@ -243,7 +254,7 @@ fn editor_contract(editor: &Editor) -> Value {
 
     let generated = {
         let sandbox = Sandbox::new();
-        let _env = IsolatedEnv::new(&sandbox.home, &sandbox.bin);
+        let _env = IsolatedEnv::new(&sandbox);
         std::env::set_var("CONTEXTSTREAM_ALLOW_LOCAL_MCP", "1");
         let mut generated = Map::new();
         for transport in ["remote", "local"] {
@@ -339,9 +350,11 @@ fn detection_matrix() -> Value {
         ".config/amp/",
         ".config/crush/",
     ];
+    // Install directories outside HOME and PATH, relative to `/`.
+    const SYSTEM_PATHS: &[&str] = &["opt/antigravity/"];
     let detect = |setup: &dyn Fn(&Sandbox)| {
         let sandbox = Sandbox::new();
-        let _env = IsolatedEnv::new(&sandbox.home, &sandbox.bin);
+        let _env = IsolatedEnv::new(&sandbox);
         setup(&sandbox);
         let ids = |editors: Vec<Editor>| -> Vec<&'static str> {
             editors
@@ -384,6 +397,14 @@ fn detection_matrix() -> Value {
             }),
         );
     }
+    for relative in SYSTEM_PATHS {
+        matrix.insert(
+            format!("system:/{relative}"),
+            detect(&|sandbox| {
+                std::fs::create_dir_all(sandbox.system.join(relative)).expect("system dir");
+            }),
+        );
+    }
     Value::Object(matrix)
 }
 
@@ -414,7 +435,7 @@ fn host_probing_editors_are_detected_by_their_own_evidence() {
         (Editor::Windsurf, "Applications/windsurf.AppImage"),
     ] {
         let sandbox = Sandbox::new();
-        let _env = IsolatedEnv::new(&sandbox.home, &sandbox.bin);
+        let _env = IsolatedEnv::new(&sandbox);
         if let Some(binary) = evidence.strip_prefix("bin:") {
             let path = sandbox.bin.join(binary);
             std::fs::write(&path, "#!/bin/sh\n").expect("stub");
@@ -433,6 +454,32 @@ fn host_probing_editors_are_detected_by_their_own_evidence() {
             editor.id()
         );
     }
+}
+
+/// A fresh Antigravity cloud VM has no `antigravity` or `agy` on PATH and no
+/// `~/.gemini` state yet; `/opt/antigravity` is always there. `setup --yes`
+/// must configure Antigravity on it without `--editors=antigravity`.
+#[test]
+fn antigravity_is_detected_by_its_install_directory_alone() {
+    let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    let sandbox = Sandbox::new();
+    let _env = IsolatedEnv::new(&sandbox);
+    let detected = super::super::editors::detect_installed_editors_for_setup;
+    assert!(
+        !detected().contains(&Editor::Antigravity),
+        "an empty machine has no Antigravity"
+    );
+
+    std::fs::create_dir_all(sandbox.system.join("opt").join("antigravity")).expect("install dir");
+    assert!(
+        detected().contains(&Editor::Antigravity),
+        "Antigravity not detected from /opt/antigravity"
+    );
+    let (editors, provenance) = super::super::resolve_setup_editors(None).expect("setup editors");
+    assert_eq!(
+        (editors, provenance),
+        (vec![Editor::Antigravity], "detected")
+    );
 }
 
 /// The generated configs carry the binary's version in their User-Agent.

@@ -7,7 +7,7 @@
 - Unchanged for clients that show a form in the middle of a call: the person is asked first, whatever the agent passes, and their no wins. That question now waits at most 45 seconds, not 300 (also the ContextAgents form): less than a client gives the call. With no answer, the agent's go-ahead carries the call when it passed one; otherwise nothing is made, sent or changed, and the answer says the person gave no answer in time and how to go on. A local client is then told the question was withdrawn (`notifications/cancelled`).
 - Off the suppression list: on a client that can ask, the agent's `confirm_email` is taken only for a bounced or hand-added address. Someone who unsubscribed or complained (or any other reason) comes off only when the client asks the person and they say yes.
 - A studio request that got no answer in time no longer says "ContextStudio could not be reached": it says this request got no answer and that the studio's other actions may still answer.
-- This release also carries the delivery changes made after 1.0.82 went out, described under 1.0.82 below: fair admission at the owner limits, bounded pins, an evicted unshown frame claimed again and shown once, and hosted reports more than 10 minutes apart collecting inline.
+- This release also carries what was merged after 1.0.82 went out and is described under 1.0.82 below: the delivery changes (fair admission at the owner limits, bounded pins, an evicted unshown frame claimed again and shown once, hosted reports more than 10 minutes apart collecting inline) and live progress from the hooks for Codex sessions.
 
 ## 1.0.82
 

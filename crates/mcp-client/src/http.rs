@@ -278,4 +278,44 @@ mod tests {
             assert!(root_sources(platform, &(None, None)).is_empty());
         }
     }
+
+    #[test]
+    fn rejected_pem_bytes_count_toward_the_store_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loader = Loader::default();
+        for (name, size) in [
+            ("oversized.pem", MAX_FILE_BYTES + 1),
+            ("part-one.pem", MAX_FILE_BYTES / 2),
+            ("part-two.pem", MAX_FILE_BYTES / 2),
+        ] {
+            let path = dir.path().join(name);
+            File::create(&path).unwrap().set_len(size).unwrap();
+            loader.file(&path);
+        }
+        assert!(loader.stopped);
+        assert_eq!(loader.total_bytes, MAX_TOTAL_BYTES);
+        let unread = dir.path().join("after-limit.pem");
+        std::fs::write(&unread, b"\n").unwrap();
+        loader.file(&unread);
+        assert_eq!(loader.total_bytes, MAX_TOTAL_BYTES);
+    }
+
+    #[test]
+    fn explicit_file_and_two_directories_share_one_file_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("explicit.pem");
+        std::fs::write(&explicit, b"\n").unwrap();
+        let mut loader = Loader::default();
+        loader.file(&explicit);
+        for name in ["first", "second"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            for i in 0..600 {
+                std::fs::write(path.join(format!("{i}.pem")), b"\n").unwrap();
+            }
+            loader.directory(&path, false).unwrap();
+        }
+        assert!(loader.stopped);
+        assert_eq!(loader.total_bytes, 1_024, "each candidate contains one byte");
+    }
 }

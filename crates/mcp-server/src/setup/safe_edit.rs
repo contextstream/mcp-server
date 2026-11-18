@@ -674,6 +674,30 @@ fn create_unique_temp(path: &Path) -> Result<(PathBuf, File)> {
     create_unique_temp_with_mode(path, 0o600)
 }
 
+#[cfg(test)]
+thread_local! {
+    // The errno every chmod of a staged file fails with on this test thread:
+    // a mount that maps all users to one owner, without needing a real one.
+    static TEST_CHMOD_REFUSAL: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    // What was said about a refused chmod on this test thread.
+    static TEST_CHMOD_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn chmod(path: &Path, permissions: std::fs::Permissions) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = TEST_CHMOD_REFUSAL.get() {
+        return Err(std::io::Error::from_raw_os_error(errno));
+    }
+    std::fs::set_permissions(path, permissions)
+}
+
+/// Give a staged file the permissions it must have before it is renamed into
+/// place.
+fn set_staged_permissions(staged: &Path, wanted: std::fs::Permissions) -> std::io::Result<()> {
+    chmod(staged, wanted)
+}
+
 fn create_unique_temp_with_mode(path: &Path, initial_mode: u32) -> Result<(PathBuf, File)> {
     #[cfg(not(unix))]
     let _ = initial_mode;
@@ -975,7 +999,7 @@ fn create_backup_if_absent(path: &Path, content: &[u8]) -> Result<bool> {
     let result = (|| -> Result<()> {
         file.write_all(content)?;
         if let Ok(metadata) = std::fs::metadata(path) {
-            file.set_permissions(metadata.permissions())?;
+            set_staged_permissions(&temporary, metadata.permissions())?;
         }
         file.sync_all()?;
         Ok(())
@@ -1367,14 +1391,14 @@ fn write_if_changed_impl_full(
     let prepare_result = (|| -> Result<()> {
         file.write_all(content.as_bytes())?;
         if let Some(permissions) = original_permissions {
-            std::fs::set_permissions(&tmp, permissions)?;
+            set_staged_permissions(&tmp, permissions)?;
         }
         #[cfg(unix)]
         if force_private_permissions
             || (existing.is_none() && !explicit_permissions && !allow_umask_for_new)
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            set_staged_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         }
         file.sync_all()?;
         Ok(())
@@ -2653,6 +2677,197 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o755
         );
+    }
+
+    /// Until it drops, every chmod of a staged file on this thread fails with
+    /// `errno`, as on a mount that maps all users to one owner (virtiofs, 9p,
+    /// a Windows drive under WSL, NFS with root_squash).
+    #[cfg(unix)]
+    struct ChmodRefused;
+
+    #[cfg(unix)]
+    impl ChmodRefused {
+        fn with(errno: i32) -> Self {
+            TEST_CHMOD_REFUSAL.set(Some(errno));
+            TEST_CHMOD_WARNINGS.with(|said| said.borrow_mut().clear());
+            Self
+        }
+
+        fn warnings() -> Vec<String> {
+            TEST_CHMOD_WARNINGS.with(|said| said.borrow().clone())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ChmodRefused {
+        fn drop(&mut self) {
+            TEST_CHMOD_REFUSAL.set(None);
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    // ~/.gemini on an Antigravity cloud VM is a virtiofs share: chmod is
+    // refused there even on a file this process created a moment ago, and
+    // setup stopped at the first config it wrote (mcp_config.json).
+    #[cfg(unix)]
+    #[test]
+    fn new_configs_are_written_where_the_mount_refuses_chmod() {
+        for errno in [libc::EPERM, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            let dir = tempfile::tempdir().unwrap();
+            let _mount = ChmodRefused::with(errno);
+
+            let config = dir.path().join("mcp_config.json");
+            let loaded = read_for_edit(&config, JsonDialect::Strict).unwrap();
+            let written = commit(&config, &loaded, &json!({"mcpServers": {}}));
+            assert!(written.expect("a new config"), "errno {errno}");
+
+            let hooks = dir.path().join("hooks.json");
+            let loaded = read_for_edit(&hooks, JsonDialect::Strict).unwrap();
+            let written = commit_private(&hooks, &loaded, &json!({"hooks": {}}), &[]);
+            assert!(written.expect("a new private file"), "errno {errno}");
+
+            // Both were created owner-only, which is what was asked: nothing
+            // is more open than it would be where chmod works.
+            assert_eq!((mode_of(&config), mode_of(&hooks)), (0o600, 0o600));
+            assert_eq!(names_in(dir.path()), ["hooks.json", "mcp_config.json"]);
+
+            // Said once, in plain words, not once per file.
+            let said = ChmodRefused::warnings();
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(said[0].contains(&*dir.path().to_string_lossy()), "{said:?}");
+            assert!(said[0].contains("permissions"), "{said:?}");
+            assert!(said[0].contains("600"), "{said:?}");
+        }
+    }
+
+    // The second run of setup on such a mount, and a config the editor wrote
+    // first: the file is there, with the mode a plain creation gives.
+    #[cfg(unix)]
+    #[test]
+    fn existing_files_keep_their_mode_and_get_their_backup_where_the_mount_refuses_chmod() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        let mode = mode_of(&path);
+        let rules = dir.path().join("AGENTS.md");
+        std::fs::write(&rules, "# old\n").unwrap();
+        let secret = dir.path().join("claude.json");
+        std::fs::write(&secret, "{}\n").unwrap();
+
+        let _mount = ChmodRefused::with(libc::EPERM);
+        assert!(write_if_changed(&path, "{\"hooks\":{}}\n").expect("rewrite"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"hooks\":{}}\n");
+        assert_eq!(mode_of(&path), mode);
+        let backup = backup_path(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "{}\n");
+        assert_eq!(mode_of(&backup), mode);
+
+        assert!(write_public_owned_file_if_unchanged(&rules, "# new\n", Some("# old\n")).unwrap());
+        assert_eq!(mode_of(&rules), mode);
+
+        // A secret-bearing file ends owner-only, whatever mode it had.
+        let loaded = read_for_edit(&secret, JsonDialect::Strict).unwrap();
+        assert!(commit_private(&secret, &loaded, &json!({"key": "k"}), &[]).unwrap());
+        assert_eq!(mode_of(&secret), 0o600);
+
+        assert_eq!(ChmodRefused::warnings().len(), 1);
+    }
+
+    // Where the staged file does not already have the mode that was asked,
+    // a refused chmod is an error: a file is never left with another mode
+    // than asked without one.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_chmod_fails_when_the_staged_file_has_another_mode_than_asked() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&staged)
+            .unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _mount = ChmodRefused::with(libc::EPERM);
+        // More open than asked, and less open than asked.
+        for asked in [0o600, 0o755] {
+            let error = set_staged_permissions(&staged, std::fs::Permissions::from_mode(asked))
+                .expect_err("the mode is not the one asked");
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        }
+        assert_eq!(mode_of(&staged), 0o644);
+        assert!(ChmodRefused::warnings().is_empty());
+    }
+
+    // The same through a whole write: the umask keeps a mode with every bit
+    // set from being created, so the staged file cannot have it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_fails_where_chmod_is_refused_and_the_asked_mode_cannot_be_created() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let umask = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Umask:"))
+            .map(|value| u32::from_str_radix(value.trim(), 8).unwrap())
+            .expect("Umask in /proc/self/status");
+        if umask & 0o777 == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("post-commit");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let _mount = ChmodRefused::with(libc::EPERM);
+        let error = write_if_changed(&path, "#!/bin/sh\nexit 0\n").expect_err("mode not kept");
+        assert!(
+            format!("{error:#}").contains("Could not prepare replacement"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "#!/bin/sh\n");
+        assert_eq!(mode_of(&path), 0o777);
+        assert_eq!(names_in(dir.path()), ["post-commit"]);
+        assert!(ChmodRefused::warnings().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn any_other_chmod_error_still_fails_the_write() {
+        for errno in [libc::EACCES, libc::EIO, libc::EROFS] {
+            let dir = tempfile::tempdir().unwrap();
+            let _mount = ChmodRefused::with(errno);
+            let config = dir.path().join("mcp_config.json");
+            let loaded = read_for_edit(&config, JsonDialect::Strict).unwrap();
+            let error = commit(&config, &loaded, &json!({"mcpServers": {}}))
+                .expect_err("chmod failed for another reason");
+            assert!(
+                format!("{error:#}").contains("Could not prepare replacement"),
+                "errno {errno}: {error:#}"
+            );
+            assert!(names_in(dir.path()).is_empty(), "errno {errno}");
+            assert!(ChmodRefused::warnings().is_empty(), "errno {errno}");
+        }
     }
 
     #[test]

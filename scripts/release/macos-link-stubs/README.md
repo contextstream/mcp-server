@@ -6,13 +6,19 @@ from Ubuntu: clang compiles the C dependencies (jemalloc, aws-lc, ring) and ld64
 
 - the macOS libc headers and the `libSystem` stub that [Zig](https://ziglang.org) ships (the build uses no
   other part of Zig);
-- the stubs in this directory for the three system frameworks the server links and for `libiconv`;
+- the stubs in this directory for the four system frameworks the server links and for `libiconv`;
 - header shims in `include/` for what Zig's headers lack, added only where Zig has no such header.
 
 The stubs (`.tbd`) are written for this repository; they are not copied from Apple's SDK. Each one names:
 
 - the library's install name and versions, exactly as a binary built on a Mac records them (`otool -L`);
 - the symbols the server imports from that library (`nm -m -u` on a binary built on a Mac).
+
+`Security` is the exception. The server links it since 1.0.83, to read the certificate authorities the Mac trusts
+from the keychain, and no binary of ours was built on a Mac with it. Its stub names the four functions the server
+calls (the link's own list of undefined symbols), the framework's install name and its compatibility version, 1. Its
+current version is the one of macOS 14.0, the SDK version `build.sh` declares, not one read with `otool -L`; macOS
+does not compare the current version when it loads a framework.
 
 At run time macOS loads the real system framework, as it does for a binary linked on a Mac.
 `scripts/release/mcp_release.py macho-check` verifies every darwin build before it can be published: the exact

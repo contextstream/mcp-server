@@ -72,7 +72,7 @@ flowchart TD
    | `darwin-arm64`, `darwin-x64` | cross-built (next section) | `mcp_release.py macho-check` |
 
    `macho-check` verifies:
-   - the linked libraries: exactly CoreFoundation, CoreServices, SystemConfiguration, libSystem and libiconv;
+   - the linked libraries: exactly CoreFoundation, CoreServices, Security, SystemConfiguration, libSystem and libiconv;
    - the minimum macOS: 11.0 on arm64 and 10.12 on x64, Rust's defaults;
    - the code signature on arm64;
    - the version string.
@@ -105,16 +105,17 @@ flowchart TD
 No macOS runner is used, so `build.sh` makes a macOS SDK root without Apple's SDK. It holds:
 
 - the macOS libc headers and `libSystem.tbd` that Zig ships (no other part of Zig is used);
-- the stubs in `scripts/release/macos-link-stubs` for the three frameworks and `libiconv`;
+- the stubs in `scripts/release/macos-link-stubs` for the four frameworks and `libiconv`;
 - the header shims in that directory's `include/`.
 
 Ubuntu's clang compiles the C dependencies (jemalloc, aws-lc, ring) and ld64.lld links against that root. The
 tool path is fixed, so the compile cache hits across runs.
 
-The binaries import no symbol that 1.0.29's Mac-built ones did not, with no weak imports and the same libraries and
-compatibility versions. The only difference is the SDK version recorded in the binary: 14.0, against 27.0 from the
-Mac. If a dependency update needs a framework symbol that is not stubbed yet, the link fails; see the stubs'
-README.
+Until 1.0.82 the binaries imported no symbol that 1.0.29's Mac-built ones did not, with no weak imports and the same
+libraries and compatibility versions; the only difference was the SDK version recorded in the binary: 14.0, against
+27.0 from the Mac. Since 1.0.83 they also link Security and six more CoreFoundation functions, to read the
+certificate authorities the Mac trusts from the keychain. No Mac-built binary of ours had those imports to compare
+with. If a dependency update needs a framework symbol that is not stubbed yet, the link fails; see the stubs' README.
 
 ## Dry run
 

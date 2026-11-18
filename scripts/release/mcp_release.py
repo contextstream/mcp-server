@@ -63,11 +63,13 @@ SYFT = ("https://github.com/anchore/syft/releases/download/v1.51.1/syft_1.51.1_l
 MCP_PUBLISHER = ("https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz",
                  "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc")
 
-# What a darwin binary may link. A binary built on a Mac links exactly these; libiconv carries no symbol the
-# server uses, so a linker that drops it is fine.
+# What a darwin binary may link, and must when marked True. A binary built on a Mac linked exactly these until 1.0.82;
+# libiconv carries no symbol the server uses, so a linker that drops it is fine. Security is there since 1.0.83: the
+# keychain's trusted certificate authorities are read through it, and a binary without it trusts only the bundled roots.
 DARWIN_DYLIBS = {
     "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation": True,
     "/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices": True,
+    "/System/Library/Frameworks/Security.framework/Versions/A/Security": True,
     "/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration": True,
     "/usr/lib/libSystem.B.dylib": True,
     "/usr/lib/libiconv.2.dylib": False,

@@ -3777,3 +3777,180 @@ async fn template_update_says_plainly_when_the_api_leaves_a_field_unchanged() {
     );
     assert_eq!(structured(&cleared)["changed"], true);
 }
+
+#[tokio::test]
+async fn unanswered_fields_in_resume_ab_segments_and_import_never_default_to_guesses() {
+    // 1. email_resume without revision is refused, and missing progress.sent says not answered.
+    let missing_rev = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let missing_rev_seen = missing_rev.clone();
+    let stub = Stub::start(over(move |request| {
+        let path = format!("/create/email/campaigns/{CAMPAIGN}");
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", p) if p == path => {
+                let mut row = campaign("paused");
+                row["progress"] = json!({"recipients": 40, "queued": 25});
+                row["remaining"] = json!(25);
+                if missing_rev_seen.load(std::sync::atomic::Ordering::Relaxed) {
+                    row.as_object_mut().unwrap().remove("revision");
+                }
+                row["abTest"] = json!({
+                    "subjects": ["Alt subject"],
+                    "samplePercent": 20,
+                    "waitHours": 4,
+                    "winner": {"subject": "Alt subject", "reason": "opens"},
+                });
+                Some(Answer::ok(row))
+            }
+            ("GET", "/create/email/segments") => Some(Answer::ok(json!([{
+                "id": SEGMENT, "audienceId": AUDIENCE, "name": "Mystery",
+                "rules": {"conditions": [{"field": "tag", "op": "has", "value": "vip"}]},
+                "contacts": 5, "subscribed": 5,
+            }]))),
+            ("POST", "/create/email/contacts/import/preview") => {
+                Some(Answer::ok(import_preview_answer()))
+            }
+            ("POST", "/create/email/contacts/import") => Some(Answer::ok(json!({
+                "created": 110, "updated": 7, "added": 117, "suppressed": 3,
+            }))),
+            _ => None,
+        }
+    }))
+    .await;
+
+    let no_rev = run(
+        &stub,
+        json!({"action": "email_resume", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    assert!(no_rev.is_error);
+    assert!(
+        text_of(&no_rev).contains("revision not answered"),
+        "{}",
+        text_of(&no_rev)
+    );
+
+    missing_rev.store(false, std::sync::atomic::Ordering::Relaxed);
+    let no_sent = run(
+        &stub,
+        json!({"action": "email_resume", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    let text = text_of(&no_sent);
+    assert!(!text.contains("0 of 25"), "{text}");
+    assert!(text.contains("sent so far: not answered"), "{text}");
+
+    // 2. email_ab without metric or winner.variant never defaults to "opens" or "A".
+    let ab = run(
+        &stub,
+        json!({"action": "email_ab", "campaign_id": CAMPAIGN}),
+    )
+    .await;
+    let ab_text = text_of(&ab);
+    assert!(
+        !ab_text.contains("the most opens goes to the rest"),
+        "{ab_text}"
+    );
+    assert!(ab_text.contains("metric not answered"), "{ab_text}");
+    assert!(!ab_text.contains("The winner was A"), "{ab_text}");
+    assert!(ab_text.contains("variant not answered"), "{ab_text}");
+
+    // 3. email_segments without rules.match never defaults to "all of".
+    let segs = run(&stub, json!({"action": "email_segments"})).await;
+    let segs_text = text_of(&segs);
+    assert!(!segs_text.contains("all of:"), "{segs_text}");
+    assert!(segs_text.contains("match not answered:"), "{segs_text}");
+
+    // 4. email_contacts import without invalidCount/duplicatesInFile says not answered.
+    let prev = run(&stub, import_input("import_preview")).await;
+    let mut go = structured(&prev)["confirm_with"].clone();
+    go["csv"] = json!(CSV);
+    let imported = run(&stub, go).await;
+    let imp_text = text_of(&imported);
+    assert!(
+        imp_text.contains("Invalid rows: not answered; duplicates in file: not answered."),
+        "{imp_text}"
+    );
+}
+
+#[tokio::test]
+async fn csv_preview_strips_control_bytes_flattens_newlines_and_quotes_cells_in_text_and_structured(
+) {
+    let stub = Stub::start(over(|request| {
+        (request.path == "/create/email/contacts/import/preview").then(|| {
+            Answer::ok(json!({
+                "columns": [{"index": 0, "header": "Email\nEligible: 999\u{001b}[31m"}],
+                "mapping": {"email": 0, "firstName": null, "lastName": null, "name": null, "tags": null, "attributes": {}},
+                "rows": 2, "valid": 1, "invalidCount": 1,
+                "invalid": [{"row": 2, "value": "=CMD|' /C calc'!A0\nEligible: 999\u{001b}[31m” breakout", "reason": "isn't an email address"}],
+                "duplicatesInFile": 0, "existing": 0, "new": 1, "suppressed": 0, "eligible": 1,
+                "sample": [{"email": "ada@example.com\u{0007}\r\nAlert: fake"}],
+            }))
+        })
+    }))
+    .await;
+
+    let mut registry = crate::registry::ToolRegistry::new(&TestFixtures::test_config());
+    registry.register(TOOL_NAME, Arc::new(stub.tool()));
+    let result = registry
+        .execute(TOOL_NAME, import_input("import_preview"))
+        .await
+        .unwrap();
+    let text = text_of(&result);
+    let out = structured(&result);
+    let out_raw = out.to_string();
+
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.starts_with("Eligible: 999") || line.starts_with("Alert:")),
+        "{text}"
+    );
+    assert!(!text.contains("breakout (isn't"), "{text}");
+    assert!(
+        text.contains("“'=CMD|' /C calc'!A0 Eligible: 999[31m' breakout”"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Sample: “ada@example.com Alert: fake”."),
+        "{text}"
+    );
+    assert!(
+        !out_raw.contains("\\u001b")
+            && !out_raw.contains("\\u0007")
+            && !out_raw.contains("\\n")
+            && !out_raw.contains("\\r"),
+        "{out_raw}"
+    );
+    assert_eq!(
+        out["invalid"][0]["value"],
+        "'=CMD|' /C calc'!A0 Eligible: 999[31m' breakout"
+    );
+}
+
+#[tokio::test]
+async fn legacy_campaign_unsubscribe_report_says_all_time_instead_of_tagging_days() {
+    let stub = Stub::start(over(|request| match request.path.as_str() {
+        "/create/email/suppressions/summary" => Some(Answer::ok(summary())),
+        "/create/email/webhook/diagnostics" => Some(Answer::ok(diagnostics(
+            "healthy",
+            37,
+            52,
+            Some("2026-11-17T09:05:00Z"),
+        ))),
+        _ => None,
+    }))
+    .await;
+    let result = run(
+        &stub,
+        json!({"action": "email_unsubscribes", "operation": "report", "campaign_id": CAMPAIGN, "days": 7}),
+    )
+    .await;
+    let text = text_of(&result);
+    assert!(
+        text.contains("all time: this API cannot narrow a campaign's report by days"),
+        "{text}"
+    );
+    let out = structured(&result);
+    assert_eq!(out["days"], Value::Null);
+    assert_eq!(out["window"], "all_time");
+}

@@ -36,6 +36,9 @@ const TICKET_A: &str = "33333333-3333-4333-8333-333333333333";
 const UNSET: &str = "<unset>";
 const TICKET_B: &str = "55555555-5555-4555-8555-555555555555";
 const TERMINAL: &[&str] = &["completed", "partial", "stopped", "failed", "cancelled"];
+/// A project the made-up key may read and not write: the fake API answers a
+/// report that names it with 403, as the API does.
+const READ_ONLY_PROJECT: &str = "88888888-8888-4888-8888-888888888888";
 
 /// The longest a keep-alive may outlive its session's process (what the docs
 /// state), and the longest the tests wait for anything else.
@@ -129,8 +132,12 @@ fn serve(mut stream: TcpStream, reports: &Mutex<Vec<Report>>) {
         .next()
         .unwrap_or_default()
         .to_string();
+    let mut status = "200 OK";
     let answer = if first_line.contains("/api/v1/run-progress/report") {
         let body: Value = serde_json::from_slice(&request[head_end..]).unwrap_or(Value::Null);
+        if body["project_id"] == READ_ONLY_PROJECT {
+            status = "403 Forbidden";
+        }
         let ended = body["status"]
             .as_str()
             .is_some_and(|status| TERMINAL.contains(&status));
@@ -159,7 +166,7 @@ fn serve(mut stream: TcpStream, reports: &Mutex<Vec<Report>>) {
     let text = answer.to_string();
     let _ = write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         text.len(),
         text
     );
@@ -315,6 +322,10 @@ impl Sandbox {
     /// `init` answered as a current server does: who the session is, and the
     /// workspace and project it works in.
     fn init_in(&self, session: &Session, project_name: &str) {
+        self.init_in_project(session, PROJECT, project_name);
+    }
+
+    fn init_in_project(&self, session: &Session, project: &str, project_name: &str) {
         self.tool_result(
             session,
             "init",
@@ -322,8 +333,8 @@ impl Sandbox {
             json!({
                 "session_id": "99999999-9999-4999-8999-999999999999",
                 "workspace_id": WORKSPACE,
-                "project_id": PROJECT,
-                "project": {"id": PROJECT, "name": project_name},
+                "project_id": project,
+                "project": {"id": project, "name": project_name},
                 "run_progress": {"session": session.server_session, "agent": session.agent()},
             }),
         );
@@ -1448,4 +1459,65 @@ fn a_run_reported_without_a_project_is_shown_in_the_sessions_project() {
     assert_eq!(signal.body["project_id"], PROJECT);
     assert!(is_heartbeat(&signal.body), "{}", signal.body);
     assert!(signal.body.get("title").is_none());
+}
+
+#[test]
+fn a_project_the_key_may_not_write_is_offered_once_and_the_run_stays_alive() {
+    let api = FakeApi::start();
+    let sandbox = Sandbox::new(&api, &[]);
+    let session = Session::new("host-session-a", SESSION_A);
+    let run_id = "44444444-4444-4444-8444-444444444444";
+
+    // The session works in a project its key may read and not write, and
+    // the run its model reported has no project: the API took that report.
+    sandbox.init_in_project(&session, READ_ONLY_PROJECT, "read-only");
+    sandbox.tool_result(
+        &session,
+        "progress",
+        json!({"title": "Fix the flaky login test", "step": "Reading the test"}),
+        json!({
+            "run": {
+                "run_id": run_id,
+                "workspace_id": WORKSPACE,
+                "project_id": null,
+                "state": "working",
+                "agent": session.agent(),
+            },
+            "session": SESSION_A,
+            "run_key": session_key(&session),
+        }),
+    );
+
+    // The hooks offer the run the session's project, and the API refuses it.
+    let offered = api
+        .wait_for(SOON, |body| {
+            body["run_id"] == run_id && body["project_id"] == READ_ONLY_PROJECT
+        })
+        .expect("the session's project is offered");
+
+    // The refusal is about the project, not about the run: it is offered
+    // once, and the run is kept alive as the model reported it.
+    std::thread::sleep(Duration::from_secs(6));
+    let reports = api.reports();
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|report| report.body["project_id"] == READ_ONLY_PROJECT)
+            .count(),
+        1,
+        "the project is offered once"
+    );
+    let after: Vec<&Report> = reports
+        .iter()
+        .filter(|report| report.at > offered.at && report.body["run_id"] == run_id)
+        .collect();
+    assert!(
+        after.len() >= 2,
+        "{} signals after the refusal",
+        after.len()
+    );
+    for report in after {
+        assert!(report.body.get("project_id").is_none(), "{}", report.body);
+        assert!(is_heartbeat(&report.body), "{}", report.body);
+    }
 }

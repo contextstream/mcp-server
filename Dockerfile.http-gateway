@@ -100,7 +100,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     rm -f target/release/contextstream-mcp && \
     echo "Building contextstream-mcp remote HTTP gateway with ${JOBS} parallel jobs..." && \
     cargo build --release --jobs ${JOBS} -p mcp-server --bin contextstream-mcp --features remote-acceleration && \
-    sccache --show-stats 2>/dev/null
+    { sccache --show-stats 2>/dev/null || true; }
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 

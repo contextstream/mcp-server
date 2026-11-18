@@ -4218,3 +4218,55 @@ async fn email_draft_and_email_test_send_deterministic_idempotency_keys() {
     assert!(r5_key.contains("-r5-"), "{r5_key}");
     assert_ne!(r4_key, r5_key);
 }
+
+#[tokio::test]
+async fn review_tokens_are_issued_to_the_current_credential() {
+    for (responder, request, write) in [
+        (
+            usual(),
+            json!({"action":"email_send","campaign_id":CAMPAIGN,"send_at":"now"}),
+            format!("/create/email/campaigns/{CAMPAIGN}/schedule"),
+        ),
+        (
+            flight_api("paused", 12, true),
+            json!({"action":"email_resume","campaign_id":CAMPAIGN}),
+            format!("/create/email/campaigns/{CAMPAIGN}/resume"),
+        ),
+        (
+            import_api(true),
+            import_input("import_preview"),
+            "/create/email/contacts/import".into(),
+        ),
+    ] {
+        let stub = Stub::start(responder).await;
+        let first = run(&stub, request).await;
+        let mut go = structured(&first)["confirm_with"].clone();
+        assert!(go.is_object(), "{}", text_of(&first));
+        if go["operation"] == "import" {
+            go["csv"] = json!(CSV);
+        }
+        let auth = mcp_types::AuthOverride {
+            api_key: Some("second-test-credential".into()),
+            ..Default::default()
+        };
+        let fresh = mcp_client::run_with_auth_override(auth, || run(&stub, go.clone())).await;
+        let original = go["confirm_review"].as_str().unwrap().to_owned();
+        let replacement = structured(&fresh)["confirm_with"]["confirm_review"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(original, replacement);
+        assert!(stub.calls_to("POST", &write).is_empty());
+
+        let (prefix, _) = original.rsplit_once('.').unwrap();
+        use sha2::{Digest, Sha256};
+        let public_digest = hex::encode(Sha256::digest(prefix.as_bytes()));
+        go["confirm_review"] = json!(format!("{prefix}.{public_digest}"));
+        let invalid = run(&stub, go).await;
+        assert_eq!(
+            structured(&invalid)["confirm_with"]["confirm_review"],
+            original
+        );
+        assert!(stub.calls_to("POST", &write).is_empty());
+    }
+}

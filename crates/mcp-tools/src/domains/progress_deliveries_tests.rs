@@ -2612,6 +2612,105 @@ async fn round6_gateway_admits_a_ninth_key_and_replaces_only_its_own_lru_at_32()
     }
 }
 
+const PAUSED_LINE: &str = "Deliveries are paused for this session; read again later.";
+
+async fn check_paused_answers(hosted: bool, prior_binding: bool) {
+    let f = Fixture::new();
+    let api = Api::start(vec![
+        f.recorded("working"),
+        (
+            "GET /api/v1/run-progress/runs/",
+            200,
+            json!({"data":f.run_view("working",json!({}))}),
+        ),
+    ])
+    .await;
+    let mut tool = if hosted {
+        f.hosted_tool(&api)
+    } else {
+        f.tool(&api)
+    };
+    let state = tempfile::tempdir().unwrap();
+    tool.delivery_state_dir = Some(state.path().to_owned());
+    tool.deliveries = Arc::default();
+    let owner = tool.delivery_owner(f.workspace, hosted).await.unwrap();
+    if prior_binding {
+        assert!(owner.bind(f.run, None, 0, None).await);
+    }
+    tool.deliveries.pin_credential_slots(&owner);
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::sync::Mutex::new(log.reopen().unwrap()))
+        .finish();
+    // The default tokio test runtime stays on this thread across awaits.
+    let _guard = tracing::subscriber::set_default(subscriber);
+    for args in [
+        json!({"step":"working","run_key":"own"}),
+        json!({"action":"get","run_id":f.run}),
+    ] {
+        let result = tool.execute(args).await.unwrap();
+        assert_eq!(
+            text_of(&result)
+                .lines()
+                .filter(|line| *line == PAUSED_LINE)
+                .count(),
+            usize::from(hosted)
+        );
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .unwrap()
+                .get("delivery_notice")
+                .and_then(Value::as_str),
+            hosted.then_some(PAUSED_LINE)
+        );
+    }
+    assert!(sent(&api, "GET", "/deliveries").is_empty());
+    let logs = std::fs::read_to_string(log.path()).unwrap();
+    let warnings: Vec<Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["fields"]["event"] == "delivery_owner_refused")
+        .collect();
+    assert_eq!(warnings.len(), if hosted { 2 } else { 0 });
+    for warning in warnings {
+        assert_eq!(warning["level"], "WARN");
+        assert_eq!(warning["fields"]["owner_digest"], owner.key.digest);
+    }
+    assert!(!logs.contains("cbiq_gateway_fixture"));
+    assert!(!logs.contains(&f.workspace.to_string()));
+}
+
+#[tokio::test]
+async fn round6_capacity_notice_on_hosted_report_and_get() {
+    with_caller(mcp_client::run_with_mcp_session_id(
+        "paused-session".into(),
+        || async {
+            check_paused_answers(true, false).await;
+        },
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn round6_capacity_notice_on_hosted_get_with_a_binding() {
+    with_caller(mcp_client::run_with_mcp_session_id(
+        "bound-session".into(),
+        || async {
+            check_paused_answers(true, true).await;
+        },
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn round6_capacity_notice_absent_locally_even_at_capacity() {
+    check_paused_answers(false, true).await;
+}
+
 async fn check_recovery(case: &str, allowed: bool) {
     let f = Fixture::new();
     let attempt = Uuid::new_v4();

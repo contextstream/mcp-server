@@ -415,12 +415,8 @@
       "setup": []
     },
     "system:/opt/antigravity/": {
-      "all": [
-        "antigravity"
-      ],
-      "setup": [
-        "antigravity"
-      ]
+      "all": [],
+      "setup": []
     }
   },
   "editors": {

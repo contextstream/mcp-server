@@ -460,7 +460,7 @@ fn host_probing_editors_are_detected_by_their_own_evidence() {
 /// `~/.gemini` state yet; `/opt/antigravity` is always there. `setup --yes`
 /// must configure Antigravity on it without `--editors=antigravity`.
 #[test]
-fn antigravity_is_detected_by_its_install_directory_alone() {
+fn antigravity_requires_an_installed_launcher_in_the_system_directory() {
     let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
     let sandbox = Sandbox::new();
     let _env = IsolatedEnv::new(&sandbox);
@@ -470,7 +470,19 @@ fn antigravity_is_detected_by_its_install_directory_alone() {
         "an empty machine has no Antigravity"
     );
 
-    std::fs::create_dir_all(sandbox.system.join("opt").join("antigravity")).expect("install dir");
+    let install = sandbox.system.join("opt/antigravity");
+    std::fs::create_dir_all(install.parent().unwrap()).unwrap();
+    std::fs::write(&install, "unrelated").unwrap();
+    assert!(!detected().contains(&Editor::Antigravity));
+    std::fs::remove_file(&install).unwrap();
+    std::fs::create_dir_all(install.join("bin")).unwrap();
+    assert!(!detected().contains(&Editor::Antigravity));
+    let launcher = install.join("bin/agy");
+    std::fs::write(&launcher, "").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!detected().contains(&Editor::Antigravity));
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
         detected().contains(&Editor::Antigravity),
         "Antigravity not detected from /opt/antigravity"

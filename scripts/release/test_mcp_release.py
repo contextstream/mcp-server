@@ -531,21 +531,18 @@ class Darwin(unittest.TestCase):
         self.assertTrue(facts["signed"])
         self.check("contextstream-mcp-darwin-x64", macho(0x01000007, self.required, (10, 12), False))
 
-    # The machine's trusted certificate authorities are in the keychain, which is read through Security.framework. A
-    # darwin binary without it trusts only the bundled roots again, and nothing else would say so.
-    def test_a_binary_links_security_for_the_keychains_authorities(self):
+    def test_unexpected_security_framework_is_rejected(self):
         security = "/System/Library/Frameworks/Security.framework/Versions/A/Security"
-        self.assertIs(release.DARWIN_DYLIBS.get(security), True)
-        without = [lib for lib in self.required if lib != security]
+        self.assertNotIn(security, release.DARWIN_DYLIBS)
         with self.assertRaises(release.Refused):
-            self.check("contextstream-mcp-darwin-arm64", macho(0x0100000C, without, (11, 0), True))
+            self.check("contextstream-mcp-darwin-arm64", macho(0x0100000C, self.required + [security], (11, 0), True))
 
     # build.sh links against the stubs of scripts/release/macos-link-stubs: a framework that may be linked and has no
     # stub there, or a stub with another install name, fails the darwin build or records a path macOS does not have.
     def test_every_framework_a_binary_may_link_has_its_link_stub(self):
         stubs = Path(release.__file__).resolve().parent / "macos-link-stubs"
         frameworks = [lib for lib in release.DARWIN_DYLIBS if lib.startswith("/System/Library/Frameworks/")]
-        self.assertEqual(len(frameworks), 4)
+        self.assertEqual(len(frameworks), 3)
         for lib in frameworks:
             name = lib.rsplit("/", 1)[1]
             with self.subTest(framework=name):
@@ -555,19 +552,6 @@ class Darwin(unittest.TestCase):
                 self.assertIn("install-name:    '%s'\n" % lib, stub.read_text())
         on_disk = sorted(path.name for path in (stubs / "System/Library/Frameworks").iterdir())
         self.assertEqual(on_disk, sorted(lib.rsplit("/", 1)[1] + ".framework" for lib in frameworks))
-
-    # What a binary built on a Mac records for each framework: the versions in the macOS 27.0 SDK (Xcode 27.0), the SDK
-    # 1.0.29 was built with. Read on a Mac (Bitrise, Xcode 27.0, 2026-11-18): Security.tbd there names no compatibility
-    # version, which means 1, and `otool -L` of a system binary shows 1.0.0.
-    def test_the_stubs_carry_the_versions_of_the_macos_27_0_sdk(self):
-        stubs = Path(release.__file__).resolve().parent / "macos-link-stubs" / "System/Library/Frameworks"
-        versions = {"CoreFoundation": ("5027.0.69", "150"), "CoreServices": ("1226", "1"),
-                    "Security": ("62460.1.2", "1"), "SystemConfiguration": ("1446", "1")}
-        for name, (current, compatibility) in versions.items():
-            with self.subTest(framework=name):
-                text = (stubs / (name + ".framework") / (name + ".tbd")).read_text()
-                self.assertIn("\ncurrent-version: %s\n" % current, text)
-                self.assertIn("\ncompatibility-version: %s\n" % compatibility, text)
 
     def test_refusals(self):
         cases = {

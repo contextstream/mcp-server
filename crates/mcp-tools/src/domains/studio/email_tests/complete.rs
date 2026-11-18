@@ -9,8 +9,8 @@
 
 use super::*;
 
-const PROOF: &str = "12121212-1212-4212-8212-121212121212";
-const NEW_AUDIENCE: &str = "13131313-1313-4313-8313-131313131313";
+const PROOF: &str = "10101010-1010-4010-8010-101010101010";
+const NEW_AUDIENCE: &str = "20202020-2020-4020-8020-202020202020";
 
 /// `extra` first, then the usual routes.
 fn over(extra: impl Fn(&Recorded) -> Option<Answer> + Send + Sync + 'static) -> Responder {
@@ -942,7 +942,7 @@ async fn a_csv_file_is_read_only_by_a_local_binary_and_only_as_a_csv() {
 // email_segments and email_recipients
 // ============================================================================
 
-const NEW_SEGMENT: &str = "14141414-1414-4414-8414-141414141414";
+const NEW_SEGMENT: &str = "30303030-3030-4030-8030-303030303030";
 
 fn rules() -> Value {
     json!({"match": "all", "conditions": [
@@ -1775,7 +1775,7 @@ fn diagnostics_and_the_report_are_listed_described_and_in_the_schema() {
 // email_templates and email_ab
 // ============================================================================
 
-const TEMPLATE: &str = "15151515-1515-4515-8515-151515151515";
+const TEMPLATE: &str = "50505050-5050-4050-8050-505050505050";
 
 fn template(id: &str, name: &str, built_in: bool) -> Value {
     json!({
@@ -3629,12 +3629,13 @@ async fn resume_requires_confirm_review_rechecks_after_live_ask_and_notes_legacy
     let state_for_live = state.clone();
     let live_stub = Stub::start(Arc::new(move |request: &Recorded| {
         let path = format!("/create/email/campaigns/{CAMPAIGN}");
-        if request.method == "GET" && request.path == path {
-            if reads_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
-                let mut answer = (flight_api("paused", 0, false))(request);
-                answer.body["data"]["revision"] = json!(5);
-                return answer;
-            }
+        if request.method == "GET"
+            && request.path == path
+            && reads_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1
+        {
+            let mut answer = (flight_api("paused", 0, false))(request);
+            answer.body["data"]["revision"] = json!(5);
+            return answer;
         }
         let (rev, aud_id, aud_name, from_email) = *state_for_live.lock().unwrap();
         let mut answer = (flight_api("paused", 0, false))(request);

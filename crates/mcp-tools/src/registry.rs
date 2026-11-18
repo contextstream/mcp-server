@@ -829,10 +829,8 @@ pub struct ToolRegistry {
 fn drop_control_characters_in_value(value: &mut Value) {
     let unwanted = |c: char| c.is_control() && c != '\n' && c != '\t';
     match value {
-        Value::String(text) => {
-            if text.contains(unwanted) {
-                text.retain(|c| !unwanted(c));
-            }
+        Value::String(text) if text.contains(unwanted) => {
+            text.retain(|c| !unwanted(c));
         }
         Value::Array(items) => {
             for item in items {

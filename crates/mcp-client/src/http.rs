@@ -95,10 +95,24 @@ fn system_cert_name(path: &Path) -> bool {
         && index.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Maximum bytes read from a single PEM file.
+pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum bytes read across all PEM sources in one store load.
+pub const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Maximum candidate PEM files read from a single certificate directory.
+pub const MAX_DIRECTORY_FILES: usize = 1_024;
+
+/// Maximum certificates added across one store load.
+pub const MAX_CERTIFICATES: usize = 1_024;
+
 #[derive(Default)]
 struct Loader {
     seen: HashSet<Vec<u8>>,
     roots: Vec<reqwest::Certificate>,
+    total_bytes: u64,
+    stopped: bool,
     first_problem: Option<String>,
 }
 
@@ -108,7 +122,15 @@ impl Loader {
             .get_or_insert_with(|| format!("{} ({why})", path.display()));
     }
 
+    fn stop(&mut self, path: &Path, why: impl std::fmt::Display) {
+        self.stopped = true;
+        self.problem(path, why);
+    }
+
     fn load_file(&mut self, path: &Path) -> io::Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
         // A configured path may point to a device or pipe. Never wait on one.
         let mut options = File::options();
         options.read(true);
@@ -121,18 +143,38 @@ impl Loader {
         if !file.metadata()?.is_file() {
             return Err(io::Error::other("expected a regular PEM file"));
         }
-        const MAX_BYTES: u64 = 16 * 1024 * 1024;
+        let remaining_total = MAX_TOTAL_BYTES.saturating_sub(self.total_bytes);
+        let cap = MAX_FILE_BYTES.min(remaining_total);
         let mut bytes = Vec::new();
-        file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_BYTES {
+        file.take(cap + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > cap {
+            if remaining_total < MAX_FILE_BYTES && bytes.len() as u64 > remaining_total {
+                self.total_bytes = MAX_TOTAL_BYTES;
+                self.stop(
+                    path,
+                    format!(
+                        "stopped after {} MiB across CA store",
+                        MAX_TOTAL_BYTES / (1024 * 1024)
+                    ),
+                );
+                return Ok(());
+            }
             return Err(io::Error::other("PEM file exceeds 16 MiB"));
         }
+        self.total_bytes += bytes.len() as u64;
         let mut found = false;
         for entry in CertificateDer::pem_slice_iter(&bytes) {
             found = true;
             match entry {
                 Ok(der) if self.seen.contains(der.as_ref()) => {}
                 Ok(der) => {
+                    if self.roots.len() >= MAX_CERTIFICATES {
+                        self.stop(
+                            path,
+                            format!("stopped after {MAX_CERTIFICATES} certificates"),
+                        );
+                        break;
+                    }
                     // reqwest parses each root when building the client. Check
                     // with the same parser so one bad entry cannot break it.
                     if rustls::RootCertStore::empty().add(der.clone()).is_ok() {
@@ -161,11 +203,23 @@ impl Loader {
 
     fn directory(&mut self, path: &Path, hashed: bool) -> io::Result<()> {
         let mut found = false;
+        let mut files = 0usize;
         for entry in path.read_dir()? {
+            if self.stopped {
+                break;
+            }
             match entry {
                 Ok(entry) => {
                     let p = entry.path();
                     if (!hashed || system_cert_name(&p)) && !p.is_dir() {
+                        if files >= MAX_DIRECTORY_FILES {
+                            self.stop(
+                                path,
+                                format!("stopped after {MAX_DIRECTORY_FILES} files in directory"),
+                            );
+                            break;
+                        }
+                        files += 1;
                         found = true;
                         self.file(&p);
                     }
@@ -191,6 +245,9 @@ fn machine_roots() -> Arc<[reqwest::Certificate]> {
     }
     let mut loader = Loader::default();
     for source in root_sources(std::env::consts::OS, &named) {
+        if loader.stopped {
+            break;
+        }
         match source {
             Source::File(path) => loader.file(&path),
             Source::Directory(path, hashed) => {

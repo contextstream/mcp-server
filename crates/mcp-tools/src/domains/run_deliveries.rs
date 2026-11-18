@@ -497,6 +497,24 @@ impl Ledger {
         }
     }
 
+    /// `age` passes for every owner with no call in between; the next call
+    /// sweeps what expired.
+    #[cfg(test)]
+    pub(super) fn idle_for(&self, age: Duration) {
+        let mut owners = self.owners.lock().unwrap();
+        for mem in owners.by_key.values_mut() {
+            mem.last_used = mem.last_used.map(|at| at - age);
+            mem.last_read = mem.last_read.map(|at| at - age);
+            mem.not_there = mem.not_there.map(|until| until - age);
+            mem.reports.values_mut().for_each(|at| *at -= age);
+            mem.polls.values_mut().for_each(|poll| poll.started -= age);
+            mem.shown
+                .values_mut()
+                .for_each(|shown| shown.held_at -= age);
+        }
+        owners.last_sweep = owners.last_sweep.map(|at| at - age);
+    }
+
     #[cfg(test)]
     pub(super) async fn age_unshown_and_evict(&self, owner: &Owner, run: Uuid, id: Uuid) {
         self.finish_claims(&owner.key, run).await;

@@ -2971,3 +2971,109 @@ async fn round7_existing_report_slot_cannot_start_a_ninth_pinned_owner() {
     ))
     .await;
 }
+
+// ============================================================================
+// Reports a quarter of an hour apart
+// ============================================================================
+
+/// A report, and then a quarter of an hour without a call: the gateway's
+/// memory of that report expires after ten minutes and is swept.
+async fn report_then_idle(f: &Fixture, tool: &ProgressTool, report: &Value) {
+    tool.execute(report.clone()).await.unwrap();
+    run_deliveries::wait_for_poll(&tool.deliveries, f.run).await;
+    tool.deliveries.idle_for(Duration::from_secs(15 * 60));
+}
+
+/// The next report, which must show what waits inline, within the one
+/// five-second budget it shares between the read and the claims.
+async fn report_within_budget(tool: &ProgressTool, report: &Value) -> String {
+    let answer = tokio::time::timeout(Duration::from_millis(5500), tool.execute(report.clone()))
+        .await
+        .expect("one five-second budget")
+        .unwrap();
+    text_of(&answer)
+}
+
+#[tokio::test]
+async fn round7_hosted_report_fifteen_minutes_later_shows_what_waits_for_its_own_run() {
+    with_caller(mcp_client::run_with_mcp_session_id(
+        "quarter-hour".into(),
+        || async {
+            // The session's default run: the API derives it from the key the
+            // report names, and that key is the caller's session's own.
+            let mut f = Fixture::new();
+            f.run = run_id_of_key(f.workspace, &run_key_of(None, &session_part(true), None));
+            let d = f.message();
+            let api = Api::start_in_turn(vec![
+                f.recorded("working"),
+                // The first read fails: nothing is collected, nothing recorded.
+                (READ, 500, json!({})),
+                offered(vec![d.clone()]),
+                (CLAIM, 200, held_with("claimed", &d, TOKEN)),
+            ])
+            .await;
+            let mut tool = f.hosted_tool(&api);
+            tool.deliveries = Arc::default();
+            let owner = tool.delivery_owner(f.workspace, true).await.unwrap();
+            let report = json!({"step": "working"});
+            report_then_idle(&f, &tool, &report).await;
+            assert!(!owner.reported(f.run), "no ownership record on disk");
+            let text = report_within_budget(&tool, &report).await;
+            assert!(text.contains(&message_block(&f)), "{text}");
+            assert_eq!(sent(&api, "GET", "/decision-requests/deliveries").len(), 2);
+            assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+        },
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn round7_hosted_report_fifteen_minutes_later_shows_what_waits_for_a_recorded_run() {
+    with_caller(mcp_client::run_with_mcp_session_id(
+        "quarter-hour-recorded".into(),
+        || async {
+            // A run under a key the agent chose: only the ownership record on
+            // disk says this session reported it.
+            let f = Fixture::new();
+            let d = f.message();
+            let api = Api::start_in_turn(vec![
+                f.recorded("working"),
+                offered(vec![]),
+                offered(vec![d.clone()]),
+                (CLAIM, 200, held_with("claimed", &d, TOKEN)),
+            ])
+            .await;
+            let mut tool = f.hosted_tool(&api);
+            tool.deliveries = Arc::default();
+            let owner = tool.delivery_owner(f.workspace, true).await.unwrap();
+            assert!(owner.bind(f.run, None, 0, None).await);
+            let report = json!({"step": "working", "run_key": "warm-cache"});
+            report_then_idle(&f, &tool, &report).await;
+            let text = report_within_budget(&tool, &report).await;
+            assert!(text.contains(&message_block(&f)), "{text}");
+            assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+        },
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn round7_local_report_fifteen_minutes_later_is_unchanged() {
+    let f = Fixture::new();
+    let d = f.message();
+    let api = Api::start_in_turn(vec![
+        f.recorded("working"),
+        offered(vec![]),
+        offered(vec![d.clone()]),
+        (CLAIM, 200, held_with("claimed", &d, TOKEN)),
+    ])
+    .await;
+    let mut tool = f.tool(&api);
+    tool.deliveries = Arc::default();
+    let report = json!({"step": "working"});
+    report_then_idle(&f, &tool, &report).await;
+    let text = report_within_budget(&tool, &report).await;
+    assert!(text.contains(&message_block(&f)), "{text}");
+    assert_eq!(sent(&api, "GET", "/decision-requests/deliveries").len(), 2);
+    assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+}

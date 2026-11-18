@@ -442,9 +442,22 @@ impl Ledger {
                 };
                 owners.by_key.remove(&key);
             } else if owners.by_key.len() >= MAX_OWNERS {
-                // The global limit refuses growth; another credential's slots
-                // are never available to this owner.
-                return T::default();
+                // Rank eligible owners by their credential's total footprint
+                // (including its pinned slots), then by the owner's last use.
+                let mut counts = HashMap::new();
+                for key in owners.by_key.keys() {
+                    *counts.entry(&key.namespace).or_insert(0usize) += 1;
+                }
+                let Some(key) = owners
+                    .by_key
+                    .iter()
+                    .filter(|(_, mem)| !mem.pinned())
+                    .min_by_key(|(k, mem)| (std::cmp::Reverse(counts[&k.namespace]), mem.last_used))
+                    .map(|(k, _)| k.clone())
+                else {
+                    return T::default();
+                };
+                owners.by_key.remove(&key);
             }
         }
         let mem = owners.by_key.entry(owner.clone()).or_default();

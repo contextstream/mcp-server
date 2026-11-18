@@ -7137,13 +7137,12 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
         let previous_api_url = std::env::var_os("CONTEXTSTREAM_API_URL");
         std::env::set_var("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
 
+        let config_path = temp.path().join(".mcp.json");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let path = temp.path().join(".mcp.json");
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, "{}").unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::write(&config_path, "{}").unwrap();
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
         write_project_mcp_config_with_remote_auth(
             &Editor::ClaudeCode,
@@ -7157,18 +7156,6 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
         )
         .expect("write project claude config");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let path = temp.path().join(".mcp.json");
-            for file in [path.clone(), safe_edit::backup_path(&path).unwrap()] {
-                assert_eq!(
-                    std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
-                    0o600
-                );
-            }
-        }
-        let config_path = temp.path().join(".mcp.json");
         let content = std::fs::read_to_string(&config_path).expect("read project claude config");
         let value: serde_json::Value = serde_json::from_str(&content).expect("parse json");
         let server = &value["mcpServers"]["contextstream"];
@@ -7178,6 +7165,23 @@ url = "https://mcp.contextstream.io/mcp?default_context_mode=fast"
             server["headers"][HEADER_PROJECT_ID].as_str(),
             Some("project-id")
         );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            let backup = safe_edit::backup_path(&config_path).unwrap();
+            assert_eq!(mode(&config_path), 0o600);
+            assert_eq!(std::fs::read_to_string(&backup).unwrap(), "{}");
+            let backup_mode = mode(&backup);
+            assert!(
+                remove_contextstream_from_project_mcp_config(&Editor::ClaudeCode, temp.path())
+                    .unwrap()
+            );
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "{}");
+            assert!(!backup.exists());
+            assert_eq!((backup_mode, mode(&config_path)), (0o644, 0o644));
+        }
 
         if let Some(value) = previous_api_url {
             std::env::set_var("CONTEXTSTREAM_API_URL", value);

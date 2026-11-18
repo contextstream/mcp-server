@@ -1368,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn round5_other_credentials_keep_their_frames_and_tokens_at_capacity() {
+    fn round6_other_credentials_keep_their_frames_and_tokens_at_capacity() {
         let ledger = Ledger::default();
         let run = Uuid::new_v4();
         let quiet = quota_owner(0, 0);
@@ -1380,8 +1380,8 @@ mod tests {
             let owner = quota_owner(index / OWNERS_PER_CREDENTIAL, index % OWNERS_PER_CREDENTIAL);
             ledger.note_report(&owner, run);
         }
-        // A full credential can reuse its own slot. A fresh credential cannot
-        // take a slot from any existing owner, even the oldest one.
+        // A full credential reuses its own slot. A new credential can take
+        // an unpinned slot from the full table, but not the oldest, pinned one.
         let busy = quota_owner(1, OWNERS_PER_CREDENTIAL);
         ledger.note_report(&busy, run);
         assert!(ledger.saw_report(&busy, run));
@@ -1398,7 +1398,66 @@ mod tests {
             .take_frames(&quiet.key, run, TOOL, 1)
             .shown
             .is_empty());
-        assert!(!ledger.saw_report(&newcomer, run));
+        assert!(ledger.saw_report(&newcomer, run));
+        assert_eq!(ledger.owner_count(), MAX_OWNERS);
+    }
+
+    #[test]
+    fn round6_global_eviction_counts_pinned_slots_and_breaks_ties_by_lru() {
+        let ledger = Ledger::default();
+        let run = Uuid::new_v4();
+        let msg = Uuid::new_v4();
+        let held = ClaimToken::new("held");
+        // The two largest credentials each have 32 slots, but just one
+        // evictable owner. Smaller credentials have older, unpinned owners.
+        for n in 0..MAX_OWNERS - 64 {
+            ledger.note_report(&quota_owner(2 + n, 0), run);
+        }
+        for key in [1, 0] {
+            for slot in 0..OWNERS_PER_CREDENTIAL {
+                let owner = quota_owner(key, slot);
+                ledger.note_report(&owner, run);
+                if slot != 0 {
+                    ledger.keep(&owner.key, msg, run, 0, held.clone());
+                }
+            }
+        }
+        let newcomer = quota_owner(MAX_OWNERS, 0);
+        assert!(ledger.note_report(&newcomer, run).is_some());
+        assert!(!ledger.saw_report(&quota_owner(1, 0), run));
+        assert!(ledger.saw_report(&quota_owner(2, 0), run));
+        assert!(ledger.saw_report(&quota_owner(0, 0), run));
+
+        // Key 0 now has the most slots, even though its unpinned owner
+        // was just touched. Once both large keys are all pinned, fall back.
+        assert!(ledger
+            .note_report(&quota_owner(MAX_OWNERS, 1), run)
+            .is_some());
+        assert!(!ledger.saw_report(&quota_owner(0, 0), run));
+        assert!(ledger
+            .note_report(&quota_owner(MAX_OWNERS, 2), run)
+            .is_some());
+        assert!(!ledger.saw_report(&newcomer, run)); // largest eligible key
+        assert_eq!(ledger.owner_count(), MAX_OWNERS);
+    }
+
+    #[test]
+    fn round6_global_refusal_only_when_every_owner_is_pinned() {
+        let ledger = Ledger::default();
+        let run = Uuid::new_v4();
+        let msg = Uuid::new_v4();
+        let held = ClaimToken::new("held");
+        for n in 0..MAX_OWNERS {
+            ledger.keep(&quota_owner(n, 0).key, msg, run, 0, held.clone());
+        }
+        let newcomer = quota_owner(MAX_OWNERS, 0);
+        assert!(ledger.note_report(&newcomer, run).is_none());
+        for n in 0..MAX_OWNERS {
+            assert_eq!(
+                ledger.claimed_as(&quota_owner(n, 0).key, msg),
+                Some((run, held.clone()))
+            );
+        }
         assert_eq!(ledger.owner_count(), MAX_OWNERS);
     }
 

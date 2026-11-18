@@ -2570,7 +2570,7 @@ async fn round4_unknown_gateway_sessions_and_workspaces_do_not_allocate() {
 }
 
 #[tokio::test]
-async fn round5_gateway_reuses_only_its_own_slots_at_the_global_limit() {
+async fn round6_gateway_admits_a_ninth_key_and_replaces_only_its_own_lru_at_32() {
     let f = Fixture::new();
     let api = Api::start(vec![]).await;
     let mut tool = f.hosted_tool(&api);
@@ -2589,15 +2589,11 @@ async fn round5_gateway_reuses_only_its_own_slots_at_the_global_limit() {
                 })
                 .await
                 .unwrap();
-                if n == 32 && key < 8 {
+                if n == 32 {
                     assert!(tool.deliveries.saw_report(&owners[0], run));
                 }
                 tool.deliveries.note_report(&owner, run);
                 owners.push(owner);
-            }
-            if key == 8 {
-                assert!(owners.iter().all(|o| !tool.deliveries.saw_report(o, run)));
-                return;
             }
             assert!(tool.deliveries.saw_report(&owners[0], run));
             assert!(

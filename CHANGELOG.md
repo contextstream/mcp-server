@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.83
+
+- Fixed: the studio can make again from clients that say they can ask the person and never show the question (a Claude Code cloud session followed in the Claude app). There, `make` asked its price question, the client waited on an answer nobody could give and ended the call after 230 seconds, and nothing was ever made, with or without `accepted_price_credits`. Now the price the agent passes is the go-ahead: show the person the plan and its price, and once they agree call `make` with `accepted_price_credits` at or above the plan's price; it is made with no further question. The same holds for `email_send` with `confirm_recipients` (the campaign's recipient count) and for taking an address off the suppression list with `confirm_email`. When the agent passes none, the client asks the person where it can, as before.
+- A question asked live (the price, a send, an unsuppress, the ContextAgents form) now waits at most 45 seconds for the person, not 300: less than any client gives a whole tool call. With no answer, nothing is made, sent or changed, and the answer says so and how to go on. A local client is told the question was withdrawn (`notifications/cancelled`), so its form does not stay up.
+- Unchanged: on a connection where a go-ahead counts only when the person was asked (`CONTEXTSTREAM_GO_AHEAD=asked` or `X-ContextStream-Go-Ahead: asked`), the agent's `accepted_price_credits`, `confirm_recipients` and `confirm_email` still count for nothing and the person is still asked; a connection's spend ceiling still holds whatever is accepted; a price below the plan's or another recipient count is not a go-ahead.
+- A studio request that got no answer in time no longer says "ContextStudio could not be reached": it says this request got no answer and that the studio's other actions may still answer.
+- This release also carries the delivery changes made after 1.0.82 went out, described under 1.0.82 below: fair admission at the owner limits, bounded pins, an evicted unshown frame claimed again and shown once, and hosted reports more than 10 minutes apart collecting inline.
+
 ## 1.0.82
 
 - Codex: live progress from the hooks now reaches Codex sessions (still off unless you turn it on). Setup wrote one hook for Codex, before a tool call, and everything the hooks do for a session's runs starts from the answers of `init` and `progress`, which only a hook after a tool call sees. A Codex session that reported once and then built or tested for more than six minutes read as stalled, and one that ended or died was left to stall for an hour before it was given up.

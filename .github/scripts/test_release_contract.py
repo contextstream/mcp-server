@@ -119,25 +119,46 @@ class ReleaseContractTest(unittest.TestCase):
     def assert_gateway_owner_policy(self, policy: str) -> None:
         policy = " ".join(policy.split())
         for term in ("32", "per credential", "256", "least recently used", "unpinned", "most slots",
-                     "10 minutes", "one hour", "70 minutes", "no guaranteed",
+                     "10 minutes", "in flight", "never pin", "eight", "five minutes",
+                     "five minutes and ten seconds",
                      "Deliveries are paused for this session; read again later."):
             self.assertIn(term, policy, f"missing gateway delivery policy: {term}")
-        self.assertNotIn("silently skips", policy)
-        self.assertNotIn("two hours", policy)
+        # Tokens no longer pin, and the wait is bounded.
+        for stale in ("silently skips", "two hours", "unexpired", "70 minutes", "no guaranteed"):
+            self.assertNotIn(stale, policy, f"stale gateway delivery policy: {stale}")
 
-    def test_delivery_release_notes_explain_owner_isolation(self) -> None:
+    def delivery_notes(self) -> list[str]:
         root = Path(__file__).resolve().parents[2]
         notes = (root / "CHANGELOG.md").read_text().split("## 1.0.82\n", 1)[1].split("\n## ", 1)[0]
-        owner_note = next(bullet for bullet in notes.split("\n- ") if "32" in bullet and "256" in bullet)
+        return [" ".join(bullet.split()) for bullet in notes.split("\n- ")]
+
+    def delivery_note(self, marker: str) -> str:
+        note = next((bullet for bullet in self.delivery_notes() if marker in bullet), None)
+        self.assertIsNotNone(note, f"missing delivery release note: {marker}")
+        return note
+
+    def test_delivery_release_notes_explain_owner_isolation(self) -> None:
+        owner_note = next(bullet for bullet in self.delivery_notes() if "32" in bullet and "256" in bullet)
         self.assert_gateway_owner_policy(owner_note)
-        self.assertIn("same credential", " ".join(owner_note.split()))
+        self.assertIn("same credential", owner_note)
+
+    def test_delivery_release_notes_explain_unshown_recovery(self) -> None:
+        note = self.delivery_note("unshown")
+        for term in ("same attempt", "once", "replicas", "within an hour"):
+            self.assertIn(term, note, f"missing unshown recovery note: {term}")
+
+    def test_delivery_release_notes_explain_hosted_reports_minutes_apart(self) -> None:
+        note = self.delivery_note("more than 10 minutes apart")
+        for term in ("inline", "five-second", "ownership record", "Local sessions are unchanged"):
+            self.assertIn(term, note, f"missing hosted report note: {term}")
 
     def test_delivery_data_handling_explains_gateway_limits_and_pins(self) -> None:
         root = Path(__file__).resolve().parents[2]
         doc = (root / "docs/data-handling.md").read_text()
         delivery = doc.split("**Gateway memory limits:**", 1)[1].split("\n- **", 1)[0]
         self.assert_gateway_owner_policy(delivery)
-        for term in ("unshown", "in flight", "unexpired"):
+        delivery = " ".join(delivery.split())
+        for term in ("unshown", "same attempt", "shown twice", "ownership record"):
             self.assertIn(term, delivery, f"missing gateway delivery policy: {term}")
 
     def test_semver_and_ordering_are_strict(self) -> None:

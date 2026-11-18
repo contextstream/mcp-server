@@ -116,18 +116,28 @@ class ReleaseContractTest(unittest.TestCase):
         for cause in ("another waiter", "no credentials", "full API key", "no workspace"):
             self.assertIn(cause, await_note)
 
+    def assert_gateway_owner_policy(self, policy: str) -> None:
+        policy = " ".join(policy.split())
+        for term in ("32", "per credential", "256", "least recently used", "unpinned", "most slots",
+                     "10 minutes", "one hour", "70 minutes", "no guaranteed",
+                     "Deliveries are paused for this session; read again later."):
+            self.assertIn(term, policy, f"missing gateway delivery policy: {term}")
+        self.assertNotIn("silently skips", policy)
+        self.assertNotIn("two hours", policy)
+
     def test_delivery_release_notes_explain_owner_isolation(self) -> None:
         root = Path(__file__).resolve().parents[2]
         notes = (root / "CHANGELOG.md").read_text().split("## 1.0.82\n", 1)[1].split("\n## ", 1)[0]
-        owner_note = next(line for line in notes.splitlines() if "32" in line and "256" in line)
-        for term in ("same credential", "unpinned", "skips delivery"):
-            self.assertIn(term, owner_note)
+        owner_note = next(bullet for bullet in notes.split("\n- ") if "32" in bullet and "256" in bullet)
+        self.assert_gateway_owner_policy(owner_note)
+        self.assertIn("same credential", " ".join(owner_note.split()))
 
     def test_delivery_data_handling_explains_gateway_limits_and_pins(self) -> None:
         root = Path(__file__).resolve().parents[2]
         doc = (root / "docs/data-handling.md").read_text()
-        delivery = " ".join(doc.split("## What a person sends a run\n", 1)[1].split("\n## ", 1)[0].split())
-        for term in ("32", "per credential", "256", "unshown", "in flight", "unexpired", "skips delivery"):
+        delivery = doc.split("**Gateway memory limits:**", 1)[1].split("\n- **", 1)[0]
+        self.assert_gateway_owner_policy(delivery)
+        for term in ("unshown", "in flight", "unexpired"):
             self.assertIn(term, delivery, f"missing gateway delivery policy: {term}")
 
     def test_semver_and_ordering_are_strict(self) -> None:

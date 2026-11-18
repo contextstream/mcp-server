@@ -19,6 +19,12 @@ struct MachineRoots {
 
 static MACHINE_ROOTS: Mutex<Option<MachineRoots>> = Mutex::new(None);
 
+/// Transport for manifests and executable downloads. The workspace reqwest
+/// configuration enables only the compiled-in WebPKI roots.
+pub fn update_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().https_only(true)
+}
+
 pub fn client_builder() -> reqwest::ClientBuilder {
     machine_roots()
         .iter()

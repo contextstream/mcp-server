@@ -16,6 +16,7 @@ name = "contextstream-mcp"
 path = "src/main.rs"
 
 [dependencies]
+tempfile = { workspace = true }
 mcp-types = { workspace = true }
 mcp-client = { workspace = true }
 mcp-session = { workspace = true }
@@ -85,7 +86,6 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
 
 [dev-dependencies]
-tempfile = "3.10"
 criterion = { workspace = true }
 tokio-test = { workspace = true }
 http-body-util = "0.1"

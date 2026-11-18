@@ -12,6 +12,9 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
+import http from "node:http";
+import https from "node:https";
+import { rootCertificates } from "node:tls";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -101,28 +104,30 @@ async function fetchBuffer(url, maxBytes = MAX_DOWNLOAD_BYTES) {
   try {
     let response;
     try {
-      response = await fetch(url, {
-        redirect: "error",
-        signal: controller.signal,
-        headers: { "user-agent": `contextstream-npm-launcher/${PACKAGE_VERSION}` },
+      const transport = url.protocol === "https:" ? https : http;
+      response = await new Promise((resolve, reject) => {
+        transport.get(url, {
+          ca: rootCertificates,
+          rejectUnauthorized: true,
+          signal: controller.signal,
+          headers: { "user-agent": `contextstream-npm-launcher/${PACKAGE_VERSION}` },
+        }, resolve).on("error", reject);
       });
     } catch (error) {
       throw new FetchFailure(`could not download ${url}`, { cause: error });
     }
-    if (!response.ok) {
-      throw new FetchFailure(`download returned HTTP ${response.status} for ${url}`);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      response.destroy();
+      throw new FetchFailure(`download returned HTTP ${response.statusCode} for ${url}`);
     }
-    const declaredLength = Number(response.headers.get("content-length"));
+    const declaredLength = Number(response.headers["content-length"]);
     if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      response.destroy();
       throw new Error(`release object exceeds the ${maxBytes}-byte safety limit`);
     }
-    if (!response.body) {
-      throw new FetchFailure(`download returned no body for ${url}`);
-    }
-
     const chunks = [];
     let total = 0;
-    for await (const chunk of response.body) {
+    for await (const chunk of response) {
       const buffer = Buffer.from(chunk);
       total += buffer.length;
       if (total > maxBytes) {

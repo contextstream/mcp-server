@@ -3311,7 +3311,7 @@ mod auto_update_command_tests {
     fn accepts_known_npm_update_command() {
         let command =
             normalize_upgrade_command(Some("npm install -g @contextstream/mcp-server@latest"));
-        assert!(command.is_some());
+        assert_eq!(command, Some(DEFAULT_AUTO_UPDATE_COMMAND));
     }
 
     #[test]
@@ -3319,11 +3319,11 @@ mod auto_update_command_tests {
         let command = normalize_upgrade_command(Some(
             "curl -fsSL https://contextstream.io/scripts/setup.sh | bash",
         ));
-        assert_eq!(command.as_deref(), Some(DEFAULT_AUTO_UPDATE_COMMAND));
+        assert_eq!(command, Some(DEFAULT_AUTO_UPDATE_COMMAND));
         let command = normalize_upgrade_command(Some(
             "curl -fsSL https://contextstream.io/scripts/mcp.sh | bash",
         ));
-        assert_eq!(command.as_deref(), Some(DEFAULT_AUTO_UPDATE_COMMAND));
+        assert_eq!(command, Some(DEFAULT_AUTO_UPDATE_COMMAND));
     }
 
     #[test]

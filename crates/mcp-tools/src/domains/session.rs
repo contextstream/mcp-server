@@ -1630,29 +1630,20 @@ pub fn should_exec_after_update() -> bool {
         .is_ok()
 }
 
-fn normalize_upgrade_command(command: Option<&str>) -> Option<String> {
-    let cmd = command
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_AUTO_UPDATE_COMMAND);
-
-    // Restrict to known-safe update channels for automatic execution.
-    let is_npm_update = cmd.starts_with("npm ")
-        && cmd.contains("@contextstream/mcp-server")
-        && (cmd.contains(" install ") || cmd.contains(" update "));
-    let is_setup_script = (cmd.starts_with("curl -fsSL https://contextstream.io/scripts/setup")
-        || cmd.starts_with("curl -fsSL https://contextstream.io/scripts/mcp.sh"))
-        && cmd.contains("| bash");
-    let is_self_update = cmd.contains("contextstream-mcp") && cmd.contains("update");
-
-    if is_setup_script {
-        // Route setup-script notices through the self-update command so automatic
-        // updates also refresh hooks/rules/configs via `contextstream-mcp update`.
-        Some(DEFAULT_AUTO_UPDATE_COMMAND.to_string())
-    } else if is_npm_update || is_self_update {
-        Some(cmd.to_string())
-    } else {
-        None
+// A release notice can request an update. The local executable owns the
+// command and its transport, even for legacy npm and setup-script notices.
+fn normalize_upgrade_command(command: Option<&str>) -> Option<&'static str> {
+    match command.map(str::trim).unwrap_or("") {
+        ""
+        | DEFAULT_AUTO_UPDATE_COMMAND
+        | "contextstream-mcp update"
+        | "npm install -g @contextstream/mcp-server@latest"
+        | "npm update -g @contextstream/mcp-server"
+        | "curl -fsSL https://contextstream.io/scripts/setup.sh | bash"
+        | "curl -fsSL https://contextstream.io/scripts/mcp.sh | bash" => {
+            Some(DEFAULT_AUTO_UPDATE_COMMAND)
+        }
+        _ => None,
     }
 }
 
@@ -1717,7 +1708,7 @@ fn maybe_schedule_version_manifest_check() {
     }
 }
 
-fn start_auto_update(command: String) -> bool {
+fn start_auto_update() -> bool {
     if self_update_disabled() {
         tracing::info!("auto-update skipped because this runtime is managed by its launcher");
         return false;
@@ -1730,16 +1721,8 @@ fn start_auto_update(command: String) -> bool {
     }
 
     tokio::spawn(async move {
-        let mut cmd = if cfg!(windows) {
-            let mut c = Command::new("cmd");
-            c.arg("/C").arg(&command);
-            c
-        } else {
-            let mut c = Command::new("sh");
-            c.arg("-lc").arg(&command);
-            c
-        };
-
+        let mut cmd = Command::new("contextstream-mcp");
+        cmd.args(["update", "--force"]);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1882,7 +1865,7 @@ async fn check_version_manifest() {
     const LATEST_VERSION_URL: &str =
         "https://pub-68429b9f7857416c9484b75bf1887b96.r2.dev/mcp/latest/version.json";
 
-    let client = match mcp_client::http::client_builder()
+    let client = match mcp_client::http::update_client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {
@@ -1917,9 +1900,7 @@ async fn check_version_manifest() {
         )
     };
     if parse(latest) > parse(current) {
-        if let Some(command) = normalize_upgrade_command(None) {
-            start_auto_update(command);
-        }
+        start_auto_update();
     }
 }
 
@@ -2980,8 +2961,8 @@ impl ToolHandler for InitTool {
                     .and_then(|notice| notice.get("upgrade_command"))
                     .and_then(|value| value.as_str());
 
-                if let Some(command) = normalize_upgrade_command(upgrade_command) {
-                    let started = start_auto_update(command);
+                if normalize_upgrade_command(upgrade_command).is_some() {
+                    let started = start_auto_update();
                     if started {
                         auto_update_note = Some(
                             "[VERSION_NOTICE] Auto-update started in background. It will apply automatically."

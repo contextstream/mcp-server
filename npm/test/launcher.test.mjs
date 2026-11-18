@@ -239,4 +239,11 @@ test("release metadata rejects an environment-only CA", integrationOptions, asyn
   await assert.rejects(launch(bins.mcp, ["--version"], launcherEnvironment(dir, prefix,
     { SSL_CERT_FILE: cert, NODE_EXTRA_CA_CERTS: cert })));
   assert.equal(requests, 0, "the TLS handshake must fail before the manifest request");
+  const curl = path.join(repositoryRoot, "scripts/release/installer-tls/curl");
+  const realCurl = (await execFileAsync("sh", ["-c", "command -v curl"])).stdout.trim();
+  await assert.rejects(execFileAsync(curl, ["-fsS", prefix], { env: {
+    ...process.env, CONTEXTSTREAM_INSTALL_CURL: realCurl, SSL_CERT_FILE: cert,
+    CURL_CA_BUNDLE: cert, NO_PROXY: "127.0.0.1",
+  } }), (error) => error.code === 60);
+  assert.equal(requests, 0, "nested installer downloads must also reject the CA");
 });

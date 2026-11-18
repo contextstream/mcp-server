@@ -44,6 +44,7 @@ use crate::peer::{self, Elicited};
 
 mod contacts;
 mod drafts;
+mod flight;
 mod go;
 mod health;
 mod segments;
@@ -67,6 +68,9 @@ pub(crate) const EMAIL_ACTIONS: &[&str] = &[
     "email_diagnostics",
     "email_templates",
     "email_ab",
+    "email_pause",
+    "email_resume",
+    "email_connection",
 ];
 
 /// Erasing a contact, which `delete` calls (`studio.email_contact_erase`). It cannot be
@@ -932,6 +936,9 @@ impl StudioTool {
             "email_diagnostics" => self.email_diagnostics(workspace_id, input).await,
             "email_templates" => self.email_templates(workspace_id, input).await,
             "email_ab" => self.email_ab(workspace_id, input).await,
+            "email_pause" => self.email_pause(workspace_id, input).await,
+            "email_resume" => self.email_resume(workspace_id, input).await,
+            "email_connection" => self.email_connection(workspace_id, input).await,
             ERASE_ACTION => self.erase_contact(workspace_id, input).await,
             other => Err(Error::Validation(format!("Unknown email action: {other}"))),
         }
@@ -1693,8 +1700,7 @@ impl StudioTool {
             }
             "paused" => {
                 return Ok(ToolResult::error(format!(
-                    "Not sent: “{name}” is paused. The person resumes it in the studio ({}), or email_cancel stops it for good.",
-                    campaign_url(&campaign_id.to_string())
+                    "Not sent: “{name}” is paused. email_resume sends to the people still waiting, with the person's go; email_cancel stops it for good."
                 )))
             }
             _ => {}

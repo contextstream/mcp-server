@@ -603,3 +603,164 @@ impl StudioTool {
         ))
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// email_connection
+// ---------------------------------------------------------------------------------------
+
+const CONNECTION_OPERATIONS: &[&str] = &["show", "refresh"];
+
+/// The sender as campaigns go out: "Northwind <hello@…>, replies to team@…".
+fn sender_words(sender: &Value) -> String {
+    let from = match (text(sender, "fromName"), text(sender, "fromEmail")) {
+        (Some(name), Some(email)) => format!("{name} <{email}>"),
+        (None, Some(email)) => email,
+        _ => return "no from address yet".to_string(),
+    };
+    match text(sender, "replyTo") {
+        Some(reply_to) => format!("{from}, replies to {reply_to}"),
+        None => from,
+    }
+}
+
+/// A sending domain's state: "news.acme.com verified (opens tracked, clicks not tracked)".
+fn domain_words(domain: &Value) -> String {
+    let name = text(domain, "name").unwrap_or_else(|| "a domain".to_string());
+    let status = text(domain, "status").unwrap_or_else(|| NOT_ANSWERED.to_string());
+    if status != "verified" {
+        return format!("{name} {}", status.replace('_', " "));
+    }
+    let tracked = |key: &str, what: &str| match domain.get(key).and_then(Value::as_bool) {
+        Some(true) => format!("{what} tracked"),
+        Some(false) => format!("{what} not tracked"),
+        None => format!("{what} tracking {NOT_ANSWERED}"),
+    };
+    format!(
+        "{name} verified ({}, {})",
+        tracked("openTracking", "opens"),
+        tracked("clickTracking", "clicks")
+    )
+}
+
+impl StudioTool {
+    /// The connection to the team's Resend: what it sends as, its domains, its webhook and
+    /// what is missing. `refresh` has Create ask Resend again. Connecting stays in the
+    /// studio: no key is taken here, and none is shown.
+    pub(super) async fn email_connection(
+        &self,
+        workspace_id: Uuid,
+        input: &StudioInput,
+    ) -> Result<ToolResult> {
+        let operation = super::operation_or(
+            input.operation.as_deref(),
+            CONNECTION_OPERATIONS,
+            "show",
+            "email_connection",
+        )?;
+        let refresh = operation == "refresh";
+        let answer = if refresh {
+            self.email_call(
+                "POST",
+                "/connection/refresh",
+                Some(&json!({"workspaceId": workspace_id})),
+                None,
+            )
+            .await?
+        } else {
+            self.email_call(
+                "GET",
+                &format!("/connection?workspaceId={workspace_id}"),
+                None,
+                None,
+            )
+            .await?
+        };
+        if !answer.is_success() {
+            let unconnected = answer.status == 404
+                && answer
+                    .error_message()
+                    .is_some_and(|said| said.contains("hasn't connected"));
+            return Ok(ToolResult::error(if unconnected {
+                format!(
+                    "Not refreshed: Resend isn't connected yet. The team connects it in the studio: {CONNECT_URL}"
+                )
+            } else if refresh {
+                format!("Not refreshed: {}", email_refusal(&answer, Topic::Other))
+            } else {
+                email_refusal(&answer, Topic::Other)
+            }));
+        }
+        let connection = answer.data;
+        let (line, mut facts) = super::connection_line(&connection);
+        let mut lines = Vec::new();
+        if refresh {
+            lines.push("Asked Resend again.".to_string());
+        }
+        lines.push(line);
+        if connection.get("connected").and_then(Value::as_bool) == Some(true) {
+            let sender = connection.get("sender").cloned().unwrap_or(Value::Null);
+            lines.push(format!("- Sender: {}.", sender_words(&sender)));
+            let domains = connection
+                .get("domains")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            lines.push(if domains.is_empty() {
+                match connection.pointer("/key/access").and_then(Value::as_str) {
+                    Some("sending_access") => format!(
+                        "- Domains: {NOT_ANSWERED} (a sending-only key can't list them; the from address is checked by its shape only)."
+                    ),
+                    _ => "- Domains: none yet; the team adds and verifies one in Resend.".to_string(),
+                }
+            } else {
+                format!(
+                    "- Domains: {}.",
+                    domains.iter().map(domain_words).collect::<Vec<_>>().join("; ")
+                )
+            });
+            let webhook = connection.get("webhook").cloned().unwrap_or(Value::Null);
+            lines.push(format!(
+                "- Webhook: set up by {}, {}; {}.",
+                match webhook.get("mode").and_then(Value::as_str) {
+                    Some("auto") => "Create",
+                    Some(_) => "hand",
+                    None => "whom is not answered",
+                },
+                match webhook.get("secretSet").and_then(Value::as_bool) {
+                    Some(true) => "with its signing secret",
+                    Some(false) => "with no signing secret yet",
+                    None => "its signing secret not answered",
+                },
+                moment(webhook.get("lastEventAt").and_then(Value::as_str)).map_or_else(
+                    || "no event has arrived yet".to_string(),
+                    |at| format!("last event on {at}")
+                )
+            ));
+            facts["sender"] = json!({
+                "from_name": sender.get("fromName"),
+                "from_email": sender.get("fromEmail"),
+                "reply_to": sender.get("replyTo"),
+            });
+            facts["domains"] = json!(domains
+                .iter()
+                .map(|domain| json!({
+                    "name": domain.get("name"),
+                    "status": domain.get("status"),
+                    "open_tracking": domain.get("openTracking"),
+                    "click_tracking": domain.get("clickTracking"),
+                }))
+                .collect::<Vec<_>>());
+            facts["webhook"] = json!({
+                "mode": webhook.get("mode"),
+                "secret_set": webhook.get("secretSet"),
+                "last_event_at": webhook.get("lastEventAt"),
+            });
+            lines.push(format!(
+                "The key, the sender and the domains are set in the studio ({CONNECT_URL}); email_connection with operation refresh has Create ask Resend again, and email_diagnostics says whether its events arrive."
+            ));
+        }
+        facts["workspace_id"] = json!(workspace_id);
+        facts["refreshed"] = json!(refresh);
+        Ok(ToolResult::with_structured(lines.join("\n"), facts))
+    }
+}

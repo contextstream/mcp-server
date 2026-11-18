@@ -810,6 +810,23 @@ async fn a_send_asks_the_person_when_the_client_can() {
     .unwrap();
     assert!(text_of(&still_no).starts_with("Not sent"));
     assert_eq!(client.sent.lock().unwrap().len(), 2, "asked again");
+    // A client asked live shows its person the form: they are asked first even when the
+    // agent confirms the right count, and their no wins over it.
+    let no_wins = run_with_call_peer(
+        CallPeer::new(client.clone(), None, true),
+        tool.execute(json!({
+            "action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37,
+            "send_at": "2026-11-02T09:00", "time_zone": "Europe/London",
+        })),
+    )
+    .await
+    .unwrap();
+    assert!(
+        text_of(&no_wins).starts_with("Not sent: the person didn't say go"),
+        "{}",
+        text_of(&no_wins)
+    );
+    assert_eq!(client.sent.lock().unwrap().len(), 3, "asked a third time");
 
     // Accepting without ticking "Send it" isn't a go.
     *client.answer.lock().unwrap() =
@@ -890,61 +907,135 @@ async fn a_stateless_client_is_asked_through_the_calls_result() {
     );
 }
 
-/// The agent's go (mcp-server ticket 875b09b7): the recipient count, or the address, the agent
-/// confirms after showing the person is their go as the agent gives it, so the client is not
-/// asked again. Some clients say they can ask and never show the question (a Claude Code cloud
-/// session): there a question waited until the client gave up on the call, and nothing could
-/// ever be sent or taken off the list.
+/// The agent's go (mcp-server ticket 875b09b7): on a stateless call, where a question can
+/// only go back as the call's result, the campaign's recipient count the agent confirms is the
+/// person's go as the agent gives it, and no question is sent. Some such clients say they can
+/// ask and never show the question (a Claude Code cloud session): the question waited until
+/// the client gave up on the call, and nothing could ever be sent. A client asked live is
+/// still asked first, for a bounded time, and with no answer the agent's count carries it.
 #[tokio::test]
-async fn the_agents_confirmation_is_the_go_and_the_person_is_not_asked_again() {
+async fn on_a_stateless_call_the_agents_confirmation_is_the_go_and_no_question_is_sent() {
     let stub = Stub::start(usual()).await;
     let tool = stub.tool();
     let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
     let send = json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37});
+    let stateless = || {
+        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}))
+    };
 
     // A stateless client: sent at once, with no question in the call's result.
-    let stateless =
-        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}));
-    let sent = run_with_call_peer(stateless.clone(), tool.execute(send.clone()))
+    let peer = stateless();
+    let sent = run_with_call_peer(peer.clone(), tool.execute(send.clone()))
         .await
         .unwrap();
     assert!(!sent.is_error, "{}", text_of(&sent));
-    assert!(stateless.take_input_required().is_none(), "nobody is asked");
+    assert!(peer.take_input_required().is_none(), "nobody is asked");
     assert_eq!(stub.calls_to("POST", &schedule).len(), 1);
 
-    // A live client, whose person would have said no: not asked.
-    let client = Arc::new(FakeClient::default());
-    *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));
+    // A live client that never answers: asked once, then the agent's count carries it.
+    let silent = Arc::new(FakeClient::default());
     let sent = run_with_call_peer(
-        CallPeer::new(client.clone(), None, true),
-        tool.execute(send),
+        CallPeer::new(silent.clone(), None, true),
+        tool.execute(send.clone()),
     )
     .await
     .unwrap();
     assert!(!sent.is_error, "{}", text_of(&sent));
-    assert!(client.sent.lock().unwrap().is_empty(), "nobody is asked");
+    assert_eq!(silent.sent.lock().unwrap().len(), 1, "asked once");
     assert_eq!(stub.calls_to("POST", &schedule).len(), 2);
 
-    // Off the suppression list on the address the agent confirms, in either client.
-    let remove = "/create/email/suppressions/remove";
-    let off = json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example", "confirm_email": "grace@northwind.example"});
-    let removed = run_with_call_peer(
-        CallPeer::new(client.clone(), None, true),
-        tool.execute(off.clone()),
+    // With no count from the agent, a live question nobody answers says so.
+    let unanswered = run_with_call_peer(
+        CallPeer::new(Arc::new(FakeClient::default()), None, true),
+        tool.execute(json!({"action": "email_send", "campaign_id": CAMPAIGN})),
     )
     .await
     .unwrap();
-    assert!(!removed.is_error, "{}", text_of(&removed));
-    assert!(client.sent.lock().unwrap().is_empty(), "nobody is asked");
+    assert!(
+        text_of(&unanswered).starts_with(
+            "Not sent yet: the person was asked through the client and gave no answer in time."
+        ),
+        "{}",
+        text_of(&unanswered)
+    );
+    assert_eq!(stub.calls_to("POST", &schedule).len(), 2);
+
+    // Where only the person's own go counts, the stateless client is asked whatever the
+    // agent confirms.
+    let peer = stateless();
+    let asked_only = mcp_types::config::ConfigOverride {
+        go_ahead_asked_only: Some(true),
+        ..Default::default()
+    };
+    let asking = mcp_client::run_with_config_override(asked_only, || {
+        run_with_call_peer(peer.clone(), tool.execute(send.clone()))
+    })
+    .await
+    .unwrap();
+    assert!(
+        text_of(&asking).starts_with("Asking the person"),
+        "{}",
+        text_of(&asking)
+    );
+    assert!(peer.take_input_required().is_some());
+    assert_eq!(stub.calls_to("POST", &schedule).len(), 2);
+}
+
+/// Off the suppression list on a stateless call: an address that bounced comes off on the
+/// address the agent confirms. One whose person unsubscribed or complained is never taken off
+/// on the agent's word where the client can ask: the address is the call's own argument, so
+/// confirming it shows nothing was read, and writing to them again is theirs to allow.
+#[tokio::test]
+async fn an_address_that_unsubscribed_comes_off_only_when_the_person_is_asked() {
+    let stub = Stub::start(usual()).await;
+    let tool = stub.tool();
+    let remove = "/create/email/suppressions/remove";
+    let stateless = || {
+        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}))
+    };
+
+    let peer = stateless();
+    let bounced = run_with_call_peer(
+        peer.clone(),
+        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "bounced@resend.dev", "confirm_email": "bounced@resend.dev"})),
+    )
+    .await
+    .unwrap();
+    assert!(!bounced.is_error, "{}", text_of(&bounced));
+    assert!(peer.take_input_required().is_none(), "nobody is asked");
     assert_eq!(stub.calls_to("POST", remove).len(), 1);
-    let stateless =
-        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}));
-    let removed = run_with_call_peer(stateless.clone(), tool.execute(off))
-        .await
-        .unwrap();
-    assert!(!removed.is_error, "{}", text_of(&removed));
-    assert!(stateless.take_input_required().is_none(), "nobody is asked");
-    assert_eq!(stub.calls_to("POST", remove).len(), 2);
+
+    let peer = stateless();
+    let asking = run_with_call_peer(
+        peer.clone(),
+        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example", "confirm_email": "grace@northwind.example"})),
+    )
+    .await
+    .unwrap();
+    assert!(
+        text_of(&asking).starts_with("Asking the person"),
+        "{}",
+        text_of(&asking)
+    );
+    assert!(peer.take_input_required().is_some());
+    assert_eq!(stub.calls_to("POST", remove).len(), 1);
+
+    // A wrong address is no go for this one on a live client either: asked, and a no stands.
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));
+    let kept = run_with_call_peer(
+        CallPeer::new(client.clone(), None, true),
+        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "bounced@resend.dev", "confirm_email": "ada@northwind.example"})),
+    )
+    .await
+    .unwrap();
+    assert!(
+        text_of(&kept).starts_with("Not removed: the person didn't say go."),
+        "{}",
+        text_of(&kept)
+    );
+    assert_eq!(client.sent.lock().unwrap().len(), 1, "asked");
+    assert_eq!(stub.calls_to("POST", remove).len(), 1);
 }
 
 #[tokio::test]
@@ -1915,7 +2006,7 @@ async fn unsubscribes_are_listed_with_why_and_a_remove_needs_the_persons_go() {
     *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));
     let declined = run_with_call_peer(
         CallPeer::new(client.clone(), None, true),
-        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example"})),
+        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example", "confirm_email": "grace@northwind.example"})),
     )
     .await
     .unwrap();

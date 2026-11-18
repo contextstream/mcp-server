@@ -868,6 +868,17 @@ async fn make_asks_the_person_when_the_client_can() {
     assert!(text_of(&still_no).contains("the person said no"));
     assert_eq!(client.sent.lock().unwrap().len(), 2, "asked again");
     assert!(stub.posts_to("/create/jobs").is_empty());
+    // A client asked live shows its person the form, so they are asked first even when the
+    // agent passes a price that covers the plan, and their no wins over it.
+    let no_wins = run_with_call_peer(
+        CallPeer::new(client.clone(), None, true),
+        tool.execute(json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 412})),
+    )
+    .await
+    .unwrap();
+    assert!(text_of(&no_wins).contains("the person said no"));
+    assert_eq!(client.sent.lock().unwrap().len(), 3, "asked a third time");
+    assert!(stub.posts_to("/create/jobs").is_empty());
 
     *client.answer.lock().unwrap() =
         Some(json!({"action": "accept", "content": {"confirm": true}}));
@@ -946,11 +957,13 @@ async fn a_stateless_client_is_asked_through_the_calls_result() {
     assert_eq!(stub.posts_to("/create/jobs").len(), 1);
 }
 
-/// The agent's go-ahead (mcp-server ticket 875b09b7): a price the agent passes that covers the
-/// plan is the person's go-ahead as the agent gives it (they agreed in the conversation), so
-/// the client is not asked again. Some clients say they can ask and never show the question
-/// (a Claude Code cloud session): there a question in the call's result waited until the
-/// client gave up on the call, every time, and nothing could ever be made.
+/// The agent's go-ahead (mcp-server ticket 875b09b7): on a stateless call, where a question
+/// can only go back as the call's result, a price the agent passes that covers the plan is the
+/// person's go-ahead as the agent gives it (they agreed in the conversation), and no question
+/// is sent. Some such clients say they can ask and never show the question (a Claude Code
+/// cloud session): the question waited until the client gave up on the call, every time, and
+/// nothing could ever be made. A client asked live is still asked first, for a bounded time,
+/// and with no answer the agent's price carries the call.
 #[tokio::test]
 async fn an_accepted_price_is_the_go_ahead_and_the_person_is_not_asked_again() {
     let stub = Stub::start(api(Arc::new(Mutex::new(("queued".into(), false))))).await;
@@ -970,18 +983,19 @@ async fn an_accepted_price_is_the_go_ahead_and_the_person_is_not_asked_again() {
     assert!(stateless.take_input_required().is_none(), "nobody is asked");
     assert_eq!(stub.posts_to("/create/jobs").len(), 1);
 
-    // A live client, whose person would have said no: not asked, and a price above the
-    // plan's covers it too.
-    let client = Arc::new(FakeClient::default());
-    *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));
+    // A live client that never answers: asked once, for less than a client gives a whole
+    // call, and then the agent's price (one above the plan's covers it too) carries it.
+    let silent = Arc::new(FakeClient::default());
     let made = run_with_call_peer(
-        CallPeer::new(client.clone(), None, true),
+        CallPeer::new(silent.clone(), None, true),
         tool.execute(json!({"action": "make", "plan_id": QUOTE, "accepted_price_credits": 500})),
     )
     .await
     .unwrap();
     assert!(!made.is_error, "{}", text_of(&made));
-    assert!(client.sent.lock().unwrap().is_empty(), "nobody is asked");
+    let waits = silent.waits.lock().unwrap().clone();
+    assert_eq!(waits.len(), 1, "asked once");
+    assert!(waits[0] < Duration::from_secs(60), "{waits:?}");
     assert_eq!(stub.posts_to("/create/jobs").len(), 2);
 }
 
@@ -1000,7 +1014,12 @@ async fn the_price_question_waits_less_than_a_client_gives_a_tool_call() {
     .await
     .unwrap();
     let text = text_of(&unanswered);
-    assert!(text.starts_with("Not made yet"), "{text}");
+    assert!(
+        text.starts_with(
+            "Not made yet: the person was asked through the client and gave no answer in time."
+        ),
+        "{text}"
+    );
     assert!(text.contains("accepted_price_credits 412"), "{text}");
     let waits = silent.waits.lock().unwrap().clone();
     assert_eq!(waits.len(), 1, "asked once");

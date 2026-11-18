@@ -386,6 +386,23 @@ mod tests {
         }
     }
 
+    /// One request that timed out is not the studio being down (ticket f9016264).
+    #[test]
+    fn a_request_that_timed_out_is_not_said_as_the_studio_being_unreachable() {
+        let timed_out = unreachable(Error::Timeout(30)).to_string();
+        assert!(timed_out.contains("got no answer in time"), "{timed_out}");
+        assert!(!timed_out.contains("could not be reached"), "{timed_out}");
+        let down = unreachable(Error::Network("connection refused".into())).to_string();
+        assert!(
+            down.contains("ContextStudio could not be reached"),
+            "{down}"
+        );
+        assert!(matches!(
+            unreachable(Error::Validation("x".into())),
+            Error::Validation(_)
+        ));
+    }
+
     #[test]
     fn refusals_are_one_plain_sentence() {
         let pilot = answer(

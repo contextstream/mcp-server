@@ -1538,7 +1538,13 @@ const CODEX_EVENT_HOOK: &str = "run-progress";
 const CODEX_NOTICE_HOOK: &str = "mid-run-notices";
 
 /// A hook input as Codex 0.169 sends it: Claude Code's fields, and the pair
-/// of `turn_id` and `model` that tells Codex from Claude Code.
+/// of `turn_id` and `model` that tells Codex from Claude Code. The shapes in
+/// this section are the ones a real `codex exec` session handed these hooks
+/// (2026-11-18, Codex 0.169.0 against the hosted server): an MCP tool as
+/// `mcp__contextstream__<tool>` with `_meta`, `content`, `isError` and
+/// `structuredContent` in its result, a shell command as `Bash` with its
+/// output as plain text, and `Stop` with `stop_hook_active` and
+/// `last_assistant_message`.
 fn codex(event: &str, mut input: Value) -> Value {
     input["hook_event_name"] = event.into();
     input["turn_id"] = "019a8f3e-turn-1".into();
@@ -1560,8 +1566,7 @@ fn codex_agent(session: &Session) -> Value {
 
 impl Sandbox {
     /// Codex's PostToolUse for one of ContextStream's tools: the tool's
-    /// arguments, and the MCP result as Codex hands it on (`content` and
-    /// `structuredContent`, no `isError` on a success). Whatever the hook
+    /// arguments, and the MCP result as Codex hands it on. Whatever the hook
     /// prints, Codex must accept: it prints nothing.
     fn codex_result(&self, session: &Session, tool: &str, tool_input: Value, structured: Value) {
         let printed = self.hook_stdout(
@@ -1574,9 +1579,29 @@ impl Sandbox {
                     "tool_use_id": "call_1",
                     "tool_input": tool_input,
                     "tool_response": {
+                        "_meta": {},
                         "content": [{"type": "text", "text": "ok"}],
+                        "isError": false,
                         "structuredContent": structured,
                     },
+                }),
+            ),
+        );
+        assert_eq!(printed.trim(), "", "Codex PostToolUse output");
+    }
+
+    /// Codex's PostToolUse for a shell command: its output, as plain text.
+    fn codex_ran(&self, session: &Session, command: &str, output: &str) {
+        let printed = self.hook_stdout(
+            session,
+            CODEX_EVENT_HOOK,
+            codex(
+                "PostToolUse",
+                json!({
+                    "tool_name": "Bash",
+                    "tool_use_id": "call_2",
+                    "tool_input": {"command": command},
+                    "tool_response": output,
                 }),
             ),
         );
@@ -1666,6 +1691,18 @@ fn a_codex_session_stays_live_through_local_work_and_ends_with_its_process() {
     // the run stalled.
     for pair in signals.windows(2) {
         assert!(pair[1].at.duration_since(pair[0].at) < stalls_after(&pair[0].body));
+    }
+    // The command comes back. Neither the command nor a word of its output
+    // is in anything the hooks sent.
+    sandbox.codex_ran(
+        &session,
+        "cargo test --workspace",
+        "test result: ok. 12 passed\n",
+    );
+    for report in api.reports() {
+        let sent = report.body.to_string();
+        assert!(!sent.contains("cargo test"), "{sent}");
+        assert!(!sent.contains("12 passed"), "{sent}");
     }
 
     // The turn ends (an interactive session): the run waits on a person.

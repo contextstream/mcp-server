@@ -954,7 +954,12 @@ impl Poll {
 
 pub(super) enum PollFor {
     Get,
-    Report { known_run: bool },
+    /// `known_run`: the run is the session's own (`progress` decides how),
+    /// so a report that finds no recent report of the session in memory, its
+    /// slot having expired, still reads and collects inline.
+    Report {
+        known_run: bool,
+    },
 }
 
 /// Cold reports start a probe. A report with a stale probe refreshes and

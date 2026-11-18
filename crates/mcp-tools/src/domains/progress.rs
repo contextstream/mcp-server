@@ -378,7 +378,7 @@ impl ProgressTool {
                 let reported_run = run_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
                 // The delivery slot can expire during the 404 cooldown. A local
                 // session still knows its own run and can collect on this report.
-                let known_run = !is_http
+                let remembered = !is_http
                     && reported_run.is_some_and(|id| {
                         self.remembered_run(workspace_id, &report.run_key) == Some(id)
                     });
@@ -401,6 +401,19 @@ impl ProgressTool {
                     (Some(run_id), Some(owner))
                         if !report.is_terminal() && !run_has_ended(&answer) =>
                     {
+                        // The gateway remembers no run between requests and its
+                        // slot expires after ten idle minutes. The run is known
+                        // all the same when the session's ownership record is on
+                        // disk, or when the report named it by the session's own key.
+                        let known_run = remembered
+                            || (is_http
+                                && (owner.reported(run_id)
+                                    || names_own_run(
+                                        workspace_id,
+                                        &report.run_key,
+                                        &context.session,
+                                        run_id,
+                                    )));
                         run_deliveries::poll(
                             &self.client,
                             &self.deliveries,
@@ -1501,6 +1514,19 @@ fn framed_digest(domain: &str, fields: &[&str]) -> String {
 /// part is every session of a caller, and `mcp` is everyone.
 fn is_one_session(session: &str, is_http: bool) -> bool {
     !is_http || session.starts_with("s-")
+}
+
+/// Whether a hosted report went to a run its caller owns: the run the API
+/// answered is the one the report's key names ([`run_id_of_key`]), and the
+/// key is the session's own, under its `s-` part, which is a digest of the
+/// caller's credential and its session ([`session_part`]). Any other key
+/// names a run any caller can report to, so it proves nothing.
+fn names_own_run(workspace_id: Uuid, run_key: &str, session: &str, run_id: Uuid) -> bool {
+    is_one_session(session, true)
+        && run_key
+            .strip_prefix(session)
+            .is_some_and(|rest| rest.starts_with(':'))
+        && run_id_of_key(workspace_id, run_key) == run_id
 }
 
 /// Whether a report names no run: no `run_key` and no `ticket_id`.

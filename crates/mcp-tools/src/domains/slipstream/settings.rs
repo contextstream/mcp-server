@@ -42,8 +42,8 @@ use crate::peer::{self, Elicited};
 /// How long the workspace's name and members may take in the fallback; past it they are left
 /// out.
 const WORKSPACE_INFO_BUDGET: Duration = Duration::from_secs(4);
-/// How long the person has to answer the form.
-const CHOOSE_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the person has to answer the form: less than any client gives the whole call.
+const CHOOSE_TIMEOUT: Duration = peer::LIVE_QUESTION_MAX;
 /// Per-agent consent changes sent at once.
 const PUT_CONCURRENCY: usize = 4;
 /// The most people a read-only answer names.

@@ -94,6 +94,14 @@ pub fn note_cancelled(request_id: &Value) {
     cancelled.push_back(request_id.to_string());
 }
 
+/// The longest a live question waits for the person, whatever its caller asks for. A client
+/// gives a whole tool call a limit of its own (60 s at the hosted edge, two minutes before
+/// Claude Code moves a call to the background, 230 s in a Claude Code cloud session), and a
+/// call that outlives it is lost with its answer: the agent is told only that the tool timed
+/// out, and what the tool would have said next (how to go on without the form) never
+/// arrives. So the wait ends first, and the tool answers (ticket 875b09b7).
+pub const LIVE_QUESTION_MAX: Duration = Duration::from_secs(45);
+
 /// The first revision whose elicitation forms have multi-select fields (an array of
 /// enumerated strings), MCP 2025-11-25.
 pub const MULTI_SELECT_PROTOCOL: &str = "2025-11-25";
@@ -334,7 +342,8 @@ impl CallPeer {
 
     /// Ask the person through a form (`elicitation/create`): `message` says what is asked,
     /// `requested_schema` is the flat object schema of the answer. Without the capability the
-    /// answer is [`Elicited::Unanswered`].
+    /// answer is [`Elicited::Unanswered`]; so is no answer within `timeout`, which is never
+    /// longer than [`LIVE_QUESTION_MAX`].
     pub async fn elicit(
         &self,
         message: &str,
@@ -347,7 +356,7 @@ impl CallPeer {
         let params = json!({ "message": message, "requestedSchema": requested_schema });
         match self
             .channel
-            .request("elicitation/create", params, timeout)
+            .request("elicitation/create", params, timeout.min(LIVE_QUESTION_MAX))
             .await
         {
             Ok(result) => read_elicitation(&result),

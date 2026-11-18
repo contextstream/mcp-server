@@ -10,8 +10,8 @@
 //! - `email_campaigns`: the workspace's campaigns and where each stands.
 //! - `email_test`: a test send to the person's own address or Resend's test addresses.
 //! - `email_send`: sends now or at a local time in a time zone, only with the person's go:
-//!   asked through MCP elicitation when the client can ask them, otherwise
-//!   `confirm_recipients` must be the recipient count they were shown. The schedule carries an
+//!   `confirm_recipients`, the recipient count they were shown and agreed to; without it they
+//!   are asked through MCP elicitation when the client can ask them. The schedule carries an
 //!   idempotency key, so a retried call schedules once.
 //! - `email_cancel`: unschedules, or stops a campaign that is sending.
 //! - `email_report`: a campaign's report, or the workspace's trends.
@@ -1377,9 +1377,19 @@ impl StudioTool {
             people(recipients)
         );
 
-        // The person's go: asked of them when the client can, else the count they were shown.
+        // The person's go. The count the agent confirms, when it is the campaign's, is their
+        // go as the agent gives it (they were shown it and agreed), and the client is not
+        // asked again: a client that says it can ask and never shows the question would hold
+        // the call until it gave up (ticket 875b09b7). Without it, or where only the person's
+        // own word counts (crate::go_ahead), they are asked when the client can.
         let mut notes: Vec<String> = Vec::new();
-        let asked = match peer::current().filter(peer::CallPeer::can_elicit) {
+        let agents_word =
+            !crate::go_ahead::asked_only() && input.confirm_recipients == Some(recipients);
+        let mut unanswered = false;
+        let asked = match peer::current()
+            .filter(peer::CallPeer::can_elicit)
+            .filter(|_| !agents_word)
+        {
             Some(peer) => {
                 let message = format!("Send {what}? Once it goes, it can't be unsent.");
                 let schema = json!({
@@ -1416,6 +1426,7 @@ impl StudioTool {
                     Elicited::Accepted(_) | Elicited::Declined | Elicited::Cancelled => Some(false),
                     Elicited::Unanswered(reason) => {
                         tracing::debug!(%reason, "studio: the send question got no answer");
+                        unanswered = true;
                         None
                     }
                 }
@@ -1451,6 +1462,7 @@ impl StudioTool {
                         people(recipients),
                         credits(confirmed)
                     ),
+                    None if unanswered => "Not sent yet: the person was asked through the client and gave no answer in time.".to_string(),
                     None => "Not sent yet: the person's go is needed first.".to_string(),
                 };
                 said.push_str(&format!(
@@ -2841,7 +2853,16 @@ impl StudioTool {
         };
         let what = format!("{email} ({why})");
 
-        let asked = match peer::current().filter(peer::CallPeer::can_elicit) {
+        // The address the agent confirms, when it is this one, is the person's go as the
+        // agent gives it, and the client is not asked again (as for a send).
+        let confirmed = input.confirm_email.as_deref().and_then(address_of);
+        let agents_word =
+            !crate::go_ahead::asked_only() && confirmed.as_deref() == Some(email.as_str());
+        let mut unanswered = false;
+        let asked = match peer::current()
+            .filter(peer::CallPeer::can_elicit)
+            .filter(|_| !agents_word)
+        {
             Some(peer) => {
                 let message = format!("Take {what} off the suppression list?{caution}");
                 let schema = json!({
@@ -2888,6 +2909,7 @@ impl StudioTool {
                     Elicited::Accepted(_) | Elicited::Declined | Elicited::Cancelled => Some(false),
                     Elicited::Unanswered(reason) => {
                         tracing::debug!(%reason, "studio: the unsuppress question got no answer");
+                        unanswered = true;
                         None
                     }
                 }
@@ -2904,7 +2926,6 @@ impl StudioTool {
                 json!({"removed": false, "email": email, "go_ahead": "asked_only"}),
             ));
         }
-        let confirmed = input.confirm_email.as_deref().and_then(address_of);
         match (asked, confirmed) {
             (Some(true), _) => {}
             (Some(false), _) => {
@@ -2919,6 +2940,7 @@ impl StudioTool {
             (None, confirmed) => {
                 let mut said = match confirmed {
                     Some(other) => format!("Not removed: confirm_email is {other}, not {email}."),
+                    None if unanswered => "Not removed yet: the person was asked through the client and gave no answer in time.".to_string(),
                     None => "Not removed yet: the person's go is needed first.".to_string(),
                 };
                 said.push_str(&format!(

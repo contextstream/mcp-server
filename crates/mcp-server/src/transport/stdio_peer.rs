@@ -93,10 +93,19 @@ impl<W: AsyncWrite + Unpin + Send + Sync> PeerChannel for StdioPeer<W> {
         let answer = match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => Err("the client went away".to_string()),
-            Err(_) => Err(format!(
-                "no answer within {} seconds",
-                timeout.as_secs().max(1)
-            )),
+            Err(_) => {
+                // Nobody waits for the answer any more: say so, so the client can take the
+                // question down instead of leaving the person to answer into nothing.
+                self.notify(
+                    "notifications/cancelled",
+                    json!({"requestId": id, "reason": "No answer came in time; the tool went on without one."}),
+                )
+                .await;
+                Err(format!(
+                    "no answer within {} seconds",
+                    timeout.as_secs().max(1)
+                ))
+            }
         };
         self.forget(&id);
         answer

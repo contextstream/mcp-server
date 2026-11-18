@@ -121,8 +121,8 @@ to pick.
   customers") and sends nothing; `email_audiences`, `email_campaigns`, `email_test` (to your
   own address or Resend's test addresses), `email_cancel` and `email_report` (a campaign's
   delivery, opens, clicks, bounces and complaints, or the workspace's trends). `email_send`
-  goes only with your go: the client asks you when it can; otherwise the agent shows you the
-  campaign and its recipient count and passes the count you agreed to.
+  goes only with your go: the agent shows you the campaign and its recipient count and passes
+  the count you agreed to; when it passes none, the client asks you where it can.
   `email_preview` gives a link to share that shows the email in Gmail, Outlook and Apple Mail
   mockups (desktop, tablet and phone, light and dark, images on or off), with the inbox line
   and what to check. `email_revise` changes a draft from plain words ("shorter subject") or

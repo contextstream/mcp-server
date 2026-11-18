@@ -360,7 +360,12 @@ impl Create<'_> {
 /// A network failure, said plainly.
 pub(crate) fn unreachable(error: Error) -> Error {
     match error {
-        Error::Timeout(_) | Error::Network(_) => Error::Network(format!(
+        // One request that got no answer is not the studio being down: other actions may
+        // answer at once (ticket f9016264).
+        Error::Timeout(_) => Error::Network(format!(
+            "This studio request got no answer in time ({error}); the studio's other actions may still answer. Try again, and read plan or library before repeating a call that changes something."
+        )),
+        Error::Network(_) => Error::Network(format!(
             "ContextStudio could not be reached ({error}); nothing was changed. Try again."
         )),
         other => other,

@@ -1,13 +1,19 @@
 //! Whose word a go-ahead is. Several actions need the person's go-ahead: the studio's `make`
 //! (a price), `email_send` (who it goes to), taking an address off the suppression list, a
-//! priced agent run, anything the `delete` tool does. The agent passes the go-ahead once the
-//! person agreed (`accepted_price_credits`, `confirm_recipients`, `confirm_email`): it is the
-//! agent's own word that they did, and the client is not asked again. When the agent passes
-//! none, the person is asked where the client can show them a question, live for at most
-//! `peer::LIVE_QUESTION_MAX`; a question nobody answers does nothing. The `delete` tool and an
-//! agent run never ask at all. (Until 1.0.83 the client was asked first whenever it said it
-//! could ask: a client that says so and shows no question, such as a Claude Code cloud
-//! session, then held every call until it gave up on it, and nothing could be made or sent.)
+//! priced agent run, anything the `delete` tool does. Where the client can show the person a
+//! question live, they are asked, for at most `peer::LIVE_QUESTION_MAX`. Where it cannot, or
+//! the question gets no answer, the agent may pass the go-ahead itself
+//! (`accepted_price_credits`, `confirm_recipients`, `confirm_email`), and the `delete` tool
+//! and an agent run never ask at all: the go-ahead is then the agent's own word that the
+//! person agreed.
+//!
+//! A stateless call can only ask through its own result, which the client shows and waits
+//! on. Since 1.0.83 a go-ahead the agent passes there is taken at once and no question is
+//! sent: a client that says it can ask and never shows the question (a Claude Code cloud
+//! session) held every such call until it gave up on it, and nothing could be made or sent.
+//! Without one the question still goes back. The exception is an address whose person
+//! unsubscribed or complained: it comes off the suppression list only when the person is
+//! asked, wherever the client can ask.
 //!
 //! A connection can refuse that word: with [`GO_AHEAD_ENV`] set (a local binary) or
 //! [`GO_AHEAD_HEADER`] sent (a hosted connection), a go-ahead counts only when the person was

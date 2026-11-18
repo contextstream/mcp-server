@@ -1020,6 +1020,25 @@ async fn an_address_that_unsubscribed_comes_off_only_when_the_person_is_asked() 
     assert!(peer.take_input_required().is_some());
     assert_eq!(stub.calls_to("POST", remove).len(), 1);
 
+    // Asked live about someone who unsubscribed, and no answer: the agent's confirmation
+    // does not stand in for theirs.
+    let silent = Arc::new(FakeClient::default());
+    let unanswered = run_with_call_peer(
+        CallPeer::new(silent.clone(), None, true),
+        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example", "confirm_email": "grace@northwind.example"})),
+    )
+    .await
+    .unwrap();
+    assert!(
+        text_of(&unanswered).starts_with(
+            "Not removed: the person was asked through the client and gave no answer in time"
+        ),
+        "{}",
+        text_of(&unanswered)
+    );
+    assert_eq!(silent.sent.lock().unwrap().len(), 1, "asked");
+    assert_eq!(stub.calls_to("POST", remove).len(), 1);
+
     // A wrong address is no go for this one on a live client either: asked, and a no stands.
     let client = Arc::new(FakeClient::default());
     *client.answer.lock().unwrap() = Some(json!({"action": "decline"}));

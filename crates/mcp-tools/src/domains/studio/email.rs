@@ -10,8 +10,9 @@
 //! - `email_campaigns`: the workspace's campaigns and where each stands.
 //! - `email_test`: a test send to the person's own address or Resend's test addresses.
 //! - `email_send`: sends now or at a local time in a time zone, only with the person's go:
-//!   `confirm_recipients`, the recipient count they were shown and agreed to; without it they
-//!   are asked through MCP elicitation when the client can ask them. The schedule carries an
+//!   asked through MCP elicitation when the client can ask them (on a stateless call the
+//!   campaign's count as `confirm_recipients` is taken at once and no question is sent),
+//!   otherwise `confirm_recipients` must be the recipient count they were shown. The schedule carries an
 //!   idempotency key, so a retried call schedules once.
 //! - `email_cancel`: unschedules, or stops a campaign that is sending.
 //! - `email_report`: a campaign's report, or the workspace's trends.
@@ -1123,7 +1124,7 @@ impl StudioTool {
         let url = campaign_url(&campaign_id.to_string());
         lines.push(format!("Edit and preview it in the studio: {url}"));
         lines.push(format!(
-            "Next, with campaign_id {campaign_id}: email_preview shows it in Gmail, Outlook and Apple Mail (a link to share); email_revise changes it from plain words; email_test sends a test to the person; email_send only when they say go."
+            "Next, with campaign_id {campaign_id}: email_preview shows it in Gmail, Outlook and Apple Mail (a link to share); email_revise changes it from plain words; email_test sends a test to the person; email_send only when they say go: show them the campaign, its sender and its recipient count, then pass that count as confirm_recipients."
         ));
         Ok(ToolResult::with_structured(
             lines.join("\n"),
@@ -1377,18 +1378,19 @@ impl StudioTool {
             people(recipients)
         );
 
-        // The person's go. The count the agent confirms, when it is the campaign's, is their
-        // go as the agent gives it (they were shown it and agreed), and the client is not
-        // asked again: a client that says it can ask and never shows the question would hold
-        // the call until it gave up (ticket 875b09b7). Without it, or where only the person's
-        // own word counts (crate::go_ahead), they are asked when the client can.
+        // The person's go: asked of them when the client can, else the count they were shown.
+        // A client asked live is asked first, for a bounded time. On a stateless call the
+        // question would go back as the call's result, and a client that says it can ask and
+        // never shows it would hold the call until it gave up (ticket 875b09b7): there the
+        // campaign's own count, confirmed by the agent, is the go as the agent gives it, and
+        // no question is sent, unless only the person's own word counts (crate::go_ahead).
         let mut notes: Vec<String> = Vec::new();
         let agents_word =
             !crate::go_ahead::asked_only() && input.confirm_recipients == Some(recipients);
         let mut unanswered = false;
         let asked = match peer::current()
             .filter(peer::CallPeer::can_elicit)
-            .filter(|_| !agents_word)
+            .filter(|peer| !(agents_word && peer.asks_through_the_result()))
         {
             Some(peer) => {
                 let message = format!("Send {what}? Once it goes, it can't be unsent.");
@@ -2853,15 +2855,20 @@ impl StudioTool {
         };
         let what = format!("{email} ({why})");
 
-        // The address the agent confirms, when it is this one, is the person's go as the
-        // agent gives it, and the client is not asked again (as for a send).
+        // As for a send: on a stateless call the address the agent confirms is the go, and
+        // no question is sent. Not for an address whose person unsubscribed or complained:
+        // the address is this call's own argument, so confirming it shows nothing was read,
+        // and writing to them again is theirs to allow. They are asked wherever the client
+        // can ask.
         let confirmed = input.confirm_email.as_deref().and_then(address_of);
-        let agents_word =
-            !crate::go_ahead::asked_only() && confirmed.as_deref() == Some(email.as_str());
+        let theirs_to_allow = matches!(reason.as_str(), "unsubscribed" | "complained");
+        let agents_word = !crate::go_ahead::asked_only()
+            && confirmed.as_deref() == Some(email.as_str())
+            && !theirs_to_allow;
         let mut unanswered = false;
         let asked = match peer::current()
             .filter(peer::CallPeer::can_elicit)
-            .filter(|_| !agents_word)
+            .filter(|peer| !(agents_word && peer.asks_through_the_result()))
         {
             Some(peer) => {
                 let message = format!("Take {what} off the suppression list?{caution}");
@@ -2928,6 +2935,15 @@ impl StudioTool {
         }
         match (asked, confirmed) {
             (Some(true), _) => {}
+            // Asked about someone who left, and no answer: the agent's word does not stand in.
+            (None, _) if unanswered && theirs_to_allow => {
+                return Ok(ToolResult::with_structured(
+                    format!(
+                        "Not removed: the person was asked through the client and gave no answer in time, and {what} comes off only on their own yes. {email} stays on the suppression list. Ask them, then call again so they can answer.{caution}"
+                    ),
+                    json!({"removed": false, "email": email, "reason": reason, "unanswered": true}),
+                ))
+            }
             (Some(false), _) => {
                 return Ok(ToolResult::with_structured(
                     format!(

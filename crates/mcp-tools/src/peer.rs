@@ -311,6 +311,14 @@ impl CallPeer {
         self.elicitation || self.inline.is_some()
     }
 
+    /// Whether a question goes back as the call's own result (a stateless call) and is the
+    /// client's to show and to wait on: the server cannot bound that wait, and a client that
+    /// never shows the question holds the call until it gives up on it. A live question is
+    /// the server's to bound ([`LIVE_QUESTION_MAX`]).
+    pub fn asks_through_the_result(&self) -> bool {
+        self.inline.is_some()
+    }
+
     /// Report progress (`total` when known, for example 100 for a percentage). A value not
     /// above the last one sent is raised just above it, since MCP asks each to increase.
     /// Nothing is sent when the call carried no progress token.

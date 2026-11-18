@@ -103,9 +103,14 @@ to pick.
   about M") and spends nothing. Pass what your agent knows that the workspace may not (the
   diff it just made, release notes, the doc it has open) as `context`; the producer reads
   it next to the team's own context.
-- **Your go-ahead.** `make` spends at most the plan's price, and only after you agree: a
-  client that can ask you (MCP elicitation, or a stateless `input_required` result) asks
-  you itself; otherwise the agent passes the price you accepted.
+- **Your go-ahead.** `make` spends at most the plan's price, and only after you agree. The
+  agent shows you the plan and its price and passes the price you accepted. A client that
+  shows you a form in the middle of a call (MCP elicitation) still asks you itself, and your
+  no wins. A client that answers through the call's result (`input_required`, as Claude Code
+  does) asks you only when the agent passed no accepted price: with one, the plan is made at
+  once. To take no go-ahead from the agent at all, set `CONTEXTSTREAM_GO_AHEAD=asked` (a
+  local binary) or send `X-ContextStream-Go-Ahead: asked` (a hosted connection): then only
+  your own yes in the client's form counts, for spending, sending and deleting.
 - **Following it.** `status` reports each piece while it waits (with
   `notifications/progress` where the call asks for them); a product film takes 13 to 21
   minutes. `result` shows images inline and links video and sound (signed links valid
@@ -121,8 +126,9 @@ to pick.
   customers") and sends nothing; `email_audiences`, `email_campaigns`, `email_test` (to your
   own address or Resend's test addresses), `email_cancel` and `email_report` (a campaign's
   delivery, opens, clicks, bounces and complaints, or the workspace's trends). `email_send`
-  goes only with your go: the agent shows you the campaign and its recipient count and passes
-  the count you agreed to; when it passes none, the client asks you where it can.
+  goes only with your go, on the same terms as `make`: the agent shows you the campaign and
+  its recipient count and passes the count you agreed to; a client that shows a form in the
+  middle of a call still asks you first.
   `email_preview` gives a link to share that shows the email in Gmail, Outlook and Apple Mail
   mockups (desktop, tablet and phone, light and dark, images on or off), with the inbox line
   and what to check. `email_revise` changes a draft from plain words ("shorter subject") or

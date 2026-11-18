@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
-    campaign_url, email_refusal, given, name_of, number, operation_of, people, purpose_words, said,
-    text, Topic, NOT_ANSWERED,
+    campaign_url, email_refusal, given, name_of, number, operation_of, people, said, text, Topic,
+    NOT_ANSWERED,
 };
 use crate::domains::studio::words::credits;
 use crate::domains::studio::{parse_id, StudioInput, StudioTool};
@@ -122,15 +122,7 @@ impl Reach {
         let Some(audience) = &self.audience else {
             return "no audience".to_string();
         };
-        let audience = format!(
-            "the audience “{}” ({})",
-            text(audience, "name").unwrap_or_else(|| "unnamed".to_string()),
-            purpose_words(audience)
-        );
-        match self.segment.as_ref().and_then(|s| text(s, "name")) {
-            Some(segment) => format!("the segment “{segment}” of {audience}"),
-            None => audience,
-        }
+        super::send::target_words(audience, self.segment.as_ref())
     }
 
     fn left_out_line(&self) -> String {

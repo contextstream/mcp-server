@@ -1,8 +1,0 @@
-#!/bin/sh
-# curl used by the Unix release installer, including its nested downloads.
-# This directory has no hashed CA entries. Both CA locations must be set:
-# overriding the CA file alone still consults curl's default CA directory.
-set -eu
-roots_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec "$CONTEXTSTREAM_INSTALL_CURL" --disable --cacert "$roots_dir/roots.pem" --capath "$roots_dir" \
-    --proto '=https' --proto-redir '=https' "$@"

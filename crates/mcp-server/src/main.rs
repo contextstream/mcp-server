@@ -3619,9 +3619,9 @@ async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
         // Windows: download binary directly from CDN
         download_and_install_binary(&client, &latest).await?;
     } else {
-        // Keep the installer's platform-specific install and signing behavior.
-        // Fetch it completely before execution. Its own curl downloads use
-        // the release bundle too, including when SSL_CERT_FILE is inherited.
+        // Unix: fetch the installer completely over bundled-root HTTPS before
+        // running it, then let the script run with the user's normal environment
+        // and curl just as 1.0.82 did.
         let installer = client
             .get(SETUP_URL)
             .send()
@@ -3631,30 +3631,22 @@ async fn run_update(check_only: bool, force: bool, remote: bool) -> Result<()> {
             .await?;
         let staging = tempfile::tempdir()?;
         let script = staging.path().join("install.sh");
-        std::fs::write(&script, installer)?;
-        let real_curl = which::which("curl")?;
-        let wrapper = staging.path().join("curl");
-        std::fs::write(
-            &wrapper,
-            include_bytes!("../../../scripts/release/installer-tls/curl"),
-        )?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700))?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&script)?;
+            file.write_all(&installer)?;
         }
-        std::fs::write(
-            staging.path().join("roots.pem"),
-            include_bytes!("../../../scripts/release/installer-tls/roots.pem"),
-        )?;
-        let current_path = std::env::var_os("PATH").unwrap_or_default();
-        let paths =
-            std::iter::once(staging.path().to_owned()).chain(std::env::split_paths(&current_path));
+        #[cfg(not(unix))]
+        std::fs::write(&script, &installer)?;
         let mut cmd = std::process::Command::new("bash");
         cmd.arg(&script)
-            .env("PATH", std::env::join_paths(paths)?)
-            .env("CONTEXTSTREAM_INSTALL_CURL", real_curl)
-            .env_remove("CONTEXTSTREAM_RELEASE_BASE_URL")
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())

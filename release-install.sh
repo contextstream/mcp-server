@@ -147,23 +147,13 @@ done
 SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")"
 [ -f "$SCRIPT_PATH" ] || die "Could not resolve script path from ${BASH_SOURCE[0]}"
 
-# Scope the installer and its children to the same bundled roots as self-update.
-CONTEXTSTREAM_INSTALL_CURL="$(type -P curl)"
-export CONTEXTSTREAM_INSTALL_CURL
-installer_tls="$(dirname "$SCRIPT_PATH")/scripts/release/installer-tls"
-[ -x "$installer_tls/curl" ] && [ -s "$installer_tls/roots.pem" ] || die "Installer TLS files are missing"
-export PATH="$installer_tls:$PATH"
-
 if [ "$LINK_SCRIPT" = true ]; then
     install_script_links "$SCRIPT_PATH"
 fi
 
 if [ "$SKIP_INSTALL" = false ]; then
     log "Running release installer from $SETUP_URL"
-    installer=$(mktemp)
-    trap 'rm -f "$installer"' EXIT
-    curl -fsSL "$SETUP_URL" -o "$installer"
-    bash "$installer"
+    curl -fsSL "$SETUP_URL" | bash
 fi
 
 # Refresh shell command cache so command -v sees the newly installed binary.

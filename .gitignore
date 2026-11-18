@@ -18,8 +18,6 @@ npm-debug.log*
 credentials.json
 secrets.json
 *.pem
-# Public CA roots compiled into the self-updater (crates/mcp-server/src/main.rs), not a secret.
-!/scripts/release/installer-tls/roots.pem
 *.key
 *.p12
 

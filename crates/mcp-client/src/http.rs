@@ -1,34 +1,17 @@
-//! Where every HTTP client of the workspace is made.
-//!
-//! A client trusts two sets of certificate authorities:
-//!
-//! - the ones bundled into the binary (reqwest's "rustls-tls"), so a
-//!   container with no certificate store still connects;
-//! - the ones this machine trusts (its certificate store, or `SSL_CERT_FILE`
-//!   and `SSL_CERT_DIR` when they are set), so the authority of a
-//!   TLS-inspecting proxy is trusted where the machine trusts it.
-//!
-//! The machine's store is read here and not by reqwest
-//! ("rustls-tls-native-roots"). reqwest refuses to build a client when the
-//! store holds certificates and none of them parses, and a client that
-//! cannot be built is a panic in most callers: one bad `SSL_CERT_FILE` then
-//! breaks every hook and every call on the machine. Here the store can only
-//! add to what is trusted. One that cannot be read, or that holds nothing
-//! usable, is said once on the log, and the client has the bundled roots.
-//!
-//! The store is read once per process, by the first client that is made:
-//! on macOS that is a question to the keychain, on Linux a few hundred
-//! files. `tests/tls_trust_roots.rs` keeps every other file of the
-//! workspace from making a client by itself.
+//! HTTP trust for API traffic. Bundled roots are always enabled. Linux can
+//! add its PEM store and all platforms can add explicitly configured PEMs.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
-/// `SSL_CERT_FILE` and `SSL_CERT_DIR` as they were when the store was read.
+use rustls::pki_types::{pem::PemObject, CertificateDer};
+
 type Named = (Option<OsString>, Option<OsString>);
 
-/// The machine's certificate authorities, and what named them.
 struct MachineRoots {
     named: Named,
     roots: Arc<[reqwest::Certificate]>,
@@ -36,8 +19,6 @@ struct MachineRoots {
 
 static MACHINE_ROOTS: Mutex<Option<MachineRoots>> = Mutex::new(None);
 
-/// A `reqwest::ClientBuilder` that trusts what this machine trusts beside the
-/// bundled roots. Use it wherever `reqwest::Client::builder()` would be.
 pub fn client_builder() -> reqwest::ClientBuilder {
     machine_roots()
         .iter()
@@ -47,106 +28,181 @@ pub fn client_builder() -> reqwest::ClientBuilder {
         })
 }
 
-/// A client with reqwest's default settings. Use it wherever
-/// `reqwest::Client::new()` would be; like it, this panics only when no TLS
-/// backend can be started at all.
 pub fn client() -> reqwest::Client {
     client_builder()
         .build()
-        .or_else(|_| reqwest::Client::builder().build())
         .expect("an HTTP client with default settings")
 }
 
-/// The machine's certificate authorities, read the first time and again only
-/// when `SSL_CERT_FILE` or `SSL_CERT_DIR` has changed since.
+#[derive(Debug)]
+enum Source {
+    File(PathBuf),
+    Directory(PathBuf, bool), // system directories use OpenSSL subject-hash names
+}
+
+fn root_sources(platform: &str, named: &Named) -> Vec<Source> {
+    let mut sources = Vec::new();
+    #[cfg(target_os = "linux")]
+    if platform == "linux" {
+        // System bundles used by Debian, Red Hat, SUSE, OpenELEC and Alpine.
+        // Probe independently of the environment: explicit roots are additive.
+        let bundle = [
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/ca-bundle.pem",
+            "/etc/pki/tls/cacert.pem",
+            "/etc/ssl/cert.pem",
+            "/opt/etc/ssl/certs/ca-certificates.crt",
+            "/etc/ssl/certs/cacert.pem",
+        ]
+        .into_iter()
+        .map(Path::new)
+        .find(|p| p.is_file());
+        sources.extend(bundle.map(|p| Source::File(p.into())));
+        sources.extend(
+            openssl_probe::candidate_cert_dirs().map(|p| Source::Directory(p.into(), true)),
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = platform;
+    if let Some(file) = &named.0 {
+        sources.push(Source::File(file.into()));
+    }
+    if let Some(dirs) = &named.1 {
+        sources.extend(std::env::split_paths(dirs).map(|p| Source::Directory(p, false)));
+    }
+    sources
+}
+
+fn system_cert_name(path: &Path) -> bool {
+    let Some((hash, index)) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|s| s.split_once('.'))
+    else {
+        return false;
+    };
+    hash.len() == 8
+        && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        && !index.is_empty()
+        && index.bytes().all(|b| b.is_ascii_digit())
+}
+
+#[derive(Default)]
+struct Loader {
+    seen: HashSet<Vec<u8>>,
+    roots: Vec<reqwest::Certificate>,
+    first_problem: Option<String>,
+}
+
+impl Loader {
+    fn problem(&mut self, path: &Path, why: impl std::fmt::Display) {
+        self.first_problem
+            .get_or_insert_with(|| format!("{} ({why})", path.display()));
+    }
+
+    fn load_file(&mut self, path: &Path) -> io::Result<()> {
+        // A configured path may point to a device or pipe. Never wait on one.
+        let mut options = File::options();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("expected a regular PEM file"));
+        }
+        const MAX_BYTES: u64 = 16 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(io::Error::other("PEM file exceeds 16 MiB"));
+        }
+        let mut found = false;
+        for entry in CertificateDer::pem_slice_iter(&bytes) {
+            found = true;
+            match entry {
+                Ok(der) if self.seen.contains(der.as_ref()) => {}
+                Ok(der) => {
+                    // reqwest parses each root when building the client. Check
+                    // with the same parser so one bad entry cannot break it.
+                    if rustls::RootCertStore::empty().add(der.clone()).is_ok() {
+                        if let Ok(root) = reqwest::Certificate::from_der(&der) {
+                            self.seen.insert(der.to_vec());
+                            self.roots.push(root);
+                            continue;
+                        }
+                    }
+                    self.problem(path, "invalid certificate");
+                }
+                Err(e) => self.problem(path, e),
+            }
+        }
+        if !found {
+            return Err(io::Error::other("no PEM certificates"));
+        }
+        Ok(())
+    }
+
+    fn file(&mut self, path: &Path) {
+        if let Err(e) = self.load_file(path) {
+            self.problem(path, e);
+        }
+    }
+
+    fn directory(&mut self, path: &Path, hashed: bool) -> io::Result<()> {
+        let mut found = false;
+        for entry in path.read_dir()? {
+            match entry {
+                Ok(entry) => {
+                    let p = entry.path();
+                    if (!hashed || system_cert_name(&p)) && !p.is_dir() {
+                        found = true;
+                        self.file(&p);
+                    }
+                }
+                Err(e) => self.problem(path, e),
+            }
+        }
+        if !hashed && !found {
+            return Err(io::Error::other("no PEM files"));
+        }
+        Ok(())
+    }
+}
+
 fn machine_roots() -> Arc<[reqwest::Certificate]> {
     let named = (
         std::env::var_os("SSL_CERT_FILE"),
         std::env::var_os("SSL_CERT_DIR"),
     );
-    let mut held = MACHINE_ROOTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(held) = held.as_ref().filter(|held| held.named == named) {
-        return held.roots.clone();
+    let mut held = MACHINE_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = held.as_ref().filter(|entry| entry.named == named) {
+        return cached.roots.clone();
     }
-
-    let started = Instant::now();
-    let found = rustls_native_certs::load_native_certs();
-    let errors: Vec<String> = found.errors.iter().map(ToString::to_string).collect();
-    let (roots, problem) = usable_roots(
-        found.certs.iter().map(|certificate| certificate.as_ref()),
-        &errors,
-        &named,
-    );
-    if let Some(problem) = problem {
-        tracing::warn!("{problem}");
+    let mut loader = Loader::default();
+    for source in root_sources(std::env::consts::OS, &named) {
+        match source {
+            Source::File(path) => loader.file(&path),
+            Source::Directory(path, hashed) => {
+                if let Err(e) = loader.directory(&path, hashed) {
+                    loader.problem(&path, e);
+                }
+            }
+        }
     }
-    tracing::debug!(
-        "Trusting {} certificate authorities of this machine beside the bundled ones (read in {:?})",
-        roots.len(),
-        started.elapsed()
-    );
-    let roots: Arc<[reqwest::Certificate]> = roots.into();
+    if let Some(problem) = loader.first_problem {
+        eprintln!("Warning: skipped unusable CA data at {problem}. Check the certificate store, SSL_CERT_FILE and SSL_CERT_DIR. Bundled roots remain trusted.");
+    }
+    let roots: Arc<[_]> = loader.roots.into();
     *held = Some(MachineRoots {
         named,
         roots: roots.clone(),
     });
     roots
-}
-
-/// The certificates a client can take as roots, and what to say when there
-/// is none where some were expected.
-///
-/// reqwest adds a root with `rustls::RootCertStore::add` and fails the whole
-/// client when one is refused, so each certificate is tried with the same
-/// call first and left out when it fails.
-fn usable_roots<'a>(
-    certificates: impl Iterator<Item = &'a [u8]>,
-    errors: &[String],
-    named: &Named,
-) -> (Vec<reqwest::Certificate>, Option<String>) {
-    let mut tried = rustls::RootCertStore::empty();
-    let mut roots = Vec::new();
-    let mut refused = 0usize;
-    for der in certificates {
-        let usable = tried
-            .add(rustls::pki_types::CertificateDer::from(der))
-            .is_ok();
-        match reqwest::Certificate::from_der(der) {
-            Ok(root) if usable => roots.push(root),
-            _ => refused += 1,
-        }
-    }
-    if !roots.is_empty() {
-        return (roots, None);
-    }
-
-    let shown = |value: &OsString| value.to_string_lossy().into_owned();
-    let source = match named {
-        (Some(file), Some(dir)) => format!(
-            "SSL_CERT_FILE ({}) and SSL_CERT_DIR ({})",
-            shown(file),
-            shown(dir)
-        ),
-        (Some(file), None) => format!("SSL_CERT_FILE ({})", shown(file)),
-        (None, Some(dir)) => format!("SSL_CERT_DIR ({})", shown(dir)),
-        // A machine with no store at all, a bare container: nothing was
-        // expected, and the bundled roots are what it has always had.
-        (None, None) if errors.is_empty() && refused == 0 => return (roots, None),
-        (None, None) => "This machine's certificate store".to_string(),
-    };
-    let why = match errors.first() {
-        Some(error) => error.clone(),
-        None if refused > 0 => format!("none of the {refused} found there could be read"),
-        None => "none was found there".to_string(),
-    };
-    let problem = format!(
-        "{source} gave no certificate authority that can be used ({why}). Only the certificate \
-         authorities bundled into this program are trusted: calls that pass through an \
-         HTTPS-inspecting proxy will fail until that is put right."
-    );
-    (roots, Some(problem))
 }
 
 #[cfg(test)]
@@ -155,71 +211,8 @@ mod tests {
 
     #[test]
     fn only_linux_reads_a_system_store_without_an_explicit_pem() {
-        for platform in ["macos", "windows", "linux"] {
-            let sources = root_sources(platform, &(None, None));
-            if platform != "linux" {
-                assert!(sources.is_empty(), "{platform}: {sources:?}");
-            }
-        }
-    }
-
-    fn named(file: Option<&str>, dir: Option<&str>) -> Named {
-        (file.map(OsString::from), dir.map(OsString::from))
-    }
-
-    #[test]
-    fn a_machine_with_no_store_is_not_a_problem() {
-        let (roots, problem) = usable_roots(std::iter::empty(), &[], &named(None, None));
-        assert!(roots.is_empty());
-        assert_eq!(problem, None);
-    }
-
-    #[test]
-    fn a_store_that_gives_nothing_usable_says_what_it_was_and_why() {
-        let not_a_certificate: &[u8] = b"not a certificate";
-        let cases = [
-            (
-                named(Some("/etc/proxy.pem"), None),
-                vec![not_a_certificate],
-                vec![],
-                "SSL_CERT_FILE (/etc/proxy.pem) gave no certificate authority that can be used \
-                 (none of the 1 found there could be read).",
-            ),
-            (
-                named(None, Some("/etc/certs")),
-                vec![],
-                vec!["could not read /etc/certs".to_string()],
-                "SSL_CERT_DIR (/etc/certs) gave no certificate authority that can be used \
-                 (could not read /etc/certs).",
-            ),
-            (
-                named(Some("/a.pem"), Some("/certs")),
-                vec![],
-                vec![],
-                "SSL_CERT_FILE (/a.pem) and SSL_CERT_DIR (/certs) gave no certificate authority \
-                 that can be used (none was found there).",
-            ),
-            (
-                named(None, None),
-                vec![not_a_certificate, not_a_certificate],
-                vec![],
-                "This machine's certificate store gave no certificate authority that can be used \
-                 (none of the 2 found there could be read).",
-            ),
-        ];
-        for (named, certificates, errors, starts_with) in cases {
-            let (roots, problem) = usable_roots(certificates.into_iter(), &errors, &named);
-            assert!(roots.is_empty());
-            let problem = problem.expect("a problem to say");
-            assert!(problem.starts_with(starts_with), "{problem}");
-            assert!(
-                problem.ends_with(
-                    "Only the certificate authorities bundled into this program are trusted: \
-                     calls that pass through an HTTPS-inspecting proxy will fail until that is \
-                     put right."
-                ),
-                "{problem}"
-            );
+        for platform in ["macos", "windows"] {
+            assert!(root_sources(platform, &(None, None)).is_empty());
         }
     }
 }

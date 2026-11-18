@@ -10,9 +10,6 @@ publish.workspace = true
 [dependencies]
 mcp-types = { workspace = true }
 reqwest = { workspace = true }
-# The certificate authorities the machine trusts, read and checked in src/http.rs
-# (see there why reqwest does not read them itself). Both are in the tree through reqwest.
-rustls-native-certs = "0.8"
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -37,6 +34,9 @@ fs2 = { workspace = true }
 futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl-probe = "0.2"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -48,5 +48,3 @@ tokio = { workspace = true, features = ["test-util"] }
 # The local TLS server of tests/tls_trust_roots.rs. Already in the tree through
 # reqwest, with the same crypto provider (ring).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-# The same tests read what a client logs.
-tracing-subscriber = { workspace = true }

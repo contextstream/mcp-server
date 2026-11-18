@@ -293,14 +293,11 @@ impl Error {
     }
 }
 
-/// What usually makes a machine refuse ContextStream's TLS certificate (#369),
-/// and what to do about the usual cause: the client trusts the authorities
-/// the machine trusts (its certificate store, or `SSL_CERT_FILE`) beside the
-/// ones bundled into the binary.
+/// Guidance for API traffic behind an HTTPS-inspecting proxy.
 pub const TLS_HINT: &str =
     "An HTTPS-inspecting proxy or firewall, or a wrong CONTEXTSTREAM_API_URL, usually causes this. \
-     For a proxy, add its certificate authority to this machine's certificate store, or set \
-     SSL_CERT_FILE to its PEM file.";
+     On macOS and Windows, set SSL_CERT_FILE to the proxy CA's PEM file. On Linux, install the CA \
+     in the system certificate store or set SSL_CERT_FILE to its PEM file.";
 
 impl Error {
     /// "ContextStream at <url> answered with a TLS certificate this machine

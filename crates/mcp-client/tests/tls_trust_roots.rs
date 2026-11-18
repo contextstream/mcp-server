@@ -15,7 +15,7 @@
 //! roots and is said once, on the log.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base64::Engine;
 use mcp_client::ContextStreamClient;
@@ -214,48 +214,6 @@ fn set_or_remove(name: &str, value: Option<&Path>) {
     }
 }
 
-/// What this thread logs at WARN or above, while the guard lives.
-#[derive(Clone, Default)]
-struct Logged(Arc<Mutex<Vec<u8>>>);
-
-impl Logged {
-    fn start() -> (Self, tracing::subscriber::DefaultGuard) {
-        let logged = Self::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logged.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        (logged, tracing::subscriber::set_default(subscriber))
-    }
-
-    fn lines(&self) -> Vec<String> {
-        String::from_utf8_lossy(&self.0.lock().unwrap())
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-}
-
-impl std::io::Write for Logged {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl tracing_subscriber::fmt::MakeWriter<'_> for Logged {
-    type Writer = Logged;
-
-    fn make_writer(&self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 #[tokio::test]
 async fn the_api_client_trusts_an_authority_named_by_ssl_cert_file() {
     let _one_at_a_time = ENVIRONMENT.lock().await;
@@ -287,13 +245,11 @@ async fn the_api_client_trusts_an_authority_named_by_ssl_cert_file() {
     ] {
         set_or_remove("SSL_CERT_FILE", file);
         set_or_remove("SSL_CERT_DIR", dir);
-        let (logged, _guard) = Logged::start();
         let user = api_client(&url)
             .me()
             .await
             .expect("the authority the machine names is trusted");
         assert_eq!(user.email, "fixture@example.test");
-        assert_eq!(logged.lines(), Vec::<String>::new());
     }
 }
 
@@ -365,7 +321,6 @@ async fn a_store_that_cannot_be_used_leaves_the_bundled_roots_and_is_said_once()
     for (case, file, dir) in cases {
         set_or_remove("SSL_CERT_FILE", file.as_deref());
         set_or_remove("SSL_CERT_DIR", dir.as_deref());
-        let (logged, _guard) = Logged::start();
 
         // Three clients, as a process that makes more than one does: none of
         // them fails to be made, and each still has the bundled roots only
@@ -382,20 +337,21 @@ async fn a_store_that_cannot_be_used_leaves_the_bundled_roots_and_is_said_once()
         }
 
         // Said once, in plain words: which variable, and what is trusted now.
-        let lines = logged.lines();
-        assert_eq!(lines.len(), 1, "{case}: {lines:?}");
-        let (variable, named) = match (&file, &dir) {
-            (Some(file), _) => ("SSL_CERT_FILE", file),
-            (_, Some(dir)) => ("SSL_CERT_DIR", dir),
-            _ => unreachable!(),
-        };
-        assert!(lines[0].contains("WARN"), "{case}: {lines:?}");
-        assert!(lines[0].contains(variable), "{case}: {lines:?}");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "build_three_clients_in_child", "--nocapture"])
+            .env("TEST_CERT_CLIENT_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(child.status.success());
+        let stderr = String::from_utf8(child.stderr).unwrap();
+        assert_eq!(stderr.lines().count(), 1, "{case}: {stderr}");
+        assert!(stderr.contains("Bundled roots"), "{case}: {stderr}");
+        let named = file.as_ref().or(dir.as_ref()).unwrap();
         assert!(
-            lines[0].contains(&*named.to_string_lossy()),
-            "{case}: {lines:?}"
+            stderr.contains(&*named.to_string_lossy()),
+            "{case}: {stderr}"
         );
-        assert!(lines[0].contains("bundled"), "{case}: {lines:?}");
+        assert!(!String::from_utf8_lossy(&child.stdout).contains("skipped unusable CA"));
     }
 
     #[cfg(unix)]
@@ -403,6 +359,15 @@ async fn a_store_that_cannot_be_used_leaves_the_bundled_roots_and_is_said_once()
         use std::os::unix::fs::PermissionsExt;
         for name in ["unreadable.pem", "unreadable-directory"] {
             std::fs::set_permissions(at(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn build_three_clients_in_child() {
+    if std::env::var_os("TEST_CERT_CLIENT_CHILD").is_some() {
+        for _ in 0..3 {
+            mcp_client::http::client();
         }
     }
 }

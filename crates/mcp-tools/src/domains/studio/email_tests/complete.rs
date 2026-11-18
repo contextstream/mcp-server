@@ -3156,3 +3156,46 @@ async fn a_send_rechecks_the_reviewed_sender_and_count_before_scheduling() {
     assert!(text_of(&result).contains("again"));
     assert!(stub.calls_to("POST", &schedule).is_empty());
 }
+
+#[tokio::test]
+async fn unanswered_live_email_reads_are_not_empty_lists_or_disconnected_accounts() {
+    let stub = Stub::start(over(|r| match r.path.as_str() {
+        "/create/email/audiences" => Some(Answer::ok(Value::Null)),
+        "/create/email/connection" => Some(Answer::ok(json!({}))),
+        "/create/email/segments" => Some(Answer::ok(Value::Null)),
+        "/create/email/templates" => Some(Answer::ok(json!({}))),
+        _ => None,
+    }))
+    .await;
+    for action in [
+        "email_audiences",
+        "email_connection",
+        "email_segments",
+        "email_templates",
+    ] {
+        let result = run(&stub, json!({"action":action})).await;
+        assert!(text_of(&result).contains("not answered"), "{action}");
+    }
+}
+
+#[tokio::test]
+async fn email_api_responses_never_expose_a_key_in_free_text() {
+    let secret = format!("re_{}", "x".repeat(32));
+    let value = secret.clone();
+    let stub = Stub::start(over(move |r| {
+        (r.path == "/create/email/audiences")
+            .then(|| Answer::ok(json!([audience(AUDIENCE, &value, Some("test"), 1, 1)])))
+    }))
+    .await;
+    let result = stub
+        .tool()
+        .execute(json!({"action":"email_audiences"}))
+        .await;
+    match result {
+        Ok(result) => assert!(
+            !text_of(&result).contains(&secret)
+                && !structured(&result).to_string().contains(&secret)
+        ),
+        Err(error) => assert!(!error.to_string().contains(&secret)),
+    }
+}

@@ -6,7 +6,7 @@ use mcp_types::{tool::ToolResult, Error, Result};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::go::{persons_go, Go, ImportToken, Question, ASKED_NOTE};
+use super::go::{persons_go, same_token, Go, ImportToken, Question, ReviewKey, ASKED_NOTE};
 use super::{
     address_of, consent_of, digest, email_refusal, given, number, purpose_words, said, strings,
     text, unknown_field, Topic, AUDIENCES_URL,
@@ -177,6 +177,7 @@ impl Counts {
 
 /// An import as the person is shown it and asked about it.
 struct Import {
+    key: ReviewKey,
     workspace_id: Uuid,
     csv: String,
     audience_id: Option<Uuid>,
@@ -214,8 +215,9 @@ impl Import {
         let audience_id = self.audience_id?;
         let eligible = self.counts.eligible?;
         let preview_digest = text(&self.preview, "digest");
-        let mac = digest(
+        let mac = self.key.sign(
             &json!([
+                "import1",
                 self.workspace_id,
                 audience_id,
                 digest(&self.csv),
@@ -589,6 +591,7 @@ impl StudioTool {
             None => None,
         };
         Ok(Ok(Import {
+            key: ReviewKey::for_call(self).await?,
             workspace_id,
             csv,
             audience_id,
@@ -769,7 +772,7 @@ impl StudioTool {
             .review_token()
             .expect("audience_id and eligible were checked above");
         let seen_token = match given(input.confirm_review.as_deref()) {
-            Some(raw) => match ImportToken::parse(raw).filter(|_| raw == token) {
+            Some(raw) => match ImportToken::parse(raw).filter(|_| same_token(raw, &token)) {
                 Some(seen) => input
                     .confirm_rows
                     .is_none_or(|n| n == seen.eligible)

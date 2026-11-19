@@ -15,8 +15,75 @@ use serde_json::{json, Value};
 use super::super::ELICIT_TIMEOUT;
 use crate::peer::{self, Elicited};
 
+use sha2::{Digest, Sha256};
+
+/// Only the current request's credential can issue a review that another gateway will accept.
+pub(super) struct ReviewKey([u8; 32]);
+
+impl ReviewKey {
+    pub async fn for_call(tool: &super::StudioTool) -> mcp_types::Result<Self> {
+        let config = tool.client.config().await;
+        let auth = mcp_client::get_task_auth_override();
+        // send_raw prefers an API key to a bearer. Never sign a caller's review with a
+        // gateway-wide credential, including a configured key that would shadow a bearer.
+        let credential = match auth {
+            Some(a) => a
+                .api_key
+                .or_else(|| a.jwt.filter(|_| config.api_key.is_none())),
+            None if !config.is_http_transport => config.api_key.or(config.jwt),
+            None => None,
+        };
+        let credential = credential.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+            mcp_types::Error::Validation(
+                "Sign in to review this email action with your own credential.".into(),
+            )
+        })?;
+        let key = Sha256::new()
+            .chain_update(b"contextstream/studio/email/review-key/v1\0")
+            .chain_update(credential.as_bytes())
+            .finalize();
+        Ok(Self(key.into()))
+    }
+
+    /// RFC 2104 HMAC-SHA256. The derived key is always 32 bytes, below SHA-256's block size.
+    pub fn sign(&self, payload: &str) -> String {
+        let mut inner = [0x36; 64];
+        let mut outer = [0x5c; 64];
+        for (i, byte) in self.0.iter().enumerate() {
+            inner[i] ^= byte;
+            outer[i] ^= byte;
+        }
+        let hash = Sha256::new()
+            .chain_update(inner)
+            .chain_update(payload.as_bytes())
+            .finalize();
+        hex::encode(
+            Sha256::new()
+                .chain_update(outer)
+                .chain_update(hash)
+                .finalize(),
+        )
+    }
+}
+
+/// Compare hashes of the complete tokens so matching MAC prefixes are never observable.
+pub(super) fn same_token(supplied: &str, current: &str) -> bool {
+    Sha256::digest(supplied.as_bytes()) == Sha256::digest(current.as_bytes())
+}
+
+#[cfg(test)]
+#[test]
+fn review_mac_matches_rfc4231_case_one() {
+    let mut key = [0; 32];
+    key[..20].fill(0x0b);
+    assert_eq!(
+        ReviewKey(key).sign("Hi There"),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+    );
+}
+
 fn is_mac_hex(mac: &str) -> bool {
-    mac.len() == 24
+    mac.len() == 64
         && mac
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

@@ -1,8 +1,8 @@
 //! Review and confirmation for sending now or scheduling at a local time.
 
-use super::go::{persons_go, Go, Question, SendToken, ASKED_NOTE};
+use super::go::{persons_go, same_token, Go, Question, ReviewKey, SendToken, ASKED_NOTE};
 use super::{
-    campaign_url, digest, email_refusal, given, moment, number, people, purpose_words, send_at_of,
+    campaign_url, email_refusal, given, moment, number, people, purpose_words, send_at_of,
     send_key, strings, text, time_zone_of, when_words, Topic, NOT_ANSWERED,
 };
 use crate::domains::studio::{parse_id, words::credits, StudioInput, StudioTool};
@@ -23,6 +23,7 @@ pub(super) fn target_words(audience: &Value, segment: Option<&Value>) -> String 
 }
 
 struct SendReview {
+    key: ReviewKey,
     workspace_id: Uuid,
     campaign_id: Uuid,
     name: String,
@@ -56,8 +57,9 @@ impl SendReview {
 
     fn token(&self, send_at: &str, zone: &str) -> String {
         // The sender can change in email settings without changing the campaign revision.
-        let mac = digest(
+        let mac = self.key.sign(
             &json!([
+                "send1",
                 self.workspace_id,
                 self.campaign_id,
                 self.revision,
@@ -234,6 +236,7 @@ impl StudioTool {
         }
         warnings.extend(strings(preview.get("warnings")));
         Ok(Ok(SendReview {
+            key: ReviewKey::for_call(self).await?,
             workspace_id,
             campaign_id,
             name,
@@ -288,7 +291,7 @@ impl StudioTool {
         }
         let token = review.token(&send_at, &time_zone);
         let seen_token = match given(input.confirm_review.as_deref()) {
-            Some(raw) => match SendToken::parse(raw).filter(|_| raw == token) {
+            Some(raw) => match SendToken::parse(raw).filter(|_| same_token(raw, &token)) {
                 Some(seen) => input
                     .confirm_recipients
                     .is_none_or(|n| n == seen.recipients)

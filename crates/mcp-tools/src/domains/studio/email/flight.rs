@@ -5,8 +5,8 @@ use mcp_types::{tool::ToolResult, Result};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::go::{persons_go, Go, Question, ResumeToken, ASKED_NOTE};
-use super::{campaign_url, digest, email_refusal, given, moment, number, people, text, Topic};
+use super::go::{persons_go, same_token, Go, Question, ResumeToken, ReviewKey, ASKED_NOTE};
+use super::{campaign_url, email_refusal, given, moment, number, people, text, Topic};
 use crate::domains::studio::words::credits;
 use crate::domains::studio::{StudioInput, StudioTool};
 
@@ -39,6 +39,7 @@ fn scheduled_for(campaign: &Value) -> Option<String> {
 }
 
 struct ResumeReview {
+    key: ReviewKey,
     workspace_id: Uuid,
     campaign_id: Uuid,
     name: String,
@@ -88,8 +89,9 @@ impl ResumeReview {
     }
 
     fn token(&self) -> String {
-        let mac = digest(
+        let mac = self.key.sign(
             &json!([
+                "resume1",
                 self.workspace_id,
                 self.campaign_id,
                 self.revision,
@@ -246,6 +248,7 @@ impl StudioTool {
         };
         let subject = text(&campaign, "subject").unwrap_or_else(|| super::NOT_ANSWERED.to_string());
         Ok(Ok(ResumeReview {
+            key: ReviewKey::for_call(self).await?,
             workspace_id,
             campaign_id,
             name,
@@ -279,7 +282,7 @@ impl StudioTool {
         };
         let token = review.token();
         let seen_token = match given(input.confirm_review.as_deref()) {
-            Some(raw) => match ResumeToken::parse(raw).filter(|_| raw == token) {
+            Some(raw) => match ResumeToken::parse(raw).filter(|_| same_token(raw, &token)) {
                 Some(seen) => input
                     .confirm_remaining
                     .is_none_or(|n| n == seen.remaining)

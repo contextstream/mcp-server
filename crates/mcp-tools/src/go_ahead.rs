@@ -94,6 +94,33 @@ pub fn refusal(name: &str, destructive: bool, input: &serde_json::Value) -> Opti
 mod tests {
     use super::on;
 
+    #[tokio::test]
+    async fn asked_only_delete_delegates_only_the_four_person_confirmed_email_erasures() {
+        let config = mcp_types::config::ConfigOverride {
+            go_ahead_asked_only: Some(true),
+            ..Default::default()
+        };
+        mcp_client::run_with_config_override(config, || async {
+            for kind in ["audience", "segment", "template", "contact"] {
+                let action = format!("studio.email_{kind}_erase");
+                let input = serde_json::json!({"action": action});
+                assert!(super::refusal("delete", true, &input).is_none(), "{action}");
+            }
+            for action in [
+                "memory.delete_doc",
+                "studio.email_other_erase",
+                "studio.email_contact_erase_all",
+                "",
+            ] {
+                let input = serde_json::json!({"action": action});
+                assert!(super::refusal("delete", true, &input).is_some(), "{action}");
+            }
+            let direct = serde_json::json!({"action": "email_contact_erase"});
+            assert!(super::refusal("studio", false, &direct).is_some());
+        })
+        .await;
+    }
+
     #[test]
     fn a_setting_that_is_present_is_on_unless_it_says_off() {
         for meant in [

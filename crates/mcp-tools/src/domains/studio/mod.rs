@@ -1826,12 +1826,14 @@ impl StudioTool {
                 " with the change"
             }
         ));
-        let voice = voice.as_deref().or_else(|| {
-            let (id, name) = locked_revision_voice(piece, job.pointer("/make/plan/voice"))?;
+        if let Some(voice) = voice {
+            request["voice"] = json!(voice);
+        } else if let Some(name) =
+            locked_revision_voice_name(piece, job.pointer("/make/plan/voice"))
+        {
+            request["voiceFrom"] = json!({"jobId": job_id, "piece": piece.index()});
             said.push(format!("Voice kept: {name} (pass voice to change it)."));
-            Some(id)
-        });
-        forms::ask(&mut request, None, &[], voice);
+        }
         self.ask_for_plan(workspace_id, project_id, &request, &notes, wait, &mut said)
             .await
     }
@@ -2257,14 +2259,11 @@ fn from_problem(
 
 /// Prefer the made piece's voice, then its planned voice. A plan-wide lock applies to
 /// films and speaking sound forms.
-fn locked_revision_voice<'a>(
+fn locked_revision_voice_name<'a>(
     piece: &'a words::PieceProgress,
     plan_voice: Option<&'a Value>,
-) -> Option<(&'a str, &'a str)> {
-    let made_voice = piece
-        .made
-        .as_ref()
-        .and_then(|made| made.pointer("/placard/voice"));
+) -> Option<&'a str> {
+    let made = piece.made.as_ref();
     let planned = &piece.piece;
     let plan_voice = plan_voice.filter(|_| {
         planned["medium"] == "video"
@@ -2273,19 +2272,22 @@ fn locked_revision_voice<'a>(
                 .and_then(forms::find_form)
                 .is_some_and(|form| form.speaks)
     });
-    [made_voice, planned.get("voice"), plan_voice]
-        .into_iter()
-        .flatten()
-        .filter(|voice| voice["locked"].as_bool() == Some(true))
-        .find_map(|voice| {
-            let text = |field: &str| {
-                voice[field]
-                    .as_str()
-                    .filter(|value| !value.trim().is_empty())
-            };
-            let id = text("key").or_else(|| text("voiceId"))?;
-            Some((id, text("name").unwrap_or(id)))
-        })
+    let voice = [
+        made.and_then(|m| m.pointer("/placard/voice")),
+        made.and_then(|m| m.get("voice")),
+        planned.get("voice"),
+        plan_voice,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|voice| voice["locked"].as_bool() == Some(true))?;
+    Some(
+        ["name", "key", "voiceId"]
+            .into_iter()
+            .filter_map(|field| voice[field].as_str())
+            .find(|label| !label.trim().is_empty())
+            .unwrap_or("the original voice"),
+    )
 }
 
 /// The prompt for another like a made piece (the web studio's "make another like this"):

@@ -3034,10 +3034,60 @@ async fn a_send_tells_a_newer_create_the_count_the_person_saw() {
 }
 
 #[tokio::test]
+async fn a_started_campaign_reviews_and_schedules_only_the_remaining_recipients() {
+    let base = api(Arc::new(Mutex::new("failed".to_string())), 12);
+    let stub = Stub::start(Arc::new(move |request| {
+        let mut answer = base(request);
+        if request.path == format!("/create/email/campaigns/{CAMPAIGN}") {
+            answer.body["data"]["progress"] = json!({"recipients":12,"sent":8,"queued":4});
+        } else if request.path.ends_with("/reach") {
+            answer.body["data"]["basis"] = json!("sends");
+            answer.body["data"]["contacts"] = json!(12);
+            answer.body["data"]["eligible"] = json!(4);
+        }
+        answer
+    }))
+    .await;
+    let review = run(&stub, json!({"action":"email_send","campaign_id":CAMPAIGN})).await;
+    assert_eq!(structured(&review)["recipients"], 4);
+    assert!(text_of(&review).contains("4 people"));
+    let confirm = &structured(&review)["confirm_with"];
+    assert_eq!(confirm["confirm_recipients"], 4);
+
+    let result = run(&stub, confirm.clone()).await;
+    assert_eq!(structured(&result)["sent"], true);
+    let posts = stub.calls_to(
+        "POST",
+        &format!("/create/email/campaigns/{CAMPAIGN}/schedule"),
+    );
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["expectedRecipients"], 4);
+}
+
+#[tokio::test]
+async fn a_testing_schedule_reply_reports_that_the_ab_send_has_started() {
+    let stub = Stub::start(over(|request| {
+        request
+            .path
+            .ends_with("/schedule")
+            .then(|| Answer::ok(campaign("testing")))
+    }))
+    .await;
+    let review = run(&stub, json!({"action":"email_send","campaign_id":CAMPAIGN})).await;
+    let result = run(&stub, structured(&review)["confirm_with"].clone()).await;
+    assert!(!result.is_error, "{}", text_of(&result));
+    assert_eq!(structured(&result)["sent"], true);
+    assert_eq!(structured(&result)["status"], "testing");
+    assert!(text_of(&result).contains("A/B") && text_of(&result).contains("started"));
+}
+
+#[tokio::test]
 async fn a_send_without_a_recipient_count_cannot_be_confirmed_as_zero() {
     let stub = Stub::start(over(|r| {
-        r.path.ends_with("/preview").then(|| {
-            Answer::ok(json!({"subject": "Sale", "from": "hello@example.com", "warnings": []}))
+        r.path.ends_with("/reach").then(|| {
+            let mut reach = guarded_reach(0);
+            reach.as_object_mut().unwrap().remove("eligible");
+            Answer::ok(reach)
         })
     }))
     .await;
@@ -3046,7 +3096,7 @@ async fn a_send_without_a_recipient_count_cannot_be_confirmed_as_zero() {
         json!({"action":"email_send","campaign_id":CAMPAIGN,"confirm_recipients":0}),
     )
     .await;
-    assert!(text_of(&result).contains("not answered"));
+    assert!(result.is_error && text_of(&result).contains("eligible count"));
     assert!(stub
         .calls_to(
             "POST",
@@ -3204,15 +3254,15 @@ async fn a_send_rechecks_the_reviewed_sender_and_count_before_scheduling() {
     let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
     assert!(stub.calls_to("POST", &schedule).is_empty());
 
-    // On a legacy API even the live question can outlast the count it showed.
-    let previews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The guarded reach can also change while the live question is open.
+    let reach_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let stub = Stub::start(over(move |request| {
-        if !request.path.ends_with("/preview") {
+        if !request.path.ends_with("/reach") {
             return None;
         }
         let mut response = (usual())(request);
-        if previews.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
-            response.body["data"]["recipients"] = json!(36);
+        if reach_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+            response.body["data"]["eligible"] = json!(36);
         }
         Some(response)
     }))
@@ -4287,8 +4337,8 @@ async fn review_tokens_are_issued_to_the_current_credential() {
 }
 
 const REVIEW_FROM: &str = "hello@news.northwind.example";
-pub(super) fn guarded_reach() -> Value {
-    json!({"reachDigest":"a".repeat(64),"from":REVIEW_FROM,
+pub(super) fn guarded_reach(eligible: i64) -> Value {
+    json!({"eligible":eligible,"reachDigest":"a".repeat(64),"from":REVIEW_FROM,
         "guards":["revision","recipients","remaining","reachDigest","from"]})
 }
 
@@ -4308,7 +4358,7 @@ async fn guarded_writes_refuse_missing_guards_and_never_retry_a_rejected_field()
             format!("{campaign}/reach"),
             format!("{campaign}/schedule"),
             "expectedReachDigest",
-            guarded_reach(),
+            guarded_reach(37),
         ),
         (
             flight_api("paused", 12, true),
@@ -4316,7 +4366,7 @@ async fn guarded_writes_refuse_missing_guards_and_never_retry_a_rejected_field()
             format!("{campaign}/reach"),
             format!("{campaign}/resume"),
             "expectedFrom",
-            guarded_reach(),
+            guarded_reach(25),
         ),
         (
             import_api(true),
@@ -4396,7 +4446,7 @@ async fn a_campaign_changed_conflict_returns_a_new_review_for_the_changed_reach(
             let stub = Stub::start(Arc::new(move |r| {
                 if r.path.ends_with("/reach") {
                     assert!(r.query.contains(WORKSPACE));
-                    let mut reach = guarded_reach();
+                    let mut reach = guarded_reach(if action == "email_send" { 37 } else { 25 });
                     if after.load(std::sync::atomic::Ordering::SeqCst) {
                         reach[field] = if field == "from" {
                             json!("changed@example.com")

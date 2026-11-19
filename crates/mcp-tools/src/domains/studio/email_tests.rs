@@ -265,7 +265,7 @@ fn api(status: Arc<Mutex<String>>, recipients: i64) -> Responder {
             ])),
             ("GET", p) if p == campaign_path => Answer::ok(campaign(&status.lock().unwrap())),
             ("GET", p) if p == format!("{campaign_path}/reach") => {
-                Answer::ok(complete::guarded_reach())
+                Answer::ok(complete::guarded_reach(recipients))
             }
             ("GET", p) if p == format!("{campaign_path}/preview") => Answer::ok(json!({
                 "subject": if request.query.contains("variant=1") { "Twenty percent off, this week only" } else { "Our winter sale starts today" },

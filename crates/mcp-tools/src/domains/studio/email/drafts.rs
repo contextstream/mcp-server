@@ -369,7 +369,13 @@ impl StudioTool {
         }
         if let Some(asked_desc) = &description {
             match asked_desc {
-                None if actual_desc.is_none() => applied += 1,
+                _ if !template
+                    .get("description")
+                    .is_some_and(|v| v.is_null() || v.is_string()) =>
+                {
+                    unapplied.push("the description was not answered");
+                }
+                None if template["description"].is_null() => applied += 1,
                 None => {
                     desc_unapplied = true;
                     unapplied.push("the description was not cleared: this API did not take it");
@@ -595,9 +601,10 @@ impl StudioTool {
                         .to_string(),
                 );
             }
-            (Some(_), None) => lines.push(format!(
+            (Some("clear"), None) if campaign.get("abTest")==Some(&Value::Null) => lines.push(format!(
                 "Cleared the A/B test on “{name}”: it goes with its one subject, “{own_subject}”."
             )),
+            (Some(_), None) => lines.push(format!("A/B test update on “{name}”: not answered.")),
             (_, Some(test)) => {
                 lines.push(format!(
                     "“{name}” tests {} subjects: {}",

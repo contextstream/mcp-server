@@ -11,8 +11,8 @@
 //! - `email_test`: a test send to the person's own address or Resend's test addresses.
 //! - `email_send`: sends now or at a local time in a time zone, only with the person's go:
 //!   asked through MCP elicitation when the client can ask them (on a stateless call the
-//!   campaign's count as `confirm_recipients` is taken at once and no question is sent),
-//!   otherwise `confirm_recipients` must be the recipient count they were shown. The schedule carries an
+//!   current review token can confirm the send). The schedule carries the reviewed sender,
+//!   recipients, revision and reach digest, with an
 //!   idempotency key, so a retried call schedules once.
 //! - `email_cancel`: unschedules, or stops a campaign that is sending.
 //! - `email_report`: a campaign's report, or the workspace's trends.
@@ -218,7 +218,6 @@ fn has_guards(read: &Value, required: &[&str]) -> bool {
 struct ReviewedReach {
     digest: String,
     from: String,
-    eligible: Option<i64>,
 }
 
 /// What a refused email call was about, for its sentence.
@@ -380,11 +379,8 @@ pub(crate) fn when_words(send_at: &str, time_zone: &str) -> String {
 
 /// The key a schedule is sent with: the same campaign, revision, time and zone schedule once.
 pub(crate) fn send_key(campaign_id: Uuid, revision: i64, send_at: &str, time_zone: &str) -> String {
-    let tail: String = format!("{send_at}-{time_zone}")
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    format!("email-send-{campaign_id}-r{revision}-{tail}")
+    let timestamp = send_at.replace(':', "-");
+    format!("email-send-{campaign_id}-r{revision}-{timestamp}-{time_zone}")
 }
 
 /// An A/B test's subject: 0 (A, the campaign's own) to 2 (C).
@@ -1110,11 +1106,7 @@ impl StudioTool {
         });
         Ok(reach
             .zip(text(data, "from"))
-            .map(|(digest, from)| ReviewedReach {
-                digest,
-                from,
-                eligible: number(data, "eligible"),
-            }))
+            .map(|(digest, from)| ReviewedReach { digest, from }))
     }
 
     /// The audiences as Create lists them now, when they can be read.
@@ -1676,25 +1668,27 @@ impl StudioTool {
     async fn email_test(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
         let campaign_id = Self::campaign_id(input, "email_test")?;
         let to = test_recipients(input.to.as_ref())?;
-        if to.iter().any(|address| !is_resend_test_address(address)) {
-            let me = self
+        let own = if to.is_empty() || to.iter().any(|address| !is_resend_test_address(address)) {
+            let response = self
                 .client
                 .studio_call("GET", "/auth/me", None, None, CALL_TIMEOUT)
-                .await
-                .map_err(unreachable)?;
-            let own = me
-                .data
-                .get("email")
-                .and_then(Value::as_str)
-                .map(|e| e.trim().to_lowercase());
-            let refused: Vec<&String> = to
-                .iter()
-                .filter(|address| {
-                    !is_resend_test_address(address) && Some(address.as_str()) != own.as_deref()
-                })
-                .collect();
-            if !refused.is_empty() {
-                return Ok(ToolResult::error(format!(
+                .await;
+            response
+                .ok()
+                .filter(|r| r.is_success())
+                .and_then(|r| text(&r.data, "email"))
+                .and_then(|s| address_of(&s))
+        } else {
+            None
+        };
+        let refused: Vec<&String> = to
+            .iter()
+            .filter(|address| {
+                !is_resend_test_address(address) && Some(address.as_str()) != own.as_deref()
+            })
+            .collect();
+        if !refused.is_empty() {
+            return Ok(ToolResult::error(format!(
                     "Not sent: test sends go to the person's own address or Resend's test addresses (delivered@resend.dev, bounced@resend.dev, complained@resend.dev), not {}.",
                     refused
                         .iter()
@@ -1702,7 +1696,6 @@ impl StudioTool {
                         .collect::<Vec<_>>()
                         .join(", ")
                 )));
-            }
         }
         let mut body = json!({"workspaceId": workspace_id});
         if !to.is_empty() {
@@ -1717,19 +1710,23 @@ impl StudioTool {
             .ok()
             .and_then(std::result::Result::ok)
             .and_then(|campaign| number(&campaign, "revision"));
-        let key = match revision {
-            Some(revision) => format!(
-                "email-test-{campaign_id}-r{revision}-{}",
-                digest(&body.to_string())
-            ),
-            None => format!("email-test-{campaign_id}-{}", digest(&body.to_string())),
+        let resolved = if to.is_empty() {
+            own.into_iter().collect()
+        } else {
+            to
         };
+        let key = revision.filter(|_| !resolved.is_empty()).map(|revision| {
+            format!(
+                "email-test-{campaign_id}-r{revision}-{}",
+                digest(&json!([body, resolved]).to_string())
+            )
+        });
         let answer = self
             .email_call(
                 "POST",
                 &format!("/campaigns/{campaign_id}/test"),
                 Some(&body),
-                Some(&key),
+                key.as_deref(),
             )
             .await?;
         if !answer.is_success() {
@@ -2726,6 +2723,40 @@ impl StudioTool {
         Ok(Ok(None))
     }
 
+    async fn confirm_erasure(
+        workspace_id: Uuid,
+        kind: &str,
+        id: &str,
+        display: &str,
+    ) -> Option<ToolResult> {
+        let state = format!("studio-email-erase:{workspace_id}:{kind}:{id}");
+        let question = go::Question {
+            key: &state,
+            state: state.clone(),
+            title: "Erase permanently",
+            message: format!("Permanently erase the {kind} {display} in workspace {workspace_id}?"),
+            does: format!("Erase this {kind}. This cannot be undone."),
+        };
+        match go::persons_go(question, false, false).await {
+            go::Go::Yes { asked: true } => None,
+            go::Go::Asking => Some(ToolResult::with_structured(
+                format!("Asking the person before erasing {display}."),
+                json!({"erased":false,"asking":true}),
+            )),
+            go::Go::No => Some(ToolResult::error(format!(
+                "Not erased: the person declined to erase {display}."
+            ))),
+            _ => {
+                let page = if kind == "template" {
+                    "https://ctxproduct.com/studio/email"
+                } else {
+                    AUDIENCES_URL
+                };
+                Some(ToolResult::error(format!("Not erased. Only you can approve this. Open the studio to erase the {kind}: {page}")))
+            }
+        }
+    }
+
     async fn erase_email_item(
         &self,
         workspace_id: Uuid,
@@ -2762,6 +2793,9 @@ impl StudioTool {
             ),
             _ => return Err(Error::Validation("Unknown email erase action".into())),
         };
+        if let Some(answer) = Self::confirm_erasure(workspace_id, kind, &id, &id).await {
+            return Ok(answer);
+        }
         let answer = self
             .email_call(
                 "DELETE",
@@ -2808,6 +2842,11 @@ impl StudioTool {
         };
         let id = text(&contact, "id").unwrap_or_default();
         let id = parse_id(&id, "contact id")?;
+        if let Some(answer) =
+            Self::confirm_erasure(workspace_id, "contact", &id.to_string(), &email).await
+        {
+            return Ok(answer);
+        }
         let answer = self
             .email_call(
                 "DELETE",
@@ -3255,6 +3294,11 @@ impl StudioTool {
         let answer = self
             .email_call("POST", "/suppressions/remove", Some(&body), None)
             .await?;
+        if answer.status == 409 && answer.error_code() == Some("suppression_changed") {
+            return Ok(ToolResult::error(
+                "Not removed: the suppression changed. Review the current row and ask again.",
+            ));
+        }
         if !answer.is_success() {
             return Ok(ToolResult::error(format!(
                 "Not removed: {}",

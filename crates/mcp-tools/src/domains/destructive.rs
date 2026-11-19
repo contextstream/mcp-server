@@ -381,14 +381,6 @@ struct DeleteTool {
 #[async_trait]
 impl ToolHandler for DeleteTool {
     async fn execute(&self, mut input: Value) -> Result<ToolResult> {
-        // Where a go-ahead counts only when the person was asked (crate::go_ahead): this tool
-        // never asks them, so it deletes nothing there.
-        if crate::go_ahead::asked_only() {
-            return Ok(ToolResult::error(format!(
-                "Not deleted: {} (the delete tool does not ask them). Nothing was changed.",
-                crate::go_ahead::NOT_ASKED
-            )));
-        }
         let requested =
             normalized_action(input.get("action").and_then(Value::as_str).unwrap_or(""));
         let Some((moved, handler)) = self
@@ -406,6 +398,22 @@ impl ToolHandler for DeleteTool {
                 known.join(", ")
             )));
         };
+        // Email erasures ask for a personal answer in the handler, after resolving the target.
+        if crate::go_ahead::asked_only()
+            && !(moved.tool == "studio"
+                && matches!(
+                    moved.action,
+                    "email_contact_erase"
+                        | "email_audience_erase"
+                        | "email_segment_erase"
+                        | "email_template_erase"
+                ))
+        {
+            return Ok(ToolResult::error(format!(
+                "Not deleted: {} (the delete tool does not ask them). Nothing was changed.",
+                crate::go_ahead::NOT_ASKED
+            )));
+        }
         if let Some(object) = input.as_object_mut() {
             object.insert("action".to_string(), json!(moved.action));
         }

@@ -175,9 +175,9 @@ impl Counts {
     }
 }
 
-/// An import as the person is shown it and asked about it.
 const IMPORT_UNGUARDED: &str = "This API cannot hold the import to what you reviewed. Its guards or preview details were not answered, so nothing was imported.";
 
+/// An import as the person is shown it and asked about it.
 struct Import {
     key: ReviewKey,
     workspace_id: Uuid,

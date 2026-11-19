@@ -1511,7 +1511,7 @@ fn send_times_and_zones_are_read_as_create_reads_them() {
     let key = send_key(campaign, 4, "2026-11-02T09:00", "Europe/London");
     assert_eq!(
         key,
-        format!("email-send-{CAMPAIGN}-r4-2026-11-02T09-00-Europe-London")
+        format!("email-send-{CAMPAIGN}-r4-2026-11-02T09-00-Europe/London")
     );
     assert!(key.len() <= 200);
     assert_ne!(

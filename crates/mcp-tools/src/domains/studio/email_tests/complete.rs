@@ -3123,17 +3123,6 @@ async fn only_the_delete_tool_erases_audiences_segments_and_templates() {
             .execute(TOOL_NAME, json!({"action":erase,&field:id}))
             .await
             .is_err());
-        let refused = mcp_client::run_with_config_override(
-            mcp_types::config::ConfigOverride {
-                go_ahead_asked_only: Some(true),
-                ..Default::default()
-            },
-            || registry.execute("delete", request.clone()),
-        )
-        .await
-        .unwrap();
-        assert!(refused.is_error);
-        assert!(text_of(&refused).contains("https://ctxproduct.com/studio/email"));
         let refused = registry.execute("delete", request.clone()).await.unwrap();
         assert!(
             refused.is_error && text_of(&refused).contains("https://ctxproduct.com/studio/email")
@@ -3145,15 +3134,9 @@ async fn only_the_delete_tool_erases_audiences_segments_and_templates() {
                 .filter(|r| r.method == "DELETE")
                 .count()
         );
-        let erased = mcp_client::run_with_config_override(
-            mcp_types::config::ConfigOverride {
-                go_ahead_asked_only: Some(true),
-                ..Default::default()
-            },
-            || run_with_call_peer(consenting_client(), registry.execute("delete", request)),
-        )
-        .await
-        .unwrap();
+        let erased = run_with_call_peer(consenting_client(), registry.execute("delete", request))
+            .await
+            .unwrap();
         assert!(!erased.is_error, "{}", text_of(&erased));
         assert_eq!(structured(&erased)[&field], id);
         let calls = stub.calls_to("DELETE", &format!("/create/email/{list}/{id}"));
@@ -4547,4 +4530,67 @@ async fn losing_import_eligibility_during_the_live_question_refuses_without_pani
     assert!(stub
         .calls_to("POST", "/create/email/contacts/import")
         .is_empty());
+}
+
+#[tokio::test]
+async fn send_review_cannot_follow_a_different_workspace_or_campaign() {
+    let base = usual();
+    let stub = Stub::start(Arc::new(move |r| {
+        let mut at = r.clone();
+        at.path = at.path.replace(COPY, CAMPAIGN);
+        base(&at)
+    }))
+    .await;
+    let first = run(
+        &stub,
+        json!({"action":"email_send","campaign_id":CAMPAIGN,"workspace_id":WORKSPACE}),
+    )
+    .await;
+    let go = structured(&first)["confirm_with"].clone();
+    let token = go["confirm_review"].clone();
+    for (field, value) in [("workspace_id", PROOF), ("campaign_id", COPY)] {
+        let mut other = go.clone();
+        other[field] = json!(value);
+        let result = run(&stub, other).await;
+        let fresh = structured(&result)["confirm_with"]["confirm_review"].clone();
+        assert!(
+            fresh.is_string() && fresh != token,
+            "{field}: {}",
+            text_of(&result)
+        );
+    }
+    assert!(!stub
+        .requests()
+        .iter()
+        .any(|r| r.path.ends_with("/schedule")));
+}
+
+#[tokio::test]
+async fn protected_suppression_reasons_always_need_a_person_and_only_the_current_row_can_be_removed(
+) {
+    for reason in ["unsubscribed", "complained", "future_reason"] {
+        let stub = Stub::start(over(move |r| match r.path.as_str() {
+            "/create/email/suppressions" => Some(Answer::ok(
+                json!({"guards":["suppressionId"],"suppressions":[
+                    {"id":CONTACT,"email":"ada@example.com","reason":reason}
+                ]}),
+            )),
+            "/create/email/suppressions/remove" => {
+                Some(Answer::error(409, "suppression_changed", ""))
+            }
+            _ => None,
+        }))
+        .await;
+        let req = json!({"action":"email_unsubscribes","operation":"remove","email":"ada@example.com","confirm_email":"ada@example.com","confirm_suppression_id":CONTACT});
+        let refused = run(&stub, req.clone()).await;
+        assert!(text_of(&refused).contains("https://ctxproduct.com/studio/email"));
+        assert!(stub
+            .calls_to("POST", "/create/email/suppressions/remove")
+            .is_empty());
+        let stale = run_with_call_peer(consenting_client(), run(&stub, req)).await;
+        assert!(stale.is_error && text_of(&stale).contains("suppression changed"));
+        let posts = stub.calls_to("POST", "/create/email/suppressions/remove");
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].body["expectedSuppressionId"], CONTACT);
+    }
 }

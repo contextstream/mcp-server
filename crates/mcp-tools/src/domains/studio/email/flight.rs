@@ -176,7 +176,7 @@ impl StudioTool {
         let name = text(&campaign, "name").unwrap_or_else(|| "The campaign".to_string());
         let went = sent(&campaign);
         let wait = waiting(&campaign);
-        let said = if started(&campaign) {
+        let said = if number(&campaign["progress"], "recipients") != Some(0) || went != Some(0) {
             format!(
                 "Paused “{name}”: {} sent, {} still wait.",
                 super::said(went),
@@ -243,9 +243,7 @@ impl StudioTool {
                     .into(),
             ));
         };
-        let remaining = number(&campaign, "remaining")
-            .or(reach.eligible)
-            .filter(|n| *n >= 0);
+        let remaining = number(&campaign, "remaining").filter(|n| *n >= 0);
         let Some(remaining) = remaining else {
             return Ok(Err(format!(
                 "Not resumed: Create did not answer how many people still wait for “{name}”, so there is no count for the person to agree to. They can resume it in the studio: {}",

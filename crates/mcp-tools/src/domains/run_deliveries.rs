@@ -214,11 +214,11 @@ fn lapsed_line(delivery: &Delivery) -> Option<String> {
 /// Render only locally authored framing. No part of a server wrapper is
 /// authoritative, including its first and last lines.
 pub fn framed(delivery: &Delivery, tool: &str) -> String {
-    format!(
-        "{}\n{}",
-        frame_body(delivery),
-        confirm_line(delivery.id, tool)
-    )
+    with_confirmation(&frame_body(delivery), delivery.id, tool)
+}
+
+fn with_confirmation(body: &str, id: Uuid, tool: &str) -> String {
+    format!("{body}\n{}", confirm_line(id, tool))
 }
 
 fn frame_body(delivery: &Delivery) -> String {
@@ -761,10 +761,11 @@ impl Ledger {
                     .is_some_and(|cleared| cleared.contains(&id)),
             };
             if show {
-                offered
-                    .blocks
-                    .push(format!("{text}\n{}", confirm_line(id, tool)));
-                offered.shown.push(json!({"id":id, "kind":kind}));
+                offered.shown.push(ShownDelivery {
+                    id,
+                    kind,
+                    frame: with_confirmation(&text, id, tool),
+                });
             }
         }
         offered
@@ -876,13 +877,18 @@ impl Ledger {
 // Reading what waits
 // ============================================================================
 
+/// The public delivery entry. Both result representations use this frame.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ShownDelivery {
+    id: Uuid,
+    kind: &'static str,
+    frame: String,
+}
+
 /// What a read of a run's deliveries came to.
 #[derive(Debug, Default)]
 pub(crate) struct Offered {
-    /// The deliveries claimed and to be shown, each as its block.
-    pub blocks: Vec<String>,
-    /// The same deliveries for a client that shows the structured answer.
-    pub shown: Vec<Value>,
+    pub shown: Vec<ShownDelivery>,
     pub notice: Option<String>,
 }
 
@@ -904,8 +910,9 @@ impl Offered {
 
     /// The blocks, each after an empty line, to add to a tool's answer.
     pub(crate) fn text(&self) -> String {
-        self.blocks
+        self.shown
             .iter()
+            .map(|delivery| &delivery.frame)
             .chain(&self.notice)
             .map(|block| format!("\n\n{block}"))
             .collect()
@@ -996,7 +1003,7 @@ pub(super) async fn poll(
     let ready = ledger
         .show_frames(owner, run_id, tool, MAX_SHOWN_AT_ONCE)
         .await;
-    if !ready.blocks.is_empty() {
+    if !ready.shown.is_empty() {
         return ready;
     }
     let poll = ledger.with_slot(&owner.key, |mem| {

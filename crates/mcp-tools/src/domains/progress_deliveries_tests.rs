@@ -2143,7 +2143,7 @@ async fn review7_racing_workers_reserve_before_sending_a_claim() {
         run_deliveries::poll(&tool.client, &second, &owner, f.run, &agent, PollFor::Get)
     );
     assert_eq!(sent(&api, "POST", "/claim").len(), 1);
-    assert_eq!(a.blocks.len() + b.blocks.len(), 1);
+    assert_eq!(a.shown.len() + b.shown.len(), 1);
 }
 
 #[tokio::test]

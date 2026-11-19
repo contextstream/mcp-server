@@ -582,7 +582,7 @@ fn a_step(step: &str) -> Value {
 async fn check_delivery_frames(action: &str) {
     let api = FakeApi::start();
     let gateway = Gateway::start_with(&api, &[]);
-    let client = reqwest::Client::new();
+    let client = mcp_client::http::client();
     let request = || {
         client
             .post(format!("http://127.0.0.1:{}/mcp", gateway.port))

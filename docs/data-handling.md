@@ -124,7 +124,10 @@ workspaces it is switched on for; for every other workspace the paths answer 404
   reads no delivery for such a session and never tells it to start `await-answer`.
 - **The tool frames each delivery.** Every line of a person's words is quoted. When the API supplies a
   wrapped message, only its quoted body lines are used. The surrounding instructions and confirmation
-  line always come from the local tool.
+  line always come from the local tool. When a report or a get of the session’s own run shows a delivery,
+  the result text includes its complete `[PERSON ANSWER]` or `[PERSON MESSAGE]` block. In
+  `structuredContent`, each `deliveries` entry carries its `id`, `kind` and the identical block in `frame`.
+  The tool omits `deliveries` when it shows none.
 - **Never sent:** the answer or message itself is not sent anywhere by this client. Nothing of the folder, the prompt
   or other tool calls goes with these requests.
 - **Local state:** a session's hooks keep the ids of the runs it reported and of the deliveries it was pointed at in

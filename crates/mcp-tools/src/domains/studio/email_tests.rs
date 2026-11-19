@@ -1832,7 +1832,6 @@ async fn a_draft_is_revised_from_plain_words_or_given_lines() {
 
     for wrong in [
         json!({"action": "email_revise", "campaign_id": CAMPAIGN}),
-        json!({"action": "email_revise", "campaign_id": CAMPAIGN, "change": "warmer", "subject": "x"}),
         json!({"action": "email_revise", "campaign_id": CAMPAIGN, "subject": " "}),
         json!({"action": "email_revise", "campaign_id": CAMPAIGN, "change": "x".repeat(1001)}),
     ] {
@@ -2977,3 +2976,4 @@ fn a_sequences_state_and_rules_are_said_from_the_apis_fields() {
 // ============================================================================
 
 mod complete;
+mod draft_actions;

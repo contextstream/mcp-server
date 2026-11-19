@@ -855,7 +855,11 @@ async fn revise_plans_another_like_a_made_film_from_the_earlier_ask() {
     );
 }
 
-async fn revise_voice_request(job: Value, piece: i64, voice: Option<&str>) -> (Value, String) {
+async fn revise_voice_request(
+    job: Value,
+    piece: impl Into<Value>,
+    voice: Option<&str>,
+) -> (Value, String) {
     let studio = api(Arc::new(Mutex::new(("succeeded".into(), true))));
     let stub = Stub::start(Arc::new(move |request| {
         match (request.method.as_str(), request.path.as_str()) {
@@ -865,7 +869,7 @@ async fn revise_voice_request(job: Value, piece: i64, voice: Option<&str>) -> (V
         }
     }))
     .await;
-    let mut input = json!({"action": "revise", "make_id": JOB, "piece": piece,
+    let mut input = json!({"action": "revise", "make_id": JOB, "piece": piece.into(),
                            "change": "shorten the opening", "wait_seconds": 0});
     if let Some(voice) = voice {
         input["voice"] = json!(voice);
@@ -879,7 +883,7 @@ async fn revise_voice_request(job: Value, piece: i64, voice: Option<&str>) -> (V
 }
 
 #[tokio::test]
-async fn revise_voice_keeps_the_made_films_curated_key() {
+async fn revise_voice_references_the_made_films_locked_voice() {
     let mut job = film_job();
     job["make"]["pieces"][0]["placard"] = json!({
         "voice": {"key": "warm-narrator", "voiceId": "ExactEricId", "name": "Eric", "locked": true},
@@ -888,7 +892,8 @@ async fn revise_voice_keeps_the_made_films_curated_key() {
         json!({"voiceId": "ExactJoshId", "name": "Josh", "locked": true});
 
     let (request, text) = revise_voice_request(job, 0, None).await;
-    assert_eq!(request["voice"], "warm-narrator");
+    assert_eq!(request["voiceFrom"], json!({"jobId": JOB, "piece": 0}));
+    assert!(request.get("voice").is_none(), "{request}");
     assert!(
         text.contains("Voice kept: Eric (pass voice to change it)."),
         "{text}"
@@ -896,14 +901,19 @@ async fn revise_voice_keeps_the_made_films_curated_key() {
 }
 
 #[tokio::test]
-async fn revise_voice_keeps_the_made_films_exact_id_without_a_key() {
+async fn revise_voice_references_a_legacy_lock_with_only_a_name() {
     let mut job = film_job();
     job["make"]["pieces"][0]["placard"] = json!({
-        "voice": {"voiceId": "ExactEricId", "name": "Eric", "locked": true},
+        "voice": {"name": "Rachel", "locked": true},
     });
 
-    let (request, _) = revise_voice_request(job, 0, None).await;
-    assert_eq!(request["voice"], "ExactEricId");
+    let (request, text) = revise_voice_request(job, 0, None).await;
+    assert_eq!(request["voiceFrom"], json!({"jobId": JOB, "piece": 0}));
+    assert!(request.get("voice").is_none(), "{request}");
+    assert!(
+        text.contains("Voice kept: Rachel (pass voice to change it)."),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -912,13 +922,14 @@ async fn revise_voice_keeps_the_unmade_pieces_planned_voice() {
     job["make"]["plan"]["pieces"][1] = json!({
         "index": 1, "id": "sale-voice-over", "title": "Sale Voice-over",
         "kindOfWork": "sound.voice-over", "medium": "sound", "form": "voice-over",
-        "status": "making", "voice": {"key": "warm-narrator", "name": "Eric", "locked": true},
+        "status": "making", "voice": {"name": "Eric", "locked": true},
     });
     job["make"]["plan"]["voice"] =
         json!({"voiceId": "ExactJoshId", "name": "Josh", "locked": true});
 
-    let (request, text) = revise_voice_request(job, 1, None).await;
-    assert_eq!(request["voice"], "warm-narrator");
+    let (request, text) = revise_voice_request(job, "sale-voice-over", None).await;
+    assert_eq!(request["voiceFrom"], json!({"jobId": JOB, "piece": 1}));
+    assert!(request.get("voice").is_none(), "{request}");
     assert!(
         text.contains("Voice kept: Eric (pass voice to change it)."),
         "{text}"
@@ -931,8 +942,13 @@ async fn revise_voice_falls_back_to_the_films_plan_voice() {
     job["make"]["plan"]["voice"] =
         json!({"voiceId": "ExactEricId", "name": "Eric", "locked": true});
 
-    let (request, _) = revise_voice_request(job, 0, None).await;
-    assert_eq!(request["voice"], "ExactEricId");
+    let (request, text) = revise_voice_request(job, 0, None).await;
+    assert_eq!(request["voiceFrom"], json!({"jobId": JOB, "piece": 0}));
+    assert!(request.get("voice").is_none(), "{request}");
+    assert!(
+        text.contains("Voice kept: Eric (pass voice to change it)."),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -944,6 +960,7 @@ async fn revise_voice_prefers_the_explicit_argument() {
 
     let (request, text) = revise_voice_request(job, 0, Some("ExactJoshId")).await;
     assert_eq!(request["voice"], "ExactJoshId");
+    assert!(request.get("voiceFrom").is_none(), "{request}");
     assert!(!text.contains("Voice kept:"), "{text}");
 }
 
@@ -959,6 +976,7 @@ async fn revise_voice_omits_the_field_without_a_locked_voice() {
 
         let (request, text) = revise_voice_request(job, 0, None).await;
         assert!(request.get("voice").is_none(), "{request}");
+        assert!(request.get("voiceFrom").is_none(), "{request}");
         assert!(!text.contains("Voice kept:"), "{text}");
     }
 }
@@ -972,6 +990,7 @@ async fn revise_voice_leaves_unmade_pieces_that_do_not_speak_without_a_voice() {
     for piece in [0, 1] {
         let (request, text) = revise_voice_request(job.clone(), piece, None).await;
         assert!(request.get("voice").is_none(), "{request}");
+        assert!(request.get("voiceFrom").is_none(), "{request}");
         assert!(!text.contains("Voice kept:"), "{text}");
     }
 }

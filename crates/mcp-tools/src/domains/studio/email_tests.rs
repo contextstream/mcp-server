@@ -1962,14 +1962,18 @@ async fn erasing_a_contact_runs_only_through_delete() {
     }
     assert!(stub.requests().is_empty(), "{:?}", stub.requests());
 
-    // Through `delete`, it erases.
-    let erased = registry
-        .execute(
-            "delete",
-            json!({"action": "studio.email_contact_erase", "email": "ADA@northwind.example"}),
-        )
-        .await
-        .unwrap();
+    let request = json!({"action":"studio.email_contact_erase","email":"ADA@northwind.example"});
+    let refused = registry.execute("delete", request.clone()).await.unwrap();
+    assert!(refused.is_error && text_of(&refused).contains(email::AUDIENCES_URL));
+    assert!(stub
+        .calls_to("DELETE", &format!("/create/email/contacts/{CONTACT}"))
+        .is_empty());
+    let erased = run_with_call_peer(
+        complete::consenting_client(),
+        registry.execute("delete", request),
+    )
+    .await
+    .unwrap();
     assert!(!erased.is_error, "{}", text_of(&erased));
     assert!(text_of(&erased).starts_with("Erased ada@northwind.example"));
     assert_eq!(

@@ -3098,7 +3098,11 @@ async fn only_the_delete_tool_erases_audiences_segments_and_templates() {
         );
         assert!(schema[&field].is_object());
         let request = json!({"action":action,&field:id});
-        let before = stub.requests().len();
+        let before = stub
+            .requests()
+            .iter()
+            .filter(|r| r.method == "DELETE")
+            .count();
         for spelling in ["erase", " Delete ", "remove"] {
             let refusal = registry
                 .execute(
@@ -3129,21 +3133,42 @@ async fn only_the_delete_tool_erases_audiences_segments_and_templates() {
         .await
         .unwrap();
         assert!(refused.is_error);
-        assert_eq!(before, stub.requests().len());
-        let erased = registry.execute("delete", request).await.unwrap();
+        assert!(text_of(&refused).contains("https://ctxproduct.com/studio/email"));
+        let refused = registry.execute("delete", request.clone()).await.unwrap();
+        assert!(
+            refused.is_error && text_of(&refused).contains("https://ctxproduct.com/studio/email")
+        );
+        assert_eq!(
+            before,
+            stub.requests()
+                .iter()
+                .filter(|r| r.method == "DELETE")
+                .count()
+        );
+        let erased = mcp_client::run_with_config_override(
+            mcp_types::config::ConfigOverride {
+                go_ahead_asked_only: Some(true),
+                ..Default::default()
+            },
+            || run_with_call_peer(consenting_client(), registry.execute("delete", request)),
+        )
+        .await
+        .unwrap();
         assert!(!erased.is_error, "{}", text_of(&erased));
         assert_eq!(structured(&erased)[&field], id);
         let calls = stub.calls_to("DELETE", &format!("/create/email/{list}/{id}"));
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].query, format!("workspaceId={WORKSPACE}"));
     }
-    let builtin = registry
-        .execute(
+    let builtin = run_with_call_peer(
+        consenting_client(),
+        registry.execute(
             "delete",
             json!({"action":"studio.email_template_erase","template_id":"builtin:announcement"}),
-        )
-        .await
-        .unwrap();
+        ),
+    )
+    .await
+    .unwrap();
     assert!(builtin.is_error && text_of(&builtin).contains("built-in"));
 }
 
@@ -4284,7 +4309,7 @@ pub(super) fn guarded_reach() -> Value {
         "guards":["revision","recipients","remaining","reachDigest","from"]})
 }
 
-fn consenting_client() -> CallPeer {
+pub(super) fn consenting_client() -> CallPeer {
     let client = Arc::new(FakeClient::default());
     *client.answer.lock().unwrap() = Some(json!({"action":"accept","content":{"confirm":true}}));
     CallPeer::new(client, None, true)
@@ -4426,4 +4451,100 @@ async fn a_campaign_changed_conflict_returns_a_new_review_for_the_changed_reach(
             );
         }
     }
+}
+
+#[tokio::test]
+async fn sparse_email_write_replies_leave_the_unanswered_outcome_open() {
+    let stub = Stub::start(over(|r| {
+        if r.method == "PATCH" && r.path.contains("/templates/") {
+            Some(Answer::ok(json!({"name":"Sale","id":TEMPLATE})))
+        } else if r.path.ends_with("/pause")
+            || (r.method == "PATCH" && r.path.contains("/campaigns/"))
+        {
+            Some(Answer::ok(json!({"name":"Sale","id":CAMPAIGN})))
+        } else {
+            None
+        }
+    }))
+    .await;
+    for request in [
+        json!({"action":"email_templates","operation":"update","template_id":TEMPLATE,"description":""}),
+        json!({"action":"email_pause","campaign_id":CAMPAIGN}),
+        json!({"action":"email_ab","operation":"set","campaign_id":CAMPAIGN,"subjects":["Sale","Special"]}),
+    ] {
+        let result = run(&stub, request).await;
+        assert!(
+            text_of(&result).contains("not answered"),
+            "{}",
+            text_of(&result)
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_send_keys_identify_the_resolved_address_and_require_revision() {
+    let state = Arc::new(Mutex::new(("first@example.com", Some(4))));
+    let read = state.clone();
+    let stub = Stub::start(over(move |r| {
+        let (email, revision) = *read.lock().unwrap();
+        if r.path == "/auth/me" {
+            Some(Answer::ok(json!({"email":email})))
+        } else if r.method == "GET" && r.path.ends_with(CAMPAIGN) {
+            Some(if let Some(rev) = revision {
+                Answer::ok(json!({"revision":rev}))
+            } else {
+                Answer::error(503, "UNAVAILABLE", "No revision")
+            })
+        } else {
+            None
+        }
+    }))
+    .await;
+    let request = json!({"action":"email_test","campaign_id":CAMPAIGN});
+    run(&stub, request.clone()).await;
+    state.lock().unwrap().0 = "second@example.com";
+    run(&stub, request.clone()).await;
+    state.lock().unwrap().1 = None;
+    run(&stub, request).await;
+    let posts = stub.calls_to("POST", &format!("/create/email/campaigns/{CAMPAIGN}/test"));
+    assert_eq!(posts.len(), 3);
+    assert!(posts[0].header("idempotency-key").is_some());
+    assert_ne!(
+        posts[0].header("idempotency-key"),
+        posts[1].header("idempotency-key")
+    );
+    assert!(posts[2].header("idempotency-key").is_none());
+}
+
+#[test]
+fn schedule_keys_preserve_the_sign_of_the_zone() {
+    let id = Uuid::parse_str(CAMPAIGN).unwrap();
+    assert_ne!(
+        send_key(id, 4, "2026-12-01T12:00", "Etc/GMT+5"),
+        send_key(id, 4, "2026-12-01T12:00", "Etc/GMT-5")
+    );
+}
+
+#[tokio::test]
+async fn losing_import_eligibility_during_the_live_question_refuses_without_panicking() {
+    let reads = std::sync::atomic::AtomicUsize::new(0);
+    let stub = Stub::start(over(move |r| {
+        if r.path.ends_with("/import/preview") {
+            let mut preview = import_preview_answer();
+            if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                for key in ["valid", "eligible", "suppressed"] {
+                    preview.as_object_mut().unwrap().remove(key);
+                }
+            }
+            Some(Answer::ok(preview))
+        } else {
+            None
+        }
+    }))
+    .await;
+    let result = run_with_call_peer(consenting_client(), run(&stub, import_input("import"))).await;
+    assert!(text_of(&result).contains("not answered"));
+    assert!(stub
+        .calls_to("POST", "/create/email/contacts/import")
+        .is_empty());
 }

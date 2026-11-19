@@ -3147,7 +3147,7 @@ impl StudioTool {
                 .find(|s| text(s, "email").map(|e| e.to_lowercase()).as_deref() == Some(email))
                 .cloned()
             {
-                if !has_guards(&answer.data, &["suppressionId"])
+                if !has_guards(&found, &["suppressionId"])
                     || text(&found, "id")
                         .and_then(|id| Uuid::parse_str(&id).ok())
                         .is_none()

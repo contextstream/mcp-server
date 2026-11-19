@@ -4270,3 +4270,153 @@ async fn review_tokens_are_issued_to_the_current_credential() {
         assert!(stub.calls_to("POST", &write).is_empty());
     }
 }
+
+const REVIEW_FROM: &str = "hello@news.northwind.example";
+fn guarded_reach() -> Value {
+    json!({"reachDigest":"a".repeat(64),"from":REVIEW_FROM,
+        "guards":["revision","recipients","remaining","reachDigest","from"]})
+}
+
+fn consenting_client() -> CallPeer {
+    let client = Arc::new(FakeClient::default());
+    *client.answer.lock().unwrap() = Some(json!({"action":"accept","content":{"confirm":true}}));
+    CallPeer::new(client, None, true)
+}
+
+#[tokio::test]
+async fn guarded_writes_refuse_missing_guards_and_never_retry_a_rejected_field() {
+    let campaign = format!("/create/email/campaigns/{CAMPAIGN}");
+    for (base, input, read, write, field, mut review) in [
+        (
+            usual(),
+            json!({"action":"email_send","campaign_id":CAMPAIGN}),
+            format!("{campaign}/reach"),
+            format!("{campaign}/schedule"),
+            "expectedReachDigest",
+            guarded_reach(),
+        ),
+        (
+            flight_api("paused", 12, true),
+            json!({"action":"email_resume","campaign_id":CAMPAIGN}),
+            format!("{campaign}/reach"),
+            format!("{campaign}/resume"),
+            "expectedFrom",
+            guarded_reach(),
+        ),
+        (
+            import_api(true),
+            import_input("import"),
+            "/create/email/contacts/import/preview".into(),
+            "/create/email/contacts/import".into(),
+            "expectedPreviewDigest",
+            {
+                let mut preview = import_preview_answer();
+                preview["eligible"] = json!(114);
+                preview["digest"] = json!("rows");
+                preview["previewDigest"] = json!("entire-preview");
+                preview["guards"] = json!(["eligible", "digest", "previewDigest"]);
+                preview
+            },
+        ),
+        (
+            usual(),
+            json!({"action":"email_unsubscribes","operation":"remove","email":"bounced@resend.dev"}),
+            "/create/email/suppressions".into(),
+            "/create/email/suppressions/remove".into(),
+            "expectedSuppressionId",
+            json!({"guards":["suppressionId"],"suppressions":[{"id":CONTACT,"email":"bounced@resend.dev","reason":"bounced"}]}),
+        ),
+    ] {
+        for advertised in [true, false] {
+            if !advertised {
+                review["guards"] = json!([]);
+            }
+            let base = base.clone();
+            let read = read.clone();
+            let mutation = write.clone();
+            let data = review.clone();
+            let stub = Stub::start(Arc::new(move |r| {
+                if r.path == read {
+                    Answer::ok(data.clone())
+                } else if r.path == mutation {
+                    unknown_field(field, "workspaceId")
+                } else {
+                    base(r)
+                }
+            }))
+            .await;
+            let result = run_with_call_peer(consenting_client(), run(&stub, input.clone())).await;
+            assert!(result.is_error, "{write}: {}", text_of(&result));
+            let posts = stub.calls_to("POST", &write);
+            assert_eq!(
+                posts.len(),
+                usize::from(advertised),
+                "{write}: {}",
+                text_of(&result)
+            );
+            if advertised {
+                assert!(!posts[0].body[field].is_null(), "{write}: missing {field}");
+            } else {
+                assert!(
+                    text_of(&result).contains("cannot hold"),
+                    "{}",
+                    text_of(&result)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_campaign_changed_conflict_returns_a_new_review_for_the_changed_reach() {
+    for action in ["email_send", "email_resume"] {
+        for field in ["from", "reachDigest"] {
+            let base = if action == "email_send" {
+                usual()
+            } else {
+                flight_api("paused", 12, true)
+            };
+            let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let after = changed.clone();
+            let stub = Stub::start(Arc::new(move |r| {
+                if r.path.ends_with("/reach") {
+                    assert!(r.query.contains(WORKSPACE));
+                    let mut reach = guarded_reach();
+                    if after.load(std::sync::atomic::Ordering::SeqCst) {
+                        reach[field] = if field == "from" {
+                            json!("changed@example.com")
+                        } else {
+                            json!("b".repeat(64))
+                        };
+                    }
+                    Answer::ok(reach)
+                } else if r.path.ends_with("/schedule") || r.path.ends_with("/resume") {
+                    assert_eq!(r.body["expectedFrom"], REVIEW_FROM);
+                    assert_eq!(r.body["expectedReachDigest"], "a".repeat(64));
+                    assert!(r.body["revision"].is_i64());
+                    after.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Answer::error(409, "campaign_changed", "Campaign changed.")
+                } else {
+                    base(r)
+                }
+            }))
+            .await;
+            let first = run(&stub, json!({"action":action,"campaign_id":CAMPAIGN})).await;
+            let confirm = structured(&first)["confirm_with"].clone();
+            assert!(
+                text_of(&first).contains(REVIEW_FROM) && text_of(&first).contains("Coffee club")
+            );
+            let refused = run(&stub, confirm.clone()).await;
+            let fresh = structured(&refused)["confirm_with"].clone();
+            assert!(fresh["confirm_review"].is_string(), "{}", text_of(&refused));
+            assert_ne!(fresh["confirm_review"], confirm["confirm_review"]);
+            assert_eq!(
+                stub.requests()
+                    .iter()
+                    .filter(|r| r.path.ends_with("/schedule") || r.path.ends_with("/resume"))
+                    .count(),
+                1
+            );
+        }
+    }
+}

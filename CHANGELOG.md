@@ -1,6 +1,12 @@
 # Changelog
 
+## 1.0.84
+
+- Email in the studio tool is complete: audiences with a purpose (test or production), contacts and CSV import with a consent source, segments, who a campaign reaches now (`email_recipients`), A/B subject tests (`email_ab`), templates, pausing and resuming a send (`email_pause`, `email_resume`), the unsubscribe report, the webhook's verdict (`email_diagnostics`) and the connection's status (`email_connection`).
+- A send, a resume and an import are held to what the person reviewed. The review answers `confirm_with`, whose token is keyed to your own credential and binds exactly who it goes to, from which sender, at which revision and how many; the API refuses the write when any of it changed, and the tool answers with a fresh review instead of retrying. A scheduled send then goes only to the people that were approved, from the approved sender (anyone who opts out meanwhile is still left out). A campaign that has started reviews the people it still has to reach.
+- Lifting an unsubscribe or a complaint, and erasing an email audience, segment, template or contact, need the person's own yes through a client that asks (or the studio page): the agent's word never does it, on any connection, `asked` mode included. A bounced or hand-added address can still come off with the reviewed row.
 - Voices: the studio tool's text now says what Create does. `voice` takes one of the picked voices by name or key (`voices` lists them), or any other voice by its exact id; a name outside the picked voices is refused with the list, and no voice is searched for by name. Planning with a named voice no longer waits on a voice-library search.
+- Revising a made film or a piece that wasn't made keeps its locked voice unless you pass `voice` (the original piece is named, so the voice stays the one it was, even after a curated voice moves to another engine voice). Revising a silent clip carries no voice.
 
 ## 1.0.83
 

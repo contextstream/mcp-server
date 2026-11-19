@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.85
 
 - Studio email revisions, previews, and test sends use the workspace's newest draft when `campaign_id` is omitted and report its subject and ID. `email_revise` can rewrite the draft and set its subject and preheader in one call.
 

@@ -73,6 +73,20 @@ pub fn refusal(name: &str, destructive: bool, input: &serde_json::Value) -> Opti
         .get("action")
         .and_then(serde_json::Value::as_str)
         .map(|action| action.trim().to_lowercase());
+    // These handlers resolve the target and require the person's answer before erasing it.
+    if name == DELETE_TOOL
+        && matches!(
+            action.as_deref(),
+            Some(
+                "studio.email_audience_erase"
+                    | "studio.email_segment_erase"
+                    | "studio.email_template_erase"
+                    | "studio.email_contact_erase"
+            )
+        )
+    {
+        return None;
+    }
     let removes = name == DELETE_TOOL
         || SEPARATED_ACTIONS.iter().any(|moved| {
             (moved.tool == name && action.as_deref() == Some(moved.action))

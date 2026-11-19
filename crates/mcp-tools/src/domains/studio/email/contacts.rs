@@ -181,7 +181,7 @@ const IMPORT_UNGUARDED: &str = "This API cannot hold the import to what you revi
 struct Import {
     key: ReviewKey,
     workspace_id: Uuid,
-    csv: String,
+    preview_request: Value,
     audience_id: Option<Uuid>,
     audience: Option<Value>,
     source: String,
@@ -228,7 +228,7 @@ impl Import {
                 "import1",
                 self.workspace_id,
                 audience_id,
-                digest(&self.csv),
+                digest(self.preview_request["csv"].as_str()?),
                 preview_digest,
                 address_digest,
                 self.preview["mapping"],
@@ -565,8 +565,34 @@ impl StudioTool {
         if let Some(audience_id) = audience_id {
             body["audienceId"] = json!(audience_id);
         }
+        let preview = match self.fetch_import_preview(&body).await? {
+            Ok(preview) => preview,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let audience = match audience_id {
+            Some(id) => self.audience(workspace_id, &id.to_string()).await,
+            None => None,
+        };
+        Ok(Ok(Import {
+            key: ReviewKey::for_call(self).await?,
+            workspace_id,
+            preview_request: body,
+            audience_id,
+            audience,
+            source,
+            note,
+            tags,
+            counts: Counts::of(&preview),
+            preview,
+        }))
+    }
+
+    async fn fetch_import_preview(
+        &self,
+        body: &Value,
+    ) -> Result<std::result::Result<Value, String>> {
         let answer = self
-            .email_call("POST", "/contacts/import/preview", Some(&body), None)
+            .email_call("POST", "/contacts/import/preview", Some(body), None)
             .await?;
         if !answer.is_success() {
             return Ok(Err(email_refusal(&answer, Topic::Audience)));
@@ -594,22 +620,7 @@ impl StudioTool {
             };
             return Ok(Err(said));
         }
-        let audience = match audience_id {
-            Some(id) => self.audience(workspace_id, &id.to_string()).await,
-            None => None,
-        };
-        Ok(Ok(Import {
-            key: ReviewKey::for_call(self).await?,
-            workspace_id,
-            csv,
-            audience_id,
-            audience,
-            source,
-            note,
-            tags,
-            counts: Counts::of(&preview),
-            preview,
-        }))
+        Ok(Ok(preview))
     }
 
     pub(super) async fn import_preview(
@@ -621,14 +632,21 @@ impl StudioTool {
             Ok(import) => import,
             Err(refused) => return Ok(ToolResult::error(format!("Not imported: {refused}"))),
         };
+        Ok(Self::describe_import_preview(
+            &import,
+            "Preview of an import",
+        ))
+    }
+
+    fn describe_import_preview(import: &Import, heading: &str) -> ToolResult {
         let counts = &import.counts;
         let preview = &import.preview;
         let mut lines = vec![match import.audience_id {
             Some(_) => format!(
-                "Preview of an import into {}: nothing is changed.",
+                "{heading} into {}: nothing is changed.",
                 audience_words(import.audience.as_ref())
             ),
-            None => "Preview of an import: nothing is changed.".to_string(),
+            None => format!("{heading}: nothing is changed."),
         }];
         lines.push(format!(
             "{} rows: {} valid, {} invalid, {} repeating an address already in the file.",
@@ -722,10 +740,10 @@ impl StudioTool {
             (None, _, _) => "To import it, an audience is needed: email_audiences lists them (operation create makes one), then preview again with audience_id.".to_string(),
             (Some(_), _, _) => IMPORT_UNGUARDED.to_string(),
         });
-        Ok(ToolResult::with_structured(
+        ToolResult::with_structured(
             lines.join("\n"),
             json!({
-                "workspace_id": workspace_id,
+                "workspace_id": import.workspace_id,
                 "imported": false,
                 "audience_id": import.audience_id,
                 "audience": import.audience.as_ref().map(|a| json!({"name": a.get("name"), "purpose": a.get("purpose")})),
@@ -743,7 +761,7 @@ impl StudioTool {
                 "consent": {"source": import.source, "note": import.note},
                 "confirm_with": import.confirm_with(),
             }),
-        ))
+        )
     }
 
     /// Imports the file, only with the person's go for the eligible count they were shown.
@@ -752,7 +770,7 @@ impl StudioTool {
         workspace_id: Uuid,
         input: &StudioInput,
     ) -> Result<ToolResult> {
-        let import = match self.read_import(workspace_id, input, true).await? {
+        let mut import = match self.read_import(workspace_id, input, true).await? {
             Ok(import) => import,
             Err(refused) => return Ok(ToolResult::error(format!("Not imported: {refused}"))),
         };
@@ -872,18 +890,30 @@ impl StudioTool {
             }
         }
 
-        let mut body = json!({
-            "workspaceId": workspace_id, "audienceId": audience_id, "csv": import.csv,
-            "mapping": import.preview["mapping"], "consentSource": import.source, "consentNote": import.note,
-            "expectedEligible":eligible, "expectedDigest": import.preview["digest"], "expectedPreviewDigest":import.preview["previewDigest"],
-        });
-        if let Some(tags) = &import.tags {
-            body["tags"] = json!(tags);
-        }
+        let mut body = import.preview_request.clone();
+        body["mapping"] = import.preview["mapping"].clone();
+        body["expectedEligible"] = json!(eligible);
+        body["expectedDigest"] = import.preview["digest"].clone();
+        body["expectedPreviewDigest"] = import.preview["previewDigest"].clone();
         let key = format!("email-import-{}", digest(&body.to_string()));
         let answer = self
             .email_call("POST", "/contacts/import", Some(&body), Some(&key))
             .await?;
+        if answer.status == 422 && answer.error_code() == Some("email_import_changed") {
+            return Ok(
+                match self.fetch_import_preview(&import.preview_request).await? {
+                    Ok(preview) => {
+                        import.counts = Counts::of(&preview);
+                        import.preview = preview;
+                        Self::describe_import_preview(
+                            &import,
+                            "The import changed. Updated preview",
+                        )
+                    }
+                    Err(reason) => ToolResult::error(format!("Not imported: {reason}")),
+                },
+            );
+        }
         if !answer.is_success() {
             return Ok(ToolResult::error(format!(
                 "Not imported: {}",

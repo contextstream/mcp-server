@@ -707,6 +707,33 @@ pub(crate) fn suppression_words(suppression: &Value) -> String {
     words
 }
 
+fn suppression_caution(reason: &str) -> &'static str {
+    match reason {
+        "unsubscribed" | "complained" => {
+            " Only if they asked to hear from the team again: campaigns will reach them."
+        }
+        "bounced" => {
+            " Their address bounced: sending to it again can hurt the team's sending reputation."
+        }
+        _ => " Campaigns will reach them again.",
+    }
+}
+
+fn show_suppression_review(email: &str, row: &Value, lead: &str) -> ToolResult {
+    let why = suppression_words(row);
+    let caution = suppression_caution(row["reason"].as_str().unwrap_or_default());
+    ToolResult::with_structured(
+        format!("{lead} Show them: {email} ({why}).{caution} If they agree, call email_unsubscribes again with operation remove, email {email} and the arguments in confirm_with."),
+        json!({
+            "removed": false, "email": email, "reason": row["reason"],
+            "confirm_with": {
+                "action": "email_unsubscribes", "operation": "remove", "email": email,
+                "confirm_email": email, "confirm_suppression_id": row["id"],
+            },
+        }),
+    )
+}
+
 /// "1 person", "1,200 people".
 fn people(count: i64) -> String {
     if count == 1 {
@@ -3098,7 +3125,7 @@ impl StudioTool {
         &self,
         workspace_id: Uuid,
         email: &str,
-    ) -> Result<std::result::Result<Option<Value>, String>> {
+    ) -> Result<std::result::Result<Value, String>> {
         let mut cursor: Option<String> = None;
         for _ in 0..50 {
             let mut path = format!(
@@ -3113,7 +3140,7 @@ impl StudioTool {
                 return Ok(Err(email_refusal(&answer, Topic::Other)));
             }
             let Some(items) = answer.data.get("suppressions").and_then(Value::as_array) else {
-                return Ok(Ok(None));
+                return Ok(Err("The suppression list was not answered.".into()));
             };
             if let Some(found) = items
                 .iter()
@@ -3127,7 +3154,7 @@ impl StudioTool {
                 {
                     return Ok(Err("This API cannot hold the removal to what you reviewed, so nothing was removed.".into()));
                 }
-                return Ok(Ok(Some(found)));
+                return Ok(Ok(found));
             }
             let next = text(&answer.data, "nextCursor");
             if items.is_empty() || next.is_none() || next == cursor {
@@ -3135,33 +3162,20 @@ impl StudioTool {
             }
             cursor = next;
         }
-        Ok(Ok(None))
+        Ok(Err(format!("{email} isn't on the suppression list.")))
     }
 
     /// Takes an address off the suppression list, only with the person's go.
     async fn unsuppress(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
         let email = one_address(input, "email_unsubscribes with operation remove")?;
         let suppression = match self.suppression_by_address(workspace_id, &email).await? {
-            Ok(Some(suppression)) => suppression,
-            Ok(None) => {
-                return Ok(ToolResult::error(format!(
-                    "Not removed: {email} isn't on the suppression list."
-                )));
-            }
+            Ok(suppression) => suppression,
             Err(refused) => return Ok(ToolResult::error(format!("Not removed: {refused}"))),
         };
         let row_id = &suppression["id"];
         let reason = text(&suppression, "reason").unwrap_or_default();
         let why = suppression_words(&suppression);
-        let caution = match reason.as_str() {
-            "unsubscribed" | "complained" => {
-                " Only if they asked to hear from the team again: campaigns will reach them."
-            }
-            "bounced" => {
-                " Their address bounced: sending to it again can hurt the team's sending reputation."
-            }
-            _ => " Campaigns will reach them again.",
-        };
+        let caution = suppression_caution(&reason);
         let what = format!("{email} ({why})");
 
         // As for a send: on a stateless call the address the agent confirms is the go, and
@@ -3262,29 +3276,13 @@ impl StudioTool {
             (None, _) if theirs_to_allow => return Ok(ToolResult::error(format!("Not removed: only the person can approve restoring {what}. Open the studio: {AUDIENCES_URL}"))),
             (None, _) if agents_word => {}
             (None, confirmed) => {
-                let mut said = match confirmed {
+                let said = match confirmed {
                     Some(other) if other != email => format!("Not removed: confirm_email is {other}, not {email}."),
                     Some(_) => "Not removed: review this suppression and confirm its current row.".into(),
                     None if unanswered => "Not removed yet: the person was asked through the client and gave no answer in time.".to_string(),
                     None => "Not removed yet: the person's go is needed first.".to_string(),
                 };
-                said.push_str(&format!(
-                    " Show them: {what}.{caution} If they agree, call email_unsubscribes again with operation remove, email {email} and the arguments in confirm_with."
-                ));
-                return Ok(ToolResult::with_structured(
-                    said,
-                    json!({
-                        "removed": false,
-                        "email": email,
-                        "reason": reason,
-                        "confirm_with": {
-                            "action": "email_unsubscribes",
-                            "operation": "remove",
-                            "email": email,
-                            "confirm_email": email, "confirm_suppression_id": row_id,
-                        },
-                    }),
-                ));
+                return Ok(show_suppression_review(&email, &suppression, &said));
             }
         }
         let mut body = json!({
@@ -3300,9 +3298,14 @@ impl StudioTool {
             .email_call("POST", "/suppressions/remove", Some(&body), None)
             .await?;
         if answer.status == 409 && answer.error_code() == Some("suppression_changed") {
-            return Ok(ToolResult::error(
-                "Not removed: the suppression changed. Review the current row and ask again.",
-            ));
+            return Ok(match self.suppression_by_address(workspace_id, &email).await? {
+                Ok(current) => show_suppression_review(
+                    &email,
+                    &current,
+                    "Not removed: the suppression changed. Review the current row and ask again.",
+                ),
+                Err(refused) => ToolResult::error(format!("Not removed: {refused}")),
+            });
         }
         if !answer.is_success() {
             return Ok(ToolResult::error(format!(

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Studio email revisions, previews, and test sends use the workspace's newest draft when `campaign_id` is omitted and report its subject and ID. `email_revise` can rewrite the draft and set its subject and preheader in one call.
+
 ## 1.0.84
 
 - Email in the studio tool is complete: audiences with a purpose (test or production), contacts and CSV import with a consent source, segments, who a campaign reaches now (`email_recipients`), A/B subject tests (`email_ab`), templates, pausing and resuming a send (`email_pause`, `email_resume`), the unsubscribe report, the webhook's verdict (`email_diagnostics`) and the connection's status (`email_connection`).

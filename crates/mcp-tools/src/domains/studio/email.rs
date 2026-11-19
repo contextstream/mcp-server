@@ -18,8 +18,8 @@
 //! - `email_report`: a campaign's report, or the workspace's trends.
 //! - `email_preview`: a shareable link to the email in Gmail, Outlook and Apple Mail mockups
 //!   (Create's preview links), with the inbox line and what to check.
-//! - `email_revise`: changes a draft from plain words (`POST …/revise`), or sets its subject
-//!   and preview line.
+//! - `email_revise`: changes a draft from plain words (`POST …/revise`) and can also set
+//!   its subject and preview line.
 //! - `email_duplicate`: a draft copy of a campaign.
 //! - `email_contacts`: the workspace's contacts: list and search, add (with where they agreed
 //!   to hear from the team), erase one, or put one on the suppression list.
@@ -956,6 +956,19 @@ fn campaign_state(campaign: &Value) -> String {
     }
 }
 
+fn is_draft(campaign: &Value) -> bool {
+    campaign.get("status").and_then(Value::as_str) == Some("draft")
+}
+
+fn revise_refusal(answer: &StudioAnswer) -> String {
+    let refused = email_refusal(answer, Topic::Campaign);
+    if answer.status == 409 {
+        format!("{refused} Read it again with email_campaigns, then change it once more.")
+    } else {
+        refused
+    }
+}
+
 impl StudioTool {
     /// The email actions: offered only where Create's catalog has an `email` block.
     pub(super) async fn email(&self, action: &str, input: &StudioInput) -> Result<ToolResult> {
@@ -1084,6 +1097,57 @@ impl StudioTool {
                 ))
             })?;
         parse_id(raw, "campaign_id")
+    }
+
+    async fn list_email_campaigns(
+        &self,
+        workspace_id: Uuid,
+        status: Option<&str>,
+    ) -> Result<StudioAnswer> {
+        let mut path = format!("/campaigns?workspaceId={workspace_id}");
+        if let Some(status) = status {
+            path.push_str(&format!("&status={status}"));
+        }
+        self.email_call("GET", &path, None, None).await
+    }
+
+    /// Only revise, preview and test may use the newest draft when the caller gives no id.
+    async fn draft_action_campaign(
+        &self,
+        workspace_id: Uuid,
+        input: &StudioInput,
+        action: &str,
+    ) -> Result<std::result::Result<(Uuid, Option<String>), String>> {
+        if input.campaign_id.is_some() {
+            return Ok(Ok((Self::campaign_id(input, action)?, None)));
+        }
+        let answer = self
+            .list_email_campaigns(workspace_id, Some("draft"))
+            .await?;
+        if !answer.is_success() {
+            return Ok(Err(email_refusal(&answer, Topic::Other)));
+        }
+        let Some(campaigns) = answer.data.as_array() else {
+            return Ok(Err("Create did not return a campaign list.".to_string()));
+        };
+        // Create orders by creation time, newest first, after filtering by status.
+        let Some(draft) = campaigns.iter().find(|campaign| is_draft(campaign)) else {
+            return Ok(Err(
+                "No draft campaigns in this workspace. Use email_draft to write one.".to_string(),
+            ));
+        };
+        let Some(id) = draft["id"].as_str().and_then(|id| Uuid::parse_str(id).ok()) else {
+            return Ok(Err(
+                "Create did not return a valid campaign ID for the newest draft.".to_string(),
+            ));
+        };
+        let subject = text(draft, "subject").unwrap_or_else(|| NOT_ANSWERED.to_string());
+        Ok(Ok((
+            id,
+            Some(format!(
+                "Using the newest draft “{subject}” (campaign_id {id})."
+            )),
+        )))
     }
 
     async fn read_campaign(
@@ -1632,11 +1696,9 @@ impl StudioTool {
                 )));
             }
         }
-        let mut path = format!("/campaigns?workspaceId={workspace_id}");
-        if let Some(status) = &status {
-            path.push_str(&format!("&status={status}"));
-        }
-        let answer = self.email_call("GET", &path, None, None).await?;
+        let answer = self
+            .list_email_campaigns(workspace_id, status.as_deref())
+            .await?;
         if !answer.is_success() {
             return Ok(ToolResult::error(email_refusal(&answer, Topic::Other)));
         }
@@ -1698,8 +1760,15 @@ impl StudioTool {
     // ------------------------------------------------------------------------------------
 
     async fn email_test(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
-        let campaign_id = Self::campaign_id(input, "email_test")?;
         let to = test_recipients(input.to.as_ref())?;
+        let variant = variant_of(input.variant)?;
+        let (campaign_id, newest_draft) = match self
+            .draft_action_campaign(workspace_id, input, "email_test")
+            .await?
+        {
+            Ok(selection) => selection,
+            Err(refused) => return Ok(ToolResult::error(refused)),
+        };
         let own = if to.is_empty() || to.iter().any(|address| !is_resend_test_address(address)) {
             let response = self
                 .client
@@ -1733,15 +1802,24 @@ impl StudioTool {
         if !to.is_empty() {
             body["to"] = json!(to);
         }
-        if let Some(variant) = variant_of(input.variant)? {
+        if let Some(variant) = variant {
             body["variant"] = json!(variant);
         }
-        let revision = self
-            .read_campaign(workspace_id, campaign_id)
-            .await
-            .ok()
-            .and_then(std::result::Result::ok)
-            .and_then(|campaign| number(&campaign, "revision"));
+        let revision = match self.read_campaign(workspace_id, campaign_id).await {
+            Ok(Ok(campaign)) => {
+                if newest_draft.is_some() && !is_draft(&campaign) {
+                    return Ok(ToolResult::error(
+                        "Test not sent: the selected campaign left draft status.",
+                    ));
+                }
+                number(&campaign, "revision")
+            }
+            Ok(Err(refused)) if newest_draft.is_some() => {
+                return Ok(ToolResult::error(format!("Test not sent: {refused}")));
+            }
+            Err(error) if newest_draft.is_some() => return Err(error),
+            _ => None,
+        };
         let resolved = if to.is_empty() {
             own.into_iter().collect()
         } else {
@@ -1782,6 +1860,10 @@ impl StudioTool {
                 addresses.join(", "),
                 campaign_url(&campaign_id.to_string())
             )
+        };
+        let said = match newest_draft {
+            Some(draft) => format!("{draft}\n{said}"),
+            None => said,
         };
         Ok(ToolResult::with_structured(
             said,
@@ -2137,12 +2219,23 @@ impl StudioTool {
     }
 
     async fn email_preview(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
-        let campaign_id = Self::campaign_id(input, "email_preview")?;
         let variant = variant_of(input.variant)?;
+        let (campaign_id, newest_draft) = match self
+            .draft_action_campaign(workspace_id, input, "email_preview")
+            .await?
+        {
+            Ok(selection) => selection,
+            Err(refused) => return Ok(ToolResult::error(refused)),
+        };
         let campaign = match self.read_campaign(workspace_id, campaign_id).await? {
             Ok(campaign) => campaign,
             Err(refused) => return Ok(ToolResult::error(format!("No preview: {refused}"))),
         };
+        if newest_draft.is_some() && !is_draft(&campaign) {
+            return Ok(ToolResult::error(
+                "No preview: the selected campaign left draft status.",
+            ));
+        }
         let name = text(&campaign, "name").unwrap_or_else(|| "The campaign".to_string());
         let preview = match self.preview(workspace_id, campaign_id, variant).await {
             Ok(preview) => preview,
@@ -2161,7 +2254,7 @@ impl StudioTool {
         let subjects = strings(preview.get("subjects"));
         let warnings = strings(preview.get("warnings"));
         let recipients = preview.get("recipients").and_then(Value::as_i64);
-        let mut lines = Vec::new();
+        let mut lines: Vec<_> = newest_draft.into_iter().collect();
         let (url, expires_at, link_id) = match &link {
             Ok(link) => {
                 let url = text(link, "url");
@@ -2246,7 +2339,6 @@ impl StudioTool {
     // ------------------------------------------------------------------------------------
 
     async fn email_revise(&self, workspace_id: Uuid, input: &StudioInput) -> Result<ToolResult> {
-        let campaign_id = Self::campaign_id(input, "email_revise")?;
         let change = input
             .change
             .as_deref()
@@ -2257,12 +2349,6 @@ impl StudioTool {
         if change.is_none() && subject.is_none() && preheader.is_none() {
             return Err(Error::Validation(
                 "email_revise needs change (plain words, e.g. \"shorter subject\" or \"add a button to https://acme.com/pricing\"), or subject and/or preheader to set".to_string(),
-            ));
-        }
-        if change.is_some() && (subject.is_some() || preheader.is_some()) {
-            return Err(Error::Validation(
-                "Pass change, or subject and preheader, not both: call email_revise once for each."
-                    .to_string(),
             ));
         }
         if change.is_some_and(|c| c.chars().count() > MAX_CHANGE_CHARS) {
@@ -2280,6 +2366,13 @@ impl StudioTool {
                 "A subject or preheader can be up to {MAX_LINE_CHARS} characters."
             )));
         }
+        let (campaign_id, newest_draft) = match self
+            .draft_action_campaign(workspace_id, input, "email_revise")
+            .await?
+        {
+            Ok(selection) => selection,
+            Err(refused) => return Ok(ToolResult::error(refused)),
+        };
         let campaign = match self.read_campaign(workspace_id, campaign_id).await? {
             Ok(campaign) => campaign,
             Err(refused) => return Ok(ToolResult::error(format!("Not changed: {refused}"))),
@@ -2298,26 +2391,43 @@ impl StudioTool {
                 "Not changed: only a draft can be changed, and “{name}” is {status}. {how}"
             )));
         }
-        let revision = campaign
-            .get("revision")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let answer = match change {
+        let revision = number(&campaign, "revision").unwrap_or(0);
+        let path = format!("/campaigns/{campaign_id}");
+        let (mut revised, changes) = match change {
             Some(change) => {
                 let key = format!("email-revise-{campaign_id}-r{revision}-{}", digest(change));
-                self.email_call(
-                    "POST",
-                    &format!("/campaigns/{campaign_id}/revise"),
-                    Some(&json!({
-                        "workspaceId": workspace_id,
-                        "instruction": change,
-                        "revision": revision,
-                    })),
-                    Some(&key),
-                )
-                .await?
+                let answer = self
+                    .email_call(
+                        "POST",
+                        &format!("{path}/revise"),
+                        Some(&json!({
+                            "workspaceId": workspace_id,
+                            "instruction": change,
+                            "revision": revision,
+                        })),
+                        Some(&key),
+                    )
+                    .await?;
+                if !answer.is_success() {
+                    return Ok(ToolResult::error(format!(
+                        "Not changed: {}",
+                        revise_refusal(&answer)
+                    )));
+                }
+                let changes = strings(answer.data.get("changes"));
+                let campaign = answer.data.get("campaign").cloned().unwrap_or(answer.data);
+                (campaign, changes)
             }
-            None => {
+            None => (campaign, Vec::new()),
+        };
+
+        // The writer can change the subject and preheader. Set any explicit lines on
+        // the returned revision so they take precedence and concurrent edits conflict.
+        let mut inbox_problem = None;
+        if subject.is_some() || preheader.is_some() {
+            if let Some(revision) =
+                number(&revised, "revision").or_else(|| change.is_none().then_some(revision))
+            {
                 let mut body = json!({"workspaceId": workspace_id, "revision": revision});
                 if let Some(subject) = subject {
                     body["subject"] = json!(subject);
@@ -2325,39 +2435,45 @@ impl StudioTool {
                 if let Some(preheader) = preheader {
                     body["preheader"] = json!(preheader);
                 }
-                self.email_call(
-                    "PATCH",
-                    &format!("/campaigns/{campaign_id}"),
-                    Some(&body),
-                    None,
-                )
-                .await?
-            }
-        };
-        if !answer.is_success() {
-            let refused = email_refusal(&answer, Topic::Campaign);
-            let refused = if answer.status == 409 {
-                format!("{refused} Read it again with email_campaigns, then change it once more.")
+                match self.email_call("PATCH", &path, Some(&body), None).await {
+                    Ok(answer) if answer.is_success() => {
+                        revised = answer.data.get("campaign").cloned().unwrap_or(answer.data);
+                    }
+                    Ok(answer) if change.is_none() => {
+                        return Ok(ToolResult::error(format!(
+                            "Not changed: {}",
+                            revise_refusal(&answer)
+                        )));
+                    }
+                    Ok(answer) => {
+                        inbox_problem = Some(format!(
+                            "The requested subject or preheader could not be set: {}",
+                            email_refusal(&answer, Topic::Campaign)
+                        ));
+                    }
+                    Err(error) if change.is_none() => return Err(error),
+                    Err(error) => {
+                        inbox_problem = Some(format!(
+                            "Create did not confirm the subject or preheader update: {error}"
+                        ));
+                    }
+                }
             } else {
-                refused
-            };
-            return Ok(ToolResult::error(format!("Not changed: {refused}")));
+                inbox_problem = Some(
+                    "The requested subject or preheader could not be set because Create did not return the new revision."
+                        .to_string(),
+                );
+            }
         }
-        // `/revise` answers {campaign, outline, changes}; PATCH answers the campaign.
-        let revised = answer
-            .data
-            .get("campaign")
-            .cloned()
-            .unwrap_or_else(|| answer.data.clone());
-        let changes = strings(answer.data.get("changes"));
-        let new_revision = revised.get("revision").and_then(Value::as_i64);
+        let new_revision = number(&revised, "revision");
         let new_subject = text(&revised, "subject").unwrap_or_default();
         let new_preheader = text(&revised, "preheader").unwrap_or_default();
         let blocks = outline(revised.get("content").unwrap_or(&Value::Null));
-        let mut lines = vec![format!(
+        let mut lines: Vec<_> = newest_draft.into_iter().collect();
+        lines.push(format!(
             "Changed “{name}”{}. Nothing is sent.",
             new_revision.map_or(String::new(), |r| format!(" (revision {r})"))
-        )];
+        ));
         if change.is_some() {
             if changes.is_empty() {
                 lines.push("The studio rewrote it as asked.".to_string());
@@ -2369,6 +2485,12 @@ impl StudioTool {
         lines.push(format!("Subject: {new_subject}"));
         if !new_preheader.is_empty() {
             lines.push(format!("Preheader: {new_preheader}"));
+        } else if preheader == Some("") && inbox_problem.is_none() {
+            lines.push("Preheader cleared.".to_string());
+        }
+        let incomplete = inbox_problem.is_some();
+        if let Some(problem) = inbox_problem {
+            lines.push(problem);
         }
         if change.is_some() && !blocks.is_empty() {
             lines.push(String::new());
@@ -2379,7 +2501,7 @@ impl StudioTool {
             "See it in the mail-client mockups with email_preview; edit it in the studio: {}",
             campaign_url(&campaign_id.to_string())
         ));
-        Ok(ToolResult::with_structured(
+        let mut result = ToolResult::with_structured(
             lines.join("\n"),
             json!({
                 "campaign_id": campaign_id,
@@ -2390,7 +2512,9 @@ impl StudioTool {
                 "outline": blocks,
                 "studio_url": campaign_url(&campaign_id.to_string()),
             }),
-        ))
+        );
+        result.is_error = incomplete;
+        Ok(result)
     }
 
     // ------------------------------------------------------------------------------------

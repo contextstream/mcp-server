@@ -784,6 +784,64 @@ async fn an_import_checks_the_people_in_the_original_preview_even_if_the_count_m
 }
 
 #[tokio::test]
+async fn an_import_conflict_previews_the_new_mapping_without_retrying_the_write() {
+    const IMPORT: &str = "/create/email/contacts/import";
+    const PREVIEW: &str = "/create/email/contacts/import/preview";
+    let changed = std::sync::atomic::AtomicBool::new(false);
+    let base = import_api(true);
+    let stub = Stub::start(Arc::new(move |request| {
+        if request.path == IMPORT && !changed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Answer::error(422, "email_import_changed", "The import changed.");
+        }
+        let mut answer = base(request);
+        if request.path == PREVIEW && changed.load(std::sync::atomic::Ordering::SeqCst) {
+            let data = &mut answer.body["data"];
+            data["mapping"]["firstName"] = Value::Null;
+            data["mapping"]["lastName"] = json!(1);
+            data["previewDigest"] = json!("b".repeat(64));
+        }
+        answer
+    }))
+    .await;
+    let review = run(&stub, import_input("import_preview")).await;
+    let mut approved = structured(&review)["confirm_with"].clone();
+    approved["csv"] = json!(CSV);
+    let result = run(&stub, approved.clone()).await;
+    let posts = stub.calls_to("POST", IMPORT);
+    assert_eq!(posts.len(), 1);
+    let calls = stub.requests();
+    let write = calls.iter().position(|r| r.path == IMPORT).unwrap();
+    assert_eq!(
+        calls.len(),
+        write + 2,
+        "only a preview follows the conflict"
+    );
+    assert_eq!(calls[write + 1].path, PREVIEW);
+    assert_eq!(
+        calls[write + 1].body,
+        stub.calls_to("POST", PREVIEW)[0].body
+    );
+    assert!(text_of(&result).contains("last name from “First”"));
+    let out = structured(&result);
+    assert_eq!(out["imported"], false);
+    let mut fresh = out["confirm_with"].clone();
+    assert_eq!(fresh["confirm_rows"], approved["confirm_rows"]);
+    assert!(fresh["confirm_review"].is_string());
+    assert_ne!(fresh["confirm_review"], approved["confirm_review"]);
+
+    fresh["csv"] = json!(CSV);
+    assert_eq!(structured(&run(&stub, fresh).await)["imported"], true);
+    let posts = stub.calls_to("POST", IMPORT);
+    assert_eq!(posts.len(), 2);
+    assert_eq!(
+        posts[1].body["expectedDigest"],
+        posts[0].body["expectedDigest"]
+    );
+    assert_eq!(posts[1].body["expectedPreviewDigest"], "b".repeat(64));
+    assert_eq!(posts[1].body["mapping"]["lastName"], 1);
+}
+
+#[tokio::test]
 async fn an_import_asks_the_person_where_the_client_can() {
     let stub = Stub::start(import_api(true)).await;
     let tool = stub.tool();
@@ -4616,6 +4674,61 @@ async fn send_review_cannot_follow_a_different_workspace_or_campaign() {
 }
 
 #[tokio::test]
+async fn a_suppression_conflict_reviews_the_replacement_without_retrying_the_removal() {
+    const LOOKUP: &str = "/create/email/suppressions";
+    const REMOVE: &str = "/create/email/suppressions/remove";
+    let changed = std::sync::atomic::AtomicBool::new(false);
+    let stub = Stub::start(over(move |r| match r.path.as_str() {
+        LOOKUP => {
+            let (id, reason) = if changed.load(std::sync::atomic::Ordering::SeqCst) {
+                (COPY, "unsubscribed")
+            } else {
+                (CONTACT, "manual")
+            };
+            Some(Answer::ok(json!({
+                "guards":["suppressionId"], "total":1, "nextCursor":null,
+                "suppressions":[{"id":id, "email":"ada@example.com", "reason":reason}]
+            })))
+        }
+        REMOVE => {
+            changed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(Answer::error(
+                409,
+                "suppression_changed",
+                "The row changed.",
+            ))
+        }
+        _ => None,
+    }))
+    .await;
+    let review = run(
+        &stub,
+        json!({"action":"email_unsubscribes","operation":"remove","email":"ada@example.com"}),
+    )
+    .await;
+    let approved = structured(&review)["confirm_with"].clone();
+    assert_eq!(approved["confirm_suppression_id"], CONTACT);
+    let result = run(&stub, approved).await;
+    let calls = stub.requests();
+    let write = calls.iter().position(|r| r.path == REMOVE).unwrap();
+    assert_eq!(calls.len(), write + 2, "only a lookup follows the conflict");
+    assert_eq!(calls[write + 1].method, "GET");
+    assert_eq!(calls[write + 1].path, LOOKUP);
+    assert_eq!(
+        calls[write + 1].query,
+        stub.calls_to("GET", LOOKUP)[0].query
+    );
+    let out = structured(&result);
+    assert_eq!(out["removed"], false);
+    assert_eq!(out["reason"], "unsubscribed");
+    assert!(text_of(&result).contains("unsubscribed"));
+    assert_eq!(out["confirm_with"]["confirm_suppression_id"], COPY);
+    let refused = run(&stub, out["confirm_with"].clone()).await;
+    assert!(text_of(&refused).contains("only the person"));
+    assert_eq!(stub.calls_to("POST", REMOVE).len(), 1);
+}
+
+#[tokio::test]
 async fn protected_suppression_reasons_always_need_a_person_and_only_the_current_row_can_be_removed(
 ) {
     for reason in ["unsubscribed", "complained", "future_reason"] {
@@ -4638,7 +4751,8 @@ async fn protected_suppression_reasons_always_need_a_person_and_only_the_current
             .calls_to("POST", "/create/email/suppressions/remove")
             .is_empty());
         let stale = run_with_call_peer(consenting_client(), run(&stub, req)).await;
-        assert!(stale.is_error && text_of(&stale).contains("suppression changed"));
+        assert!(text_of(&stale).contains("suppression changed"));
+        assert_eq!(structured(&stale)["reason"], reason);
         let posts = stub.calls_to("POST", "/create/email/suppressions/remove");
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].body["expectedSuppressionId"], CONTACT);

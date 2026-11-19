@@ -939,6 +939,9 @@ async fn revise_voice_keeps_the_unmade_pieces_planned_voice() {
 #[tokio::test]
 async fn revise_voice_falls_back_to_the_films_plan_voice() {
     let mut job = film_job();
+    let film = &mut job["make"]["plan"]["pieces"][0];
+    film["kindOfWork"] = json!("video.explainer");
+    film["film"] = json!({"product": {"name": "Studio"}, "beats": []});
     job["make"]["plan"]["voice"] =
         json!({"voiceId": "ExactEricId", "name": "Eric", "locked": true});
 
@@ -949,6 +952,30 @@ async fn revise_voice_falls_back_to_the_films_plan_voice() {
         text.contains("Voice kept: Eric (pass voice to change it)."),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn revise_voice_keeps_josh_only_on_the_voice_over_in_a_mixed_making() {
+    let mut job = film_job();
+    job["status"] = json!("generating");
+    job["request"]["prompt"] = json!("A silent product clip and a separate voice-over");
+    let plan = &mut job["make"]["plan"];
+    let josh = json!({"name": "Josh", "locked": true});
+    plan["voice"] = josh.clone();
+    plan["pieces"].as_array_mut().unwrap().push(json!({
+        "index": 1, "id": "voice-over", "title": "Voice-over", "medium": "sound",
+        "kindOfWork": "sound.voice-over", "form": "voice-over", "status": "making", "voice": josh
+    }));
+
+    let (request, text) = revise_voice_request(job.clone(), "launch-film", None).await;
+    assert!(request.get("voiceFrom").is_none(), "{request}");
+    assert!(request.get("voice").is_none(), "{request}");
+    assert!(!text.contains("Voice kept:"), "{text}");
+
+    let (request, text) = revise_voice_request(job, "voice-over", None).await;
+    assert_eq!(request["voiceFrom"], json!({"jobId": JOB, "piece": 1}));
+    assert!(request.get("voice").is_none(), "{request}");
+    assert!(text.contains("Voice kept: Josh"), "{text}");
 }
 
 #[tokio::test]
@@ -984,10 +1011,14 @@ async fn revise_voice_omits_the_field_without_a_locked_voice() {
 #[tokio::test]
 async fn revise_voice_leaves_unmade_pieces_that_do_not_speak_without_a_voice() {
     let mut job = brand_job("generating", false);
-    job["make"]["plan"]["voice"] =
-        json!({"voiceId": "ExactEricId", "name": "Eric", "locked": true});
+    let plan = &mut job["make"]["plan"];
+    plan["voice"] = json!({"voiceId": "ExactEricId", "name": "Eric", "locked": true});
+    plan["pieces"].as_array_mut().unwrap().push(json!({
+        "index": 2, "id": "instrumental-intro", "title": "Instrumental Intro", "medium": "sound",
+        "kindOfWork": "music.sting", "form": "podcast-intro", "status": "planned"
+    }));
 
-    for piece in [0, 1] {
+    for piece in [0, 1, 2] {
         let (request, text) = revise_voice_request(job.clone(), piece, None).await;
         assert!(request.get("voice").is_none(), "{request}");
         assert!(request.get("voiceFrom").is_none(), "{request}");

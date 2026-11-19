@@ -2257,21 +2257,17 @@ fn from_problem(
     None
 }
 
-/// Prefer the made piece's voice, then its planned voice. A plan-wide lock applies to
-/// films and speaking sound forms.
+/// Prefer the made piece's lock, then its planned lock.
 fn locked_revision_voice_name<'a>(
     piece: &'a words::PieceProgress,
     plan_voice: Option<&'a Value>,
 ) -> Option<&'a str> {
     let made = piece.made.as_ref();
     let planned = &piece.piece;
-    let plan_voice = plan_voice.filter(|_| {
-        planned["medium"] == "video"
-            || planned["form"]
-                .as_str()
-                .and_then(forms::find_form)
-                .is_some_and(|form| form.speaks)
-    });
+    // Create projects a narrator or speaking step onto the piece's public `voice`
+    // when the plan has a lock. A narrated product explainer also exposes `film`.
+    let plan_voice =
+        plan_voice.filter(|_| planned["voice"].is_object() || planned["film"].is_object());
     let voice = [
         made.and_then(|m| m.pointer("/placard/voice")),
         made.and_then(|m| m.get("voice")),

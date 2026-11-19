@@ -473,6 +473,7 @@ fn import_preview_answer() -> Value {
             {"index": 2, "header": "Plan", "guess": "attribute", "samples": ["pro"]},
         ],
         "mapping": {"email": 0, "firstName": 1, "lastName": null, "name": null, "tags": null, "attributes": {"plan": 2}},
+        "guards":["eligible","digest","previewDigest"], "eligible":114,"digest":"5f2c9a","previewDigest":"full-map",
         "rows": 120, "valid": 117, "invalidCount": 2,
         "invalid": [
             {"row": 4, "value": "bob@", "reason": "isn't an email address"},
@@ -530,7 +531,7 @@ fn import_input(operation: &str) -> Value {
 
 #[tokio::test]
 async fn an_import_is_previewed_and_changes_nothing() {
-    let stub = Stub::start(import_api(false)).await;
+    let stub = Stub::start(import_api(true)).await;
     let result = run(&stub, import_input("import_preview")).await;
     let text = text_of(&result);
     assert!(!result.is_error, "{text}");
@@ -538,7 +539,7 @@ async fn an_import_is_previewed_and_changes_nothing() {
     assert_eq!(previews.len(), 1);
     assert_eq!(
         previews[0].body,
-        json!({"workspaceId": WORKSPACE, "csv": CSV, "audienceId": AUDIENCE})
+        json!({"workspaceId": WORKSPACE, "csv": CSV, "audienceId": AUDIENCE, "consentSource":"form", "consentNote":NOTE})
     );
     assert!(
         text.starts_with(
@@ -652,7 +653,7 @@ async fn a_file_create_cant_read_as_contacts_is_said_plainly() {
 
 #[tokio::test]
 async fn an_import_needs_the_persons_go_for_the_eligible_count() {
-    let stub = Stub::start(import_api(false)).await;
+    let stub = Stub::start(import_api(true)).await;
     let tool = stub.tool();
     let import = "/create/email/contacts/import";
 
@@ -700,7 +701,7 @@ async fn an_import_needs_the_persons_go_for_the_eligible_count() {
         json!({
             "workspaceId": WORKSPACE, "audienceId": AUDIENCE, "csv": CSV,
             "mapping": import_preview_answer()["mapping"],
-            "consentNote": "Signed up at the Spring market (consent source: form)",
+            "consentNote":NOTE, "consentSource":"form","expectedEligible":114,"expectedDigest":"5f2c9a","expectedPreviewDigest":"full-map",
         })
     );
     let key = posts[0].header("idempotency-key").unwrap().to_string();
@@ -784,7 +785,7 @@ async fn an_import_checks_the_people_in_the_original_preview_even_if_the_count_m
 
 #[tokio::test]
 async fn an_import_asks_the_person_where_the_client_can() {
-    let stub = Stub::start(import_api(false)).await;
+    let stub = Stub::start(import_api(true)).await;
     let tool = stub.tool();
     let import = "/create/email/contacts/import";
     let client = Arc::new(FakeClient::default());
@@ -878,7 +879,7 @@ async fn an_import_asks_the_person_where_the_client_can() {
 
 #[tokio::test]
 async fn a_csv_file_is_read_only_by_a_local_binary_and_only_as_a_csv() {
-    let stub = Stub::start(import_api(false)).await;
+    let stub = Stub::start(import_api(true)).await;
     let folder = tempfile::tempdir().unwrap();
     let file = folder.path().join("spring.csv");
     std::fs::write(&file, CSV).unwrap();
@@ -1256,6 +1257,7 @@ fn api_with_reach(basis: &'static str) -> Responder {
 #[tokio::test]
 async fn without_reach_the_recipients_are_put_together_from_what_create_answers() {
     let stub = Stub::start(over(|request| {
+        if request.path.ends_with("/reach") {return Some(Answer::error(404,"NOT_FOUND","No route"));}
         if request.method != "GET" {
             return None;
         }
@@ -1322,6 +1324,7 @@ async fn a_segments_left_out_people_are_not_answered_without_reach() {
     let stub = Stub::start({
         let segments = segments_api();
         Arc::new(move |request: &Recorded| {
+            if request.path.ends_with("/reach") {return Answer::error(404,"NOT_FOUND","No route");}
             if request.method == "GET"
                 && request.path == format!("/create/email/campaigns/{CAMPAIGN}")
             {
@@ -1369,6 +1372,9 @@ async fn a_segments_left_out_people_are_not_answered_without_reach() {
 #[tokio::test]
 async fn a_campaign_with_no_audience_reaches_no_one_and_says_so() {
     let stub = Stub::start(over(|request| {
+        if request.path.ends_with("/reach") {
+            return Some(Answer::error(404, "NOT_FOUND", "No route"));
+        }
         if request.method == "GET" && request.path == format!("/create/email/campaigns/{CAMPAIGN}")
         {
             let mut campaign = campaign("draft");
@@ -2329,7 +2335,7 @@ async fn a_send_in_flight_is_paused_and_says_how_many_went_and_how_many_wait() {
 
 #[tokio::test]
 async fn a_paused_send_resumes_only_with_the_persons_go_for_who_still_waits() {
-    let stub = Stub::start(flight_api("paused", 12, false)).await;
+    let stub = Stub::start(flight_api("paused", 12, true)).await;
     let tool = stub.tool();
     let resume = format!("/create/email/campaigns/{CAMPAIGN}/resume");
 
@@ -2339,7 +2345,7 @@ async fn a_paused_send_resumes_only_with_the_persons_go_for_who_still_waits() {
         .unwrap();
     let text = text_of(&unasked);
     assert!(
-        text.starts_with("Not resumed yet: the person's go is needed first. Show them: “Winter sale” (subject “Our winter sale starts today”) to the 25 people still waiting (12 of 37 sent so far)."),
+        text.starts_with("Not resumed yet: the person's go is needed first. Show them: “Winter sale” (subject “Our winter sale starts today”) to the 25 people still waiting (12 of 37 sent so far) in the audience “Coffee club” (purpose not answered), from hello@news.northwind.example."),
         "{text}"
     );
     assert!(text.contains("confirm_remaining 25"), "{text}");
@@ -2384,7 +2390,10 @@ async fn a_paused_send_resumes_only_with_the_persons_go_for_who_still_waits() {
     assert!(!resumed.is_error, "{text}");
     let posts = stub.calls_to("POST", &resume);
     assert_eq!(posts.len(), 1);
-    assert_eq!(posts[0].body, json!({"workspaceId": WORKSPACE}));
+    assert_eq!(
+        posts[0].body,
+        json!({"workspaceId": WORKSPACE,"revision":6,"expectedRemaining":25,"expectedFrom":REVIEW_FROM,"expectedReachDigest":"a".repeat(64)})
+    );
     assert_eq!(
         posts[0].header("idempotency-key"),
         Some(format!("email-resume-{CAMPAIGN}-r6").as_str())
@@ -2426,18 +2435,18 @@ async fn a_resume_tells_a_newer_create_the_count_the_person_saw() {
     assert!(!resumed.is_error, "{}", text_of(&resumed));
     assert_eq!(
         stub.calls_to("POST", &resume)[0].body,
-        json!({"workspaceId": WORKSPACE, "expectedRemaining": 25})
+        json!({"workspaceId": WORKSPACE,"revision":6, "expectedRemaining": 25,"expectedFrom":REVIEW_FROM,"expectedReachDigest":"a".repeat(64)})
     );
 
     // Paused before it started: it goes back on its schedule, to who its audience holds now.
-    let scheduled = Stub::start(flight_api("paused", 0, false)).await;
+    let scheduled = Stub::start(flight_api("paused", 0, true)).await;
     let review = run(
         &scheduled,
         json!({"action": "email_resume", "campaign_id": CAMPAIGN}),
     )
     .await;
     assert!(
-        text_of(&review).contains("Show them: “Winter sale” (subject “Our winter sale starts today”) back on its schedule (2026-11-20 09:00 UTC) to 37 people."),
+        text_of(&review).contains("Show them: “Winter sale” (subject “Our winter sale starts today”) back on its schedule (2026-11-20 09:00 UTC) to 37 people in the audience “Coffee club” (purpose not answered), from hello@news.northwind.example."),
         "{}",
         text_of(&review)
     );
@@ -2453,7 +2462,7 @@ async fn a_resume_tells_a_newer_create_the_count_the_person_saw() {
 
 #[tokio::test]
 async fn a_resume_asks_the_person_where_the_client_can() {
-    let stub = Stub::start(flight_api("paused", 12, false)).await;
+    let stub = Stub::start(flight_api("paused", 12, true)).await;
     let tool = stub.tool();
     let resume = format!("/create/email/campaigns/{CAMPAIGN}/resume");
     let unasked = tool
@@ -2496,7 +2505,7 @@ async fn a_resume_asks_the_person_where_the_client_can() {
         .unwrap()
         .to_string();
     assert!(
-        message.starts_with("Resume “Winter sale” (subject “Our winter sale starts today”) to the 25 people still waiting (12 of 37 sent so far)?"),
+        message.starts_with("Resume “Winter sale” (subject “Our winter sale starts today”) to the 25 people still waiting (12 of 37 sent so far) in the audience “Coffee club” (purpose not answered), from hello@news.northwind.example?"),
         "{message}"
     );
     assert!(stub.calls_to("POST", &resume).is_empty());
@@ -2533,7 +2542,7 @@ async fn a_resume_asks_the_person_where_the_client_can() {
 
 #[tokio::test]
 async fn a_send_that_is_paused_points_at_resume() {
-    let stub = Stub::start(flight_api("paused", 12, false)).await;
+    let stub = Stub::start(flight_api("paused", 12, true)).await;
     let refused = run(
         &stub,
         json!({"action": "email_send", "campaign_id": CAMPAIGN, "confirm_recipients": 37}),
@@ -2761,7 +2770,7 @@ async fn the_send_review_names_the_audience_its_purpose_and_what_to_check() {
     .await;
     let text = text_of(&review);
     assert!(
-        text.starts_with("Not sent yet: the person's go is needed first. Show them: “Winter sale” (subject “Our winter sale starts today”, from Northwind <hello@news.northwind.example>) to 3 people in the audience “Proof” (test) now."),
+        text.starts_with("Not sent yet: the person's go is needed first. Show them: “Winter sale” (subject “Our winter sale starts today”, from hello@news.northwind.example) to 3 people in the audience “Proof” (test) now."),
         "{text}"
     );
     assert!(
@@ -2837,7 +2846,7 @@ async fn the_send_review_names_the_audience_its_purpose_and_what_to_check() {
         .unwrap()
         .to_string();
     assert!(
-        message.starts_with("Send “Winter sale” (subject “Our winter sale starts today”, from Northwind <hello@news.northwind.example>) to 10 people in the segment “Regulars” of the audience “Coffee club” (production) now?"),
+        message.starts_with("Send “Winter sale” (subject “Our winter sale starts today”, from hello@news.northwind.example) to 10 people in the segment “Regulars” of the audience “Coffee club” (production) now?"),
         "{message}"
     );
     assert!(
@@ -2870,7 +2879,7 @@ async fn a_go_is_for_the_audience_the_person_saw() {
         None,
         "Winter sale",
         37,
-        false,
+        true,
     ))
     .await;
     let tool = stub.tool();
@@ -2898,7 +2907,7 @@ async fn a_go_is_for_the_audience_the_person_saw() {
     );
     assert!(stub.calls_to("POST", &schedule).is_empty());
 
-    // The audience they saw, and its review token: sent. Today's main is told no count.
+    // The audience they saw, and its review token: sent. The write must carry the reviewed count.
     let sent = tool
         .execute(structured(&other)["confirm_with"].clone())
         .await
@@ -2906,7 +2915,7 @@ async fn a_go_is_for_the_audience_the_person_saw() {
     assert!(!sent.is_error, "{}", text_of(&sent));
     let posts = stub.calls_to("POST", &schedule);
     assert_eq!(posts.len(), 1);
-    assert!(posts[0].body.get("expectedRecipients").is_none());
+    assert_eq!(posts[0].body["expectedRecipients"], 37);
     assert!(
         text_of(&sent).starts_with(
             "Sending “Winter sale” to 37 people in the audience “Coffee club” (production) now"
@@ -3143,10 +3152,9 @@ async fn a_send_rechecks_the_reviewed_sender_and_count_before_scheduling() {
     let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let current = changed.clone();
     let stub = Stub::start(over(move |request| {
-        if request.path.ends_with("/preview") && current.load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if request.path.ends_with("/reach") && current.load(std::sync::atomic::Ordering::Relaxed) {
             let mut response = (usual())(request);
-            response.body["data"]["from"] = json!("Other <other@northwind.example>");
+            response.body["data"]["from"] = json!("other@northwind.example");
             Some(response)
         } else {
             None
@@ -3184,7 +3192,7 @@ async fn a_send_rechecks_the_reviewed_sender_and_count_before_scheduling() {
     assert!(fresh["inputRequests"].get(request_id).is_none());
 
     let result = run(&stub, confirmation).await;
-    assert!(text_of(&result).contains("Other <other@northwind.example>"));
+    assert!(text_of(&result).contains("other@northwind.example"));
     let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
     assert!(stub.calls_to("POST", &schedule).is_empty());
 
@@ -3472,7 +3480,7 @@ async fn count_only_import_never_imports_a_changed_csv_at_the_same_eligible_coun
                     "mapping": {"email": 0, "firstName": null, "lastName": null, "name": null, "tags": null, "attributes": {}},
                     "rows": 3, "valid": 3, "invalidCount": 0, "invalid": [],
                     "duplicatesInFile": 0, "existing": 0, "new": 3, "suppressed": 1,
-                    "eligible": 2, "digest": digest,
+                    "guards":["eligible","digest","previewDigest"],"previewDigest":"full", "eligible": 2, "digest": digest,
                     "sample": [{"email": if csv.contains("ada@example.com") { "ada@example.com" } else { "dee@example.com" }}],
                 })))
             }
@@ -3555,7 +3563,7 @@ async fn count_only_import_never_imports_a_changed_csv_at_the_same_eligible_coun
 }
 
 #[tokio::test]
-async fn resume_requires_confirm_review_rechecks_after_live_ask_and_notes_legacy_counts() {
+async fn resume_requires_confirm_review_and_rechecks_after_live_ask() {
     let state = Arc::new(Mutex::new((
         2_i64,
         PROOF,
@@ -3563,7 +3571,7 @@ async fn resume_requires_confirm_review_rechecks_after_live_ask_and_notes_legacy
         "hello@news.northwind.example",
     )));
     let state_seen = state.clone();
-    let base = flight_api("paused", 0, false);
+    let base = flight_api("paused", 0, true);
     let stub = Stub::start(Arc::new(move |request: &Recorded| {
         let path = format!("/create/email/campaigns/{CAMPAIGN}");
         match (request.method.as_str(), request.path.as_str()) {
@@ -3571,6 +3579,7 @@ async fn resume_requires_confirm_review_rechecks_after_live_ask_and_notes_legacy
                 let (rev, aud_id, aud_name, from_email) = *state_seen.lock().unwrap();
                 let mut answer = base(request);
                 answer.body["data"]["revision"] = json!(rev);
+                answer.body["data"]["remaining"] = json!(3);
                 answer.body["data"]["audienceId"] = json!(aud_id);
                 answer.body["data"]["audience"] = json!({"id": aud_id, "name": aud_name});
                 answer.body["data"]["sender"] =
@@ -3633,14 +3642,15 @@ async fn resume_requires_confirm_review_rechecks_after_live_ask_and_notes_legacy
             && request.path == path
             && reads_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1
         {
-            let mut answer = (flight_api("paused", 0, false))(request);
+            let mut answer = (flight_api("paused", 0, true))(request);
             answer.body["data"]["revision"] = json!(5);
             return answer;
         }
         let (rev, aud_id, aud_name, from_email) = *state_for_live.lock().unwrap();
-        let mut answer = (flight_api("paused", 0, false))(request);
+        let mut answer = (flight_api("paused", 0, true))(request);
         if request.path == path {
             answer.body["data"]["revision"] = json!(rev);
+            answer.body["data"]["remaining"] = json!(3);
             answer.body["data"]["audienceId"] = json!(aud_id);
             answer.body["data"]["audience"] = json!({"id": aud_id, "name": aud_name});
             answer.body["data"]["sender"] =
@@ -3670,15 +3680,12 @@ async fn resume_requires_confirm_review_rechecks_after_live_ask_and_notes_legacy
     );
     assert!(live_stub.calls_to("POST", &resume).is_empty());
 
-    // Valid rev 4 confirm_with resumes against legacy main and discloses unanswered live count check.
+    // A fresh review can resume the new pause.
     let fresh_confirm = structured(&stale)["confirm_with"].clone();
     let resumed = run(&stub, fresh_confirm).await;
     let text = text_of(&resumed);
     assert!(!resumed.is_error, "{text}");
-    assert!(
-        text.contains("Remaining recipients at resume time: not answered by this API."),
-        "{text}"
-    );
+    assert!(text.contains("Resumed"), "{text}");
     let posts = stub.calls_to("POST", &resume);
     assert_eq!(posts.len(), 1);
     assert_eq!(
@@ -4067,8 +4074,8 @@ async fn exact_address_lookups_page_past_fifty_substring_matches_for_contacts_an
             ("GET", "/create/email/suppressions") => {
                 if request.query.contains("cursor=50") {
                     Some(Answer::ok(json!({
-                        "suppressions": [{
-                            "email": "ada@northwind.example",
+                        "guards":["suppressionId"],"suppressions": [{
+                            "id":CONTACT, "email": "ada@northwind.example",
                             "reason": "bounced",
                             "source": "webhook",
                             "detail": "550 Unknown",
@@ -4121,7 +4128,7 @@ async fn exact_address_lookups_page_past_fifty_substring_matches_for_contacts_an
         &stub,
         json!({
             "action": "email_unsubscribes", "operation": "remove",
-            "email": "ada@northwind.example", "confirm_email": "ada@northwind.example",
+            "email": "ada@northwind.example", "confirm_email": "ada@northwind.example", "confirm_suppression_id":CONTACT,
         }),
     )
     .await;
@@ -4272,7 +4279,7 @@ async fn review_tokens_are_issued_to_the_current_credential() {
 }
 
 const REVIEW_FROM: &str = "hello@news.northwind.example";
-fn guarded_reach() -> Value {
+pub(super) fn guarded_reach() -> Value {
     json!({"reachDigest":"a".repeat(64),"from":REVIEW_FROM,
         "guards":["revision","recipients","remaining","reachDigest","from"]})
 }

@@ -176,6 +176,8 @@ impl Counts {
 }
 
 /// An import as the person is shown it and asked about it.
+const IMPORT_UNGUARDED: &str = "This API cannot hold the import to what you reviewed. Its guards or preview details were not answered, so nothing was imported.";
+
 struct Import {
     key: ReviewKey,
     workspace_id: Uuid,
@@ -212,9 +214,15 @@ impl Import {
     }
 
     fn review_token(&self) -> Option<String> {
+        if !super::has_guards(&self.preview, &["eligible", "digest", "previewDigest"])
+            || !self.preview["mapping"].is_object()
+        {
+            return None;
+        }
         let audience_id = self.audience_id?;
-        let eligible = self.counts.eligible?;
-        let preview_digest = text(&self.preview, "digest");
+        let eligible = number(&self.preview, "eligible").filter(|n| *n >= 0)?;
+        let address_digest = text(&self.preview, "digest")?;
+        let preview_digest = text(&self.preview, "previewDigest")?;
         let mac = self.key.sign(
             &json!([
                 "import1",
@@ -222,6 +230,8 @@ impl Import {
                 audience_id,
                 digest(&self.csv),
                 preview_digest,
+                address_digest,
+                self.preview["mapping"],
                 eligible,
                 self.source,
                 self.note,
@@ -232,7 +242,7 @@ impl Import {
         Some(
             ImportToken {
                 eligible,
-                digest: preview_digest,
+                digest: Some(address_digest),
             }
             .encode(&mac),
         )
@@ -261,16 +271,11 @@ impl Import {
     }
 
     fn show(&self, reason: &str) -> ToolResult {
-        let audience_id = self
-            .audience_id
-            .expect("show is called on an import with an audience");
-        let eligible = self
-            .counts
-            .eligible
-            .expect("show is called on an import with an eligible count");
-        let token = self
-            .review_token()
-            .expect("show is called on an import with a token");
+        let (Some(audience_id), Some(eligible), Some(token)) =
+            (self.audience_id, self.counts.eligible, self.review_token())
+        else {
+            return ToolResult::error(IMPORT_UNGUARDED);
+        };
         let what = self.what();
         ToolResult::with_structured(
             format!(
@@ -553,7 +558,10 @@ impl StudioTool {
         if super::looks_like_resend_key(&csv) {
             return Err(Error::Validation(super::KEY_REFUSED.to_string()));
         }
-        let mut body = json!({"workspaceId": workspace_id, "csv": csv});
+        let mut body = json!({"workspaceId": workspace_id, "csv": csv, "consentSource":source, "consentNote": note});
+        if let Some(tags) = &tags {
+            body["tags"] = json!(tags);
+        }
         if let Some(audience_id) = audience_id {
             body["audienceId"] = json!(audience_id);
         }
@@ -712,7 +720,7 @@ impl StudioTool {
                 import.source
             ),
             (None, _, _) => "To import it, an audience is needed: email_audiences lists them (operation create makes one), then preview again with audience_id.".to_string(),
-            (Some(_), _, _) => "Create did not answer how many could be sent to, so there is no count for the person to agree to: import it in the studio.".to_string(),
+            (Some(_), _, _) => IMPORT_UNGUARDED.to_string(),
         });
         Ok(ToolResult::with_structured(
             lines.join("\n"),
@@ -764,13 +772,13 @@ impl StudioTool {
         }
         let Some(eligible) = import.counts.eligible else {
             return Ok(ToolResult::error(
-                "Not imported: Create did not answer how many of these people could be sent to, so there is no count for the person to agree to. Import the file in the studio instead."
+                "This API cannot hold the import to what you reviewed. The eligible count was not answered, so nothing was imported."
                     .to_string(),
             ));
         };
-        let token = import
-            .review_token()
-            .expect("audience_id and eligible were checked above");
+        let Some(token) = import.review_token() else {
+            return Ok(ToolResult::error(IMPORT_UNGUARDED));
+        };
         let seen_token = match given(input.confirm_review.as_deref()) {
             Some(raw) => match ImportToken::parse(raw).filter(|_| same_token(raw, &token)) {
                 Some(seen) => input
@@ -864,54 +872,18 @@ impl StudioTool {
             }
         }
 
-        let agreed = seen_token.unwrap_or_else(|| ImportToken {
-            eligible,
-            digest: text(&import.preview, "digest"),
-        });
-        let legacy_note = format!("{} (consent source: {})", import.note, import.source);
         let mut body = json!({
-            "workspaceId": workspace_id,
-            "audienceId": audience_id,
-            "csv": import.csv,
-            "mapping": import.preview.get("mapping"),
-            "consentNote": legacy_note,
+            "workspaceId": workspace_id, "audienceId": audience_id, "csv": import.csv,
+            "mapping": import.preview["mapping"], "consentSource": import.source, "consentNote": import.note,
+            "expectedEligible":eligible, "expectedDigest": import.preview["digest"], "expectedPreviewDigest":import.preview["previewDigest"],
         });
         if let Some(tags) = &import.tags {
             body["tags"] = json!(tags);
         }
-        // A Create that answers the count and a digest of who it would add also takes them
-        // back, and refuses an import that is no longer what the person saw.
-        let mut newer: Vec<&str> = Vec::new();
-        if number(&import.preview, "eligible").is_some() {
-            body["expectedEligible"] = json!(agreed.eligible);
-            newer.push("expectedEligible");
-        }
-        if let Some(seen) = agreed.digest {
-            body["expectedDigest"] = json!(seen);
-            newer.push("expectedDigest");
-        }
-        if !newer.is_empty() {
-            body["consentSource"] = json!(import.source);
-            body["consentNote"] = json!(import.note);
-        }
-        // Different writes carry different keys, including their tags and preview digest.
         let key = format!("email-import-{}", digest(&body.to_string()));
-        let (mut answer, mut kept) = self
-            .email_call_newer("POST", "/contacts/import", &body, &newer, Some(&key))
+        let answer = self
+            .email_call("POST", "/contacts/import", Some(&body), Some(&key))
             .await?;
-        if unknown_field(&answer, "consentSource") {
-            body.as_object_mut()
-                .expect("import is an object")
-                .remove("consentSource");
-            body["consentNote"] = json!(legacy_note);
-            let key = format!("email-import-{}", digest(&body.to_string()));
-            (answer, kept) = self
-                .email_call_newer("POST", "/contacts/import", &body, &newer, Some(&key))
-                .await?;
-        }
-        if !kept || newer.is_empty() {
-            notes.push("Eligible recipients at import time: not answered by this API.".into());
-        }
         if !answer.is_success() {
             return Ok(ToolResult::error(format!(
                 "Not imported: {}",

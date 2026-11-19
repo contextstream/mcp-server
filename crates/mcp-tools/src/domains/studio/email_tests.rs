@@ -264,6 +264,9 @@ fn api(status: Arc<Mutex<String>>, recipients: i64) -> Responder {
                 campaign("draft")
             ])),
             ("GET", p) if p == campaign_path => Answer::ok(campaign(&status.lock().unwrap())),
+            ("GET", p) if p == format!("{campaign_path}/reach") => {
+                Answer::ok(complete::guarded_reach())
+            }
             ("GET", p) if p == format!("{campaign_path}/preview") => Answer::ok(json!({
                 "subject": if request.query.contains("variant=1") { "Twenty percent off, this week only" } else { "Our winter sale starts today" },
                 "subjects": ["Our winter sale starts today", "Twenty percent off, this week only"],
@@ -329,12 +332,12 @@ fn api(status: Arc<Mutex<String>>, recipients: i64) -> Responder {
                 Answer::ok(json!({"deleted": true}))
             }
             ("GET", "/create/email/suppressions") => Answer::ok(json!({
-                "suppressions": [
-                    {"email": "grace@northwind.example", "reason": "unsubscribed", "source": "one_click",
+                "guards":["suppressionId"],"suppressions": [
+                    {"id": CONTACT, "email": "grace@northwind.example", "reason": "unsubscribed", "source": "one_click",
                      "campaignId": CAMPAIGN, "campaign": {"id": CAMPAIGN, "name": "Winter sale"},
                      "feedback": {"reason": "too_many", "comment": "Weekly is plenty", "at": "2026-10-20T08:01:00Z"},
                      "detail": null, "createdAt": "2026-10-20T08:00:00Z"},
-                    {"email": "bounced@resend.dev", "reason": "bounced", "source": "webhook",
+                    {"id": CONTACT, "email": "bounced@resend.dev", "reason": "bounced", "source": "webhook",
                      "campaignId": CAMPAIGN, "campaign": {"id": CAMPAIGN, "name": "Winter sale"},
                      "feedback": null, "detail": "550 5.1.1 Unknown user", "createdAt": "2026-10-19T08:00:00Z"}
                 ],
@@ -650,7 +653,7 @@ async fn a_send_needs_the_persons_go_and_the_count_they_saw() {
         text.starts_with("Not sent yet: the person's go is needed first."),
         "{text}"
     );
-    assert!(text.contains("“Winter sale” (subject “Our winter sale starts today”, from Northwind <hello@news.northwind.example>) to 37 people in the audience “Coffee club” (purpose not answered) now"), "{text}");
+    assert!(text.contains("“Winter sale” (subject “Our winter sale starts today”, from hello@news.northwind.example) to 37 people in the audience “Coffee club” (purpose not answered) now"), "{text}");
     assert!(text.contains("confirm_recipients 37"), "{text}");
     assert_eq!(
         structured(&unasked)["confirm_with"]["confirm_recipients"],
@@ -1018,7 +1021,7 @@ async fn an_address_that_unsubscribed_comes_off_only_when_the_person_is_asked() 
     let peer = stateless();
     let bounced = run_with_call_peer(
         peer.clone(),
-        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "bounced@resend.dev", "confirm_email": "bounced@resend.dev"})),
+        tool.execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "bounced@resend.dev", "confirm_email": "bounced@resend.dev", "confirm_suppression_id":CONTACT})),
     )
     .await
     .unwrap();
@@ -1086,12 +1089,12 @@ async fn an_unknown_reason_is_asked_about_and_the_other_ways_through_are_pinned(
     let stub = Stub::start(Arc::new(|request: &Recorded| {
         if request.method == "GET" && request.path == "/create/email/suppressions" {
             return Answer::ok(json!({
-                "suppressions": [
-                    {"email": "ada@northwind.example", "reason": "spam", "source": "webhook",
+                "guards":["suppressionId"],"suppressions": [
+                    {"id": CONTACT, "email": "ada@northwind.example", "reason": "spam", "source": "webhook",
                      "detail": null, "createdAt": "2026-10-21T08:00:00Z"},
-                    {"email": "lin@northwind.example", "source": "import",
+                    {"id": CONTACT,"email": "lin@northwind.example", "source": "import",
                      "detail": null, "createdAt": "2026-10-22T08:00:00Z"},
-                    {"email": "bounced@resend.dev", "reason": "bounced", "source": "webhook",
+                    {"id": CONTACT, "email": "bounced@resend.dev", "reason": "bounced", "source": "webhook",
                      "detail": "550 5.1.1 Unknown user", "createdAt": "2026-10-19T08:00:00Z"}
                 ],
                 "nextCursor": null, "total": 3
@@ -1102,7 +1105,7 @@ async fn an_unknown_reason_is_asked_about_and_the_other_ways_through_are_pinned(
     .await;
     let tool = stub.tool();
     let remove = "/create/email/suppressions/remove";
-    let off = |email: &str| json!({"action": "email_unsubscribes", "operation": "remove", "email": email, "confirm_email": email});
+    let off = |email: &str| json!({"action": "email_unsubscribes", "operation": "remove", "email": email, "confirm_email": email, "confirm_suppression_id":CONTACT});
     let stateless = || {
         CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({}))
     };
@@ -2118,24 +2121,12 @@ async fn unsubscribes_are_listed_with_why_and_a_remove_needs_the_persons_go() {
         .execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example"}))
         .await
         .unwrap();
-    let text = text_of(&unasked);
-    assert!(
-        text.starts_with("Not removed yet: the person's go is needed first."),
-        "{text}"
-    );
-    assert!(
-        text.contains("Only if they asked to hear from the team again"),
-        "{text}"
-    );
-    assert!(
-        text.contains("confirm_email grace@northwind.example"),
-        "{text}"
-    );
+    assert!(unasked.is_error && text_of(&unasked).contains(email::AUDIENCES_URL));
     let wrong = tool
         .execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "grace@northwind.example", "confirm_email": "ada@northwind.example"}))
         .await
         .unwrap();
-    assert!(text_of(&wrong).starts_with("Not removed: confirm_email is ada@northwind.example"));
+    assert!(wrong.is_error && text_of(&wrong).contains(email::AUDIENCES_URL));
     assert!(stub.calls_to("POST", &remove).is_empty());
 
     // Through the client: a no keeps them on the list, a yes takes them off.
@@ -2178,7 +2169,7 @@ async fn unsubscribes_are_listed_with_why_and_a_remove_needs_the_persons_go() {
 
     // Without a client to ask, the confirmed address is the go; a bounce needs no confirm flag.
     let bounced = tool
-        .execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "bounced@resend.dev", "confirm_email": "Bounced@resend.dev"}))
+        .execute(json!({"action": "email_unsubscribes", "operation": "remove", "email": "bounced@resend.dev", "confirm_email": "Bounced@resend.dev", "confirm_suppression_id":CONTACT}))
         .await
         .unwrap();
     assert!(!bounced.is_error, "{}", text_of(&bounced));

@@ -49,17 +49,21 @@ struct ResumeReview {
     remaining: i64,
     went: Option<i64>,
     when: Option<String>,
-    sender: Value,
+    reach: super::ReviewedReach,
     audience_id: Option<String>,
     audience: Value,
     segment_id: Option<String>,
     segment: Value,
     schedule: Value,
-    checks_remaining: bool,
 }
 
 impl ResumeReview {
     fn what(&self) -> String {
+        let target = super::send::target_words(
+            &self.audience,
+            self.segment_id.as_ref().map(|_| &self.segment),
+        );
+        let from = &self.reach.from;
         if self.begun {
             let progress = match self.went {
                 Some(went) => format!(
@@ -70,14 +74,14 @@ impl ResumeReview {
                 None => format!("sent so far: {}", super::NOT_ANSWERED),
             };
             format!(
-                "“{}” (subject “{}”) to the {} still waiting ({progress})",
+                "“{}” (subject “{}”) to the {} still waiting ({progress}) in {target}, from {from}",
                 self.name,
                 self.subject,
                 people(self.remaining),
             )
         } else {
             format!(
-                "“{}” (subject “{}”) back on its schedule{} to {}",
+                "“{}” (subject “{}”) back on its schedule{} to {} in {target}, from {from}",
                 self.name,
                 self.subject,
                 self.when
@@ -100,7 +104,8 @@ impl ResumeReview {
                 self.went,
                 self.name,
                 self.subject,
-                self.sender,
+                self.reach.from,
+                self.reach.digest,
                 self.audience_id,
                 self.audience,
                 self.segment_id,
@@ -130,7 +135,7 @@ impl ResumeReview {
                 "revision": self.revision,
                 "remaining": self.remaining,
                 "sent": self.went,
-                "subject": self.subject,
+                "subject": self.subject, "from": self.reach.from, "audience": self.audience, "segment": self.segment,
                 "confirm_with": {
                     "action": "email_resume",
                     "campaign_id": self.campaign_id,
@@ -229,17 +234,18 @@ impl StudioTool {
             ));
         };
         let begun = started(&campaign);
-        // Who it would reach: its own count of who waits; a campaign paused before it
-        // started goes back on its schedule, to whoever its audience holds then.
-        let remaining = match waiting(&campaign) {
-            Some(remaining) => Some(remaining),
-            None if !begun => self
-                .preview(workspace_id, campaign_id, None)
-                .await
-                .ok()
-                .and_then(|preview| number(&preview, "recipients")),
-            None => None,
+        let Some(reach) = self
+            .reviewed_reach(workspace_id, campaign_id, "remaining")
+            .await?
+        else {
+            return Ok(Err(
+                "This API cannot hold the resume to what you reviewed, so nothing was resumed."
+                    .into(),
+            ));
         };
+        let remaining = number(&campaign, "remaining")
+            .or(reach.eligible)
+            .filter(|n| *n >= 0);
         let Some(remaining) = remaining else {
             return Ok(Err(format!(
                 "Not resumed: Create did not answer how many people still wait for “{name}”, so there is no count for the person to agree to. They can resume it in the studio: {}",
@@ -258,14 +264,13 @@ impl StudioTool {
             remaining,
             went: sent(&campaign),
             when: scheduled_for(&campaign),
-            sender: campaign.get("sender").cloned().unwrap_or(Value::Null),
+            reach,
             audience_id: text(&campaign, "audienceId")
                 .or_else(|| text(&campaign["audience"], "id")),
             audience: campaign.get("audience").cloned().unwrap_or(Value::Null),
             segment_id: text(&campaign, "segmentId").or_else(|| text(&campaign["segment"], "id")),
             segment: campaign.get("segment").cloned().unwrap_or(Value::Null),
             schedule: campaign.get("schedule").cloned().unwrap_or(Value::Null),
-            checks_remaining: number(&campaign, "remaining").is_some(),
         }))
     }
 
@@ -382,23 +387,21 @@ impl StudioTool {
         // One key per pause: each pause moves the revision on, so a retried resume is one
         // resume. A Create that answers `remaining` also takes the count the person saw.
         let key = format!("email-resume-{campaign_id}-r{}", agreed.revision);
-        let mut body = json!({"workspaceId": workspace_id});
-        let mut newer: Vec<&str> = Vec::new();
-        if review.checks_remaining {
-            body["expectedRemaining"] = json!(remaining);
-            newer.push("expectedRemaining");
-        }
-        let (answer, kept) = self
-            .email_call_newer(
+        let body = json!({"workspaceId":workspace_id, "revision":agreed.revision, "expectedRemaining":remaining,
+            "expectedReachDigest":review.reach.digest,"expectedFrom":review.reach.from});
+        let answer = self
+            .email_call(
                 "POST",
                 &format!("/campaigns/{campaign_id}/resume"),
-                &body,
-                &newer,
+                Some(&body),
                 Some(&key),
             )
             .await?;
-        if !kept || body.get("expectedRemaining").is_none() {
-            notes.push("Remaining recipients at resume time: not answered by this API.".into());
+        if answer.status == 409 && answer.error_code() == Some("campaign_changed") {
+            return Ok(match self.resume_review(workspace_id, campaign_id).await? {
+                Ok(now) => now.show("Not resumed: the campaign changed. Ask the person again."),
+                Err(why) => ToolResult::error(why),
+            });
         }
         if !answer.is_success() {
             let refused = email_refusal(&answer, Topic::Campaign);

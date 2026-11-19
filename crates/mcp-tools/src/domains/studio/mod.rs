@@ -219,6 +219,7 @@ pub struct StudioInput {
     pub reason: Option<String>,
     pub note: Option<String>,
     pub confirm_email: Option<String>,
+    pub confirm_suppression_id: Option<String>,
     /// email_audiences create and update: what it is called, what it is for.
     pub name: Option<String>,
     pub purpose: Option<String>,
@@ -2726,6 +2727,7 @@ pub(crate) fn input_schema() -> Value {
             false,
         )
         .string("note", "Why, kept with a suppression change (email_unsubscribes add or remove, email_contacts unsubscribe)", false)
+        .string("confirm_suppression_id", "The suppression row returned in confirm_with for a bounce or manual suppression.", false)
         .string("confirm_email", "The address the person agreed to take off the suppression list (email_unsubscribes remove): pass it once they agree", false)
         .uuid("workspace_id", "Workspace (defaults to the session's)", false)
         .uuid("project_id", "Project (defaults to the session's)", false)

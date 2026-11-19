@@ -207,6 +207,20 @@ fn digest(value: &str) -> String {
     hex::encode(&Sha256::digest(value.as_bytes())[..12])
 }
 
+fn has_guards(read: &Value, required: &[&str]) -> bool {
+    read["guards"].as_array().is_some_and(|guards| {
+        required
+            .iter()
+            .all(|name| guards.iter().any(|g| g.as_str() == Some(*name)))
+    })
+}
+
+struct ReviewedReach {
+    digest: String,
+    from: String,
+    eligible: Option<i64>,
+}
+
 /// What a refused email call was about, for its sentence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Topic {
@@ -1066,6 +1080,41 @@ impl StudioTool {
         } else {
             Err(email_refusal(&answer, Topic::Campaign))
         })
+    }
+
+    async fn reviewed_reach(
+        &self,
+        workspace_id: Uuid,
+        campaign_id: Uuid,
+        count_guard: &str,
+    ) -> Result<Option<ReviewedReach>> {
+        let answer = self
+            .email_call(
+                "GET",
+                &format!("/campaigns/{campaign_id}/reach?workspaceId={workspace_id}"),
+                None,
+                None,
+            )
+            .await?;
+        let data = &answer.data;
+        if !answer.is_success()
+            || !has_guards(data, &["revision", count_guard, "reachDigest", "from"])
+        {
+            return Ok(None);
+        }
+        let reach = text(data, "reachDigest").filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+        Ok(reach
+            .zip(text(data, "from"))
+            .map(|(digest, from)| ReviewedReach {
+                digest,
+                from,
+                eligible: number(data, "eligible"),
+            }))
     }
 
     /// The audiences as Create lists them now, when they can be read.
@@ -3027,6 +3076,13 @@ impl StudioTool {
                 .find(|s| text(s, "email").map(|e| e.to_lowercase()).as_deref() == Some(email))
                 .cloned()
             {
+                if !has_guards(&answer.data, &["suppressionId"])
+                    || text(&found, "id")
+                        .and_then(|id| Uuid::parse_str(&id).ok())
+                        .is_none()
+                {
+                    return Ok(Err("This API cannot hold the removal to what you reviewed, so nothing was removed.".into()));
+                }
                 return Ok(Ok(Some(found)));
             }
             let next = text(&answer.data, "nextCursor");
@@ -3050,6 +3106,7 @@ impl StudioTool {
             }
             Err(refused) => return Ok(ToolResult::error(format!("Not removed: {refused}"))),
         };
+        let row_id = &suppression["id"];
         let reason = text(&suppression, "reason").unwrap_or_default();
         let why = suppression_words(&suppression);
         let caution = match reason.as_str() {
@@ -3073,12 +3130,17 @@ impl StudioTool {
         let theirs_to_allow = !matches!(reason.as_str(), "bounced" | "manual");
         let agents_word = !crate::go_ahead::asked_only()
             && confirmed.as_deref() == Some(email.as_str())
-            && !theirs_to_allow;
+            && !theirs_to_allow
+            && input
+                .confirm_suppression_id
+                .as_deref()
+                .is_some_and(|id| row_id == id);
         let mut unanswered = false;
         let asked = match peer::current()
             .filter(peer::CallPeer::can_elicit)
-            .filter(|peer| !(agents_word && peer.asks_through_the_result()))
-        {
+            .filter(|peer| {
+                !(agents_word && peer.asks_through_the_result() && !peer.carries_inline_answer())
+            }) {
             Some(peer) => {
                 let message = format!("Take {what} off the suppression list?{caution}");
                 let schema = json!({
@@ -3095,18 +3157,10 @@ impl StudioTool {
                 });
                 // What the question is about: an answer for another address or another
                 // suppression of it is not taken.
-                let state = format!(
-                    "studio-email-unsuppress:{email}:{reason}:{}",
-                    text(&suppression, "createdAt").unwrap_or_default()
-                );
+                let state =
+                    format!("studio-email-unsuppress:{workspace_id}:{row_id}:{email}:{reason}");
                 match peer
-                    .ask(
-                        "confirm-unsuppress",
-                        &message,
-                        schema,
-                        &state,
-                        ELICIT_TIMEOUT,
-                    )
+                    .ask(&state, &message, schema, &state, ELICIT_TIMEOUT)
                     .await
                 {
                     Elicited::Pending => {
@@ -3136,7 +3190,7 @@ impl StudioTool {
         if asked.is_none() && crate::go_ahead::asked_only() {
             return Ok(ToolResult::with_structured(
                 format!(
-                    "Not removed: {}. {email} stays on the suppression list.",
+                    "Not removed: {}. {email} stays on the suppression list. Open the studio: {AUDIENCES_URL}",
                     crate::go_ahead::NOT_ASKED
                 ),
                 json!({"removed": false, "email": email, "go_ahead": "asked_only"}),
@@ -3148,7 +3202,7 @@ impl StudioTool {
             (None, _) if unanswered && theirs_to_allow => {
                 return Ok(ToolResult::with_structured(
                     format!(
-                        "Not removed: the person was asked through the client and gave no answer in time, and {what} comes off only on their own yes. {email} stays on the suppression list. Ask them, then call again so they can answer.{caution}"
+                        "Not removed: the person was asked through the client and gave no answer in time, and {what} comes off only on their own yes. {email} stays on the suppression list. Open the studio: {AUDIENCES_URL}.{caution}"
                     ),
                     json!({"removed": false, "email": email, "reason": reason, "unanswered": true}),
                 ))
@@ -3161,15 +3215,17 @@ impl StudioTool {
                     json!({"removed": false, "email": email, "declined": true}),
                 ))
             }
-            (None, Some(confirmed)) if confirmed == email => {}
+            (None, _) if theirs_to_allow => return Ok(ToolResult::error(format!("Not removed: only the person can approve restoring {what}. Open the studio: {AUDIENCES_URL}"))),
+            (None, _) if agents_word => {}
             (None, confirmed) => {
                 let mut said = match confirmed {
-                    Some(other) => format!("Not removed: confirm_email is {other}, not {email}."),
+                    Some(other) if other != email => format!("Not removed: confirm_email is {other}, not {email}."),
+                    Some(_) => "Not removed: review this suppression and confirm its current row.".into(),
                     None if unanswered => "Not removed yet: the person was asked through the client and gave no answer in time.".to_string(),
                     None => "Not removed yet: the person's go is needed first.".to_string(),
                 };
                 said.push_str(&format!(
-                    " Show them: {what}.{caution} If they agree, call email_unsubscribes again with operation remove, email {email} and confirm_email {email}."
+                    " Show them: {what}.{caution} If they agree, call email_unsubscribes again with operation remove, email {email} and the arguments in confirm_with."
                 ));
                 return Ok(ToolResult::with_structured(
                     said,
@@ -3181,7 +3237,7 @@ impl StudioTool {
                             "action": "email_unsubscribes",
                             "operation": "remove",
                             "email": email,
-                            "confirm_email": email,
+                            "confirm_email": email, "confirm_suppression_id": row_id,
                         },
                     }),
                 ));
@@ -3191,6 +3247,7 @@ impl StudioTool {
             "workspaceId": workspace_id,
             "email": email,
             "note": note_of(input, "Taken off through the studio tool, with the person's go"),
+            "expectedSuppressionId": row_id,
         });
         if matches!(reason.as_str(), "unsubscribed" | "complained") {
             body["confirm"] = json!(true);

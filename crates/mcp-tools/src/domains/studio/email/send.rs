@@ -28,7 +28,7 @@ struct SendReview {
     campaign_id: Uuid,
     name: String,
     subject: Option<String>,
-    from: Option<String>,
+    reach: super::ReviewedReach,
     revision: i64,
     recipients: i64,
     audience_id: String,
@@ -36,7 +36,6 @@ struct SendReview {
     audience: Value,
     segment: Option<Value>,
     warnings: Vec<String>,
-    checks_count: bool,
 }
 
 impl SendReview {
@@ -49,7 +48,7 @@ impl SendReview {
             "“{}” (subject “{}”, from {}) to {} in {} {when}",
             self.name,
             self.subject.as_deref().unwrap_or(NOT_ANSWERED),
-            self.from.as_deref().unwrap_or(NOT_ANSWERED),
+            self.reach.from,
             people(self.recipients),
             self.target()
         )
@@ -65,7 +64,8 @@ impl SendReview {
                 self.revision,
                 self.name,
                 self.subject,
-                self.from,
+                self.reach.from,
+                self.reach.digest,
                 self.audience_id,
                 self.segment_id,
                 self.audience,
@@ -115,7 +115,7 @@ impl SendReview {
             json!({
                 "sent": false, "campaign_id": self.campaign_id, "revision": self.revision,
                 "audience": self.audience, "segment": self.segment, "recipients": self.recipients,
-                "subject": self.subject, "from": self.from, "send_at": send_at, "time_zone": zone,
+                "subject": self.subject, "from": self.reach.from, "send_at": send_at, "time_zone": zone,
                 "warnings": warnings, "confirm_with": confirm,
             }),
         )
@@ -213,7 +213,14 @@ impl StudioTool {
             .as_ref()
             .map(|id| json!({"id": id, "name": campaign.pointer("/segment/name")}));
         let subject = text(&preview, "subject").or_else(|| text(&campaign, "subject"));
-        let from = text(&preview, "from");
+        let Some(reach) = self
+            .reviewed_reach(workspace_id, campaign_id, "recipients")
+            .await?
+        else {
+            return Ok(Err(
+                "This API cannot hold the send to what you reviewed, so nothing was sent.".into(),
+            ));
+        };
         let count = people(recipients);
         let mut warnings = Vec::new();
         let audience_name = text(&audience, "name").unwrap_or_else(|| NOT_ANSWERED.into());
@@ -241,7 +248,7 @@ impl StudioTool {
             campaign_id,
             name,
             subject,
-            from,
+            reach,
             revision,
             recipients,
             audience_id,
@@ -249,7 +256,6 @@ impl StudioTool {
             audience,
             segment,
             warnings,
-            checks_count: campaign.get("remaining").is_some(),
         }))
     }
 
@@ -397,27 +403,27 @@ impl StudioTool {
         });
         let recipients = agreed.recipients;
         let key = send_key(campaign_id, agreed.revision, &send_at, &time_zone);
-        let mut body = json!({
-            "workspaceId": workspace_id,
-            "sendAt": send_at,
-            "timeZone": time_zone,
-            "revision": agreed.revision,
-        });
-        // Older servers do not have the atomic count check. Both API features shipped together.
-        if review.checks_count {
-            body["expectedRecipients"] = json!(recipients);
-        }
-        let (answer, kept) = self
-            .email_call_newer(
+        let body = json!({"workspaceId":workspace_id, "sendAt":send_at, "timeZone":time_zone,
+            "revision":agreed.revision, "expectedRecipients":recipients,
+            "expectedReachDigest":review.reach.digest, "expectedFrom":review.reach.from});
+        let answer = self
+            .email_call(
                 "POST",
                 &format!("/campaigns/{campaign_id}/schedule"),
-                &body,
-                &["expectedRecipients"],
+                Some(&body),
                 Some(&key),
             )
             .await?;
-        if !kept || body.get("expectedRecipients").is_none() {
-            notes.push("Recipient count at schedule time: not answered by this API.".into());
+        if answer.status == 409 && answer.error_code() == Some("campaign_changed") {
+            return Ok(match self.send_review(workspace_id, campaign_id).await? {
+                Ok(now) => now.show(
+                    "Not sent: the campaign changed. Ask the person again.",
+                    &send_at,
+                    &time_zone,
+                    Some(recipients),
+                ),
+                Err(why) => ToolResult::error(why),
+            });
         }
         if !answer.is_success() {
             let refused = email_refusal(&answer, Topic::Campaign);

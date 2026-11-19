@@ -4430,8 +4430,8 @@ async fn guarded_writes_refuse_missing_guards_and_never_retry_a_rejected_field()
         (
             import_api(true),
             json!({"action":"email_contacts","operation":"import","csv":"Email\nada@example.com",
-                "workspace_id":"00000000-0000-4000-8000-000000000001",
-                "audience_id":"00000000-0000-4000-8000-000000000002",
+                "workspace_id":"17ab6543-59d3-4a97-a57e-6add460d98ae",
+                "audience_id":"fe106dc3-6903-4d62-b0b3-c33d33f19f71",
                 "consent_note":"Newsletter signup","consent_source":"form"}),
             "/create/email/contacts/import/preview".into(),
             "/create/email/contacts/import".into(),
@@ -4441,7 +4441,7 @@ async fn guarded_writes_refuse_missing_guards_and_never_retry_a_rejected_field()
         (
             usual(),
             json!({"action":"email_unsubscribes","operation":"remove","email":"ada@example.com",
-                "workspace_id":"00000000-0000-4000-8000-000000000001"}),
+                "workspace_id":"17ab6543-59d3-4a97-a57e-6add460d98ae"}),
             "/create/email/suppressions".into(),
             "/create/email/suppressions/remove".into(),
             "expectedSuppressionId",

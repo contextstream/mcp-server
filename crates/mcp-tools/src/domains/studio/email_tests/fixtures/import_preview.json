@@ -1,0 +1,10 @@
+{
+  "guards": ["eligible", "digest", "previewDigest"],
+  "columns": [{"index": 0, "header": "Email", "guess": "email", "samples": ["ada@example.com"]}],
+  "mapping": {"email": 0, "firstName": null, "lastName": null, "name": null, "tags": null, "attributes": {}},
+  "rows": 1, "valid": 1, "invalidCount": 0, "invalid": [], "duplicatesInFile": 0,
+  "existing": 0, "new": 1, "suppressed": 0, "eligible": 1,
+  "digest": "b5fc85e55755f9e0d030a10ab4429b6b2944855f9a0d60077fe832becbc41d72",
+  "previewDigest": "ac5f63e39c3e8208e8a1ed7351d5fe7620d09a8c7620dbad1552e35f0fd5368b",
+  "sample": [{"email": "ada@example.com", "firstName": null, "lastName": null, "tags": [], "attributes": {}}]
+}

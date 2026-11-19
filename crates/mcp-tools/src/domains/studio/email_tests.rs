@@ -332,12 +332,12 @@ fn api(status: Arc<Mutex<String>>, recipients: i64) -> Responder {
                 Answer::ok(json!({"deleted": true}))
             }
             ("GET", "/create/email/suppressions") => Answer::ok(json!({
-                "guards":["suppressionId"],"suppressions": [
-                    {"id": CONTACT, "email": "grace@northwind.example", "reason": "unsubscribed", "source": "one_click",
+                "suppressions": [
+                    {"id": CONTACT, "guards": ["suppressionId"], "email": "grace@northwind.example", "reason": "unsubscribed", "source": "one_click",
                      "campaignId": CAMPAIGN, "campaign": {"id": CAMPAIGN, "name": "Winter sale"},
                      "feedback": {"reason": "too_many", "comment": "Weekly is plenty", "at": "2026-10-20T08:01:00Z"},
                      "detail": null, "createdAt": "2026-10-20T08:00:00Z"},
-                    {"id": CONTACT, "email": "bounced@resend.dev", "reason": "bounced", "source": "webhook",
+                    {"id": CONTACT, "guards": ["suppressionId"], "email": "bounced@resend.dev", "reason": "bounced", "source": "webhook",
                      "campaignId": CAMPAIGN, "campaign": {"id": CAMPAIGN, "name": "Winter sale"},
                      "feedback": null, "detail": "550 5.1.1 Unknown user", "createdAt": "2026-10-19T08:00:00Z"}
                 ],
@@ -927,14 +927,10 @@ async fn a_stateless_client_is_asked_through_the_calls_result() {
     );
 }
 
-/// The agent's go (mcp-server ticket 875b09b7): on a stateless call, where a question can
-/// only go back as the call's result, the campaign's recipient count the agent confirms is the
-/// person's go as the agent gives it, and no question is sent. Some such clients say they can
-/// ask and never show the question (a Claude Code cloud session): the question waited until
-/// the client gave up on the call, and nothing could ever be sent. A client asked live is
-/// still asked first, for a bounded time, and with no answer the agent's count carries it.
+/// Decision fa8df22d: a current token is the agent's go for a result-answering client.
 #[tokio::test]
-async fn on_a_stateless_call_the_agents_confirmation_is_the_go_and_no_question_is_sent() {
+async fn a_result_answering_client_sends_with_a_current_token_unless_asked_mode_requires_a_person()
+{
     let stub = Stub::start(usual()).await;
     let tool = stub.tool();
     let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
@@ -956,34 +952,6 @@ async fn on_a_stateless_call_the_agents_confirmation_is_the_go_and_no_question_i
     assert!(peer.take_input_required().is_none(), "nobody is asked");
     assert_eq!(stub.calls_to("POST", &schedule).len(), 1);
 
-    // A live client that never answers: asked once, then the agent's count carries it.
-    let silent = Arc::new(FakeClient::default());
-    let sent = run_with_call_peer(
-        CallPeer::new(silent.clone(), None, true),
-        tool.execute(send.clone()),
-    )
-    .await
-    .unwrap();
-    assert!(!sent.is_error, "{}", text_of(&sent));
-    assert_eq!(silent.sent.lock().unwrap().len(), 1, "asked once");
-    assert_eq!(stub.calls_to("POST", &schedule).len(), 2);
-
-    // With no count from the agent, a live question nobody answers says so.
-    let unanswered = run_with_call_peer(
-        CallPeer::new(Arc::new(FakeClient::default()), None, true),
-        tool.execute(json!({"action": "email_send", "campaign_id": CAMPAIGN})),
-    )
-    .await
-    .unwrap();
-    assert!(
-        text_of(&unanswered).starts_with(
-            "Not sent yet: the person was asked through the client and gave no answer in time."
-        ),
-        "{}",
-        text_of(&unanswered)
-    );
-    assert_eq!(stub.calls_to("POST", &schedule).len(), 2);
-
     // Where only the person's own go counts, the stateless client is asked whatever the
     // agent confirms.
     let peer = stateless();
@@ -1001,8 +969,71 @@ async fn on_a_stateless_call_the_agents_confirmation_is_the_go_and_no_question_i
         "{}",
         text_of(&asking)
     );
-    assert!(peer.take_input_required().is_some());
-    assert_eq!(stub.calls_to("POST", &schedule).len(), 2);
+    assert_eq!(structured(&asking)["sent"], false);
+    let question = peer
+        .take_input_required()
+        .expect("asked mode must ask the person");
+    assert_eq!(stub.calls_to("POST", &schedule).len(), 1);
+    let key = question["inputRequests"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap();
+    let peer =
+        CallPeer::new(Arc::new(FakeClient::default()), None, false).with_inline_input(&json!({
+            "requestState": question["requestState"], "inputResponses": {key: {"action":"decline"}}
+        }));
+    let declined = mcp_client::run_with_config_override(
+        mcp_types::config::ConfigOverride {
+            go_ahead_asked_only: Some(true),
+            ..Default::default()
+        },
+        || run_with_call_peer(peer, tool.execute(send)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(structured(&declined)["declined"], true);
+    assert_eq!(stub.calls_to("POST", &schedule).len(), 1);
+}
+
+#[tokio::test]
+async fn a_live_client_is_asked_before_using_the_agents_confirmation() {
+    let stub = Stub::start(usual()).await;
+    let tool = stub.tool();
+    let schedule = format!("/create/email/campaigns/{CAMPAIGN}/schedule");
+    let review = tool
+        .execute(json!({"action":"email_send", "campaign_id":CAMPAIGN}))
+        .await
+        .unwrap();
+    let send = structured(&review)["confirm_with"].clone();
+    // A live client that never answers: asked once, then the agent's count carries it.
+    let silent = Arc::new(FakeClient::default());
+    let sent = run_with_call_peer(
+        CallPeer::new(silent.clone(), None, true),
+        tool.execute(send.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(!sent.is_error, "{}", text_of(&sent));
+    assert_eq!(silent.sent.lock().unwrap().len(), 1, "asked once");
+    assert_eq!(stub.calls_to("POST", &schedule).len(), 1);
+
+    // With no count from the agent, a live question nobody answers says so.
+    let unanswered = run_with_call_peer(
+        CallPeer::new(Arc::new(FakeClient::default()), None, true),
+        tool.execute(json!({"action": "email_send", "campaign_id": CAMPAIGN})),
+    )
+    .await
+    .unwrap();
+    assert!(
+        text_of(&unanswered).starts_with(
+            "Not sent yet: the person was asked through the client and gave no answer in time."
+        ),
+        "{}",
+        text_of(&unanswered)
+    );
+    assert_eq!(stub.calls_to("POST", &schedule).len(), 1);
 }
 
 /// Off the suppression list on a stateless call: an address that bounced comes off on the
@@ -1089,12 +1120,12 @@ async fn an_unknown_reason_is_asked_about_and_the_other_ways_through_are_pinned(
     let stub = Stub::start(Arc::new(|request: &Recorded| {
         if request.method == "GET" && request.path == "/create/email/suppressions" {
             return Answer::ok(json!({
-                "guards":["suppressionId"],"suppressions": [
-                    {"id": CONTACT, "email": "ada@northwind.example", "reason": "spam", "source": "webhook",
+                "suppressions": [
+                    {"id": CONTACT, "guards": ["suppressionId"], "email": "ada@northwind.example", "reason": "spam", "source": "webhook",
                      "detail": null, "createdAt": "2026-10-21T08:00:00Z"},
-                    {"id": CONTACT,"email": "lin@northwind.example", "source": "import",
+                    {"id": CONTACT,"guards": ["suppressionId"], "email": "lin@northwind.example", "source": "import",
                      "detail": null, "createdAt": "2026-10-22T08:00:00Z"},
-                    {"id": CONTACT, "email": "bounced@resend.dev", "reason": "bounced", "source": "webhook",
+                    {"id": CONTACT, "guards": ["suppressionId"], "email": "bounced@resend.dev", "reason": "bounced", "source": "webhook",
                      "detail": "550 5.1.1 Unknown user", "createdAt": "2026-10-19T08:00:00Z"}
                 ],
                 "nextCursor": null, "total": 3

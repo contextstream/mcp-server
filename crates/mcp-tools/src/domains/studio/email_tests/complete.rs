@@ -464,7 +464,7 @@ async fn newer_contacts_apply_membership_deltas_by_id_in_one_write() {
     assert!(stub.calls_to("GET", "/create/email/contacts").is_empty());
 }
 
-/// What `POST /contacts/import/preview` answers on today's main.
+/// A multi-row import preview with invalid, duplicate and suppressed addresses.
 fn import_preview_answer() -> Value {
     json!({
         "columns": [
@@ -4190,8 +4190,8 @@ async fn exact_address_lookups_page_past_fifty_substring_matches_for_contacts_an
             ("GET", "/create/email/suppressions") => {
                 if request.query.contains("cursor=50") {
                     Some(Answer::ok(json!({
-                        "guards":["suppressionId"],"suppressions": [{
-                            "id":CONTACT, "email": "ada@northwind.example",
+                        "suppressions": [{
+                            "id":CONTACT, "guards":["suppressionId"], "email": "ada@northwind.example",
                             "reason": "bounced",
                             "source": "webhook",
                             "detail": "550 Unknown",
@@ -4204,6 +4204,7 @@ async fn exact_address_lookups_page_past_fifty_substring_matches_for_contacts_an
                     let decoys: Vec<Value> = (0..50)
                         .map(|i| {
                             json!({
+                                "id":Uuid::from_u128(i + 1), "guards":["suppressionId"],
                                 "email": format!("prefix-{i}-ada@northwind.example"),
                                 "reason": "bounced",
                                 "source": "webhook",
@@ -4428,31 +4429,37 @@ async fn guarded_writes_refuse_missing_guards_and_never_retry_a_rejected_field()
         ),
         (
             import_api(true),
-            import_input("import"),
+            json!({"action":"email_contacts","operation":"import","csv":"Email\nada@example.com",
+                "workspace_id":"00000000-0000-4000-8000-000000000001",
+                "audience_id":"00000000-0000-4000-8000-000000000002",
+                "consent_note":"Newsletter signup","consent_source":"form"}),
             "/create/email/contacts/import/preview".into(),
             "/create/email/contacts/import".into(),
             "expectedPreviewDigest",
-            {
-                let mut preview = import_preview_answer();
-                preview["eligible"] = json!(114);
-                preview["digest"] = json!("rows");
-                preview["previewDigest"] = json!("entire-preview");
-                preview["guards"] = json!(["eligible", "digest", "previewDigest"]);
-                preview
-            },
+            serde_json::from_str(include_str!("fixtures/import_preview.json")).unwrap(),
         ),
         (
             usual(),
-            json!({"action":"email_unsubscribes","operation":"remove","email":"bounced@resend.dev"}),
+            json!({"action":"email_unsubscribes","operation":"remove","email":"ada@example.com",
+                "workspace_id":"00000000-0000-4000-8000-000000000001"}),
             "/create/email/suppressions".into(),
             "/create/email/suppressions/remove".into(),
             "expectedSuppressionId",
-            json!({"guards":["suppressionId"],"suppressions":[{"id":CONTACT,"email":"bounced@resend.dev","reason":"bounced"}]}),
+            serde_json::from_str(include_str!("fixtures/suppressions.json")).unwrap(),
         ),
     ] {
         for advertised in [true, false] {
             if !advertised {
-                review["guards"] = json!([]);
+                if field == "expectedSuppressionId" {
+                    // A page-level guard, or one on a different row, cannot authorize this row.
+                    let decoy =
+                        json!({"id":COPY, "email":"else@example.com", "guards":["suppressionId"]});
+                    review["suppressions"][0]["guards"] = json!([]);
+                    review["suppressions"].as_array_mut().unwrap().push(decoy);
+                    review["guards"] = json!(["suppressionId"]);
+                } else {
+                    review["guards"] = json!([]);
+                }
             }
             let base = base.clone();
             let read = read.clone();
@@ -4686,8 +4693,8 @@ async fn a_suppression_conflict_reviews_the_replacement_without_retrying_the_rem
                 (CONTACT, "manual")
             };
             Some(Answer::ok(json!({
-                "guards":["suppressionId"], "total":1, "nextCursor":null,
-                "suppressions":[{"id":id, "email":"ada@example.com", "reason":reason}]
+                "total":1, "nextCursor":null,
+                "suppressions":[{"id":id, "guards":["suppressionId"], "email":"ada@example.com", "reason":reason}]
             })))
         }
         REMOVE => {
@@ -4733,11 +4740,9 @@ async fn protected_suppression_reasons_always_need_a_person_and_only_the_current
 ) {
     for reason in ["unsubscribed", "complained", "future_reason"] {
         let stub = Stub::start(over(move |r| match r.path.as_str() {
-            "/create/email/suppressions" => Some(Answer::ok(
-                json!({"guards":["suppressionId"],"suppressions":[
-                    {"id":CONTACT,"email":"ada@example.com","reason":reason}
-                ]}),
-            )),
+            "/create/email/suppressions" => Some(Answer::ok(json!({"suppressions":[
+                {"id":CONTACT,"guards":["suppressionId"],"email":"ada@example.com","reason":reason}
+            ]}))),
             "/create/email/suppressions/remove" => {
                 Some(Answer::error(409, "suppression_changed", ""))
             }

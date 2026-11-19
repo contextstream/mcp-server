@@ -4594,3 +4594,44 @@ async fn protected_suppression_reasons_always_need_a_person_and_only_the_current
         assert_eq!(posts[0].body["expectedSuppressionId"], CONTACT);
     }
 }
+
+#[tokio::test]
+async fn asked_only_delete_routes_email_erasures_to_the_personal_question() {
+    let stub = Stub::start(over(|r| {
+        (r.method == "DELETE")
+            .then(|| Answer::ok(json!({"id":r.path.rsplit('/').next(),"deleted":true})))
+    }))
+    .await;
+    let mut registry = crate::registry::ToolRegistry::new(&TestFixtures::test_config());
+    registry.register(TOOL_NAME, Arc::new(stub.tool()));
+    registry.register("workspace", Arc::new(Bystander::workspace()));
+    crate::domains::destructive::register_delete_tool(&mut registry);
+    let request = json!({"action":"studio.email_audience_erase","audience_id":AUDIENCE});
+    let asked = mcp_types::config::ConfigOverride {
+        go_ahead_asked_only: Some(true),
+        ..Default::default()
+    };
+    let refused = mcp_client::run_with_config_override(asked.clone(), || {
+        registry.execute("delete", request.clone())
+    })
+    .await
+    .unwrap();
+    let erased = mcp_client::run_with_config_override(asked, || {
+        run_with_call_peer(consenting_client(), registry.execute("delete", request))
+    })
+    .await
+    .unwrap();
+    assert!(
+        refused.is_error
+            && text_of(&refused).contains("https://ctxproduct.com/studio/email")
+            && !erased.is_error,
+        "Without a client: {}. With a person's yes: {}",
+        text_of(&refused),
+        text_of(&erased)
+    );
+    assert_eq!(
+        stub.calls_to("DELETE", &format!("/create/email/audiences/{AUDIENCE}"))
+            .len(),
+        1
+    );
+}

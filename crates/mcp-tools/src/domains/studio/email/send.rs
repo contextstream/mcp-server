@@ -177,7 +177,15 @@ impl StudioTool {
                 )))
             }
         };
-        let Some(recipients) = number(&preview, "recipients") else {
+        let Some(reach) = self
+            .reviewed_reach(workspace_id, campaign_id, "recipients")
+            .await?
+        else {
+            return Ok(Err(
+                "This API cannot hold the send to what you reviewed, so nothing was sent.".into(),
+            ));
+        };
+        let Some(recipients) = reach.eligible else {
             return Ok(Err(format!("Not sent: the eligible count for “{name}” was not answered. Check its audience with email_recipients.")));
         };
         if recipients <= 0 {
@@ -213,14 +221,6 @@ impl StudioTool {
             .as_ref()
             .map(|id| json!({"id": id, "name": campaign.pointer("/segment/name")}));
         let subject = text(&preview, "subject").or_else(|| text(&campaign, "subject"));
-        let Some(reach) = self
-            .reviewed_reach(workspace_id, campaign_id, "recipients")
-            .await?
-        else {
-            return Ok(Err(
-                "This API cannot hold the send to what you reviewed, so nothing was sent.".into(),
-            ));
-        };
         let count = people(recipients);
         let mut warnings = Vec::new();
         let audience_name = text(&audience, "name").unwrap_or_else(|| NOT_ANSWERED.into());
@@ -439,14 +439,16 @@ impl StudioTool {
         let when = when_words(&send_at, &time_zone);
         let scheduled = answer.data;
         let state = text(&scheduled, "status").unwrap_or_default();
-        if !matches!(state.as_str(), "scheduled" | "sending" | "sent") {
+        if !matches!(state.as_str(), "scheduled" | "testing" | "sending" | "sent") {
             // A repeated key answers the campaign as it is: never say it went when it didn't.
             return Ok(ToolResult::error(format!(
                 "Not sent: Create kept “{name}” as {}. Read it with email_campaigns and ask the person again.",
                 if state.is_empty() { "it was" } else { state.as_str() }
             )));
         }
-        let mut lines = vec![if send_at == "now" {
+        let mut lines = vec![if state == "testing" {
+            format!("The A/B send for “{name}” has started in {target}. The sample is testing the subjects, and the remaining recipients will get the winner.")
+        } else if send_at == "now" {
             format!(
                 "Sending “{name}” to {} in {target} now: it starts within a minute.",
                 people(recipients)

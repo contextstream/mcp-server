@@ -216,6 +216,7 @@ fn has_guards(read: &Value, required: &[&str]) -> bool {
 }
 
 struct ReviewedReach {
+    eligible: Option<i64>,
     digest: String,
     from: String,
 }
@@ -1106,7 +1107,11 @@ impl StudioTool {
         });
         Ok(reach
             .zip(text(data, "from"))
-            .map(|(digest, from)| ReviewedReach { digest, from }))
+            .map(|(digest, from)| ReviewedReach {
+                eligible: number(data, "eligible"),
+                digest,
+                from,
+            }))
     }
 
     /// The audiences as Create lists them now, when they can be read.

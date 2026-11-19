@@ -293,7 +293,7 @@ async fn a_report_shows_a_persons_answer_once_and_claims_it() {
     let structured = first.structured_content.clone().expect("structured");
     assert_eq!(
         structured["deliveries"],
-        json!([{"id": fixture.delivery, "kind": "answer"}]),
+        json!([{"id": fixture.delivery, "kind": "answer", "frame": answer_block(fixture.delivery)}]),
         "{structured}"
     );
 
@@ -372,7 +372,7 @@ async fn a_persons_message_is_shown_as_the_server_wrapped_it_and_not_wrapped_aga
     assert!(!text.contains(TOKEN));
     assert_eq!(
         result.structured_content.unwrap()["deliveries"],
-        json!([{"id": fixture.delivery, "kind": "person_message"}])
+        json!([{"id": fixture.delivery, "kind": "person_message", "frame": message_block(&fixture)}])
     );
 }
 
@@ -455,7 +455,7 @@ async fn what_a_person_wrote_stays_inside_the_frame() {
     );
     assert_eq!(
         result.structured_content.unwrap()["deliveries"],
-        json!([{"id": fixture.delivery, "kind": "person_message"}])
+        json!([{"id": fixture.delivery, "kind": "person_message", "frame": text.split_once("\n\n").unwrap().1}])
     );
     // Only what the tool itself does was asked of the API.
     let asked: Vec<String> = api
@@ -1093,8 +1093,11 @@ async fn a_reply_the_api_does_not_take_is_said_calmly_and_can_be_sent_again() {
 #[tokio::test]
 async fn get_reads_this_sessions_run_with_what_waits_for_it() {
     let fixture = Fixture::new();
-    let delivery = fixture.message();
-    // Nothing waits when the run is first reported; a message does later.
+    let message = fixture.message();
+    let answer_id = Uuid::new_v4();
+    let mut answer = fixture.answer(json!([]));
+    answer["id"] = json!(answer_id);
+    // Nothing waits when the run is first reported; an answer and a message arrive later.
     let api = Api::start_in_turn(vec![
         fixture.recorded("working"),
         (
@@ -1103,8 +1106,9 @@ async fn get_reads_this_sessions_run_with_what_waits_for_it() {
             json!({"success": true, "data": fixture.run_view("working", json!({"name": "cinder", "runtime": "mcp"}))}),
         ),
         offered(vec![]),
-        offered(vec![delivery.clone()]),
-        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+        offered(vec![message.clone(), answer.clone()]),
+        (CLAIM, 200, held_with("claimed", &message, TOKEN)),
+        (CLAIM, 200, held_with("claimed", &answer, SECOND_TOKEN)),
     ])
     .await;
     let tool = fixture.tool(&api);
@@ -1120,11 +1124,20 @@ async fn get_reads_this_sessions_run_with_what_waits_for_it() {
         .await
         .expect("get");
     let text = text_of(&result);
+    let message = message_block(&fixture);
+    let answer = answer_block(answer_id);
     assert!(
-        text.ends_with(&format!("\n\n{}", message_block(&fixture))),
+        text.ends_with(&format!("\n\n{message}\n\n{answer}")),
         "{text}"
     );
-    assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+    assert_eq!(
+        result.structured_content.unwrap()["deliveries"],
+        json!([
+            {"id": fixture.delivery, "kind": "person_message", "frame": message},
+            {"id": answer_id, "kind": "answer", "frame": answer}
+        ])
+    );
+    assert_eq!(sent(&api, "POST", "/claim").len(), 2);
 }
 
 #[tokio::test]
@@ -1153,6 +1166,11 @@ async fn get_of_a_run_that_is_not_this_sessions_asks_for_no_delivery() {
     let text = text_of(&result);
     assert!(text.starts_with("[PROGRESS] "), "{text}");
     assert!(!text.contains("[PERSON"), "{text}");
+    assert!(result
+        .structured_content
+        .unwrap()
+        .get("deliveries")
+        .is_none());
     assert!(sent(&api, "GET", "/decision-requests/deliveries").is_empty());
     assert!(sent(&api, "POST", "/claim").is_empty());
 }
@@ -1421,7 +1439,7 @@ async fn a_kind_this_tool_does_not_know_is_not_passed_on() {
     assert!(!text.contains("COMMAND"), "{text}");
     assert_eq!(
         result.structured_content.unwrap()["deliveries"],
-        json!([{"id": fixture.delivery, "kind": "other"}])
+        json!([{"id": fixture.delivery, "kind": "other", "frame": text.split_once("\n\n").unwrap().1}])
     );
 }
 

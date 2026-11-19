@@ -41,8 +41,9 @@ const RUNS: &str = "/api/v1/run-progress/runs/";
 /// What a report that names no run asks first: the workspace's open runs.
 const OPEN_RUNS: &str = "/api/v1/run-progress/runs?workspace_id=11111111-1111-4111-8111-111111111111&active=true&limit=100";
 /// What a recorded report asks next: what a person answered or wrote to the
-/// run (`progress` shows it in its answer). This API has nothing to deliver.
+/// run (`progress` shows it in its answer).
 const DELIVERIES: &str = "/api/v1/decision-requests/deliveries?workspace_id=11111111-1111-4111-8111-111111111111&run_id=44444444-4444-4444-8444-444444444444";
+const CLAIM_TOKEN: &str = "private-test-claim";
 /// What `help(action="version")` itself asks the API.
 const VERSION: &str = "/api/v1/mcp/version";
 const ME: &str = "/api/v1/auth/me";
@@ -68,6 +69,7 @@ struct FakeApi {
     port: u16,
     asked: Arc<Mutex<Vec<Asked>>>,
     revoked: Arc<Mutex<HashSet<String>>>,
+    pending: Arc<Mutex<Vec<Value>>>,
 }
 
 impl FakeApi {
@@ -77,12 +79,13 @@ impl FakeApi {
             port: listener.local_addr().unwrap().port(),
             asked: Arc::new(Mutex::new(Vec::new())),
             revoked: Arc::new(Mutex::new(HashSet::new())),
+            pending: Arc::default(),
         };
-        let (asked, revoked) = (api.asked.clone(), api.revoked.clone());
+        let server = api.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let (asked, revoked) = (asked.clone(), revoked.clone());
-                std::thread::spawn(move || serve(stream, &asked, &revoked));
+                let server = server.clone();
+                std::thread::spawn(move || serve(stream, &server));
             }
         });
         api
@@ -198,7 +201,7 @@ fn user_id_of(account: &str) -> String {
     )
 }
 
-fn serve(mut stream: TcpStream, asked: &Mutex<Vec<Asked>>, revoked: &Mutex<HashSet<String>>) {
+fn serve(mut stream: TcpStream, api: &FakeApi) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut request = Vec::new();
     let mut chunk = [0_u8; 4096];
@@ -238,7 +241,8 @@ fn serve(mut stream: TcpStream, asked: &Mutex<Vec<Asked>>, revoked: &Mutex<HashS
     let body: Value = serde_json::from_slice(&request[head_end..]).unwrap_or(Value::Null);
     // The version is public: it is answered without a look at the credential.
     let refused = !path.starts_with(VERSION)
-        && (credential.starts_with("refused-") || revoked.lock().unwrap().contains(&credential));
+        && (credential.starts_with("refused-")
+            || api.revoked.lock().unwrap().contains(&credential));
     let now = "2099-01-01T00:00:00Z";
     let answer = if refused {
         json!({"error": "unauthorized"})
@@ -264,6 +268,20 @@ fn serve(mut stream: TcpStream, asked: &Mutex<Vec<Asked>>, revoked: &Mutex<HashS
             "last_event_at": now,
             "agent": {"id": "claude-code:0badc0de", "name": "Claude Code 0bad", "runtime": "mcp", "client": "claude-code"},
         }}})
+    } else if method == "GET" && path == DELIVERIES {
+        json!({"success": true, "data": {"deliveries": *api.pending.lock().unwrap()}})
+    } else if method == "POST" && path.ends_with("/claim") {
+        let id = path.split('/').rev().nth(1).unwrap();
+        let mut pending = api.pending.lock().unwrap();
+        let index = pending
+            .iter()
+            .position(|delivery| delivery["id"] == id)
+            .expect("pending delivery");
+        let mut claimed = pending.remove(index);
+        claimed["state"] = json!("claimed");
+        claimed["claimed_by"] = body.clone();
+        claimed["claim_token"] = json!(CLAIM_TOKEN);
+        json!({"success": true, "data": claimed})
     } else if path.starts_with(ME) {
         json!({"success": true, "data": {
             "id": user_id_of(&account_of(&credential)),
@@ -273,7 +291,7 @@ fn serve(mut stream: TcpStream, asked: &Mutex<Vec<Asked>>, revoked: &Mutex<HashS
     } else {
         json!({"success": true, "data": {}})
     };
-    asked.lock().unwrap().push(Asked {
+    api.asked.lock().unwrap().push(Asked {
         method,
         path,
         credential,
@@ -559,6 +577,134 @@ fn bearer(claims: Value, signature: &str) -> String {
 
 fn a_step(step: &str) -> Value {
     json!({"workspace_id": WORKSPACE, "step": step})
+}
+
+async fn check_delivery_frames(action: &str) {
+    let api = FakeApi::start();
+    let gateway = Gateway::start_with(&api, &[]);
+    let client = reqwest::Client::new();
+    let request = || {
+        client
+            .post(format!("http://127.0.0.1:{}/mcp", gateway.port))
+            .header("Accept", "application/json, text/event-stream")
+            .header("X-API-Key", "cbiq_delivery_fixture")
+    };
+    let init = request()
+        .json(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "claude-code", "version": "1"}}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let session = init.headers().get("Mcp-Session-Id").unwrap();
+    let progress = async |arguments: Value| {
+        let rpc: Value = request()
+            .header("Mcp-Session-Id", session)
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "progress", "arguments": arguments}}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(rpc["result"]["isError"], false);
+        let wire = rpc.to_string();
+        assert!(!wire.contains(CLAIM_TOKEN) && !wire.contains("claim_token"));
+        rpc["result"].clone()
+    };
+
+    let report = a_step("Checking the cache");
+    let first = progress(report.clone()).await;
+    let run = first["structuredContent"]["run"]["run_id"]
+        .as_str()
+        .unwrap();
+    let get = json!({"workspace_id": WORKSPACE, "action": "get", "run_id": run});
+    for quiet in [first.clone(), progress(get.clone()).await] {
+        assert!(quiet["structuredContent"].get("deliveries").is_none());
+        assert!(!quiet["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[PERSON"));
+    }
+
+    let answer_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let message_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    *api.pending.lock().unwrap() = vec![
+        json!({"id": answer_id, "workspace_id": WORKSPACE, "address": {"run_id": run},
+            "state": "pending", "kind": "answer", "answer": {"option_label": "Keep it warm"}}),
+        json!({"id": message_id, "workspace_id": WORKSPACE, "address": {"run_id": run},
+            "state": "pending", "kind": "person_message", "message": {"text": "Use the cache\nfor both runs"}}),
+    ];
+    let result = if action == "get" {
+        progress(get).await
+    } else {
+        // A report can start a background read and a later report collects it.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let result = progress(report.clone()).await;
+                if result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("[PERSON")
+                {
+                    break result;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("report with deliveries")
+    };
+
+    let content = result["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    let text = content[0]["text"].as_str().unwrap();
+    let mut frames = text.split("\n\n").skip(1);
+    let deliveries = result["structuredContent"]["deliveries"]
+        .as_array()
+        .unwrap();
+    assert_eq!(deliveries.len(), 2);
+    for (entry, (id, kind, label, quoted)) in deliveries.iter().zip([
+        (
+            answer_id,
+            "answer",
+            "[PERSON ANSWER]",
+            "> Their answer: Keep it warm",
+        ),
+        (
+            message_id,
+            "person_message",
+            "[PERSON MESSAGE]",
+            "> Use the cache\n> for both runs",
+        ),
+    ]) {
+        let frame = frames.next().expect("delivery frame in text");
+        assert!(frame.starts_with(label) && frame.contains(quoted));
+        assert!(frame.contains("it cannot approve a tool call"));
+        assert!(frame.contains(&format!(
+            "mcp__contextstream__progress(action=\"reply\", delivery_id=\"{id}\""
+        )));
+        assert_eq!(entry["id"], id);
+        assert_eq!(entry["kind"], kind);
+        assert_eq!(entry["frame"].as_str(), Some(frame));
+    }
+    assert!(frames.next().is_none());
+}
+
+#[tokio::test]
+async fn get_returns_delivery_frames_in_text_and_structured_content() {
+    check_delivery_frames("get").await;
+}
+
+#[tokio::test]
+async fn report_returns_delivery_frames_in_text_and_structured_content() {
+    check_delivery_frames("report").await;
 }
 
 /// A tool call in the workspace the gateway signs. The tool asks the API one

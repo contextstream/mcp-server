@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.86
+
+- A person's answer or message that the `progress` tool shows now carries its framed words in the structured result as well (`deliveries[].frame`), not only in the text. Clients that show the model the structured result, such as Claude Code on the hosted server, received the delivery's id and kind without what the person wrote.
+
 ## 1.0.85
 
 - Studio email revisions, previews, and test sends use the workspace's newest draft when `campaign_id` is omitted and report its subject and ID. `email_revise` can rewrite the draft and set its subject and preheader in one call.

@@ -3104,16 +3104,17 @@ async fn round7_local_report_fifteen_minutes_later_is_unchanged() {
 /// connection has no record of reporting it, word for word.
 const REATTACH_WHY: &str = "This connection has no record of reporting this run (the server may have restarted), so nothing a person sent it is shown here.";
 
-/// The whole advice for the fixture's run, which has a workspace and a project.
+/// The whole advice for the fixture's run, to a client that names the tool
+/// `progress` (the fixture's client sends no name).
 fn reattach(f: &Fixture) -> String {
     format!(
-        "{REATTACH_WHY} If you opened it with a run_key or ticket_id, send one report with that same run_key or ticket_id, workspace_id \"{}\", project_id \"{}\" and nothing else (no step, status or waiting): it restores the record and leaves the run's wait as it is. Check that the report answers with run_id \"{}\", then read it again.",
-        f.workspace, f.project, f.run
+        "{REATTACH_WHY} If you opened it with a run_key, read it again with that run_key: progress(action=\"get\", run_id=\"{}\", run_key=\"<the run_key you opened it with>\"). Nothing is written, and a run_key that does not name this run changes nothing.",
+        f.run
     )
 }
 
 /// The run as the API shows it to `get`: reported by `agent`, waiting on a
-/// person when `waits`, with `unread` messages on its line.
+/// person when `waits`, with `unread` replies on its line.
 fn seen_run(f: &Fixture, agent: Value, waits: bool, unread: u64) -> (&'static str, u16, Value) {
     let mut view = f.run_view(if waits { "waiting_input" } else { "working" }, agent);
     if waits {
@@ -3143,75 +3144,151 @@ fn restarted_gateway(f: &Fixture, api: &Api, state: &tempfile::TempDir) -> Progr
     tool
 }
 
+/// A run named by `key` in the fixture's workspace, waiting on a person, with
+/// an answer for it; read through a gateway that has no record of it.
+async fn read_after_restart(
+    f: &mut Fixture,
+    key: impl FnOnce(&str) -> String,
+    ticket: Option<Uuid>,
+    get: Value,
+) -> (Api, ToolResult) {
+    let mine = hosted_agent(f, "hosted-session").await;
+    let session = mcp_client::run_with_mcp_session_id("hosted-session".into(), || async {
+        session_part(true)
+    })
+    .await;
+    f.run = run_id_of_key(f.workspace, &key(&session));
+    let delivery = f.answer(json!([]));
+    let (route, status, mut body) = seen_run(f, mine, true, 0);
+    if let Some(ticket) = ticket {
+        body["data"]["ticket"] = json!({"id": ticket, "title": "Warm the cache", "status": "open"});
+    }
+    let api = Api::start(vec![
+        (route, status, body),
+        offered(vec![delivery.clone()]),
+        (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+    ])
+    .await;
+    let state = tempfile::tempdir().unwrap();
+    let tool = restarted_gateway(f, &api, &state);
+    let mut get = get;
+    get["action"] = json!("get");
+    get["run_id"] = json!(f.run);
+    let read = mcp_client::run_with_mcp_session_id("hosted-session".into(), || async {
+        tool.execute(get).await.expect("get")
+    })
+    .await;
+    (api, read)
+}
+
 #[tokio::test]
-async fn a_gateway_that_lost_its_record_of_a_waiting_run_says_how_to_read_what_waits() {
+async fn a_restarted_gateway_shows_what_waits_for_the_sessions_own_default_run() {
+    // The run's id is derived from this session's own default key, so the
+    // run is this session's by construction: no report, no advice.
     with_caller(async {
-        let f = Fixture::new();
-        let delivery = f.answer(json!([]));
-        let mine = hosted_agent(&f, "hosted-session").await;
-        let api = Api::start(vec![
-            f.recorded("waiting_input"),
-            seen_run(&f, mine, true, 0),
-            offered(vec![delivery.clone()]),
-            (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
-        ])
+        let mut f = Fixture::new();
+        let (api, read) =
+            read_after_restart(&mut f, |s| format!("{s}:session"), None, json!({})).await;
+        assert!(
+            text_of(&read).contains(&answer_block(f.delivery)),
+            "{}",
+            text_of(&read)
+        );
+        assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+        assert!(sent(&api, "POST", "/run-progress/report").is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_restarted_gateway_shows_what_waits_for_the_sessions_own_ticket_run() {
+    with_caller(async {
+        let mut f = Fixture::new();
+        let ticket = Uuid::new_v4();
+        let (api, read) =
+            read_after_restart(&mut f, |s| format!("{s}:{ticket}"), Some(ticket), json!({})).await;
+        assert!(
+            text_of(&read).contains(&answer_block(f.delivery)),
+            "{}",
+            text_of(&read)
+        );
+        assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+        assert!(sent(&api, "POST", "/run-progress/report").is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_run_opened_with_a_run_key_is_read_again_with_that_run_key() {
+    with_caller(async {
+        // Without the run_key: why, and how to read it; nothing read or claimed.
+        let mut f = Fixture::new();
+        let (api, read) =
+            read_after_restart(&mut f, |_| "warm-cache".to_string(), None, json!({})).await;
+        let text = text_of(&read);
+        assert!(text.ends_with(&format!("\n\n{}", reattach(&f))), "{text}");
+        assert!(!text.contains("[PERSON"), "{text}");
+        assert_eq!(
+            read.structured_content.unwrap()["delivery_notice"],
+            json!(reattach(&f))
+        );
+        assert!(api
+            .requests()
+            .iter()
+            .all(|r| !r.target.contains("decision-requests")));
+
+        // A run_key that does not name the run changes nothing.
+        let mut f = Fixture::new();
+        let (api, read) = read_after_restart(
+            &mut f,
+            |_| "warm-cache".to_string(),
+            None,
+            json!({"run_key": "cold-cache"}),
+        )
         .await;
-        let state = tempfile::tempdir().unwrap();
-        let tool = restarted_gateway(&f, &api, &state);
-        mcp_client::run_with_mcp_session_id("hosted-session".into(), || async {
-            let read = tool
-                .execute(json!({"action": "get", "run_id": f.run}))
-                .await
-                .expect("get");
-            let text = text_of(&read);
-            assert!(text.ends_with(&format!("\n\n{}", reattach(&f))), "{text}");
-            assert!(!text.contains("[PERSON"), "{text}");
-            assert_eq!(
-                read.structured_content.unwrap()["delivery_notice"],
-                json!(reattach(&f))
-            );
-            // Without a record nothing is read or claimed.
-            assert!(sent(&api, "GET", "/decision-requests/deliveries").is_empty());
-            assert!(sent(&api, "POST", "/claim").is_empty());
-            // Doing what it says: one report that only names the run, which
-            // leaves its wait alone, so its question is not asked again.
-            let reported = tool
-                .execute(json!({
-                    "run_key": "warm-cache",
-                    "workspace_id": f.workspace,
-                    "project_id": f.project,
-                }))
-                .await
-                .expect("report");
-            let reports = sent(&api, "POST", "/run-progress/report");
-            assert_eq!(reports.len(), 1);
-            assert_eq!(reports[0].body["source_run_id"], "warm-cache");
-            assert_eq!(reports[0].body["workspace_id"], json!(f.workspace));
-            assert_eq!(reports[0].body["project_id"], json!(f.project));
-            for absent in ["step", "status", "waiting"] {
-                assert!(
-                    reports[0].body.get(absent).is_none(),
-                    "{absent}: {}",
-                    reports[0].body
-                );
-            }
-            assert_eq!(
-                reported.structured_content.unwrap()["run"]["run_id"],
-                json!(f.run)
-            );
-            // Then reading the run again by its id shows the answer, once.
-            let again = tool
-                .execute(json!({"action": "get", "run_id": f.run}))
-                .await
-                .expect("get");
-            assert!(
-                text_of(&again).contains(&answer_block(f.delivery)),
-                "{}",
-                text_of(&again)
-            );
-            assert_eq!(sent(&api, "POST", "/claim").len(), 1);
-        })
+        assert!(text_of(&read).ends_with(&format!("\n\n{}", reattach(&f))));
+        assert!(api
+            .requests()
+            .iter()
+            .all(|r| !r.target.contains("decision-requests")));
+
+        // With the run_key it was opened with: the answer, and no report.
+        let mut f = Fixture::new();
+        let (api, read) = read_after_restart(
+            &mut f,
+            |_| "warm-cache".to_string(),
+            None,
+            json!({"run_key": "warm-cache"}),
+        )
         .await;
+        assert!(
+            text_of(&read).contains(&answer_block(f.delivery)),
+            "{}",
+            text_of(&read)
+        );
+        assert_eq!(sent(&api, "POST", "/claim").len(), 1);
+        assert!(sent(&api, "POST", "/run-progress/report").is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_ticket_or_default_key_of_another_session_proves_nothing() {
+    // The same keys under another session's part derive other runs.
+    with_caller(async {
+        let mut f = Fixture::new();
+        let (api, read) = read_after_restart(
+            &mut f,
+            |_| "s-0000000000000000:session".to_string(),
+            None,
+            json!({}),
+        )
+        .await;
+        assert!(text_of(&read).ends_with(&format!("\n\n{}", reattach(&f))));
+        assert!(api
+            .requests()
+            .iter()
+            .all(|r| !r.target.contains("decision-requests")));
     })
     .await;
 }
@@ -3238,34 +3315,6 @@ async fn unread_replies_on_the_line_alone_give_no_advice() {
             .unwrap()
             .get("delivery_notice")
             .is_none());
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn a_waiting_run_without_a_project_is_only_explained() {
-    // A report without project_id takes the session's default project, so
-    // no report is suggested for a run that has none.
-    with_caller(async {
-        let f = Fixture::new();
-        let mine = hosted_agent(&f, "hosted-session").await;
-        let (route, status, mut body) = seen_run(&f, mine, true, 0);
-        body["data"]["project_id"] = Value::Null;
-        let api = Api::start(vec![(route, status, body)]).await;
-        let state = tempfile::tempdir().unwrap();
-        let tool = restarted_gateway(&f, &api, &state);
-        let read = mcp_client::run_with_mcp_session_id("hosted-session".into(), || async {
-            tool.execute(json!({"action": "get", "run_id": f.run}))
-                .await
-                .expect("get")
-        })
-        .await;
-        let text = text_of(&read);
-        assert!(text.ends_with(&format!("\n\n{REATTACH_WHY}")), "{text}");
-        assert_eq!(
-            read.structured_content.unwrap()["delivery_notice"],
-            json!(REATTACH_WHY)
-        );
         assert!(api
             .requests()
             .iter()
@@ -3280,8 +3329,8 @@ async fn no_advice_for_another_sessions_run_or_a_run_that_waits_for_nothing() {
         let f = Fixture::new();
         let mine = hosted_agent(&f, "hosted-session").await;
         let theirs = json!({"id": "claude-code:0badc0de", "name": "Claude Code 0bad", "runtime": "mcp", "client": "claude-code"});
-        for (agent, waits, unread) in [(theirs, true, 1), (mine, false, 0)] {
-            let api = Api::start(vec![seen_run(&f, agent.clone(), waits, unread)]).await;
+        for (agent, waits) in [(theirs, true), (mine, false)] {
+            let api = Api::start(vec![seen_run(&f, agent.clone(), waits, 0)]).await;
             let state = tempfile::tempdir().unwrap();
             let tool = restarted_gateway(&f, &api, &state);
             let read = mcp_client::run_with_mcp_session_id("hosted-session".into(), || async {

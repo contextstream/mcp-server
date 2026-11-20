@@ -719,8 +719,15 @@ impl ProgressTool {
                         let offered = if run_has_ended(&view) {
                             Offered::default()
                         } else {
-                            self.offered_to_own_run(workspace_id, run_id, is_http, &view)
-                                .await
+                            self.offered_to_own_run(
+                                workspace_id,
+                                run_id,
+                                is_http,
+                                &view,
+                                input.run_key.as_deref(),
+                                ticket_id,
+                            )
+                            .await
                         };
                         let text = format!("{}{}", run_text(&view), offered.text());
                         if let Some(fields) = view.as_object_mut() {
@@ -824,6 +831,8 @@ impl ProgressTool {
         run_id: Uuid,
         is_http: bool,
         view: &Value,
+        run_key: Option<&str>,
+        ticket_id: Option<Uuid>,
     ) -> Offered {
         let Some(owner) = self.delivery_owner(workspace_id, is_http).await else {
             return Offered::default();
@@ -834,15 +843,20 @@ impl ProgressTool {
             if is_http && self.deliveries.would_refuse(&owner) {
                 return Offered::refused(&owner, is_http);
             }
-            // Nothing is read or claimed without the evidence. The gateway
-            // keeps it in memory and in its own state directory, so a
-            // restart, a redeploy or another replica loses it while the run
-            // still waits. Say how to take the run back instead of saying
+            // The gateway keeps its evidence in memory and in its own state
+            // directory, so a restart, a redeploy or another replica loses it
+            // while the run still waits. A run whose id derives from a key
+            // this session's reports would name is this session's by
+            // construction, and `poll` records the evidence again before it
+            // claims anything. Otherwise nothing is read or claimed, and the
+            // session is told how to name its run instead of being told
             // nothing.
-            return Offered {
-                notice: self.reattach_advice(view, is_http).await,
-                ..Offered::default()
-            };
+            if !derives_own_run(workspace_id, run_id, is_http, view, run_key, ticket_id) {
+                return Offered {
+                    notice: self.reattach_advice(view, run_id, is_http).await,
+                    ..Offered::default()
+                };
+            }
         }
         run_deliveries::poll(
             &self.client,
@@ -856,19 +870,16 @@ impl ProgressTool {
     }
 
     /// What to tell a session that asks for a run it has no record of
-    /// reporting here, when the run waits on a person (an answer, an approval
-    /// or a sign-in) and the run's agent is this session's agent. That match
-    /// is never proof of ownership (anyone who reports may name any agent),
-    /// so nothing is read or claimed. It only decides whether the advice is
-    /// given. Unread replies on the run's line are not a reason: they are the
-    /// agent's own applied replies that the viewer has not read.
-    ///
-    /// A report is suggested only to a session that opened the run with a
-    /// run_key or ticket_id, and with the run's own workspace and project
-    /// named. An unkeyed report can reach another run of the session, and one
-    /// without project_id takes the session's default project. A run without
-    /// a project is therefore only explained.
-    async fn reattach_advice(&self, view: &Value, is_http: bool) -> Option<String> {
+    /// reporting here and cannot prove is its own (see [`derives_own_run`]),
+    /// when the run waits on a person (an answer, an approval or a sign-in)
+    /// and the run's agent is this session's agent. That match is never proof
+    /// of ownership (anyone who reports may name any agent), so nothing is
+    /// read or claimed. It only decides whether the advice is given. Unread
+    /// replies on the run's line are not a reason: they are the agent's own
+    /// applied replies that the viewer has not read. The advice never asks
+    /// for a write. A run opened with an explicit run_key is read again with
+    /// that run_key, which proves the run only if it derives the same id.
+    async fn reattach_advice(&self, view: &Value, run_id: Uuid, is_http: bool) -> Option<String> {
         let waits = view
             .pointer("/waiting/on")
             .and_then(Value::as_str)
@@ -887,17 +898,10 @@ impl ProgressTool {
         if !same {
             return None;
         }
-        let id = |field: &str| {
-            view.get(field)
-                .and_then(Value::as_str)
-                .and_then(|raw| Uuid::parse_str(raw).ok())
-        };
-        Some(match (id("run_id"), id("workspace_id"), id("project_id")) {
-            (Some(run), Some(workspace), Some(project)) => format!(
-                "{REATTACH_WHY} If you opened it with a run_key or ticket_id, send one report with that same run_key or ticket_id, workspace_id \"{workspace}\", project_id \"{project}\" and nothing else (no step, status or waiting): it restores the record and leaves the run's wait as it is. Check that the report answers with run_id \"{run}\", then read it again."
-            ),
-            _ => REATTACH_WHY.to_string(),
-        })
+        let tool = run_deliveries::tool_for(mine.get("client").and_then(Value::as_str));
+        Some(format!(
+            "{REATTACH_WHY} If you opened it with a run_key, read it again with that run_key: {tool}(action=\"get\", run_id=\"{run_id}\", run_key=\"<the run_key you opened it with>\"). Nothing is written, and a run_key that does not name this run changes nothing."
+        ))
     }
 
     /// `reply` and `decline`: confirm what a person sent a run.
@@ -1610,6 +1614,52 @@ fn short_digest(text: &str) -> String {
         write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
     }
     encoded
+}
+
+/// Whether `run_id` is a run this session can show what waits for, without
+/// a report. The API derives a run's id from the key a report names
+/// ([`run_id_of_key`]), so `run_id` is proven when it is the run of one of these:
+/// - this session's default key or its key for a ticket (the call's, or the
+///   view's). Each carries the session's own part, and counts only when that
+///   part stands for one session ([`is_one_session`]), as in
+///   [`names_own_run`];
+/// - the run_key the call names. A report naming that key would reach the same
+///   run and record the same evidence, so this grants nothing a report does
+///   not.
+///
+/// Nothing is written to find out, a key that derives another id changes
+/// nothing, and the API still decides every claim.
+fn derives_own_run(
+    workspace_id: Uuid,
+    run_id: Uuid,
+    is_http: bool,
+    view: &Value,
+    run_key: Option<&str>,
+    ticket_id: Option<Uuid>,
+) -> bool {
+    let session = session_part(is_http);
+    let ticket_of = |pointer: &str| {
+        view.pointer(pointer)
+            .and_then(Value::as_str)
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+    };
+    let tickets = [
+        ticket_id,
+        ticket_of("/ticket/id"),
+        ticket_of("/scope/ticket_id"),
+    ];
+    let own = is_one_session(&session, is_http).then(|| {
+        std::iter::once(run_key_of(None, &session, None)).chain(
+            tickets
+                .into_iter()
+                .flatten()
+                .map(|ticket| run_key_of(None, &session, Some(ticket))),
+        )
+    });
+    own.into_iter()
+        .flatten()
+        .chain(run_key.map(|given| run_key_of(Some(given), &session, None)))
+        .any(|key| run_id_of_key(workspace_id, &key) == run_id)
 }
 
 /// The id the API gives the run an MCP agent reports under `key` (its

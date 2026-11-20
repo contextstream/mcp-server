@@ -853,7 +853,9 @@ impl ProgressTool {
             // nothing.
             if !derives_own_run(workspace_id, run_id, is_http, view, run_key, ticket_id) {
                 return Offered {
-                    notice: self.reattach_advice(view, run_id, is_http).await,
+                    notice: self
+                        .reattach_advice(view, workspace_id, run_id, is_http)
+                        .await,
                     ..Offered::default()
                 };
             }
@@ -877,9 +879,17 @@ impl ProgressTool {
     /// read or claimed. It only decides whether the advice is given. Unread
     /// replies on the run's line are not a reason: they are the agent's own
     /// applied replies that the viewer has not read. The advice never asks
-    /// for a write. A run opened with an explicit run_key is read again with
-    /// that run_key, which proves the run only if it derives the same id.
-    async fn reattach_advice(&self, view: &Value, run_id: Uuid, is_http: bool) -> Option<String> {
+    /// for a progress report. A run opened with an explicit run_key is read
+    /// again with that run_key, in the same workspace. That proves the run only
+    /// if it derives the same id, and then claims what waits, as any get of a
+    /// proven run does.
+    async fn reattach_advice(
+        &self,
+        view: &Value,
+        workspace_id: Uuid,
+        run_id: Uuid,
+        is_http: bool,
+    ) -> Option<String> {
         let waits = view
             .pointer("/waiting/on")
             .and_then(Value::as_str)
@@ -900,7 +910,7 @@ impl ProgressTool {
         }
         let tool = run_deliveries::tool_for(mine.get("client").and_then(Value::as_str));
         Some(format!(
-            "{REATTACH_WHY} If you opened it with a run_key, read it again with that run_key: {tool}(action=\"get\", run_id=\"{run_id}\", run_key=\"<the run_key you opened it with>\"). Nothing is written, and a run_key that does not name this run changes nothing."
+            "{REATTACH_WHY} If you opened it with a run_key, add that run_key to this same call: {tool}(action=\"get\", run_id=\"{run_id}\", workspace_id=\"{workspace_id}\", run_key=\"<the run_key you opened it with>\"). That sends no progress report. With the run_key it was opened with, it shows and claims what waits; a run_key that does not name this run changes nothing."
         ))
     }
 

@@ -95,9 +95,10 @@ const OPEN_RUNS_READ: i64 = 100;
 /// The agent's name when neither an agent name nor a client name is known.
 const DEFAULT_AGENT_NAME: &str = "MCP agent";
 
-/// What `get` says of a run that waits on a person when this connection has
-/// no record of reporting it (see `ProgressTool::reattach_advice`).
-const REATTACH_ADVICE: &str = "This connection has no record of reporting this run (the server may have restarted), so nothing a person sent it is shown here. If it is your run, send one report that names it exactly as before (the same run_key, or the same ticket_id, or neither if you gave neither) and nothing else: no step, status or waiting, so its wait stays as it is and no question is asked again. Check that the report answers with this run's run_id, then read it again.";
+/// Why `get` shows nothing for a run that waits on a person when this
+/// connection has no record of reporting it (see
+/// `ProgressTool::reattach_advice`).
+const REATTACH_WHY: &str = "This connection has no record of reporting this run (the server may have restarted), so nothing a person sent it is shown here.";
 
 /// `kind` values of a step.
 const STEP_KINDS: &[&str] = &[
@@ -855,21 +856,23 @@ impl ProgressTool {
     }
 
     /// What to tell a session that asks for a run it has no record of
-    /// reporting here, when something from a person may wait for that run:
-    /// it waits on an answer, an approval or a sign-in, or its line has
-    /// unread messages. Only when the run's agent is this session's agent.
-    /// That match is never proof of ownership (anyone who reports may name
-    /// any agent), so it never reads or claims anything. It only decides
-    /// whether this advice is worth giving.
+    /// reporting here, when the run waits on a person (an answer, an approval
+    /// or a sign-in) and the run's agent is this session's agent. That match
+    /// is never proof of ownership (anyone who reports may name any agent),
+    /// so nothing is read or claimed. It only decides whether the advice is
+    /// given. Unread replies on the run's line are not a reason: they are the
+    /// agent's own applied replies that the viewer has not read.
+    ///
+    /// A report is suggested only to a session that opened the run with a
+    /// run_key or ticket_id, and with the run's own workspace and project
+    /// named. An unkeyed report can reach another run of the session, and one
+    /// without project_id takes the session's default project. A run without
+    /// a project is therefore only explained.
     async fn reattach_advice(&self, view: &Value, is_http: bool) -> Option<String> {
         let waits = view
             .pointer("/waiting/on")
             .and_then(Value::as_str)
-            .is_some_and(|on| matches!(on, "person" | "approval" | "sign_in"))
-            || view
-                .pointer("/line/unread")
-                .and_then(Value::as_u64)
-                .is_some_and(|unread| unread > 0);
+            .is_some_and(|on| matches!(on, "person" | "approval" | "sign_in"));
         if !waits {
             return None;
         }
@@ -881,7 +884,20 @@ impl ProgressTool {
             (Some(theirs), Some(ours)) => !ours.is_empty() && theirs == ours,
             _ => false,
         };
-        same.then(|| REATTACH_ADVICE.to_string())
+        if !same {
+            return None;
+        }
+        let id = |field: &str| {
+            view.get(field)
+                .and_then(Value::as_str)
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+        };
+        Some(match (id("run_id"), id("workspace_id"), id("project_id")) {
+            (Some(run), Some(workspace), Some(project)) => format!(
+                "{REATTACH_WHY} If you opened it with a run_key or ticket_id, send one report with that same run_key or ticket_id, workspace_id \"{workspace}\", project_id \"{project}\" and nothing else (no step, status or waiting): it restores the record and leaves the run's wait as it is. Check that the report answers with run_id \"{run}\", then read it again."
+            ),
+            _ => REATTACH_WHY.to_string(),
+        })
     }
 
     /// `reply` and `decline`: confirm what a person sent a run.

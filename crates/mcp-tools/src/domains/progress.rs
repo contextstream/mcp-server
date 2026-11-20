@@ -95,6 +95,10 @@ const OPEN_RUNS_READ: i64 = 100;
 /// The agent's name when neither an agent name nor a client name is known.
 const DEFAULT_AGENT_NAME: &str = "MCP agent";
 
+/// What `get` says of a run that waits on a person when this connection has
+/// no record of reporting it (see `ProgressTool::reattach_advice`).
+const REATTACH_ADVICE: &str = "This connection has no record of reporting this run (the server may have restarted), so nothing a person sent it is shown here. If it is your run, report on it once as before (the same run_key, or none if you gave none, with its waiting question if it still waits), then read it again.";
+
 /// `kind` values of a step.
 const STEP_KINDS: &[&str] = &[
     "read", "edit", "run", "search", "browse", "git", "test", "think", "post", "other",
@@ -714,7 +718,8 @@ impl ProgressTool {
                         let offered = if run_has_ended(&view) {
                             Offered::default()
                         } else {
-                            self.offered_to_own_run(workspace_id, run_id, is_http).await
+                            self.offered_to_own_run(workspace_id, run_id, is_http, &view)
+                                .await
                         };
                         let text = format!("{}{}", run_text(&view), offered.text());
                         if let Some(fields) = view.as_object_mut() {
@@ -812,7 +817,13 @@ impl ProgressTool {
         })
     }
 
-    async fn offered_to_own_run(&self, workspace_id: Uuid, run_id: Uuid, is_http: bool) -> Offered {
+    async fn offered_to_own_run(
+        &self,
+        workspace_id: Uuid,
+        run_id: Uuid,
+        is_http: bool,
+        view: &Value,
+    ) -> Offered {
         let Some(owner) = self.delivery_owner(workspace_id, is_http).await else {
             return Offered::default();
         };
@@ -822,7 +833,15 @@ impl ProgressTool {
             if is_http && self.deliveries.would_refuse(&owner) {
                 return Offered::refused(&owner, is_http);
             }
-            return Offered::default();
+            // Nothing is read or claimed without the evidence. The gateway
+            // keeps it in memory and in its own state directory, so a
+            // restart, a redeploy or another replica loses it while the run
+            // still waits. Say how to take the run back instead of saying
+            // nothing.
+            return Offered {
+                notice: self.reattach_advice(view, is_http).await,
+                ..Offered::default()
+            };
         }
         run_deliveries::poll(
             &self.client,
@@ -833,6 +852,36 @@ impl ProgressTool {
             PollFor::Get,
         )
         .await
+    }
+
+    /// What to tell a session that asks for a run it has no record of
+    /// reporting here, when something from a person may wait for that run:
+    /// it waits on an answer, an approval or a sign-in, or its line has
+    /// unread messages. Only when the run's agent is this session's agent.
+    /// That match is never proof of ownership (anyone who reports may name
+    /// any agent), so it never reads or claims anything. It only decides
+    /// whether this advice is worth giving.
+    async fn reattach_advice(&self, view: &Value, is_http: bool) -> Option<String> {
+        let waits = view
+            .pointer("/waiting/on")
+            .and_then(Value::as_str)
+            .is_some_and(|on| matches!(on, "person" | "approval" | "sign_in"))
+            || view
+                .pointer("/line/unread")
+                .and_then(Value::as_u64)
+                .is_some_and(|unread| unread > 0);
+        if !waits {
+            return None;
+        }
+        let mine = self.agent(is_http).await;
+        let same = match (
+            view.pointer("/agent/id").and_then(Value::as_str),
+            mine.get("id").and_then(Value::as_str),
+        ) {
+            (Some(theirs), Some(ours)) => !ours.is_empty() && theirs == ours,
+            _ => false,
+        };
+        same.then(|| REATTACH_ADVICE.to_string())
     }
 
     /// `reply` and `decline`: confirm what a person sent a run.

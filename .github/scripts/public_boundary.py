@@ -114,6 +114,9 @@ ALLOWED_UUID_LITERALS = {
     "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
     "ffffffff-ffff-4fff-bfff-ffffffffffff",
+    # uuid5(11111111-1111-4111-8111-111111111111, "mcp:warm-cache"): the run id the API derives for a synthetic
+    # key in a synthetic workspace (progress_deliveries_tests::the_run_id_of_a_key_is_the_apis).
+    "20cfc4dd-2f15-5b2b-9281-da04e222e3af",
 }
 
 

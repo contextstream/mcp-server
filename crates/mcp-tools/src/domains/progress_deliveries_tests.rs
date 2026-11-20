@@ -3212,11 +3212,12 @@ fn nothing_taken(api: &Api, state: &tempfile::TempDir) {
 #[test]
 fn the_run_id_of_a_key_is_the_apis() {
     // uuid5(workspace, "mcp:warm-cache"), computed outside this crate
-    // (Python's uuid.uuid5), as the API's report_run_id derives it.
-    let workspace = Uuid::parse_str("7b0c3f52-1e2d-4c6a-9f10-2a3b4c5d6e7f").unwrap();
+    // (Python's uuid.uuid5), as the API's report_run_id derives it. Both ids
+    // are on the public boundary's list of synthetic fixtures.
+    let workspace = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
     assert_eq!(
         run_id_of_key(workspace, "warm-cache"),
-        Uuid::parse_str("f1528f68-d25a-5f41-b6ed-e83d0b302c3a").unwrap()
+        Uuid::parse_str("20cfc4dd-2f15-5b2b-9281-da04e222e3af").unwrap()
     );
 }
 

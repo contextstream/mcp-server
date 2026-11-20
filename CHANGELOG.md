@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.87
+
+- A bot whose hosted server restarted, redeployed or answered from another replica since it asked a person something now gets the answer. Before, `progress(action="get")` showed nothing and said nothing. A session's default run and its ticket runs are recognised from the run's id. A run opened with an explicit `run_key` is read again by adding that `run_key` to the same `get`. Without that proof nothing is read or claimed, and a run waiting on a person is told why nothing is shown and how to read it.
+
 ## 1.0.86
 
 - A person's answer or message that the `progress` tool shows now carries its framed words in the structured result as well (`deliveries[].frame`), not only in the text. Clients that show the model the structured result, such as Claude Code on the hosted server, received the delivery's id and kind without what the person wrote.

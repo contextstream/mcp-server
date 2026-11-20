@@ -330,6 +330,10 @@ pub fn guidance_for_input(input: &Value) -> Option<String> {
         HandoffIntent::Canonical | HandoffIntent::ExplicitLocalFile => {
             Some(HANDOFF_INTENT_GUIDANCE.to_string())
         }
+        // A Live Capsule asked for or pasted: the one tool call that answers it.
+        HandoffIntent::None if super::capsule_intent::guidance_for_prompt(&prompt).is_some() => {
+            super::capsule_intent::guidance_for_prompt(&prompt).map(str::to_string)
+        }
         // Resume wins over the save keywords: "remember where we left off".
         HandoffIntent::None if super::resume_intent::detect_resume_intent(&prompt).is_some() => {
             super::resume_intent::guidance_for_input(input)
@@ -344,6 +348,27 @@ pub fn guidance_for_input(input: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_capsule_request_or_link_gets_its_own_guidance() {
+        let ask = serde_json::json!({"prompt": "Make a live capsule so ChatGPT can read the repo"});
+        let guidance = guidance_for_input(&ask).expect("live capsule guidance");
+        assert!(guidance.contains("capsule(action=\"live\""), "{guidance}");
+
+        let paste = serde_json::json!({"prompt": "Summarize https://contextstream.io/c/capsule_9f8e7d6c5b4a/live"});
+        let guidance = guidance_for_input(&paste).expect("live link guidance");
+        assert!(
+            guidance.contains("capsule(action=\"live_read\""),
+            "{guidance}"
+        );
+
+        // A handoff that also wants a link still gets the handoff guidance.
+        let handoff =
+            serde_json::json!({"prompt": "Create a handoff and a live capsule for the next agent"});
+        assert!(guidance_for_input(&handoff)
+            .expect("handoff guidance")
+            .contains("CANONICAL HANDOFF"));
+    }
 
     #[test]
     fn detects_direct_save_intent() {

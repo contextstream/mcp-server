@@ -64,6 +64,24 @@ Then ask it to save a real decision and its reason. Start a new session and
 retrieve that decision without explaining it again. Indexing supplies code
 context; it cannot recover every undocumented decision.
 
+## Give any AI app the project: Live Capsule
+
+Ask your agent to "make a live capsule". One `capsule(action="live")` call
+returns:
+
+- a **live link** (`/c/<token>/live`) to paste into ChatGPT or Claude: small,
+  current pages about the file tree, files, symbols, decisions, lessons, plans
+  and docs, which the chat reads by following links;
+- an **MCP link** (`/c/<token>/mcp`) to add once as a custom connector in
+  Claude, ChatGPT, Gemini, Cursor or any MCP app. The app shows it as
+  "Live Capsule". It needs no sign-in, because the link is its own key.
+
+By default a link shows no file contents and no personal items, and it expires
+after 7 days. Including code or personal items, or a longer expiry (up to 30
+days), happens only when you ask for it. You can revoke a link at any time.
+When someone pastes a live link, the agent reads it with
+`capsule(action="live_read")`.
+
 ## Benchmarks
 
 Each benchmark runs through the production API, is registered before its results

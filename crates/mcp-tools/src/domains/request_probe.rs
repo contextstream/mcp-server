@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// request's first line and body.
 pub(crate) struct RequestProbe {
     pub(crate) base_url: String,
-    requests: Arc<Mutex<Vec<(String, String)>>>,
+    requests: Arc<Mutex<Vec<(String, String, String)>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -54,7 +54,7 @@ impl RequestProbe {
                         }
                     };
                     let line = head.lines().next().unwrap_or_default().to_string();
-                    recorded.lock().unwrap().push((line, body));
+                    recorded.lock().unwrap().push((line, body, head));
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                         payload.len()
@@ -77,7 +77,7 @@ impl RequestProbe {
             .lock()
             .unwrap()
             .iter()
-            .map(|(line, _)| line.clone())
+            .map(|(line, _, _)| line.clone())
             .collect()
     }
 
@@ -87,8 +87,24 @@ impl RequestProbe {
             .lock()
             .unwrap()
             .iter()
-            .find(|(line, _)| line.contains(needle))
-            .and_then(|(_, body)| serde_json::from_str(body).ok())
+            .find(|(line, _, _)| line.contains(needle))
+            .and_then(|(_, body, _)| serde_json::from_str(body).ok())
+    }
+
+    /// The value of header `name` on the first request whose line contains
+    /// `needle`.
+    pub(crate) fn header_of(&self, needle: &str, name: &str) -> Option<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(line, _, _)| line.contains(needle))
+            .and_then(|(_, _, head)| {
+                head.lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.trim().to_string())
+            })
     }
 }
 

@@ -133,6 +133,7 @@ Every workspace-scoped call below must include `workspace_id="<current_workspace
 - "extract clip" / "trim video" / "clip audio" → `media(action="get_clip", content_id="...", start="1:34", end="2:15", output_format="raw")` (also supports `ffmpeg` and `remotion`)
 - "create capsule" / "context capsule" / "capsule link" → `capsule(action="create", scope="session", session_id="<current session id>", purpose="handoff")`. Session creates automatically mint a safe external-agent share and return the capsule id plus Agent URL and Dashboard URL; use `audience="self"` only when the user explicitly asks for no share link. **NEVER substitute a handoff entity, design spec, document, or prose summary for a requested capsule.**
 - "share this context with another agent" / "handoff with a link" → first create the durable handoff with `entity(kind="handoff", action="create", body={...}, workspace_id="<current_workspace_id>", project_id="<current_project_id>")`, then create the portable artifact with `capsule(action="create", scope="session", session_id="<current session id>", purpose="handoff", workspace_id="<current_workspace_id>", project_id="<current_project_id>")`. Return both results.
+- "live capsule" / "share the project with ChatGPT, Claude or Gemini" / "connector link" / "MCP link for another AI app" → `capsule(action="live", name="...")`. One call returns a live link (paste into ChatGPT or Claude), an MCP link (add as a custom connector in Claude, ChatGPT, Gemini, Cursor or any MCP app; no sign-in), the connector name and a paste-ready message: give the user all of them. Defaults are safe (no file contents, no personal items, 7 days); pass `include_code="lazy"`, `include_personal=true` or `expires_in_days` up to 30 only when the user asks, with `allow_risky_policy=true`. A pasted `/c/<token>/live` or `/c/<token>/mcp` link → `capsule(action="live_read", url="<link>")`, then follow the links each page lists.
 - "create diagram" / "save diagram" / "show diagrams" → `memory(action="create_diagram", diagram_type="flowchart|sequence|class|er|gantt|mindmap|pie|other", title="...", content="...")` or `memory(action="list_diagrams")`; use `sequence` for service/API handoffs, `er` for data models, `flowchart` for process flows.
 - "list skills" / "show my skills" → `skill(action="list")`
 - "create a skill" → `skill(action="create", name="...", instruction_body="...", project_id="<current_project_id>", trigger_patterns=[...])`
@@ -3618,6 +3619,31 @@ mod tests {
         for rules in [&codex, &claude] {
             assert!(rules.contains("return the capsule id plus Agent URL and Dashboard URL"));
             assert!(rules.contains("NEVER substitute a handoff entity"));
+        }
+    }
+
+    #[test]
+    fn live_capsule_requests_route_to_capsule_live_and_live_read() {
+        let codex = generate_rule_content(
+            &Editor::Codex,
+            Some("test-id"),
+            Some("Test"),
+            RulesMode::Full,
+        );
+        let claude = generate_rule_content(
+            &Editor::ClaudeCode,
+            Some("test-id"),
+            Some("Test"),
+            RulesMode::Full,
+        );
+        assert!(codex.contains("`capsule(action=\"live\", name=\"...\")`"));
+        assert!(codex.contains("`capsule(action=\"live_read\", url=\"<link>\")`"));
+        assert!(claude.contains("`mcp__contextstream__capsule(action=\"live\""));
+        assert!(claude.contains("`mcp__contextstream__capsule(action=\"live_read\""));
+        for rules in [&codex, &claude] {
+            assert!(rules.contains("\"live capsule\""));
+            assert!(rules.contains("an MCP link (add as a custom connector"));
+            assert!(rules.contains("with `allow_risky_policy=true`"));
         }
     }
 

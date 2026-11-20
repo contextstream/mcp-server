@@ -424,6 +424,17 @@ pub struct ContextCapsuleLinks {
     /// Dashboard deep-link to the full code dependency graph (auth required).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_graph_url: Option<String>,
+    /// The Live Capsule index (`/c/<token>/live`): small, current Markdown
+    /// pages about the project's files, symbols and knowledge that a chat
+    /// (ChatGPT, Claude) opens by following links. Read it from MCP with
+    /// `capsule(action="live_read")`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_url: Option<String>,
+    /// The Live Capsule as a remote MCP server (`/c/<token>/mcp`, Streamable
+    /// HTTP, no sign-in: the link is its own key) for Claude, ChatGPT,
+    /// Gemini, Cursor and any app that takes a custom connector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_url: Option<String>,
 }
 
 /// ContextCapsule policy metadata.
@@ -668,6 +679,15 @@ pub struct ContextCapsuleShareResponse {
     /// absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_url: Option<String>,
+    /// The share's Live Capsule index (`/c/<token>/live`): what to give an
+    /// AI chat so it asks the live project small questions instead of
+    /// loading the whole capsule. Absent for a bootstrap link and from an
+    /// API that predates Live Capsules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_url: Option<String>,
+    /// The share's live index as a remote MCP server (`/c/<token>/mcp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

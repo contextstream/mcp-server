@@ -10,7 +10,7 @@ use mcp_types::api::{
     ContextCapsuleReadiness, ContextCapsuleResolvedScope, ContextCapsuleResponse,
     ContextCapsuleSection, ContextCapsuleShareResponse,
 };
-use mcp_types::tool::ToolCategory;
+use mcp_types::tool::{ToolCategory, ToolResult};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -1411,4 +1411,466 @@ fn share_text_shows_numbers_and_times_not_debug_values() {
     assert_eq!(share_limit(None), "unlimited");
     assert_eq!(share_time(None), "none");
     assert_eq!(share_time(Some("not a time")), "not a time");
+}
+
+// ─────────────────────────────── Live Capsule ────────────────────────────────
+
+/// One payload that reads as both a capsule (create) and a share (share), so a
+/// single stub answers the two calls `action="live"` makes.
+const LIVE_STUB: &str = r#"{"capsule_id":"cap_live1","name":"Acme","id":"22222222-2222-4222-8222-222222222222","audience":"external_agent","token_prefix":"capsule_t","share_url":"https://ctx.example/c/capsule_tok","agent_url":"https://api.ctx.example/api/v1/capsules/shares/capsule_tok","live_url":"https://ctx.example/c/capsule_tok/live","mcp_url":"https://ctx.example/c/capsule_tok/mcp","expires_at":"2026-11-27T20:00:00Z","single_use":false}"#;
+
+fn text_of(result: &ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match item {
+            mcp_types::tool::ContentItem::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn posted(probe: &RequestProbe, path_suffix: &str) -> Value {
+    probe
+        .request_lines()
+        .iter()
+        .find(|line| line.starts_with("POST /api/v1/capsules") && line.contains(path_suffix))
+        .and_then(|line| probe.body_of(line.split(' ').nth(1).unwrap_or_default()))
+        .unwrap_or_else(|| panic!("no POST {path_suffix}: {:?}", probe.request_lines()))
+}
+
+#[tokio::test]
+async fn live_makes_a_capsule_and_one_multi_use_link_any_ai_app_reads() {
+    let probe = RequestProbe::answering(LIVE_STUB).await;
+    let (tool, session) = hosted_capsule_tool(&probe.base_url);
+    let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+    let result = mcp_client::run_with_auth_override(hosted_auth(None), || async {
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        tool.execute(json!({"action": "live", "name": "Acme", "notes": "Start with the API crate"}))
+            .await
+    })
+    .await
+    .expect("live capsule");
+
+    let capsule = posted(&probe, "/capsules ");
+    assert_eq!(capsule["scope"], "project");
+    assert_eq!(capsule["project_id"], project.to_string());
+    assert_eq!(capsule["workspace_id"], workspace.to_string());
+    assert_eq!(capsule["name"], "Acme");
+    assert_eq!(capsule["purpose"], "external_agent");
+    assert_eq!(capsule["audience"], "external_agent");
+    assert_eq!(capsule["include_code"], "none");
+    assert_eq!(capsule["include_personal"], false);
+    assert_eq!(capsule["redaction_level"], "standard");
+    assert_eq!(capsule["permissions"], "read_only");
+    assert_eq!(capsule["notes"], "Start with the API crate");
+
+    let share = posted(&probe, "/cap_live1/share");
+    assert_eq!(share["audience"], "external_agent");
+    assert_eq!(share["multi_use"], true);
+    assert_eq!(share["expires_in_days"], 7);
+    assert_eq!(share["include_code"], "none");
+    assert_eq!(share["include_personal"], false);
+    assert_eq!(share["redaction_level"], "standard");
+    assert!(share.get("max_uses").is_none(), "{share}");
+    assert!(share.get("allow_risky_policy").is_none(), "{share}");
+
+    let text = text_of(&result);
+    assert!(
+        text.contains("✓ Live Capsule ready · \"Live Capsule - Acme\""),
+        "{text}"
+    );
+    assert!(text.contains(
+        "Live link (paste into ChatGPT or Claude): https://ctx.example/c/capsule_tok/live"
+    ));
+    assert!(text.contains("https://ctx.example/c/capsule_tok/mcp"));
+    assert!(text.contains("Connector name: Live Capsule - Acme"));
+    assert!(text.contains("Open this link and use it to understand the project \"Acme\":\nhttps://ctx.example/c/capsule_tok/live"));
+    assert!(text.contains(
+        "claude mcp add --transport http live-capsule-acme https://ctx.example/c/capsule_tok/mcp"
+    ));
+    assert!(text.contains("gemini mcp add --transport http live-capsule-acme"));
+    assert!(
+        text.contains("delete(action=\"capsule.revoke_share\""),
+        "{text}"
+    );
+    assert!(text.contains("no file contents"));
+
+    let structured = result.structured_content.expect("structured");
+    assert_eq!(structured["kind"], "live_capsule");
+    assert_eq!(structured["capsule_id"], "cap_live1");
+    assert_eq!(
+        structured["live_url"],
+        "https://ctx.example/c/capsule_tok/live"
+    );
+    assert_eq!(
+        structured["mcp_url"],
+        "https://ctx.example/c/capsule_tok/mcp"
+    );
+    assert_eq!(structured["connector_name"], "Live Capsule - Acme");
+    assert_eq!(
+        structured["mcp_config"]["mcpServers"]["live-capsule-acme"]["url"],
+        "https://ctx.example/c/capsule_tok/mcp"
+    );
+    assert_eq!(structured["policy"]["multi_use"], true);
+    assert!(structured["paste_prompt"]
+        .as_str()
+        .unwrap()
+        .contains("https://ctx.example/c/capsule_tok/live"));
+}
+
+#[tokio::test]
+async fn live_without_a_name_is_named_like_the_web_app_and_the_connector_is_plain() {
+    let probe = RequestProbe::answering(LIVE_STUB).await;
+    let (tool, session) = hosted_capsule_tool(&probe.base_url);
+    let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+    let result = mcp_client::run_with_auth_override(hosted_auth(None), || async {
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        tool.execute(json!({"action": "live", "project_name": "Orbit"}))
+            .await
+    })
+    .await
+    .expect("live capsule");
+    assert_eq!(posted(&probe, "/capsules ")["name"], "Orbit · live");
+    assert_eq!(posted(&probe, "/share")["name"], "Orbit · live");
+    let structured = result.structured_content.expect("structured");
+    assert_eq!(structured["connector_name"], "Live Capsule");
+    assert_eq!(structured["server_key"], "live-capsule");
+}
+
+#[tokio::test]
+async fn live_refuses_code_personal_items_or_a_long_link_unless_asked() {
+    for extra in [
+        json!({"include_code": "lazy"}),
+        json!({"include_personal": true}),
+        json!({"expires_in_days": 30}),
+    ] {
+        let probe = RequestProbe::answering(LIVE_STUB).await;
+        let (tool, _session) = hosted_capsule_tool(&probe.base_url);
+        let mut input =
+            json!({"action": "live", "workspace_id": Uuid::new_v4(), "project_id": Uuid::new_v4()});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let error = mcp_client::run_with_auth_override(hosted_auth(None), || tool.execute(input))
+            .await
+            .expect_err("risky without opt-in")
+            .to_string();
+        assert!(error.contains("allow_risky_policy=true"), "{error}");
+        assert!(
+            probe.request_lines().is_empty(),
+            "{:?}",
+            probe.request_lines()
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_with_the_users_opt_in_sends_it_to_the_api() {
+    let probe = RequestProbe::answering(LIVE_STUB).await;
+    let (tool, _session) = hosted_capsule_tool(&probe.base_url);
+    let input = json!({
+        "action": "live", "name": "Acme",
+        "workspace_id": Uuid::new_v4(), "project_id": Uuid::new_v4(),
+        "include_code": "lazy", "expires_in_days": 30, "allow_risky_policy": true
+    });
+    let result = mcp_client::run_with_auth_override(hosted_auth(None), || tool.execute(input))
+        .await
+        .expect("opted in");
+    let share = posted(&probe, "/share");
+    assert_eq!(share["include_code"], "lazy");
+    assert_eq!(share["expires_in_days"], 30);
+    assert_eq!(share["allow_risky_policy"], true);
+    assert!(text_of(&result).contains("files and code"));
+}
+
+#[tokio::test]
+async fn live_for_the_workspace_leaves_the_sessions_project_out() {
+    let probe = RequestProbe::answering(LIVE_STUB).await;
+    let (tool, session) = hosted_capsule_tool(&probe.base_url);
+    let (workspace, project) = (Uuid::new_v4(), Uuid::new_v4());
+    mcp_client::run_with_auth_override(hosted_auth(None), || async {
+        session
+            .update_scope(Some(workspace), Some(project), None)
+            .await;
+        tool.execute(json!({"action": "live", "scope": "workspace", "name": "Team"}))
+            .await
+    })
+    .await
+    .expect("workspace live capsule");
+    let capsule = posted(&probe, "/capsules ");
+    assert_eq!(capsule["scope"], "workspace");
+    assert_eq!(capsule["workspace_id"], workspace.to_string());
+    assert!(capsule.get("project_id").is_none(), "{capsule}");
+}
+
+#[tokio::test]
+async fn live_rejects_a_session_scope_and_days_out_of_range() {
+    let probe = RequestProbe::answering(LIVE_STUB).await;
+    let (tool, _session) = hosted_capsule_tool(&probe.base_url);
+    for (input, expected) in [
+        (
+            json!({"action": "live", "scope": "session", "project_id": Uuid::new_v4(), "workspace_id": Uuid::new_v4()}),
+            "session handoff",
+        ),
+        (
+            json!({"action": "live", "expires_in_days": 0, "project_id": Uuid::new_v4(), "workspace_id": Uuid::new_v4()}),
+            "between 1 and 30",
+        ),
+        (
+            json!({"action": "live", "expires_in_days": 31, "project_id": Uuid::new_v4(), "workspace_id": Uuid::new_v4(), "allow_risky_policy": true}),
+            "between 1 and 30",
+        ),
+        (
+            json!({"action": "live", "include_code": "everything", "project_id": Uuid::new_v4(), "workspace_id": Uuid::new_v4()}),
+            "include_code must be",
+        ),
+    ] {
+        let error = mcp_client::run_with_auth_override(hosted_auth(None), || tool.execute(input))
+            .await
+            .expect_err("invalid")
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+    assert!(probe.request_lines().is_empty());
+}
+
+#[tokio::test]
+async fn live_read_follows_a_pasted_page_link() {
+    let probe = RequestProbe::answering("# src/a.rs\n").await;
+    let (tool, _session) = hosted_capsule_tool(&probe.base_url);
+    let result = mcp_client::run_with_auth_override(hosted_auth(None), || {
+        tool.execute(json!({
+            "action": "live_read",
+            "url": "https://contextstream.io/c/capsule_tok/live/file?path=src%2Fa.rs&start=10"
+        }))
+    })
+    .await
+    .expect("live page");
+    assert_eq!(text_of(&result), "# src/a.rs\n");
+    assert_eq!(
+        probe.request_lines(),
+        vec!["GET /api/v1/capsules/shares/capsule_tok/live/file?path=src%2Fa.rs&start=10 HTTP/1.1"]
+    );
+    assert_eq!(
+        probe.header_of("/live/file", "accept").as_deref(),
+        Some("text/markdown")
+    );
+    assert_eq!(result.structured_content.unwrap()["page"], "file");
+}
+
+#[tokio::test]
+async fn live_read_fields_win_over_the_link_and_send_the_unlock_key() {
+    let probe = RequestProbe::answering("ok").await;
+    let (tool, _session) = hosted_capsule_tool(&probe.base_url);
+    mcp_client::run_with_auth_override(hosted_auth(None), || {
+        tool.execute(json!({
+            "action": "live_read",
+            "share_token": "capsule_tok",
+            "page": "search",
+            "query": "token refresh & retry",
+            "limit": 5,
+            "unlock_key": "ck_secret"
+        }))
+    })
+    .await
+    .expect("live search");
+    assert_eq!(
+        probe.request_lines(),
+        vec!["GET /api/v1/capsules/shares/capsule_tok/live/search?q=token%20refresh%20%26%20retry&limit=5 HTTP/1.1"]
+    );
+    assert_eq!(
+        probe.header_of("/live/search", "x-capsule-key").as_deref(),
+        Some("ck_secret")
+    );
+}
+
+#[tokio::test]
+async fn open_on_a_live_or_mcp_link_reads_the_live_home() {
+    for url in [
+        "https://contextstream.io/c/capsule_tok/live",
+        "https://contextstream.io/c/capsule_tok/mcp",
+    ] {
+        let probe = RequestProbe::answering("# Live Capsule").await;
+        let (tool, _session) = hosted_capsule_tool(&probe.base_url);
+        let result = mcp_client::run_with_auth_override(hosted_auth(None), || {
+            tool.execute(json!({"action": "open", "url": url}))
+        })
+        .await
+        .expect("live home");
+        assert_eq!(text_of(&result), "# Live Capsule");
+        assert_eq!(
+            probe.request_lines(),
+            vec!["GET /api/v1/capsules/shares/capsule_tok/live HTTP/1.1"]
+        );
+    }
+}
+
+#[test]
+fn live_page_paths_carry_only_what_each_page_reads() {
+    use mcp_client::{capsule_live_path, CapsuleLiveParams};
+    let params = |page: &str| CapsuleLiveParams {
+        share: "https://contextstream.io/c/capsule_tok/live".to_string(),
+        page: Some(page.to_string()),
+        path: Some("src".to_string()),
+        query: Some("Auth".to_string()),
+        kind: Some("decisions".to_string()),
+        id: Some("decision:6f1c".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        capsule_live_path(&params("home")).unwrap(),
+        "/capsules/shares/capsule_tok/live"
+    );
+    assert_eq!(
+        capsule_live_path(&params("tree")).unwrap(),
+        "/capsules/shares/capsule_tok/live/tree?path=src"
+    );
+    assert_eq!(
+        capsule_live_path(&params("symbols")).unwrap(),
+        "/capsules/shares/capsule_tok/live/symbols?q=Auth"
+    );
+    assert_eq!(
+        capsule_live_path(&params("knowledge")).unwrap(),
+        "/capsules/shares/capsule_tok/live/knowledge?kind=decisions&q=Auth"
+    );
+    assert_eq!(
+        capsule_live_path(&params("item")).unwrap(),
+        "/capsules/shares/capsule_tok/live/item?id=decision%3A6f1c"
+    );
+    assert!(capsule_live_path(&params("graph"))
+        .unwrap_err()
+        .to_string()
+        .contains("Pages: home, tree"));
+    let bare = |page: &str| CapsuleLiveParams {
+        share: "capsule_tok".to_string(),
+        page: Some(page.to_string()),
+        ..Default::default()
+    };
+    for (page, needed) in [
+        ("file", "path is required"),
+        ("search", "query is required"),
+        ("item", "id is required"),
+    ] {
+        assert!(
+            capsule_live_path(&bare(page))
+                .unwrap_err()
+                .to_string()
+                .contains(needed),
+            "{page}"
+        );
+    }
+}
+
+#[test]
+fn live_connector_names_match_the_api_and_web_app() {
+    use super::live::{live_connector_name, live_server_key};
+    assert_eq!(live_connector_name(None), "Live Capsule");
+    assert_eq!(live_connector_name(Some("  ")), "Live Capsule");
+    assert_eq!(live_connector_name(Some("Orbit · live")), "Live Capsule");
+    assert_eq!(live_connector_name(Some("Orbit - Live")), "Live Capsule");
+    assert_eq!(live_connector_name(Some("Orbit")), "Live Capsule - Orbit");
+    assert_eq!(live_connector_name(Some("Olive")), "Live Capsule - Olive");
+    let long = live_connector_name(Some("A very long project name that keeps going"));
+    assert_eq!(long.chars().count(), 40);
+    assert!(long.ends_with('…'));
+    assert_eq!(live_server_key(Some("Acme API")), "live-capsule-acme-api");
+    assert_eq!(live_server_key(None), "live-capsule");
+}
+
+#[test]
+fn every_share_result_names_its_live_and_mcp_links() {
+    let mut share = ContextCapsuleShareResponse {
+        id: Uuid::new_v4(),
+        audience: Some("external_agent".to_string()),
+        share_url: Some("https://ctx.example/c/capsule_tok".to_string()),
+        ..Default::default()
+    };
+    // An API that predates live_url still serves the index under the link.
+    let text = format_share_result_text("cap_1", &share);
+    assert!(
+        text.contains(
+            "Live link (paste into ChatGPT or Claude): https://ctx.example/c/capsule_tok/live"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("MCP link (add as a connector in Claude, ChatGPT, Gemini, Cursor): https://ctx.example/c/capsule_tok/mcp"));
+    assert!(!text.contains("single-use, so its live index"));
+
+    share.live_url = Some("https://eu.ctx.example/c/capsule_tok/live".to_string());
+    share.single_use = true;
+    share.max_uses = Some(1);
+    let text = format_share_result_text("cap_1", &share);
+    assert!(text.contains("https://eu.ctx.example/c/capsule_tok/live"));
+    assert!(text.contains("single-use, so its live index"));
+    assert!(text.contains("capsule(action=\"live\")"));
+
+    share.audience = Some("bootstrap_link".to_string());
+    assert!(!format_share_result_text("cap_1", &share).contains("Live link"));
+}
+
+#[test]
+fn the_tool_tells_agents_when_to_make_and_read_a_live_capsule() {
+    let tool = CapsuleTool::new(create_mock_client());
+    let description = &tool.metadata().description;
+    assert!(description.contains("call action=live"), "{description}");
+    assert!(description.contains("action=live_read"));
+    assert!(description.contains("ChatGPT, Claude, Gemini or any AI app"));
+    assert!(VALID_ACTIONS.contains(&"live") && VALID_ACTIONS.contains(&"live_read"));
+    let schema = tool.input_schema();
+    let properties = &schema["properties"];
+    for field in [
+        "page",
+        "path",
+        "start_line",
+        "end_line",
+        "query",
+        "kind",
+        "item_id",
+        "unlock_key",
+    ] {
+        assert!(properties.get(field).is_some(), "{field}");
+    }
+    let action = properties["action"].to_string();
+    assert!(
+        action.contains("Live Capsule") && action.contains("live_read"),
+        "{action}"
+    );
+}
+
+#[test]
+fn capsule_and_share_responses_carry_the_live_links() {
+    let share: ContextCapsuleShareResponse = serde_json::from_value(json!({
+        "id": Uuid::new_v4(),
+        "live_url": "https://ctx.example/c/capsule_tok/live",
+        "mcp_url": "https://ctx.example/c/capsule_tok/mcp"
+    }))
+    .unwrap();
+    assert_eq!(
+        share.live_url.as_deref(),
+        Some("https://ctx.example/c/capsule_tok/live")
+    );
+    assert_eq!(
+        share.mcp_url.as_deref(),
+        Some("https://ctx.example/c/capsule_tok/mcp")
+    );
+    let capsule: ContextCapsuleResponse = serde_json::from_value(json!({
+        "capsule_id": "cap_1",
+        "links": {"live_url": "https://ctx.example/c/t/live", "mcp_url": "https://ctx.example/c/t/mcp"}
+    }))
+    .unwrap();
+    assert_eq!(
+        capsule.links.live_url.as_deref(),
+        Some("https://ctx.example/c/t/live")
+    );
+    assert_eq!(
+        capsule.links.mcp_url.as_deref(),
+        Some("https://ctx.example/c/t/mcp")
+    );
 }

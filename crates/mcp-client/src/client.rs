@@ -13362,6 +13362,24 @@ impl ContextStreamClient {
             .await
     }
 
+    /// One page of a Live Capsule's index (`/capsules/shares/{token}/live[/page]`),
+    /// as the Markdown a model reads best. What the page may show is decided by
+    /// the share (its policy, expiry and unlock key), never by this request.
+    pub async fn capsule_live_page(&self, params: CapsuleLiveParams) -> Result<String> {
+        let path = capsule_live_path(&params)?;
+        let options = params
+            .unlock_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(|key| RequestOptions {
+                extra_headers: Some(vec![("X-Capsule-Key".to_string(), key.to_string())]),
+                ..Default::default()
+            });
+        self.request_text("GET", &path, None::<()>, options, Some("text/markdown"))
+            .await
+    }
+
     fn capsule_locator_path<T: CapsuleLocatorInput>(
         &self,
         params: &T,
@@ -19679,6 +19697,117 @@ pub struct CapsuleChunkParams {
     pub share_token: Option<String>,
     pub url: Option<String>,
     pub chunk_id: String,
+}
+
+/// Parameters for `capsule(action="live_read", ...)`: one question to a Live
+/// Capsule's index.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapsuleLiveParams {
+    /// A share token or any capsule link (`/c/<token>`, `/c/<token>/live`,
+    /// `/c/<token>/mcp`, `/api/v1/capsules/shares/<token>/...`).
+    pub share: String,
+    /// home (default), tree, file, search, symbols, knowledge or item.
+    pub page: Option<String>,
+    pub path: Option<String>,
+    pub start: Option<u32>,
+    pub end: Option<u32>,
+    pub query: Option<String>,
+    pub kind: Option<String>,
+    pub id: Option<String>,
+    pub limit: Option<u32>,
+    /// Sent as `X-Capsule-Key` for a share whose live index is keyed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlock_key: Option<String>,
+}
+
+/// The live pages a capsule link answers.
+pub const CAPSULE_LIVE_PAGES: &[&str] = &[
+    "home",
+    "tree",
+    "file",
+    "search",
+    "symbols",
+    "knowledge",
+    "item",
+];
+
+/// The API path of one live page: the token from whatever link was given,
+/// the page named, and only the parameters that page reads.
+pub fn capsule_live_path(params: &CapsuleLiveParams) -> Result<String> {
+    let token = resolve_capsule_share_token_str(&params.share)?;
+    let page = params
+        .page
+        .as_deref()
+        .map(str::trim)
+        .filter(|page| !page.is_empty())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "home".to_string());
+    if !CAPSULE_LIVE_PAGES.contains(&page.as_str()) {
+        return Err(Error::Validation(format!(
+            "Unknown live page '{}'. Pages: {}.",
+            page,
+            CAPSULE_LIVE_PAGES.join(", ")
+        )));
+    }
+    let text = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| urlencoding::encode(value).into_owned())
+    };
+    let mut query: Vec<String> = Vec::new();
+    let mut push = |key: &str, value: Option<String>| {
+        if let Some(value) = value {
+            query.push(format!("{key}={value}"));
+        }
+    };
+    match page.as_str() {
+        "tree" => push("path", text(&params.path)),
+        "file" => {
+            let path = text(&params.path).ok_or_else(|| {
+                Error::Validation(
+                    "path is required for the file page (a repository-relative path such as src/main.rs)"
+                        .to_string(),
+                )
+            })?;
+            push("path", Some(path));
+            push("start", params.start.map(|line| line.to_string()));
+            push("end", params.end.map(|line| line.to_string()));
+        }
+        "search" | "symbols" => {
+            let words = text(&params.query).ok_or_else(|| {
+                Error::Validation(format!("query is required for the {page} page"))
+            })?;
+            push("q", Some(words));
+            push("limit", params.limit.map(|limit| limit.to_string()));
+        }
+        "knowledge" => {
+            push("kind", text(&params.kind));
+            push("q", text(&params.query));
+            push("limit", params.limit.map(|limit| limit.to_string()));
+        }
+        "item" => {
+            let id = text(&params.id).ok_or_else(|| {
+                Error::Validation(
+                    "id is required for the item page, as kind:uuid (for example decision:<uuid>); knowledge pages list them"
+                        .to_string(),
+                )
+            })?;
+            push("id", Some(id));
+        }
+        _ => {}
+    }
+    let mut path = format!("/capsules/shares/{token}/live");
+    if page != "home" {
+        path.push('/');
+        path.push_str(&page);
+    }
+    if !query.is_empty() {
+        path.push('?');
+        path.push_str(&query.join("&"));
+    }
+    Ok(path)
 }
 
 /// Parameters for `capsule(action="ack", ...)`.

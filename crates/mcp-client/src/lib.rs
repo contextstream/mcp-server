@@ -55,6 +55,7 @@ pub use client::{
     run_with_tool_surface_profile, spawn_with_task_context, ApiCallStats, CapturedTenantHome,
     TaskContextSnapshot, TENANT_HOME_SCOPE_HEADER,
 };
+pub use client::{capsule_live_path, CapsuleLiveParams, CAPSULE_LIVE_PAGES};
 pub use client::{
     delta_since,
     entity_kind_to_path,

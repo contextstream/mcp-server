@@ -4,6 +4,7 @@
 //! These replace the previous bash/curl scripts with fast, native Rust handlers.
 
 pub mod antigravity;
+mod capsule_intent;
 pub mod client_model_extractor;
 pub mod coaching_turn;
 pub mod command_rewrite;

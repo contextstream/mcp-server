@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use mcp_client::{
     resolve_capsule_share_token_str, CapsuleAckParams, CapsuleAuditParams, CapsuleChunkParams,
-    CapsuleContextDocParams, CapsuleListSharesParams, CapsuleOpenParams, CapsulePrimerParams,
-    CapsuleShareParams, CapsuleStreamParams, ContextStreamClient, CreateCapsuleParams,
-    ListCapsulesParams,
+    CapsuleContextDocParams, CapsuleListSharesParams, CapsuleLiveParams, CapsuleOpenParams,
+    CapsulePrimerParams, CapsuleShareParams, CapsuleStreamParams, ContextStreamClient,
+    CreateCapsuleParams, ListCapsulesParams,
 };
 use mcp_types::{
     api::{
@@ -24,12 +24,21 @@ use uuid::Uuid;
 use crate::registry::ToolHandler;
 use crate::schema::SchemaBuilder;
 
+#[path = "capsule_live.rs"]
+mod live;
+use live::{
+    default_live_name, live_link_lines, live_page_of_url, live_policy, live_risk_refusal,
+    live_url_query, LiveCapsuleResult,
+};
+
 pub(crate) const VALID_ACTIONS: &[&str] = &[
     "open",
     "get",
     "delete",
     "list",
     "create",
+    "live",
+    "live_read",
     "share",
     "chunk",
     "stream",
@@ -181,6 +190,28 @@ pub struct CapsuleInput {
     /// destinations the key unlocks (explorer, knowledge_graph,
     /// code_graph, chunks, stream). Omit for all.
     pub unlock_destinations: Option<Vec<String>>,
+    /// For `action="live_read"`: which live page to read — home (default),
+    /// tree, file, search, symbols, knowledge or item.
+    pub page: Option<String>,
+    /// For `action="live_read"` with page=tree|file: a repository-relative
+    /// path (a directory for tree, a file for file).
+    pub path: Option<String>,
+    /// For `action="live_read"` with page=file: first line (default 1).
+    pub start_line: Option<u32>,
+    /// For `action="live_read"` with page=file: last line (default start+199).
+    pub end_line: Option<u32>,
+    /// For `action="live_read"`: search words (page=search), a symbol name
+    /// (page=symbols) or words to filter knowledge (page=knowledge).
+    pub query: Option<String>,
+    /// For `action="live_read"` with page=knowledge: decisions, constraints,
+    /// lessons, plans, tasks or docs.
+    pub kind: Option<String>,
+    /// For `action="live_read"` with page=item: the item as kind:uuid
+    /// (e.g. decision:6f1c…), as knowledge pages list it.
+    pub item_id: Option<String>,
+    /// For `action="live_read"`: the share's unlock key, sent as
+    /// `X-Capsule-Key`, when the link was minted with require_unlock_key.
+    pub unlock_key: Option<String>,
 }
 
 pub struct CapsuleTool {
@@ -264,18 +295,19 @@ impl CapsuleTool {
 }
 
 /// Routing summary advertised as the tool description (<= 1024 chars).
-const CAPSULE_TOOL_DESCRIPTION: &str = "ContextCapsule: portable, shareable, hydrate-on-demand snapshots of project or session context. Use it when the user pastes a /c/<token> link or capsule_<uuid> token (action=open), asks for a capsule, portable bundle, or share link (action=create; session creates mint a safe share by default), wants a paste-ready bootstrap prompt (action=bootstrap_prompt), wants graphs from a share token (action=graph), or wants to list/audit capsules.\n\nHandoffs: a generic handoff request MUST create `entity(kind=\"handoff\", action=\"create\", ...)`. If it also needs a portable bundle or share link, create the entity AND this capsule and return both; a capsule is not a replacement for the handoff entity. Never substitute HANDOFF.md, a scratch prompt, or prose.\n\nNot for turn-by-turn retrieval (use `context`). Session-capsule results must include the capsule id plus Agent URL / Dashboard URL links. Full action reference: the `action` parameter.";
+const CAPSULE_TOOL_DESCRIPTION: &str = "ContextCapsule: portable, shareable snapshots of project or session context. LIVE CAPSULE: to let ChatGPT, Claude, Gemini or any AI app read the project live (a live capsule, connector or MCP link), call action=live: one call returns a live link to paste and an MCP link to add as a connector. Read a pasted /c/<token>/live or /mcp link with action=live_read. Also: a pasted /c/<token> link or capsule_<uuid> token (action=open); a capsule, bundle or share link (action=create; session creates mint a safe share); a paste-ready prompt (action=bootstrap_prompt); share-token graphs (action=graph); list/audit.\n\nHandoffs MUST create `entity(kind=\"handoff\", action=\"create\", ...)`; if a bundle or link is also wanted, create the entity AND this capsule and return both (a capsule is not a replacement). Never HANDOFF.md, a scratch prompt, or prose.\n\nNot for turn-by-turn retrieval (use `context`). Results must include the capsule id plus Agent URL / Dashboard URL links. Full reference: the `action` parameter.";
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const CAPSULE_TOOL_REFERENCE: &str = "ContextCapsule: portable, shareable, hydrate-on-demand snapshots of project or session context.\n\nUse capsule when:\n- User pastes a /c/<token> link or capsule_<uuid> token → action=open, url=<paste>\n- User explicitly asks for a capsule, portable bundle, share link, team link, or external-agent link → action=create; session creates automatically mint a safe share by default, so call action=share only for a different/additional policy\n- User asks for an end-of-session capsule or shareable summary → action=create, scope=session, session_id=<current session id> (or transcript_id=<uuid>). Return the capsule id plus Agent URL + Dashboard URL links; pass audience=\"self\" only when the user explicitly requests no share link\n- User wants to bootstrap a fresh agent with project state → action=open after action=create\n- User asks for a paste-ready capsule prompt (\"bootstrap prompt\", \"prompt for ChatGPT/Claude\", \"summarize this capsule for a fresh agent\") → action=bootstrap_prompt — returns Markdown the agent can paste verbatim into another LLM\n- User wants files / knowledge / code graphs from a share token → action=graph (share_token or url)\n- User wants to list or audit capsules → action=list, list_shares, audit\n\nHandoff routing:\n- A generic request to create/prepare a handoff, hand work over, or continue in another agent/session MUST create `entity(kind=\"handoff\", action=\"create\", ...)` as the durable handoff.\n- If that handoff also needs a portable bundle, capsule, or share link, create the entity AND this capsule; return both results. Capsule is the artifact, not a replacement for the handoff entity.\n- Never replace either tool call with HANDOFF.md, a scratch prompt, a generic document/event, or prose alone.\n\nDo NOT use capsule for normal turn-by-turn retrieval — use `context` instead.\nDo NOT satisfy a session-capsule request with a prose summary only; default shared results must include the created capsule id plus Agent URL / Dashboard URL links. If audience=\"self\" is passed or auto-share fails, still return the capsule id and explain the missing share link.\n\nSession capsules default to a snapshot handoff with the full transcript available as lazy chunks and owner-only transcript access enforced by the API. Session create results include share links by default; audience=\"self\" opts out. Team share links are authenticated and reusable by default; external_agent/public_link/support shares are token-gated and single-use by default. After action=open with hydrate=false (default), follow up with action=chunk for lazy sections (chunk_ids present, no inline data). For share tokens, action=graph returns JSON (explorer|knowledge|code).";
+const CAPSULE_TOOL_REFERENCE: &str = "ContextCapsule: portable, shareable, hydrate-on-demand snapshots of project or session context.\n\nLive Capsule (the default way to give an AI app the project):\n- A Live Capsule is one capsule of the project (or workspace) plus one multi-use link that stays current. Its live index (`/c/<token>/live`) is small Markdown pages a chat opens by following links; its MCP door (`/c/<token>/mcp`) is a remote MCP server (Streamable HTTP, 7 read-only tools, no sign-in: the link is its own key) that Claude, ChatGPT, Gemini, Cursor, VS Code, Windsurf or Claude Code adds as a custom connector. The app shows it as \"Live Capsule\" or \"Live Capsule - <name>\".\n- User wants ChatGPT, Claude, Gemini, another AI app or a teammate without ContextStream to read the project, asks for a live capsule, a connector or MCP link, or \"share the project with <AI>\" → action=live. One call creates the capsule and the link. Optional: name, scope=project|workspace (project when one is known), expires_in_days 1-30 (default 7), notes for the reader. Defaults are safe for a link anyone holding it can read: no file contents (include_code=none), no personal items, standard redaction, read-only, at most 7 days; .env and key files are never served. Use include_code=lazy, include_personal=true or more than 7 days only when the user asked, with allow_risky_policy=true.\n- Give the user the live link, the MCP link, the connector name and the paste-ready message (all in the result text; structured: live_url, mcp_url, connector_name, paste_prompt, connector_prompt, mcp_config, gemini_command, claude_code_command). Gemini does not open pasted links: give it the MCP link as a connector. Revoke with delete(action=\"capsule.revoke_share\", share_id=<share id>).\n- User pastes a /c/<token>/live (any page) or /c/<token>/mcp link, or you need the live state of a capsule's project → action=live_read, url=<link>. page=home (start here), tree (path), file (path, start_line, end_line; 200 lines a page), search (query), symbols (query), knowledge (kind=decisions|constraints|lessons|plans|tasks|docs, query), item (item_id=kind:uuid). Every page names its next steps as links; pass any of them back as url. Reads are rate-limited per link (120 a minute, 20 searches a minute) and audited for the owner.\n- Every share result (action=share, or a session create's auto-share) also lists its Live link and MCP link. A single-use link's live index lasts only the first open's one-hour window, so make a Live Capsule (action=live) for a link an app keeps reading.\n\nUse capsule when:\n- User pastes a /c/<token> link or capsule_<uuid> token → action=open, url=<paste> (a /live or /mcp link is read as with live_read)\n- User explicitly asks for a capsule, portable bundle, share link, team link, or external-agent link → action=create; session creates automatically mint a safe share by default, so call action=share only for a different/additional policy\n- User asks for an end-of-session capsule or shareable summary → action=create, scope=session, session_id=<current session id> (or transcript_id=<uuid>). Return the capsule id plus Agent URL + Dashboard URL links; pass audience=\"self\" only when the user explicitly requests no share link\n- User wants to bootstrap a fresh agent with project state → action=open after action=create\n- User asks for a paste-ready capsule prompt (\"bootstrap prompt\", \"prompt for ChatGPT/Claude\", \"summarize this capsule for a fresh agent\") → action=bootstrap_prompt — returns Markdown the agent can paste verbatim into another LLM\n- User wants files / knowledge / code graphs from a share token → action=graph (share_token or url)\n- User wants to list or audit capsules → action=list, list_shares, audit\n\nHandoff routing:\n- A generic request to create/prepare a handoff, hand work over, or continue in another agent/session MUST create `entity(kind=\"handoff\", action=\"create\", ...)` as the durable handoff.\n- If that handoff also needs a portable bundle, capsule, or share link, create the entity AND this capsule; return both results. Capsule is the artifact, not a replacement for the handoff entity.\n- Never replace either tool call with HANDOFF.md, a scratch prompt, a generic document/event, or prose alone.\n\nDo NOT use capsule for normal turn-by-turn retrieval — use `context` instead.\nDo NOT satisfy a session-capsule request with a prose summary only; default shared results must include the created capsule id plus Agent URL / Dashboard URL links. If audience=\"self\" is passed or auto-share fails, still return the capsule id and explain the missing share link.\n\nSession capsules default to a snapshot handoff with the full transcript available as lazy chunks and owner-only transcript access enforced by the API. Session create results include share links by default; audience=\"self\" opts out. Team share links are authenticated and reusable by default; external_agent/public_link/support shares are token-gated and single-use by default. After action=open with hydrate=false (default), follow up with action=chunk for lazy sections (chunk_ids present, no inline data). For share tokens, action=graph returns JSON (explorer|knowledge|code).";
 
 /// Actions whose workspace and project the API client takes from the process
 /// defaults when the call names none. A hosted session keeps the scope `init`
 /// resolved in its session state (or in the connection's headers), never in
 /// those process defaults, so these actions fill it in themselves. Actions
 /// that read no scope are left alone.
-const SCOPE_DEFAULTED_ACTIONS: &[&str] = &["create", "list", "list_shares", "audit", "primer"];
+const SCOPE_DEFAULTED_ACTIONS: &[&str] =
+    &["create", "live", "list", "list_shares", "audit", "primer"];
 
 /// Complete a call's scope from the session's `(workspace, project)`.
 ///
@@ -306,6 +338,238 @@ fn fill_scope_defaults(
 }
 
 impl CapsuleTool {
+    /// `action="live"`: a Live Capsule in one call, as the web app's
+    /// Capsules slide-out makes it — a capsule of the project (or
+    /// workspace) and one multi-use external link whose live index an AI app
+    /// reads (`live_url`) or adds as a connector (`mcp_url`).
+    async fn create_live_capsule(&self, input: &CapsuleInput) -> Result<ToolResult> {
+        let policy = live_policy(
+            input.include_code.as_deref(),
+            input.include_personal,
+            input.expires_in_days,
+        )
+        .map_err(Error::Validation)?;
+        let risks = policy.risks();
+        if !risks.is_empty() && input.allow_risky_policy != Some(true) {
+            return Err(Error::Validation(live_risk_refusal(&risks)));
+        }
+
+        let workspace_id = Self::parse_uuid(&input.workspace_id, "workspace_id")?;
+        let mut project_id = Self::parse_uuid(&input.project_id, "project_id")?;
+        let names_project = project_id.is_some()
+            || input
+                .folder_path
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || input
+                .project_name
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+        let scope_is_project = match input
+            .scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            None => names_project,
+            Some("project") => {
+                if !names_project {
+                    return Err(Error::Validation(
+                        "scope=project needs a project: pass project_id, folder_path or project_name, or run init in the project first"
+                            .to_string(),
+                    ));
+                }
+                true
+            }
+            Some("workspace") => false,
+            Some("session") => {
+                return Err(Error::Validation(
+                    "A Live Capsule reads a project or workspace as it is now. For a session handoff use capsule(action=\"create\", scope=\"session\", session_id=...)."
+                        .to_string(),
+                ))
+            }
+            Some(other) => {
+                return Err(Error::Validation(format!(
+                    "scope must be project or workspace for a Live Capsule (got '{other}')"
+                )))
+            }
+        };
+        if !scope_is_project {
+            project_id = None;
+            if workspace_id.is_none() {
+                return Err(Error::Validation(
+                    "A workspace Live Capsule needs workspace_id (or run init first)".to_string(),
+                ));
+            }
+        }
+
+        let person_name = input
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        let name = match &person_name {
+            Some(name) => name.clone(),
+            None => {
+                let subject = if scope_is_project {
+                    match (project_id, input.project_name.as_deref()) {
+                        (_, Some(name)) if !name.trim().is_empty() => Some(name.trim().to_string()),
+                        (Some(id), _) => self.client.get_project(id).await.ok().map(|p| p.name),
+                        _ => None,
+                    }
+                } else {
+                    match workspace_id {
+                        Some(id) => self.client.get_workspace(id).await.ok().map(|w| w.name),
+                        None => None,
+                    }
+                };
+                default_live_name(subject.as_deref(), scope_is_project)
+            }
+        };
+        let notes = input
+            .notes
+            .as_deref()
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+            .map(str::to_string);
+
+        let capsule = self
+            .client
+            .create_capsule(CreateCapsuleParams {
+                scope: Some(
+                    if scope_is_project {
+                        "project"
+                    } else {
+                        "workspace"
+                    }
+                    .to_string(),
+                ),
+                workspace_id,
+                project_id,
+                name: Some(name.clone()),
+                purpose: Some("external_agent".to_string()),
+                audience: Some("external_agent".to_string()),
+                include_personal: Some(policy.include_personal),
+                include_code: Some(policy.include_code.clone()),
+                redaction_level: Some("standard".to_string()),
+                permissions: Some("read_only".to_string()),
+                folder_path: if scope_is_project {
+                    input.folder_path.clone()
+                } else {
+                    None
+                },
+                project_name: if scope_is_project {
+                    input.project_name.clone()
+                } else {
+                    None
+                },
+                notes,
+                ..Default::default()
+            })
+            .await?;
+        if capsule.capsule_id.trim().is_empty() {
+            return Err(Error::Tool(
+                "The capsule was not created (the response had no capsule_id), so there is no Live Capsule link.".to_string(),
+            ));
+        }
+
+        // Straight to the API, not through apply_safe_share_defaults: a Live
+        // Capsule link is multi-use by design (an AI app reads it many times)
+        // and its policy was settled above.
+        let share = self
+            .client
+            .capsule_share(
+                &capsule.capsule_id,
+                CapsuleShareParams {
+                    name: Some(name.clone()),
+                    audience: Some("external_agent".to_string()),
+                    include_personal: Some(policy.include_personal),
+                    include_code: Some(policy.include_code.clone()),
+                    redaction_level: Some("standard".to_string()),
+                    permissions: Some("read_only".to_string()),
+                    expires_in_days: Some(policy.days),
+                    multi_use: Some(true),
+                    allow_risky_policy: (!risks.is_empty()).then_some(true),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let share = match share {
+            Ok(share) => share,
+            Err(err) => {
+                return Err(Error::Tool(format!(
+                    "Capsule {} was created, but its Live Capsule link was not: {}. Retry the link with capsule(action=\"share\", capsule_id=\"{}\", audience=\"external_agent\", multi_use=true, expires_in_days={}), or delete the capsule with capsule(action=\"delete\", capsule_id=\"{}\").",
+                    capsule.capsule_id, err, capsule.capsule_id, policy.days, capsule.capsule_id
+                )))
+            }
+        };
+        let result = LiveCapsuleResult {
+            capsule: &capsule,
+            share: &share,
+            name: &name,
+            named_by_person: person_name.is_some(),
+            policy: &policy,
+        };
+        Ok(ToolResult::with_structured(
+            result.text(),
+            result.structured(),
+        ))
+    }
+
+    /// `action="live_read"`: one page of a Live Capsule's index, by share
+    /// token or any capsule link. A pasted page link (`/c/<token>/live/file?path=…`)
+    /// is read as it is; explicit fields win over the link's own parameters.
+    async fn read_live_page(&self, input: &CapsuleInput) -> Result<ToolResult> {
+        let share = input
+            .url
+            .clone()
+            .or_else(|| input.share_token.clone())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Error::Validation(
+                    "url (a /c/<token>/live or /c/<token>/mcp link) or share_token is required for action=live_read"
+                        .to_string(),
+                )
+            })?;
+        let from_url = live_url_query(&share);
+        let from_link = |key: &str| {
+            from_url
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        let page = input
+            .page
+            .clone()
+            .or_else(|| live_page_of_url(&share))
+            .unwrap_or_else(|| "home".to_string());
+        let number =
+            |value: Option<String>| value.and_then(|value| value.trim().parse::<u32>().ok());
+        let params = CapsuleLiveParams {
+            share: share.clone(),
+            page: Some(page.clone()),
+            path: input.path.clone().or_else(|| from_link("path")),
+            start: input.start_line.or_else(|| number(from_link("start"))),
+            end: input.end_line.or_else(|| number(from_link("end"))),
+            query: input.query.clone().or_else(|| from_link("q")),
+            kind: input.kind.clone().or_else(|| from_link("kind")),
+            id: input.item_id.clone().or_else(|| from_link("id")),
+            limit: input
+                .limit
+                .and_then(|limit| u32::try_from(limit).ok())
+                .or_else(|| number(from_link("limit"))),
+            unlock_key: input.unlock_key.clone(),
+        };
+        let markdown = self.client.capsule_live_page(params).await?;
+        let structured = serde_json::json!({
+            "kind": "live_capsule_page",
+            "page": page,
+            "markdown": markdown,
+        });
+        Ok(ToolResult::with_structured(markdown, structured))
+    }
+
     async fn execute_action(&self, input: Value) -> Result<ToolResult> {
         let mut input: CapsuleInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
@@ -317,6 +581,20 @@ impl CapsuleTool {
         }
 
         match action.as_str() {
+            "open"
+                if input
+                    .url
+                    .as_deref()
+                    .or(input.share_token.as_deref())
+                    .and_then(live_page_of_url)
+                    .is_some() =>
+            {
+                // A /c/<token>/live (or /mcp) link is the Live Capsule's index,
+                // not the capsule: read the page it names.
+                self.read_live_page(&input).await
+            }
+            "live" => self.create_live_capsule(&input).await,
+            "live_read" => self.read_live_page(&input).await,
             "open" => {
                 if is_context_doc_format(input.format.as_deref()) {
                     let response = self
@@ -958,7 +1236,7 @@ impl CapsuleTool {
                 Ok(ToolResult::with_structured(text, response))
             }
             "explain" => Ok(ToolResult::text(
-                "ContextCapsule packages ContextStream context into a portable artifact. Use `context` for normal turn-by-turn retrieval and `capsule` when you need a shareable, renderable, lazy-hydrated handoff or snapshot.".to_string(),
+                "ContextCapsule packages ContextStream context into a portable artifact. Use `context` for normal turn-by-turn retrieval and `capsule` when you need a shareable, renderable, lazy-hydrated handoff or snapshot. A Live Capsule (action=live) is a capsule plus one multi-use link that any AI app reads live: paste its live link into ChatGPT or Claude, or add its MCP link as a custom connector in Claude, ChatGPT, Gemini, Cursor or any MCP app. Read a live link yourself with action=live_read.".to_string(),
             )),
             _ => Err(Error::Validation(format!(
                 "Unknown action: {}. Available actions: {}",
@@ -1005,7 +1283,7 @@ impl ToolHandler for CapsuleTool {
 
     fn input_schema(&self) -> Value {
         SchemaBuilder::new()
-            .description("Portable ContextCapsule operations. open|get|list|create|share|chunk|stream|context_doc|graph|audit|list_shares|explain — see tool description for when to use each.")
+            .description("Portable ContextCapsule operations. live (one-call Live Capsule: a link any AI app reads live, or adds as an MCP connector) | live_read (ask a /c/<token>/live link a question) | open|get|list|create|share|chunk|stream|context_doc|graph|audit|list_shares|explain — see tool description for when to use each.")
             .string_enum(
                 "action",
                 &crate::schema::with_full_reference("Action to perform", CAPSULE_TOOL_REFERENCE),
@@ -1028,7 +1306,7 @@ impl ToolHandler for CapsuleTool {
             )
             .integer(
                 "expires_in_days",
-                "Share expiry in days (defaults: team=7, external_agent/public_link/support=1)",
+                "Share expiry in days (defaults: team=7, external_agent/public_link/support=3, clamped to 7 unless allow_risky_policy=true). For action=live: 1-30, default 7; over 7 needs allow_risky_policy=true.",
                 false,
             )
             .boolean(
@@ -1036,10 +1314,10 @@ impl ToolHandler for CapsuleTool {
                 "Allow the share to be opened multiple times until expires_at. Defaults to true for team links and false for external_agent/public_link/support links. Each open of a capped link starts a one-hour viewing window: reads within it count as that open, so the reader can follow the capsule's links. A read after the last open's window returns 410 Gone.",
                 false,
             )
-            .boolean("include_personal", "Include personal artifacts", false)
+            .boolean("include_personal", "Include personal artifacts. For action=live: the creator's own docs, plans and tasks (default false; true needs allow_risky_policy=true).", false)
             .string_enum(
                 "include_code",
-                "Code inclusion mode",
+                "Code inclusion mode. For action=live: none (default: the reader sees the file tree and symbol names, not file contents) or lazy (file contents and search snippets; needs allow_risky_policy=true).",
                 VALID_INCLUDE_CODE,
                 false,
             )
@@ -1181,6 +1459,39 @@ impl ToolHandler for CapsuleTool {
                 "For action=schedule: when true, the worker also re-shares the refreshed capsule with the existing share audience on each tick. Default false.",
                 false,
             )
+            .string_enum(
+                "page",
+                "For action=live_read: the live page to read. home (default: index freshness, top of the tree, recently changed files, newest knowledge), tree (one directory level; path), file (up to 200 lines with symbols; path, start_line, end_line), search (ranked code search; query), symbols (functions and types by name; query), knowledge (decisions, constraints, lessons, plans, tasks, docs; kind, query), item (one knowledge item in full; item_id).",
+                mcp_client::CAPSULE_LIVE_PAGES,
+                false,
+            )
+            .string(
+                "path",
+                "For action=live_read with page=tree (a directory; omit for the top level) or page=file (a file): repository-relative, e.g. src/main.rs.",
+                false,
+            )
+            .integer("start_line", "For action=live_read with page=file: first line (default 1).", false)
+            .integer("end_line", "For action=live_read with page=file: last line (default start_line+199).", false)
+            .string(
+                "query",
+                "For action=live_read: search words (page=search), a symbol name or part of one (page=symbols), or words to filter knowledge (page=knowledge).",
+                false,
+            )
+            .string(
+                "kind",
+                "For action=live_read with page=knowledge: decisions, constraints, lessons, plans, tasks or docs. Omit for all.",
+                false,
+            )
+            .string(
+                "item_id",
+                "For action=live_read with page=item: the item as kind:uuid (e.g. decision:6f1c…), as knowledge pages list it.",
+                false,
+            )
+            .string(
+                "unlock_key",
+                "For action=live_read on a keyed share: the unlock key, sent as the X-Capsule-Key header.",
+                false,
+            )
             .build()
     }
 }
@@ -1262,6 +1573,8 @@ fn format_share_result_text(capsule_id: &str, response: &ContextCapsuleShareResp
             lines.push(format!("{}: {}", label, url));
         }
     }
+
+    lines.extend(live_link_lines(response));
 
     if let Some(key) = response.unlock_key.as_deref() {
         lines.push(format!(

@@ -3391,8 +3391,10 @@ mod tests {
             // media, memory, project, qa, session, skill, vcs and workspace left
             // their action enums for `delete` (#334: the old names are refused,
             // and parameters only those actions took left with them).
+            // Live Capsule: actions live and live_read, with live_read's page,
+            // path, start_line, end_line, query, kind, item_id and unlock_key.
             "capsule",
-            "0c524ef0743c2d4efd16ad74661684144d696b02fa0dd85d0dc4d1aaf65b832f",
+            "b07b4cd4ca44edfcb04befcab71f4f0a164b458be64e00e6c31fda693a2146d8",
         ),
         (
             "capture_plan",

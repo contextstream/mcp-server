@@ -97,7 +97,7 @@ const DEFAULT_AGENT_NAME: &str = "MCP agent";
 
 /// What `get` says of a run that waits on a person when this connection has
 /// no record of reporting it (see `ProgressTool::reattach_advice`).
-const REATTACH_ADVICE: &str = "This connection has no record of reporting this run (the server may have restarted), so nothing a person sent it is shown here. If it is your run, report on it once as before (the same run_key, or none if you gave none, with its waiting question if it still waits), then read it again.";
+const REATTACH_ADVICE: &str = "This connection has no record of reporting this run (the server may have restarted), so nothing a person sent it is shown here. If it is your run, send one report that names it exactly as before (the same run_key, or the same ticket_id, or neither if you gave neither) and nothing else: no step, status or waiting, so its wait stays as it is and no question is asked again. Check that the report answers with this run's run_id, then read it again.";
 
 /// `kind` values of a step.
 const STEP_KINDS: &[&str] = &[

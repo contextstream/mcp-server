@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.88
+
+- New `capsule(action="live")` makes a Live Capsule in one call, as the web app's Capsules slide-out does: a project (or workspace) capsule with one multi-use link. The result gives the live link (`/c/<token>/live`) to paste into ChatGPT or Claude, the MCP link (`/c/<token>/mcp`) to add as a custom connector named "Live Capsule" (or "Live Capsule - <name>"), a paste-ready message, per-app steps, an `mcpServers` config and `claude mcp add` / `gemini mcp add` commands. The capsule tool can also read a Live Capsule and shows the live and MCP links the API returns.
+
 ## 1.0.87
 
 - A bot whose hosted server restarted, redeployed or answered from another replica since it asked a person something now gets the answer. Before, `progress(action="get")` showed nothing and said nothing. A session's default run and its ticket runs are recognised from the run's id. A run opened with an explicit `run_key` is read again by adding that `run_key` to the same `get`. Without that proof nothing is read or claimed, and a run waiting on a person is told why nothing is shown and how to read it.

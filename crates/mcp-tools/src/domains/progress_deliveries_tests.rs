@@ -3100,9 +3100,17 @@ async fn round7_local_report_fifteen_minutes_later_is_unchanged() {
 // A gateway that lost its record of the session's run
 // ============================================================================
 
-/// What `get` says of a run that waits on a person when this connection has
-/// no record of reporting it, word for word.
-const REATTACH: &str = "This connection has no record of reporting this run (the server may have restarted), so nothing a person sent it is shown here. If it is your run, send one report that names it exactly as before (the same run_key, or the same ticket_id, or neither if you gave neither) and nothing else: no step, status or waiting, so its wait stays as it is and no question is asked again. Check that the report answers with this run's run_id, then read it again.";
+/// Why `get` shows nothing for a run that waits on a person when this
+/// connection has no record of reporting it, word for word.
+const REATTACH_WHY: &str = "This connection has no record of reporting this run (the server may have restarted), so nothing a person sent it is shown here.";
+
+/// The whole advice for the fixture's run, which has a workspace and a project.
+fn reattach(f: &Fixture) -> String {
+    format!(
+        "{REATTACH_WHY} If you opened it with a run_key or ticket_id, send one report with that same run_key or ticket_id, workspace_id \"{}\", project_id \"{}\" and nothing else (no step, status or waiting): it restores the record and leaves the run's wait as it is. Check that the report answers with run_id \"{}\", then read it again.",
+        f.workspace, f.project, f.run
+    )
+}
 
 /// The run as the API shows it to `get`: reported by `agent`, waiting on a
 /// person when `waits`, with `unread` messages on its line.
@@ -3156,11 +3164,11 @@ async fn a_gateway_that_lost_its_record_of_a_waiting_run_says_how_to_read_what_w
                 .await
                 .expect("get");
             let text = text_of(&read);
-            assert!(text.ends_with(&format!("\n\n{REATTACH}")), "{text}");
+            assert!(text.ends_with(&format!("\n\n{}", reattach(&f))), "{text}");
             assert!(!text.contains("[PERSON"), "{text}");
             assert_eq!(
                 read.structured_content.unwrap()["delivery_notice"],
-                json!(REATTACH)
+                json!(reattach(&f))
             );
             // Without a record nothing is read or claimed.
             assert!(sent(&api, "GET", "/decision-requests/deliveries").is_empty());
@@ -3168,12 +3176,18 @@ async fn a_gateway_that_lost_its_record_of_a_waiting_run_says_how_to_read_what_w
             // Doing what it says: one report that only names the run, which
             // leaves its wait alone, so its question is not asked again.
             let reported = tool
-                .execute(json!({"run_key": "warm-cache"}))
+                .execute(json!({
+                    "run_key": "warm-cache",
+                    "workspace_id": f.workspace,
+                    "project_id": f.project,
+                }))
                 .await
                 .expect("report");
             let reports = sent(&api, "POST", "/run-progress/report");
             assert_eq!(reports.len(), 1);
             assert_eq!(reports[0].body["source_run_id"], "warm-cache");
+            assert_eq!(reports[0].body["workspace_id"], json!(f.workspace));
+            assert_eq!(reports[0].body["project_id"], json!(f.project));
             for absent in ["step", "status", "waiting"] {
                 assert!(
                     reports[0].body.get(absent).is_none(),
@@ -3203,23 +3217,55 @@ async fn a_gateway_that_lost_its_record_of_a_waiting_run_says_how_to_read_what_w
 }
 
 #[tokio::test]
-async fn unread_messages_on_a_run_it_lost_its_record_of_are_pointed_at_too() {
+async fn unread_replies_on_the_line_alone_give_no_advice() {
+    // line.unread counts the agent's applied replies the viewer has not
+    // read; it says nothing about what waits for the agent.
     with_caller(async {
         let f = Fixture::new();
         let mine = hosted_agent(&f, "hosted-session").await;
         let api = Api::start(vec![seen_run(&f, mine, false, 2)]).await;
         let state = tempfile::tempdir().unwrap();
         let tool = restarted_gateway(&f, &api, &state);
-        let text = mcp_client::run_with_mcp_session_id("hosted-session".into(), || async {
-            text_of(
-                &tool
-                    .execute(json!({"action": "get", "run_id": f.run}))
-                    .await
-                    .expect("get"),
-            )
+        let read = mcp_client::run_with_mcp_session_id("hosted-session".into(), || async {
+            tool.execute(json!({"action": "get", "run_id": f.run}))
+                .await
+                .expect("get")
         })
         .await;
-        assert!(text.ends_with(&format!("\n\n{REATTACH}")), "{text}");
+        assert!(!text_of(&read).contains(REATTACH_WHY), "{}", text_of(&read));
+        assert!(read
+            .structured_content
+            .unwrap()
+            .get("delivery_notice")
+            .is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_waiting_run_without_a_project_is_only_explained() {
+    // A report without project_id takes the session's default project, so
+    // no report is suggested for a run that has none.
+    with_caller(async {
+        let f = Fixture::new();
+        let mine = hosted_agent(&f, "hosted-session").await;
+        let (route, status, mut body) = seen_run(&f, mine, true, 0);
+        body["data"]["project_id"] = Value::Null;
+        let api = Api::start(vec![(route, status, body)]).await;
+        let state = tempfile::tempdir().unwrap();
+        let tool = restarted_gateway(&f, &api, &state);
+        let read = mcp_client::run_with_mcp_session_id("hosted-session".into(), || async {
+            tool.execute(json!({"action": "get", "run_id": f.run}))
+                .await
+                .expect("get")
+        })
+        .await;
+        let text = text_of(&read);
+        assert!(text.ends_with(&format!("\n\n{REATTACH_WHY}")), "{text}");
+        assert_eq!(
+            read.structured_content.unwrap()["delivery_notice"],
+            json!(REATTACH_WHY)
+        );
         assert!(api
             .requests()
             .iter()
@@ -3245,7 +3291,7 @@ async fn no_advice_for_another_sessions_run_or_a_run_that_waits_for_nothing() {
             })
             .await;
             let text = text_of(&read);
-            assert!(!text.contains("no record of reporting"), "{agent}: {text}");
+            assert!(!text.contains(REATTACH_WHY), "{agent}: {text}");
             assert!(
                 read.structured_content.unwrap().get("delivery_notice").is_none(),
                 "{agent}"

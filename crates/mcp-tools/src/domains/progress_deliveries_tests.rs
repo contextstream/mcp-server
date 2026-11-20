@@ -3102,7 +3102,7 @@ async fn round7_local_report_fifteen_minutes_later_is_unchanged() {
 
 /// What `get` says of a run that waits on a person when this connection has
 /// no record of reporting it, word for word.
-const REATTACH: &str = "This connection has no record of reporting this run (the server may have restarted), so nothing a person sent it is shown here. If it is your run, report on it once as before (the same run_key, or none if you gave none, with its waiting question if it still waits), then read it again.";
+const REATTACH: &str = "This connection has no record of reporting this run (the server may have restarted), so nothing a person sent it is shown here. If it is your run, send one report that names it exactly as before (the same run_key, or the same ticket_id, or neither if you gave neither) and nothing else: no step, status or waiting, so its wait stays as it is and no question is asked again. Check that the report answers with this run's run_id, then read it again.";
 
 /// The run as the API shows it to `get`: reported by `agent`, waiting on a
 /// person when `waits`, with `unread` messages on its line.
@@ -3165,18 +3165,35 @@ async fn a_gateway_that_lost_its_record_of_a_waiting_run_says_how_to_read_what_w
             // Without a record nothing is read or claimed.
             assert!(sent(&api, "GET", "/decision-requests/deliveries").is_empty());
             assert!(sent(&api, "POST", "/claim").is_empty());
-            // Doing what it says brings the answer.
+            // Doing what it says: one report that only names the run, which
+            // leaves its wait alone, so its question is not asked again.
             let reported = tool
-                .report_then_collect(json!({
-                    "run_key": "warm-cache",
-                    "waiting": {"on": "person", "question": "Which cache stays warm?"},
-                }))
+                .execute(json!({"run_key": "warm-cache"}))
                 .await
                 .expect("report");
+            let reports = sent(&api, "POST", "/run-progress/report");
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].body["source_run_id"], "warm-cache");
+            for absent in ["step", "status", "waiting"] {
+                assert!(
+                    reports[0].body.get(absent).is_none(),
+                    "{absent}: {}",
+                    reports[0].body
+                );
+            }
+            assert_eq!(
+                reported.structured_content.unwrap()["run"]["run_id"],
+                json!(f.run)
+            );
+            // Then reading the run again by its id shows the answer, once.
+            let again = tool
+                .execute(json!({"action": "get", "run_id": f.run}))
+                .await
+                .expect("get");
             assert!(
-                text_of(&reported).contains(&answer_block(f.delivery)),
+                text_of(&again).contains(&answer_block(f.delivery)),
                 "{}",
-                text_of(&reported)
+                text_of(&again)
             );
             assert_eq!(sent(&api, "POST", "/claim").len(), 1);
         })

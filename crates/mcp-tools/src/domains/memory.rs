@@ -739,6 +739,62 @@ fn format_collection_page(
     )
 }
 
+/// The most characters of a doc's body a listing shows.
+const DOC_LIST_PREVIEW_CHARS: usize = 200;
+
+/// A doc body with its whitespace collapsed, cut to
+/// [`DOC_LIST_PREVIEW_CHARS`] (an ellipsis marks a cut).
+fn doc_list_preview(content: &str) -> String {
+    let mut collapsed = content
+        .split_whitespace()
+        .flat_map(|word| std::iter::once(' ').chain(word.chars()))
+        .skip(1);
+    let mut preview: String = collapsed.by_ref().take(DOC_LIST_PREVIEW_CHARS).collect();
+    if collapsed.next().is_some() {
+        preview.pop();
+        preview.truncate(preview.trim_end().len());
+        preview.push('…');
+    }
+    preview
+}
+
+/// A listed doc without its body: `content_chars` and a `preview` instead,
+/// so a listing does not carry every doc in full (nine docs cost about 25k
+/// tokens of structured content). An API asked for `include_content=false`
+/// already sends `content: ""` with both; they are kept as they are.
+/// `get_doc` reads the body.
+fn slim_listed_doc(doc: &mut Value) {
+    let Some(obj) = doc
+        .as_object_mut()
+        .filter(|obj| obj.get("content").is_some_and(Value::is_string))
+    else {
+        return;
+    };
+    let Some(Value::String(content)) = obj.remove("content") else {
+        return;
+    };
+    if !obj.contains_key("content_chars") {
+        obj.insert(
+            "content_chars".to_string(),
+            Value::from(content.chars().count()),
+        );
+    }
+    if !obj.contains_key("preview") && !content.is_empty() {
+        obj.insert(
+            "preview".to_string(),
+            Value::String(doc_list_preview(&content)),
+        );
+    }
+}
+
+/// [`slim_listed_doc`] for every doc of a listing, whatever its shape (a bare
+/// array, `items`, `docs`, or either under `data`).
+fn slim_listed_docs(listing: &mut Value) {
+    if let Some(docs) = extract_collection_array_mut(listing) {
+        docs.iter_mut().for_each(slim_listed_doc);
+    }
+}
+
 /// Format a collection of items into a human-readable list with IDs and titles.
 /// This allows the AI to see item details (especially IDs) so it can act on them.
 fn format_collection(entity_name: &str, value: &Value) -> String {
@@ -6553,17 +6609,20 @@ impl MemoryTool {
                         }
 
                         let text = format_doc_matches(trimmed, &matches);
-                        let structured = serde_json::json!({
+                        let mut structured = serde_json::json!({
                             "query": trimmed,
                             "matches": matches
                         });
+                        if let Some(matches) = structured["matches"].as_array_mut() {
+                            matches.iter_mut().for_each(slim_listed_doc);
+                        }
                         return Ok(ToolResult::with_structured(text, structured));
                     }
                 }
 
-                let result = match mcp_client::with_list_offset(
+                let mut result = match mcp_client::with_list_offset(
                     input.offset,
-                    self.client.list_docs(
+                    self.client.list_doc_summaries(
                         workspace_id,
                         project_id,
                         input.doc_type,
@@ -6585,6 +6644,7 @@ impl MemoryTool {
                     Err(err) => return Err(err),
                 };
                 let text = format_collection_page("docs", &result, input.offset, input.limit);
+                slim_listed_docs(&mut result);
                 Ok(ToolResult::with_structured(text, result))
             }
             "create_roadmap" => {
@@ -7144,18 +7204,19 @@ impl MemoryTool {
                 Ok(ToolResult::with_structured(text, items))
             }
             "team_docs" => {
-                let items = self
+                let mut items = self
                     .fetch_team_entity(|client, ws_id| {
                         let doc_type = input.doc_type.clone();
                         let limit = input.limit;
                         Box::pin(async move {
                             client
-                                .list_docs(Some(ws_id), None, doc_type, None, None, limit)
+                                .list_doc_summaries(Some(ws_id), None, doc_type, None, None, limit)
                                 .await
                         })
                     })
                     .await?;
                 let text = format_collection("team docs", &items);
+                slim_listed_docs(&mut items);
                 Ok(ToolResult::with_structured(text, items))
             }
             "team_discussions" => {

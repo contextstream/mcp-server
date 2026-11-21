@@ -4553,12 +4553,15 @@ impl ContextStreamClient {
         is_personal: Option<bool>,
         query: Option<&str>,
         limit: Option<i64>,
+        include_content: bool,
     ) -> CacheKey {
         let workspace_id = workspace_id.map(|id| id.to_string());
         let project_id = project_id.map(|id| id.to_string());
         let is_personal = is_personal.map(|value| value.to_string());
         let query = query.map(str::trim).filter(|value| !value.is_empty());
         let limit = limit.map(|value| value.clamp(1, 100).to_string());
+        // A page without bodies must never answer a caller that reads them.
+        let include_content: &[u8] = if include_content { b"true" } else { b"false" };
         Self::caller_bound_cache_key(
             DOCS_LIST_CACHE_PREFIX,
             "contextstream-client-docs-list-cache-v2",
@@ -4570,6 +4573,7 @@ impl ContextStreamClient {
                 ("is_personal", is_personal.as_deref().map(str::as_bytes)),
                 ("query", query.map(str::as_bytes)),
                 ("limit", limit.as_deref().map(str::as_bytes)),
+                ("include_content", Some(include_content)),
             ],
         )
     }
@@ -15660,7 +15664,9 @@ impl ContextStreamClient {
         Ok(result)
     }
 
-    /// List docs.
+    /// The `GET /docs` path. `include_content: false` asks for each doc
+    /// without its body (`content: ""` plus `content_chars` and a short
+    /// `preview`); an API that predates the parameter ignores it.
     fn build_docs_path(
         workspace_id: Option<Uuid>,
         project_id: Option<Uuid>,
@@ -15668,6 +15674,7 @@ impl ContextStreamClient {
         is_personal: Option<bool>,
         query: Option<String>,
         limit: Option<i64>,
+        include_content: bool,
     ) -> String {
         let mut path = "/docs".to_string();
         let mut params = vec![];
@@ -15689,13 +15696,16 @@ impl ContextStreamClient {
         if let Some(l) = limit {
             params.push(format!("per_page={}", l.clamp(1, 100)));
         }
+        if !include_content {
+            params.push("include_content=false".to_string());
+        }
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));
         }
         path
     }
 
-    /// List docs.
+    /// List docs, each with its full content.
     pub async fn list_docs(
         &self,
         workspace_id: Option<Uuid>,
@@ -15704,6 +15714,52 @@ impl ContextStreamClient {
         is_personal: Option<bool>,
         query: Option<String>,
         limit: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        self.list_docs_page(
+            workspace_id,
+            project_id,
+            doc_type,
+            is_personal,
+            query,
+            limit,
+            true,
+        )
+        .await
+    }
+
+    /// List docs without their bodies, for a listing that shows titles: a
+    /// page of nine docs carried every body in full, about 25k tokens.
+    /// `get_doc` reads a body.
+    pub async fn list_doc_summaries(
+        &self,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        doc_type: Option<String>,
+        is_personal: Option<bool>,
+        query: Option<String>,
+        limit: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        self.list_docs_page(
+            workspace_id,
+            project_id,
+            doc_type,
+            is_personal,
+            query,
+            limit,
+            false,
+        )
+        .await
+    }
+
+    async fn list_docs_page(
+        &self,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        doc_type: Option<String>,
+        is_personal: Option<bool>,
+        query: Option<String>,
+        limit: Option<i64>,
+        include_content: bool,
     ) -> Result<serde_json::Value> {
         let config = self.config.read().await;
         let (ws_id, proj_id) = scope_ids_with_defaults(workspace_id, project_id, &config);
@@ -15721,9 +15777,18 @@ impl ContextStreamClient {
                     is_personal,
                     query.as_deref(),
                     limit,
+                    include_content,
                 )
             });
-        let mut path = Self::build_docs_path(ws_id, proj_id, doc_type, is_personal, query, limit);
+        let mut path = Self::build_docs_path(
+            ws_id,
+            proj_id,
+            doc_type,
+            is_personal,
+            query,
+            limit,
+            include_content,
+        );
         if let Some(page) = list_page(limit.unwrap_or(20)) {
             let separator = if path.contains('?') { '&' } else { '?' };
             path.push(separator);
@@ -30110,6 +30175,7 @@ mod tests {
             Some(false),
             Some("ContextStream Infrastructure Reference".to_string()),
             Some(25),
+            true,
         );
 
         assert!(path.starts_with("/docs?"));
@@ -30120,6 +30186,26 @@ mod tests {
         assert!(path.contains("query=ContextStream%20Infrastructure%20Reference"));
         assert!(path.contains("per_page=25"));
         assert!(!path.contains("limit="));
+        assert!(!path.contains("include_content"), "{path}");
+    }
+
+    #[test]
+    fn a_doc_summary_listing_asks_for_no_bodies() {
+        let path = ContextStreamClient::build_docs_path(
+            Some(Uuid::nil()),
+            None,
+            None,
+            None,
+            None,
+            Some(9),
+            false,
+        );
+        assert!(path.starts_with("/docs?"), "{path}");
+        assert!(path.contains("include_content=false"), "{path}");
+        assert!(path.contains("per_page=9"), "{path}");
+
+        let bare = ContextStreamClient::build_docs_path(None, None, None, None, None, None, false);
+        assert_eq!(bare, "/docs?include_content=false");
     }
 
     #[test]
@@ -35617,6 +35703,7 @@ mod caller_bound_response_cache_tests {
                 Some(true),
                 Some("private docs query | exact"),
                 Some(41),
+                true,
             ),
             ContextStreamClient::doc_get_cache_key(caller, doc_id),
             ContextStreamClient::search_cache_key(caller, "/search/hybrid", &search_body),
@@ -35769,6 +35856,7 @@ mod caller_bound_response_cache_tests {
             Some(true),
             Some("c:d"),
             Some(10),
+            true,
         );
         let docs_right = ContextStreamClient::docs_list_cache_key(
             caller,
@@ -35778,6 +35866,7 @@ mod caller_bound_response_cache_tests {
             Some(true),
             Some("b|c:d"),
             Some(10),
+            true,
         );
         let docs_absent = ContextStreamClient::docs_list_cache_key(
             caller,
@@ -35787,6 +35876,7 @@ mod caller_bound_response_cache_tests {
             None,
             None,
             None,
+            true,
         );
         let docs_present_empty = ContextStreamClient::docs_list_cache_key(
             caller,
@@ -35796,9 +35886,22 @@ mod caller_bound_response_cache_tests {
             None,
             None,
             None,
+            true,
+        );
+        let docs_without_content = ContextStreamClient::docs_list_cache_key(
+            caller,
+            Some(workspace_id),
+            Some(project_id),
+            None,
+            None,
+            None,
+            None,
+            false,
         );
         assert_ne!(docs_left, docs_right);
         assert_ne!(docs_absent, docs_present_empty);
+        // A page without bodies never answers a caller that reads them.
+        assert_ne!(docs_absent, docs_without_content);
     }
 
     #[test]

@@ -3844,6 +3844,39 @@ mod personal_mode_reference_tests {
     }
 
     #[tokio::test]
+    async fn list_docs_asks_for_no_bodies_and_returns_previews() {
+        let (tool, listener) = personal_mode_tool().await;
+        let server = serve(
+            listener,
+            json!({"success": true, "data": {"items": [
+                {"id": TEAM_ITEM, "title": "Big doc", "doc_type": "general",
+                 "content": "word ".repeat(2000)}
+            ], "total": 1}}),
+            json!({"success": true, "data": {}}),
+        );
+        let result = tool
+            .execute(json!({"action": "list_docs"}))
+            .await
+            .expect("list_docs");
+        let lines = server.await.expect("server");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("GET /api/v1/docs?")
+                    && line.contains("include_content=false")),
+            "{lines:?}"
+        );
+        assert!(text_of(&result).contains("Big doc"));
+        let structured = result.structured_content.expect("structured content");
+        let doc = &structured["items"][0];
+        assert!(doc.get("content").is_none(), "{doc}");
+        assert_eq!(doc["content_chars"], 10_000);
+        assert!(doc["preview"]
+            .as_str()
+            .is_some_and(|p| p.chars().count() <= 200));
+    }
+
+    #[tokio::test]
     async fn a_team_doc_is_updated_and_deleted_by_its_exact_title_in_personal_mode() {
         let team_doc = json!({"id": TEAM_ITEM, "title": "Own team doc 492",
                               "doc_type": "general", "is_personal": false});
@@ -3952,5 +3985,71 @@ mod personal_mode_reference_tests {
                 "{lines:?}"
             );
         }
+    }
+}
+
+mod doc_listing_slim_tests {
+    use super::{slim_listed_doc, slim_listed_docs, DOC_LIST_PREVIEW_CHARS};
+    use serde_json::json;
+
+    #[test]
+    fn a_listed_doc_carries_a_preview_not_its_body() {
+        let mut listing =
+            json!({"items": [{"id": "d1", "title": "A", "content": "x".repeat(5000)}]});
+        slim_listed_docs(&mut listing);
+        let doc = &listing["items"][0];
+        assert!(doc.get("content").is_none(), "{doc}");
+        assert_eq!(doc["content_chars"], 5000);
+        let preview = doc["preview"].as_str().expect("preview");
+        assert!(
+            preview.chars().count() <= DOC_LIST_PREVIEW_CHARS,
+            "{preview}"
+        );
+        assert!(preview.ends_with('…'), "{preview}");
+        assert_eq!(doc["title"], "A");
+        assert_eq!(doc["id"], "d1");
+    }
+
+    #[test]
+    fn a_bare_array_listing_is_slimmed_too() {
+        let mut listing = json!([
+            {"title": "B", "content": "  line one\n\n\tline   two  "},
+            {"title": "C", "content": ""}
+        ]);
+        slim_listed_docs(&mut listing);
+        assert!(listing[0].get("content").is_none());
+        assert_eq!(listing[0]["preview"], "line one line two");
+        assert_eq!(listing[0]["content_chars"], 25);
+        assert!(listing[1].get("content").is_none());
+        assert_eq!(listing[1]["content_chars"], 0);
+        assert!(listing[1].get("preview").is_none());
+    }
+
+    #[test]
+    fn a_doc_the_api_already_slimmed_keeps_its_count_and_preview() {
+        let mut listing = json!({"data": {"items": [
+            {"title": "D", "content": "", "content_chars": 12345, "preview": "server preview"}
+        ]}});
+        slim_listed_docs(&mut listing);
+        let doc = &listing["data"]["items"][0];
+        assert!(doc.get("content").is_none(), "{doc}");
+        assert_eq!(doc["content_chars"], 12345);
+        assert_eq!(doc["preview"], "server preview");
+    }
+
+    #[test]
+    fn a_preview_counts_characters_not_bytes() {
+        let mut doc = json!({"content": "é".repeat(300)});
+        slim_listed_doc(&mut doc);
+        assert_eq!(doc["content_chars"], 300);
+        let preview = doc["preview"].as_str().expect("preview");
+        assert_eq!(preview.chars().count(), DOC_LIST_PREVIEW_CHARS);
+    }
+
+    #[test]
+    fn a_short_body_is_previewed_whole() {
+        let mut doc = json!({"content": "y".repeat(DOC_LIST_PREVIEW_CHARS)});
+        slim_listed_doc(&mut doc);
+        assert_eq!(doc["preview"], "y".repeat(DOC_LIST_PREVIEW_CHARS));
     }
 }

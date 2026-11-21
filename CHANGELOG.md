@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.90
+
+- `memory(action="create_node")` accepts the `goal`, `risk` and `term` node types its schema lists. Before, `risk` and `term` were refused with "Invalid node_type".
+- `memory(action="list_docs")` returns previews instead of every document in full.
+- Hook reminders (ticket links, plans, skills) show once per session, tool failures are counted once per session and parallel batch, and a session's own saves no longer come back to it as live notices.
+- Captures keep `is_personal` instead of dropping it, and results no longer carry the unavailable `current_truth` stub.
+- Setup keeps machine-local files out of Git, keeps an explicit `autoMemoryEnabled: true`, and init names a Windows client's folder by its last path segment on a Linux gateway.
+- The entity docs describe an incident's lifecycle times.
+
 ## 1.0.89
 
 - Dependency updates (jsonwebtoken 12, clap, uuid, notify, ignore, globset, flate2, tokio-rustls, toml_edit).

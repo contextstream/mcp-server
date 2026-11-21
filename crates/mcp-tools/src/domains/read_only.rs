@@ -134,6 +134,35 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
             "list_coached_rules",
         ],
     },
+    ReadOnlyTwin {
+        name: "graph_read",
+        tool: "graph",
+        title: "Read Code & Knowledge Graph",
+        description: "Read ContextStream code and knowledge graphs without changing anything: \
+                      dependencies, impact, usages, call_path, related items, item paths, \
+                      code decisions, contradictions, cached code_drift, circular_dependencies, \
+                      unused_code, complexity_metrics, quality_trends, quality_history and \
+                      quality_freshness. Same arguments as graph(action=...) for these actions. \
+                      Use this for every read; use `graph` only for ingest, quality_snapshot, \
+                      outbox ops or code_drift with refresh=true.",
+        actions: &[
+            "dependencies",
+            "impact",
+            "usages",
+            "call_path",
+            "related",
+            "path",
+            "decisions",
+            "contradictions",
+            "code_drift",
+            "circular_dependencies",
+            "unused_code",
+            "complexity_metrics",
+            "quality_trends",
+            "quality_history",
+            "quality_freshness",
+        ],
+    },
 ];
 
 /// Whether `name` is one of the read-only twins.
@@ -144,7 +173,10 @@ pub fn is_read_only_twin(name: &str) -> bool {
 /// Register every twin whose tool this registry serves directly.
 pub fn register_read_only_twins(registry: &mut ToolRegistry) {
     for twin in READ_ONLY_TWINS {
-        let Some(inner) = registry.get(twin.tool).map(|tool| tool.handler.clone()) else {
+        let Some(inner) = registry
+            .get_registered(twin.tool)
+            .map(|tool| tool.handler.clone())
+        else {
             continue;
         };
         registry.register(twin.name, Arc::new(ReadOnlyTwinTool::new(twin, inner)));
@@ -375,6 +407,15 @@ impl ToolHandler for ReadOnlyTwinTool {
             .map(|actions| actions.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         let action = read_action(self.twin, &tool_actions, &input)?;
+        if self.twin.name == "graph_read"
+            && action == "code_drift"
+            && input.get("refresh").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(Error::Validation(
+                "`graph_read` only reads cached `code_drift` findings. Use `graph(action=\"code_drift\", refresh=true)` to recompute findings."
+                    .to_string(),
+            ));
+        }
         if let Some(object) = input.as_object_mut() {
             object.insert("action".to_string(), Value::String(action.to_string()));
         }
@@ -606,5 +647,110 @@ mod tests {
             assert!(!twin.actions.is_empty(), "{}", twin.name);
         }
         assert!(!is_read_only_twin("memory"));
+        assert!(!is_read_only_twin("graph"));
+    }
+
+    struct RecordingGraph {
+        metadata: ToolMetadata,
+        calls: Mutex<Vec<Value>>,
+    }
+
+    impl RecordingGraph {
+        fn new() -> Self {
+            Self {
+                metadata: ToolMetadata {
+                    name: "graph".to_string(),
+                    title: "Code Graph Analysis".to_string(),
+                    description: "test".to_string(),
+                    category: ToolCategory::Graph,
+                    annotations: ToolAnnotations::write(),
+                    is_pro: false,
+                    required_tier: None,
+                },
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ToolHandler for RecordingGraph {
+        async fn execute(&self, input: Value) -> Result<ToolResult> {
+            self.calls.lock().unwrap().push(input);
+            Ok(ToolResult::text("ok"))
+        }
+        fn metadata(&self) -> &ToolMetadata {
+            &self.metadata
+        }
+        fn input_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "dependencies", "impact", "usages", "call_path",
+                            "related", "path", "decisions", "contradictions",
+                            "code_drift", "circular_dependencies", "unused_code",
+                            "complexity_metrics", "quality_trends", "quality_history",
+                            "quality_freshness", "ingest", "outbox_status",
+                            "outbox_canary", "quality_snapshot"
+                        ]
+                    },
+                    "target_id": {"type": "string"},
+                    "refresh": {"type": "boolean"}
+                },
+                "required": ["action"]
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_read_runs_reads_and_refuses_writes_and_refresh() {
+        let twin = READ_ONLY_TWINS
+            .iter()
+            .find(|twin| twin.name == "graph_read")
+            .expect("graph_read");
+        let inner = Arc::new(RecordingGraph::new());
+        let tool = ReadOnlyTwinTool::new(twin, inner.clone());
+        assert!(tool.metadata().annotations.read_only);
+        assert!(!tool.metadata().annotations.destructive);
+
+        // Pure reads succeed.
+        tool.execute(json!({"action": "dependencies", "target_id": "src/lib.rs"}))
+            .await
+            .expect("dependencies read runs");
+        tool.execute(json!({"action": "impact", "target_id": "src/lib.rs"}))
+            .await
+            .expect("impact read runs");
+        tool.execute(json!({"action": "code_drift"}))
+            .await
+            .expect("cached code_drift read runs");
+        tool.execute(json!({"action": "code_drift", "refresh": false}))
+            .await
+            .expect("explicit refresh=false code_drift read runs");
+
+        // Write/trigger actions are refused.
+        for write_action in ["ingest", "quality_snapshot", "outbox_canary", "outbox_status"] {
+            let err = tool
+                .execute(json!({"action": write_action}))
+                .await
+                .expect_err(write_action);
+            assert!(
+                err.to_string().contains(&format!("Use `graph` for `{write_action}`")),
+                "{write_action}: {err}"
+            );
+        }
+
+        // Recomputing code_drift with refresh=true is refused on graph_read.
+        let refresh_err = tool
+            .execute(json!({"action": "code_drift", "refresh": true}))
+            .await
+            .expect_err("refresh=true must be refused on graph_read");
+        assert!(
+            refresh_err.to_string().contains("refresh=true"),
+            "{refresh_err}"
+        );
+
+        assert_eq!(inner.calls.lock().unwrap().len(), 4);
     }
 }

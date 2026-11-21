@@ -241,7 +241,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "init" => "Initializing ContextStream session".to_string(),
         "context" => "Loading ContextStream context".to_string(),
         "search" => "Searching ContextStream index".to_string(),
-        "graph" => "Analyzing ContextStream code graph".to_string(),
+        "graph" | "graph_read" => "Analyzing ContextStream code graph".to_string(),
         "help" => "Looking up ContextStream help".to_string(),
         "capture_plan" => "Saving plan to ContextStream".to_string(),
         "session_capture_lesson" => "Saving lesson to ContextStream".to_string(),
@@ -281,7 +281,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "init" => "ContextStream session ready".to_string(),
         "context" => "ContextStream context loaded".to_string(),
         "search" => "ContextStream search complete".to_string(),
-        "graph" => "ContextStream graph analysis complete".to_string(),
+        "graph" | "graph_read" => "ContextStream graph analysis complete".to_string(),
         "help" => "ContextStream help complete".to_string(),
         "capture_plan" => "Plan saved to ContextStream".to_string(),
         "session_capture_lesson" => "Lesson saved to ContextStream".to_string(),
@@ -3303,6 +3303,7 @@ mod tests {
         "entity",
         "feed",
         "graph",
+        "graph_read",
         "help",
         "init",
         "instruct",
@@ -3352,6 +3353,7 @@ mod tests {
         "context",
         "delete",
         "execute_operation",
+        "graph_read",
         "help",
         "init",
         "instruct",
@@ -3432,6 +3434,13 @@ mod tests {
         (
             "graph",
             "a86ddb1fff028415180c19a8a61492418ed9bd2ca22a3f0dd59e4eaeee74c4ca",
+        ),
+        (
+            // Read-only twin of `graph` (readOnlyHint: true) exposing the 15
+            // pure-read graph actions without approval prompts and refusing
+            // `code_drift` with `refresh: true`.
+            "graph_read",
+            "e413b4fba525035f221d5f08f857fd35a06394c72a3896f68651a739af2bb943",
         ),
         (
             // Advanced when the `feeds` bundle joined the `bundle` enum

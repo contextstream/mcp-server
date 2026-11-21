@@ -1057,6 +1057,14 @@ impl ToolRegistry {
         }
     }
 
+    /// Get a direct tool registered in this registry regardless of surface
+    /// visibility filtering (used to wire read-only twins like `graph_read`
+    /// on compact profiles where the mutating parent tool stays behind
+    /// `tool_search`, while still skipping non-direct tools in router mode).
+    pub(crate) fn get_registered(&self, name: &str) -> Option<&RegisteredTool> {
+        self.tools.get(name)
+    }
+
     /// List all registered tools.
     ///
     /// Back-compat aliases — registry keys that differ from the tool's
@@ -2867,8 +2875,9 @@ const OPENAI_AGENTIC_CORE_TOOLS: &[&str] = &[
     "project",
     "workspace",
     "help",
-    // The read-only twins of memory, project, session and workspace: reads
-    // that a client can run without asking its person to confirm (#330).
+    // The read-only twins of graph, memory, project, session and workspace:
+    // reads that a client can run without asking its person to confirm (#330).
+    "graph_read",
     "memory_read",
     "project_read",
     "session_read",

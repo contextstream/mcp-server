@@ -27,6 +27,7 @@ dirs = "7.0"
 sha2 = "0.11"
 hex = "0.4"
 ignore = { workspace = true }
+globset = "0.4"
 flate2 = "1"
 regex = "1"
 tempfile = { workspace = true }

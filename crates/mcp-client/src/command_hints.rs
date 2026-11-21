@@ -181,6 +181,10 @@ pub struct Cache {
     pub api_url: String,
     /// Seconds since the epoch.
     pub written_at: u64,
+    /// Settings generation when the catalog read began. A slower read from a
+    /// different process must not resurrect a check the caller has turned off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_changed: Option<SystemTime>,
     pub tools: Vec<CachedTool>,
 }
 
@@ -191,6 +195,7 @@ impl Cache {
             identity: identity.to_string(),
             api_url: normalized_url(api_url),
             written_at: now_secs(),
+            settings_changed: CheckMarker::SettingsChanged.modified(identity, api_url),
             tools: tools.into_iter().take(MAX_TOOLS).collect(),
         }
     }
@@ -230,6 +235,44 @@ pub fn cache_path(identity: &str) -> Option<PathBuf> {
     })
 }
 
+/// Small, account- and endpoint-specific signals shared by CLI processes and stdio.
+#[derive(Clone, Copy)]
+pub enum CheckMarker {
+    SettingsChanged,
+    OutOfCredits,
+}
+
+impl CheckMarker {
+    fn path(self, identity: &str, api_url: &str) -> Option<PathBuf> {
+        let digest = hex::encode(Sha256::digest(
+            format!("{identity}\0{}", normalized_url(api_url)).as_bytes(),
+        ));
+        let suffix = match self {
+            Self::SettingsChanged => "settings",
+            Self::OutOfCredits => "credits",
+        };
+        Some(cache_path(identity)?.with_file_name(format!("remote-checks-{suffix}-{digest}")))
+    }
+
+    pub fn modified(self, identity: &str, api_url: &str) -> Option<SystemTime> {
+        let meta = std::fs::symlink_metadata(self.path(identity, api_url)?).ok()?;
+        meta.is_file().then(|| meta.modified().ok()).flatten()
+    }
+
+    pub fn mark(self, identity: &str, api_url: &str) {
+        let Some(path) = self.path(identity, api_url) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_ok() {
+                if let Ok(file) = tempfile::NamedTempFile::new_in(parent) {
+                    let _ = file.persist(path);
+                }
+            }
+        }
+    }
+}
+
 /// Write `cache` to `path` unless the file already says the same (ignoring
 /// when it was written). Returns whether it wrote. A symlink at `path` is
 /// never written through.
@@ -238,6 +281,7 @@ pub fn write_to(path: &Path, cache: &Cache) -> std::io::Result<bool> {
         if let Ok(old) = serde_json::from_str::<Cache>(&existing) {
             let same = old.identity == cache.identity
                 && old.api_url == cache.api_url
+                && old.settings_changed == cache.settings_changed
                 && old.tools == cache.tools
                 && old.version == cache.version;
             // A file nearly as old as it may be is written again, so a live session keeps it fresh.
@@ -289,6 +333,11 @@ pub fn read_from(path: &Path, identity: &str, api_url: &str) -> Option<Cache> {
 
 /// [`write_to`] the default path for the cache's account.
 pub fn write(cache: &Cache) -> std::io::Result<bool> {
+    if cache.settings_changed
+        != CheckMarker::SettingsChanged.modified(&cache.identity, &cache.api_url)
+    {
+        return Ok(false);
+    }
     let path = cache_path(&cache.identity)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home folder"))?;
     write_to(&path, cache)
@@ -296,7 +345,11 @@ pub fn write(cache: &Cache) -> std::io::Result<bool> {
 
 /// [`read_from`] the default path for `identity`.
 pub fn read(identity: &str, api_url: &str) -> Option<Cache> {
-    read_from(&cache_path(identity)?, identity, api_url)
+    let mut cache = read_from(&cache_path(identity)?, identity, api_url)?;
+    if cache.settings_changed != CheckMarker::SettingsChanged.modified(identity, api_url) {
+        cache.tools.retain(|tool| tool.name != "check");
+    }
+    Some(cache)
 }
 
 /// Quote `text` as one word for a POSIX shell.

@@ -23184,7 +23184,7 @@ fn extract_validation_error_message(body: &serde_json::Value) -> Option<String> 
     }
 }
 
-fn extract_error_code(body: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_error_code(body: &serde_json::Value) -> Option<String> {
     // Try nested error.code
     if let Some(error) = body.get("error") {
         if let Some(code) = error.get("code").and_then(|c| c.as_str()) {
@@ -24706,6 +24706,58 @@ mod tests {
             .await
             .expect("context");
         assert!(answer.version_notice.is_some_and(|notice| notice.behind));
+    }
+
+    #[tokio::test]
+    async fn remote_checks_settings_routes_accept_old_and_new_answers() {
+        let old = serde_json::json!({"tool":"check","enabled":true,"available":true});
+        let mut new = old.clone();
+        new["more_engines"] = true.into();
+        new["pricing"] = serde_json::Value::Null;
+        new["credits"] = serde_json::json!({"available": 41200, "no_charge":true});
+        new["languages"] = serde_json::json!([]);
+        let toggle = serde_json::json!({"enabled":true});
+        let answers = [&old, &new, &old, &toggle, &toggle].map(|data| {
+            (
+                "200 OK",
+                serde_json::json!({"success":true, "data":data}).to_string(),
+            )
+        });
+        let (client, server) = client_with_http_sequence(answers.into()).await;
+        let legacy = client.remote_checks().await.unwrap();
+        assert_eq!(legacy.languages.len(), 15);
+        assert_eq!(legacy.pricing.unwrap().credits_per_10s, 20);
+        assert!(legacy.more_engines.is_none());
+        let current = client.set_remote_checks(true, Some(true)).await.unwrap();
+        assert!(current.pricing.is_none());
+        assert!(current.languages.is_empty());
+        assert_eq!(current.more_engines, Some(true));
+        assert!(current.credits.unwrap().no_charge);
+        client.set_remote_checks(false, None).await.unwrap();
+        assert!(client.more_engines().await.unwrap());
+        assert!(client.set_more_engines(true).await.unwrap());
+        let requests = server.await.unwrap();
+        for (request, (method, path, body)) in requests.iter().zip([
+            ("GET", "enabled", None),
+            (
+                "PUT",
+                "enabled",
+                Some(serde_json::json!({"enabled":true,"more_engines":true})),
+            ),
+            ("PUT", "enabled", Some(serde_json::json!({"enabled":false}))),
+            ("GET", "more-engines", None),
+            ("PUT", "more-engines", Some(toggle)),
+        ]) {
+            assert!(request.starts_with(&format!("{method} /api/v1/mcp/hosted-tools/{path} HTTP/")));
+            assert!(request_header(request, "x-api-key").is_some());
+            if let Some(expected) = body {
+                let (_, body) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                    expected
+                );
+            }
+        }
     }
 
     async fn client_with_http_sequence(

@@ -1,0 +1,17 @@
+[
+  {"id": "rust", "name": "Rust", "tools": "cargo check · test · clippy", "more": false, "markers": ["Cargo.toml"]},
+  {"id": "typescript", "name": "TypeScript and JavaScript", "tools": "tsc · eslint · biome · vitest · jest · builds", "more": false, "markers": ["package.json", "tsconfig.json"]},
+  {"id": "python", "name": "Python", "tools": "pytest · mypy · pyright · ruff, through uv", "more": false, "markers": ["pyproject.toml", "requirements.txt", "setup.py", "uv.lock"]},
+  {"id": "go", "name": "Go", "tools": "go build · vet · test", "more": false, "markers": ["go.mod"]},
+  {"id": "jvm", "name": "Java and Kotlin", "tools": "Maven · Gradle", "more": true, "markers": ["pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"]},
+  {"id": "dotnet", "name": ".NET", "tools": "dotnet build · test · format", "more": true, "markers": ["*.csproj", "*.fsproj", "*.sln", "global.json"]},
+  {"id": "ruby", "name": "Ruby", "tools": "rspec · rubocop · rails test", "more": true, "markers": ["Gemfile"]},
+  {"id": "php", "name": "PHP", "tools": "phpunit · pest · phpstan · psalm", "more": true, "markers": ["composer.json"]},
+  {"id": "cc", "name": "C and C++", "tools": "make · cmake · ctest · clang-tidy", "more": true, "markers": ["CMakeLists.txt", "Makefile", "meson.build"]},
+  {"id": "bun", "name": "Bun", "tools": "bun test · bunx tsc", "more": true, "markers": ["bun.lock", "bun.lockb", "bunfig.toml"]},
+  {"id": "deno", "name": "Deno", "tools": "deno check · lint · test", "more": true, "markers": ["deno.json", "deno.jsonc"]},
+  {"id": "dart", "name": "Dart", "tools": "dart analyze · test · format", "more": true, "markers": ["pubspec.yaml"]},
+  {"id": "elixir", "name": "Elixir", "tools": "mix compile · test · format · credo", "more": true, "markers": ["mix.exs"]},
+  {"id": "zig", "name": "Zig", "tools": "zig build · test · fmt", "more": true, "markers": ["build.zig"]},
+  {"id": "swift", "name": "Swift", "tools": "swift build · test", "more": true, "markers": ["Package.swift"]}
+]

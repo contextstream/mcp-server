@@ -30,6 +30,14 @@ impl HostedToolsAnswer {
         (200..300).contains(&self.status)
     }
 
+    /// A check refused for lack of credit. A past-due subscription uses
+    /// the same HTTP status with its own code and billing message.
+    pub fn insufficient_credits(&self) -> bool {
+        let code = crate::client::extract_error_code(&self.body);
+        code.as_deref() == Some("INSUFFICIENT_CREDITS")
+            || (self.status == 402 && code.as_deref() != Some("PAYMENT_REQUIRED"))
+    }
+
     /// The error's message, when the answer is an error that has one.
     pub fn error_message(&self) -> Option<String> {
         self.body

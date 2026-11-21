@@ -33,6 +33,7 @@ pub mod ingest_guard;
 pub mod json;
 pub mod parity;
 pub mod plan_loops;
+pub mod remote_checks;
 pub mod retry;
 pub mod run_progress;
 pub mod studio;

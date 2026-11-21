@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.92
+
+- Remote checks can be turned on from the MCP: `session(action="remote_checks")` shows whether they are on, what they cost, your credit balance and which of the project's languages run remotely; pass `enabled=true` or `false`, and `more_engines` for the extra languages (Java, .NET, Ruby, PHP, C/C++, Bun, Deno, Dart, Elixir, Zig, Swift). The same from a shell: `contextstream-mcp remote-checks [status|on|off] [--more-engines|--no-more-engines] [--json]`. The `check` tool appears or goes away at once, without a restart.
+- `contextstream-mcp setup` has a Remote checks step: it finds the languages of the project you connect, says which run remotely, shows the price (20 Context Credits per 10 seconds of run time; exact repeats and checks that run on your machine are free) and your balance, and turns them on with one keypress. Scripted setups use `--remote-checks` or `--no-remote-checks`. `doctor` reports whether remote checks are on.
+- When the account is out of Context Credits, a remote check says so and runs on your machine (`contextstream-mcp run`) or tells the agent to run it locally, with where to add credits; the client does not ask again for three minutes.
+
 ## 1.0.91
 
 - The `check` tool reports Zig's version from `zig version` and Elixir's from the `Elixir` line of `elixir --version`, as the remote worker records them, so Zig and Elixir checks can run remotely instead of falling back to the local machine.

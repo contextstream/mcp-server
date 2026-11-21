@@ -3703,11 +3703,12 @@ pub async fn auth_middleware(
     if let (Some(secret), Some(ref a)) = (&state.jwt_secret, &auth) {
         if let Some(ref token) = a.jwt {
             let validation = Validation::new(Algorithm::HS256);
-            match decode::<Claims>(
-                token,
-                &DecodingKey::from_secret(secret.as_bytes()),
-                &validation,
-            ) {
+            // jsonwebtoken 12 refuses an empty HMAC key. An empty
+            // CONTEXTSTREAM_JWT_SECRET verifies nothing, so every token fails
+            // closed (11 accepted tokens signed with the empty key).
+            let verified = DecodingKey::from_secret(secret.as_bytes())
+                .and_then(|key| decode::<Claims>(token, &key, &validation));
+            match verified {
                 Ok(data) => {
                     jwt_subject = Some(data.claims.sub);
                 }
@@ -5750,15 +5751,18 @@ mod tests {
             jsonwebtoken::encode(
                 &jsonwebtoken::Header::new(algorithm),
                 claims,
-                &jsonwebtoken::EncodingKey::from_secret(secret),
+                &jsonwebtoken::EncodingKey::from_secret(secret).unwrap(),
             )
             .unwrap()
         }
 
         async fn jwt_auth_response(token: &str) -> Response {
+            jwt_auth_response_with(std::str::from_utf8(JWT_TEST_SECRET).unwrap(), token).await
+        }
+
+        async fn jwt_auth_response_with(secret: &str, token: &str) -> Response {
             // Exercise the real middleware without sending any upstream request.
-            let state =
-                create_auth_state(true, Some(std::str::from_utf8(JWT_TEST_SECRET).unwrap()));
+            let state = create_auth_state(true, Some(secret));
             let app = Router::new()
                 .route("/auth-probe", get(|| async { StatusCode::NO_CONTENT }))
                 .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
@@ -5771,6 +5775,20 @@ mod tests {
             )
             .await
             .unwrap()
+        }
+
+        #[tokio::test]
+        async fn empty_jwt_secret_rejects_every_token() {
+            let future = chrono::Utc::now().timestamp() + 3600;
+            let token = signed_test_jwt(
+                &json!({"sub": "caller", "exp": future}),
+                Algorithm::HS256,
+                JWT_TEST_SECRET,
+            );
+            assert_eq!(
+                jwt_auth_response_with("", &token).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
         }
 
         #[tokio::test]
@@ -5825,7 +5843,7 @@ mod tests {
             // GHSA-h395-gr6q-cpjc: enabled validation must not treat a malformed
             // optional claim as absent. The transport currently requires exp
             // and does not enable nbf; pin the patched library contract too.
-            let key = DecodingKey::from_secret(JWT_TEST_SECRET);
+            let key = DecodingKey::from_secret(JWT_TEST_SECRET).unwrap();
             for claim in ["exp", "nbf"] {
                 let mut validation = Validation::new(Algorithm::HS256);
                 validation.required_spec_claims.clear();

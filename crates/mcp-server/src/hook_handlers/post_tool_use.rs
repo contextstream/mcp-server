@@ -319,6 +319,49 @@ fn contextstream_post_tool_nudge(
     }
 }
 
+/// How much of a saved item's content stands in for a title it lacks.
+const SELF_AUTHORED_CONTENT_CHARS: usize = 40;
+
+/// The title of the lesson, preference or decision this call saves (the
+/// first `SELF_AUTHORED_CONTENT_CHARS` characters of its content when it has
+/// no title), which the mid-run poll must not play back to the session as
+/// news. `None` for any other call.
+fn self_authored_title(normalized_tool_name: &str, tool_input: &Value) -> Option<String> {
+    let lowercase = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| tool_input.get(*key).and_then(Value::as_str))
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    let action = contextstream_action(tool_input);
+    let is_decision = || lowercase(&["event_type", "eventType"]) == "decision";
+    let saves = match (normalized_tool_name, action.as_str()) {
+        ("session", "capture_lesson" | "remember")
+        | ("session_capture_lesson" | "session_remember", _) => true,
+        ("session", "capture")
+        | ("memory", "create_event")
+        | ("session_capture" | "memory_create_event", _) => is_decision(),
+        ("memory", "create_node") => matches!(
+            lowercase(&["node_type", "nodeType"]).as_str(),
+            "preference" | "lesson" | "decision"
+        ),
+        _ => false,
+    };
+    if !saves {
+        return None;
+    }
+    let text = |key: &str| {
+        tool_input
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    text("title").map(str::to_string).or_else(|| {
+        text("content").map(|content| content.chars().take(SELF_AUTHORED_CONTENT_CHARS).collect())
+    })
+}
+
 /// The token under which a post-tool reminder is shown at most once per
 /// session, for each tool and kind; `None` for one shown every time it
 /// applies (a saved handoff's next step is news with every save).
@@ -942,6 +985,13 @@ pub async fn handle() -> Result<()> {
     if is_contextstream_server_call(&mcp_server_name, &tool_name) {
         // Notices a `context`/`init` result showed are not shown again mid-run.
         super::mid_run_notices::record_tool_result_delivery(&input, &cwd, &tool_response);
+        // Nor is what the session just saved itself: a lesson, preference or
+        // decision it wrote is not news when the next poll returns it.
+        if tool_call_succeeded(&tool_response) {
+            if let Some(title) = self_authored_title(&normalized_tool_name, &tool_input) {
+                super::mid_run_notices::record_self_authored_title(&input, &cwd, &title);
+            }
+        }
         // A run the session reported is one the mid-run poll asks about:
         // what a person answered or wrote to it (no network here).
         if normalized_tool_name == "progress" {
@@ -2005,6 +2055,78 @@ mod tests {
                 contextstream_post_tool_nudge("entity", action, kind, &ok).is_none(),
                 "entity {action} {kind} gets no reminder"
             );
+        }
+    }
+
+    #[test]
+    fn saved_lessons_preferences_and_decisions_name_their_titles() {
+        use serde_json::json;
+        let long = "Always run cargo fmt before committing any Rust change";
+        for (tool, input, title) in [
+            (
+                "session",
+                json!({"action": "capture_lesson", "title": "Check the lock", "trigger": "t"}),
+                "Check the lock",
+            ),
+            (
+                "session_capture_lesson",
+                json!({"title": "  Spaced title  "}),
+                "Spaced title",
+            ),
+            (
+                "session",
+                json!({"action": "remember", "content": long}),
+                "Always run cargo fmt before committing a",
+            ),
+            (
+                "session_remember",
+                json!({"content": "Prefer X"}),
+                "Prefer X",
+            ),
+            (
+                "memory",
+                json!({"action": "create_node", "node_type": "preference", "title": "Prefer tabs", "content": "c"}),
+                "Prefer tabs",
+            ),
+            (
+                "session",
+                json!({"action": "capture", "event_type": "decision", "title": "Ship it", "content": "c"}),
+                "Ship it",
+            ),
+            (
+                "session_capture",
+                json!({"event_type": "Decision", "title": "Use Postgres"}),
+                "Use Postgres",
+            ),
+            (
+                "memory",
+                json!({"action": "create_event", "event_type": "decision", "content": "Pin the toolchain"}),
+                "Pin the toolchain",
+            ),
+        ] {
+            assert_eq!(
+                self_authored_title(tool, &input).as_deref(),
+                Some(title),
+                "{tool} {input}"
+            );
+        }
+        for (tool, input) in [
+            (
+                "session",
+                json!({"action": "capture", "event_type": "note", "title": "A note"}),
+            ),
+            (
+                "memory",
+                json!({"action": "create_node", "node_type": "fact", "title": "A fact"}),
+            ),
+            ("session", json!({"action": "get_lessons", "query": "x"})),
+            (
+                "entity",
+                json!({"action": "create", "kind": "ticket", "body": {"title": "T"}}),
+            ),
+            ("session", json!({"action": "remember", "content": "   "})),
+        ] {
+            assert_eq!(self_authored_title(tool, &input), None, "{tool} {input}");
         }
     }
 

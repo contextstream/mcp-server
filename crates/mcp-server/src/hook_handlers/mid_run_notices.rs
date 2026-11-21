@@ -89,6 +89,11 @@ const DELIVERIES_NOT_THERE_MS: u64 = 10 * 60 * 1000;
 /// Once-per-session reminder tokens remembered per session. Past this the
 /// oldest are forgotten, and a forgotten reminder may be shown once more.
 const MAX_SHOWN_ONCE: usize = 64;
+/// Titles of a session's own saves remembered; older ones give way.
+const MAX_SELF_AUTHORED_TITLES: usize = 64;
+/// A saved title shorter than this would match unrelated lines, so it is not
+/// remembered.
+const MIN_SELF_AUTHORED_TITLE_CHARS: usize = 6;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct MidRunSessionState {
@@ -152,6 +157,12 @@ pub(crate) struct MidRunSessionState {
     /// `MAX_SHOWN_ONCE`); see [`claim_once_per_session`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shown_once: Vec<String>,
+    /// Titles of the lessons, preferences and decisions this session saved
+    /// itself, lowercased with whitespace collapsed (at most
+    /// `MAX_SELF_AUTHORED_TITLES`): a poll that returns one does not announce
+    /// it as new.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub self_authored_titles: Vec<String>,
     #[serde(default)]
     pub updated_at: String,
 }
@@ -282,6 +293,48 @@ fn claim_once(entry: &mut MidRunSessionState, token: &str) -> bool {
     }
     push_bounded(&mut entry.shown_once, token.to_string(), MAX_SHOWN_ONCE);
     true
+}
+
+/// Remember that this session saved a lesson, preference or decision under
+/// `title`, so a later poll that returns it does not play it back as news.
+pub(crate) fn record_self_authored_title(input: &Value, cwd: &str, title: &str) {
+    if !mid_run_notices_enabled() {
+        return;
+    }
+    let key = session_state_key(input, cwd);
+    let _ = update_session_entry(&key, |entry| remember_self_authored_title(entry, title));
+}
+
+fn remember_self_authored_title(entry: &mut MidRunSessionState, title: &str) {
+    let normalized = normalize_for_match(title);
+    if normalized.chars().count() >= MIN_SELF_AUTHORED_TITLE_CHARS {
+        push_bounded(
+            &mut entry.self_authored_titles,
+            normalized,
+            MAX_SELF_AUTHORED_TITLES,
+        );
+    }
+}
+
+/// Lowercase, with every run of whitespace as one space.
+fn normalize_for_match(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// True when a lesson or preference line names something this session saved
+/// itself.
+fn is_self_authored(entry: &MidRunSessionState, block: &str) -> bool {
+    if entry.self_authored_titles.is_empty() {
+        return false;
+    }
+    let line = normalize_for_match(block);
+    entry
+        .self_authored_titles
+        .iter()
+        .any(|title| line.contains(title.as_str()))
 }
 
 /// True when `path` is a scratch, temp, or agent-harness state directory that
@@ -1809,7 +1862,8 @@ async fn check_deliveries(key: &str, editor: &str, config: &ApiConfig) {
 
 /// Keep what a poll returned that this session has not seen: every new
 /// `[COORDINATION]` notice, and lessons or preferences that appeared after
-/// the first complete context. `complete` is false when the API answered
+/// the first complete context, except the ones this session saved itself
+/// (recorded, never announced). `complete` is false when the API answered
 /// from its cache-miss fallback, which leaves lessons and preferences out:
 /// those are then neither recorded nor announced. Returns the rendered
 /// message (if any) and the notice ids to acknowledge.
@@ -1849,7 +1903,7 @@ pub(crate) fn filter_and_record_polled_context(
                 block.clone(),
                 MAX_SEEN_STATIC_LINES,
             );
-            if was_baselined && !already_seen {
+            if was_baselined && !already_seen && !is_self_authored(entry, &block) {
                 emit_lines.push(block);
             }
         } else if block.starts_with("[PREFERENCE]") {
@@ -1859,7 +1913,7 @@ pub(crate) fn filter_and_record_polled_context(
                 block.clone(),
                 MAX_SEEN_STATIC_LINES,
             );
-            if was_baselined && !already_seen {
+            if was_baselined && !already_seen && !is_self_authored(entry, &block) {
                 emit_lines.push(block);
             }
         }
@@ -3488,5 +3542,63 @@ mod tests {
         assert!(!serde_json::to_string(&entry)
             .unwrap()
             .contains("shown_once"));
+    }
+
+    #[test]
+    fn what_the_session_saved_itself_is_not_played_back_as_news() {
+        let mut state = MidRunSessionState::default();
+        let baseline = "[PREFERENCE] Prefer concise diffs\n[LESSONS_WARNING] Old lesson";
+        assert!(filter_and_record_polled_context(&mut state, baseline, true)
+            .0
+            .is_none());
+
+        remember_self_authored_title(&mut state, "Prefer X");
+        remember_self_authored_title(&mut state, "Check  the LOCK first");
+        let echo = "[PREFERENCE] Prefer concise diffs\n[PREFERENCE] Prefer X: use X over Y\n[LESSONS_WARNING] Check the lock first — before writing";
+        let (msg, _) = filter_and_record_polled_context(&mut state, echo, true);
+        assert!(msg.is_none(), "own saves are not news: {msg:?}");
+        assert!(state
+            .seen_preference_lines
+            .iter()
+            .any(|line| line.contains("Prefer X")));
+
+        let (msg, _) = filter_and_record_polled_context(
+            &mut state,
+            "[PREFERENCE] Prefer X: use X over Y\n[PREFERENCE] Prefer small commits",
+            true,
+        );
+        let msg = msg.expect("an unrelated new preference still emits");
+        assert!(msg.contains("Prefer small commits"));
+        assert!(!msg.contains("Prefer X"));
+    }
+
+    #[test]
+    fn self_authored_titles_are_bounded_and_skip_ones_too_short_to_match() {
+        let mut state = MidRunSessionState::default();
+        remember_self_authored_title(&mut state, "  X ");
+        assert!(state.self_authored_titles.is_empty());
+        for n in 0..(MAX_SELF_AUTHORED_TITLES + 3) {
+            remember_self_authored_title(&mut state, &format!("Saved title {n}"));
+        }
+        assert_eq!(state.self_authored_titles.len(), MAX_SELF_AUTHORED_TITLES);
+        assert_eq!(state.self_authored_titles[0], "saved title 3");
+
+        let old = r#"{"last_poll_unix_ms":5,"updated_at":"t"}"#;
+        let entry: MidRunSessionState = serde_json::from_str(old).unwrap();
+        assert!(entry.self_authored_titles.is_empty());
+        assert!(!serde_json::to_string(&entry)
+            .unwrap()
+            .contains("self_authored_titles"));
+    }
+
+    #[test]
+    fn a_recorded_title_reaches_the_session_state_the_poll_reads() {
+        with_temp_home(|| {
+            let input = serde_json::json!({"session_id": "self-authored-session"});
+            record_self_authored_title(&input, "/repo", "Prefer X");
+            let key = session_state_key(&input, "/repo");
+            let entry = read_session_entry_fast(&key).expect("state written");
+            assert_eq!(entry.self_authored_titles, vec!["prefer x".to_string()]);
+        });
     }
 }

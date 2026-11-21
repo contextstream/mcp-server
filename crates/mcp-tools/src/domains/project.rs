@@ -16,7 +16,9 @@ use std::sync::Arc;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::domains::scope_resolution::{classify_scope_id_arg, refuse_malformed_scope_id};
+use crate::domains::scope_resolution::{
+    classify_scope_id_arg, folder_name_from_path, refuse_malformed_scope_id,
+};
 use crate::registry::ToolHandler;
 
 /// One clause for the files the API keeps for exact search only (minified or generated
@@ -722,26 +724,6 @@ struct ResolvedIngestContext {
 struct ResolvedReadProject {
     project_id: Uuid,
     project: Project,
-}
-
-/// Last path segment for both `/` and `\\` (handles Windows paths on non-Windows MCP hosts).
-fn folder_name_from_path(path: &str) -> String {
-    const SEPS: [char; 2] = ['/', '\\'];
-    let trimmed = path.trim_end_matches(SEPS);
-    let last = trimmed
-        .rsplit_once(SEPS)
-        .map(|(_, name)| name)
-        .unwrap_or(trimmed)
-        .trim();
-    if last.is_empty() {
-        return String::new();
-    }
-    // Drive-only roots: `C:` / `D:` from `C:\` style paths
-    let bytes = last.as_bytes();
-    if bytes.len() == 2 && bytes[1] == b':' {
-        return String::new();
-    }
-    last.to_string()
 }
 
 fn project_repository_identity(project: &Project) -> Option<mcp_session::RepositoryRemoteIdentity> {

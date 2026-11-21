@@ -201,6 +201,10 @@ mod repository_project_resolution_tests {
             .expect("resolve unique project");
 
         assert_eq!(resolved.map(|(id, _)| id), Some(expected));
+
+        let windows = resolve_project_from_catalog(&projects, r"C:\Users\me\context-stream")
+            .expect("resolve a Windows folder");
+        assert_eq!(windows.map(|(id, _)| id), Some(expected));
     }
 
     fn project_with_repository(id: Uuid, name: &str, repository_url: &str) -> Project {
@@ -733,6 +737,15 @@ mod context_guidance_tests {
         assert!(!project_name_matches_folder(
             "/home/alice/projects/example-code",
             "admin-console"
+        ));
+        // A Windows client's folder, read on the Linux-hosted gateway.
+        assert!(project_name_matches_folder(
+            r"C:\Users\alice\projects\example-app",
+            "Example App"
+        ));
+        assert!(project_name_matches_folder(
+            r"\\wsl$\Ubuntu\home\alice\example_app\",
+            "exampleapp"
         ));
     }
 

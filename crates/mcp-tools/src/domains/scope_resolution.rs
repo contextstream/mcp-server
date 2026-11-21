@@ -259,13 +259,38 @@ pub(crate) async fn candidates_for_folder(
     }
 }
 
+/// Last path segment for both `/` and `\`: the gateway runs on Linux, where
+/// `Path::file_name` keeps a Windows path such as `C:\Users\me\repo` whole.
+/// A drive root (`C:\`) or an empty path has no name and answers "".
+pub(crate) fn folder_name_from_path(path: &str) -> String {
+    const SEPS: [char; 2] = ['/', '\\'];
+    let trimmed = path.trim_end_matches(SEPS);
+    let last = trimmed
+        .rsplit_once(SEPS)
+        .map(|(_, name)| name)
+        .unwrap_or(trimmed)
+        .trim();
+    if last.is_empty() {
+        return String::new();
+    }
+    // Drive-only roots: `C:` / `D:` from `C:\` style paths
+    let bytes = last.as_bytes();
+    if bytes.len() == 2 && bytes[1] == b':' {
+        return String::new();
+    }
+    last.to_string()
+}
+
+/// The folder's name to match projects against and to show: its last path
+/// segment whichever separator the client's system uses, or the whole path
+/// when it has none (`/`, `C:\`).
 pub(crate) fn folder_display_name(folder_path: &str) -> String {
-    std::path::Path::new(folder_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(folder_path)
-        .trim()
-        .to_string()
+    let name = folder_name_from_path(folder_path);
+    if name.is_empty() {
+        folder_path.trim().to_string()
+    } else {
+        name
+    }
 }
 
 /// The scope an init that found no match for its folder ended up using.
@@ -660,6 +685,27 @@ pub(crate) fn with_scope_repair(mut result: ToolResult, repair: &ScopeRepair) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_is_named_by_its_last_segment_whatever_the_separator() {
+        // The gateway runs on Linux, where Path::file_name kept a Windows
+        // path whole, so a Windows client's folder matched no project.
+        for path in [
+            r"C:\Users\me\repo",
+            r"C:\Users\me\repo\",
+            "/home/me/repo",
+            "/home/me/repo/",
+            r"\\wsl$\Ubuntu\home\me\repo",
+            "C:/Users/me/repo",
+        ] {
+            assert_eq!(folder_name_from_path(path), "repo", "{path}");
+            assert_eq!(folder_display_name(path), "repo", "{path}");
+        }
+        assert_eq!(folder_name_from_path(r"C:\"), "");
+        // A path with no name shows whole rather than as nothing.
+        assert_eq!(folder_display_name(r"C:\"), r"C:\");
+        assert_eq!(folder_display_name("/"), "/");
+    }
 
     #[test]
     fn a_folder_is_named_after_a_repository_by_its_whole_namespace() {

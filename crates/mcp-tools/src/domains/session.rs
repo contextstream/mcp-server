@@ -888,15 +888,11 @@ fn project_path_matches_folder(folder_path: &str, project_path: &str) -> bool {
 }
 
 fn project_name_matches_folder(folder_path: &str, project_name: &str) -> bool {
-    let folder_name = std::path::Path::new(folder_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(folder_path)
-        .trim();
-    let folder_key = normalize_project_match_key(folder_name);
+    let folder_name = scope_resolution::folder_display_name(folder_path);
+    let folder_key = normalize_project_match_key(&folder_name);
     let project_key = normalize_project_match_key(project_name);
     !folder_key.is_empty()
-        && (project_name.trim().eq_ignore_ascii_case(folder_name) || project_key == folder_key)
+        && (project_name.trim().eq_ignore_ascii_case(&folder_name) || project_key == folder_key)
 }
 
 fn project_metadata_matches_folder(folder_path: &str, project: &Project) -> bool {
@@ -1189,12 +1185,7 @@ fn resolve_project_from_catalog(
     workspace_projects: &[Project],
     folder_path: &str,
 ) -> Result<Option<(Uuid, String)>> {
-    let folder_name = std::path::Path::new(folder_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(folder_path)
-        .trim()
-        .to_string();
+    let folder_name = scope_resolution::folder_display_name(folder_path);
     // A clone a runner named `<owner>-<repo>` belongs to the project that
     // holds that repository, whatever the project is called. This is checked
     // before the name: a project that merely shares the folder's name and has

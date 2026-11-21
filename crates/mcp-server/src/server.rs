@@ -3558,7 +3558,7 @@ mod tests {
             // accepts and the tool dropped. Additive only
             // (is_personal_only_adds_to_the_capture_schemas).
             "session",
-            "e7ba0bdee769737f888a0adb582a5d3a8c9b30c366b15bb0556fe2156094f4f6",
+            "33c854921599cc43aac6915a0d557f5c9cea5d63b96c56d212a456c0902397ef",
         ),
         (
             // Advanced for `is_personal`, as for `session`.
@@ -3577,7 +3577,7 @@ mod tests {
             // ticket inputs, and `channel`. Additive only, as for `session`.
             // Advanced for `is_personal`, which a twin lists as its tool does.
             "session_read",
-            "0dd68782fb5e496b826eb442b8b5d5b9e247e27f2527da3ed66e2a4e019b2d98",
+            "6fcd7a4a8dccdcd04a7137cc68afdc22beb165d66af13c5106252e429c9ba979",
         ),
         (
             "session_remember",
@@ -3922,6 +3922,29 @@ mod tests {
         schema_contract_hash(&schema)
     }
 
+    /// Earlier session contracts predate the account's remote check settings.
+    /// The shared input schema adds two optional booleans, and only the writable
+    /// tool can dispatch the action.
+    fn tools_before_remote_checks() -> Vec<serde_json::Value> {
+        let mut tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        for tool in &mut tools {
+            let writable = tool["name"] == "session";
+            if !writable && tool["name"] != "session_read" {
+                continue;
+            }
+            let props = tool["inputSchema"]["properties"].as_object_mut().unwrap();
+            for field in ["enabled", "more_engines"] {
+                assert_eq!(props.remove(field).unwrap()["type"], "boolean");
+            }
+            let actions = props.get_mut("action").unwrap()["enum"]
+                .as_array_mut()
+                .unwrap();
+            assert_eq!(actions.iter().any(|a| a == "remote_checks"), writable);
+            actions.retain(|a| a != "remote_checks");
+        }
+        tools
+    }
+
     #[test]
     fn loop_ticket_inputs_only_add_to_the_session_schemas() {
         // Contract v1.3 added three ticket actions and three parameters to
@@ -3930,7 +3953,7 @@ mod tests {
         // `session_read`. Without them both schemas are exactly the
         // contracts plan loops v1.2 gave them, so every loop action, every
         // plan action and every other parameter is unchanged.
-        let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        let tools = tools_before_remote_checks();
         let params: Vec<&str> = LOOP_TICKET_PARAMS
             .iter()
             .chain(CAPTURE_VISIBILITY_PARAMS)
@@ -3991,7 +4014,7 @@ mod tests {
             .chain(CAPTURE_VISIBILITY_PARAMS)
             .copied()
             .collect();
-        let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        let tools = tools_before_remote_checks();
         for (name, before) in [
             (
                 "session",
@@ -4016,7 +4039,7 @@ mod tests {
         // an agent's is_personal although the API takes it. Advertising it
         // added one optional boolean; without it each schema is exactly the
         // contract it had before.
-        let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        let tools = tools_before_remote_checks();
         for (name, before) in [
             (
                 "session",
@@ -4770,29 +4793,33 @@ mod tests {
                     let line = head.lines().next().unwrap_or("").to_string();
                     let body: serde_json::Value =
                         serde_json::from_slice(&buffer[header_end..]).unwrap_or_default();
-                    let (status, answer) = if line.starts_with("GET /api/v1/mcp/hosted-tools ") {
-                        (
-                            200,
-                            serde_json::json!({"tools": [{
-                                "name": "echo",
-                                "description": "Answer with the text it is given.",
-                                "input_schema": {
-                                    "type": "object",
-                                    "properties": {"text": {"type": "string"}},
-                                    "required": ["text"]
-                                }
-                            }]}),
-                        )
-                    } else if line.starts_with("POST /api/v1/mcp/hosted-tools/echo/call ") {
-                        (
-                            200,
-                            serde_json::json!({"content": [
-                                {"type": "text", "text": body["arguments"]["text"]}
-                            ]}),
-                        )
-                    } else {
-                        (404, serde_json::json!({}))
-                    };
+                    // A linked checkout adds workspace_id to the catalog request.
+                    let target = line.split_whitespace().nth(1).unwrap_or_default();
+                    let path = target.split('?').next().unwrap_or_default();
+                    let (status, answer) =
+                        if line.starts_with("GET ") && path == "/api/v1/mcp/hosted-tools" {
+                            (
+                                200,
+                                serde_json::json!({"tools": [{
+                                    "name": "echo",
+                                    "description": "Answer with the text it is given.",
+                                    "input_schema": {
+                                        "type": "object",
+                                        "properties": {"text": {"type": "string"}},
+                                        "required": ["text"]
+                                    }
+                                }]}),
+                            )
+                        } else if line.starts_with("POST /api/v1/mcp/hosted-tools/echo/call ") {
+                            (
+                                200,
+                                serde_json::json!({"content": [
+                                    {"type": "text", "text": body["arguments"]["text"]}
+                                ]}),
+                            )
+                        } else {
+                            (404, serde_json::json!({}))
+                        };
                     let answer = answer.to_string();
                     let response = format!(
                         "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",

@@ -651,7 +651,7 @@ impl ToolHandler for HelpTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "help".to_string(),
             title: "Help & Utility".to_string(),
-            description: "Read-only utility and help. Actions: tools (list available tools), auth (current user and plan), billing (plan upgrade options), version (server version), workflow (versioned ContextStream harness workflow; optional exact client_name), editor_rules (preview an editor-rules request; never writes files or installs hooks), enable_bundle (preview bundle metadata), team_status (team subscription info).".to_string(),
+            description: "Read-only utility and help. Actions: tools (list available tools), auth (current user and plan), billing (plan upgrade options), version (server version), workflow (versioned ContextStream harness workflow; optional exact client_name), editor_rules (preview an editor-rules request; never writes files or installs hooks), enable_bundle (preview bundle metadata), team_status (team subscription info). For remote builds and tests, use session(action=remote_checks).".to_string(),
             category: ToolCategory::Utility,
             annotations: ToolAnnotations::read_only(),
             is_pro: false,

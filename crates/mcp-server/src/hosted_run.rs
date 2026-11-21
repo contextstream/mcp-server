@@ -20,7 +20,8 @@ use mcp_client::frames::{Delivery, Event};
 use mcp_client::ContextStreamClient;
 use mcp_session::SessionManager;
 use mcp_tools::domains::hosted_tools::{
-    begin_snapshot, call_api, drive_stream, stream_call, Attachment, HostedTool, Transport,
+    begin_snapshot, call_api, drive_stream, stream_call, Attachment, CallRefusal, HostedTool,
+    Transport, ADD_CREDITS, CREDIT_MESSAGE,
 };
 use serde_json::Value;
 
@@ -33,6 +34,7 @@ enum Remote {
     Here(Option<String>),
     /// It started on the service and then the stream broke: its output was already written.
     Broken,
+    OutOfCredits,
 }
 
 /// Run `command` and return the process's exit status.
@@ -42,6 +44,10 @@ pub async fn run(tool: Option<String>, command: String) -> i32 {
         Remote::Ran(status, said) => {
             eprintln!("{said}");
             status
+        }
+        Remote::OutOfCredits => {
+            eprintln!("{}", out_of_credits_line());
+            run_here(&command, &cwd)
         }
         Remote::Broken => {
             eprintln!("contextstream: the remote run ended without a result");
@@ -54,6 +60,10 @@ pub async fn run(tool: Option<String>, command: String) -> i32 {
             run_here(&command, &cwd)
         }
     }
+}
+
+fn out_of_credits_line() -> String {
+    format!("contextstream: {CREDIT_MESSAGE} Running the command locally. {ADD_CREDITS}")
 }
 
 async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
@@ -124,7 +134,10 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
     .await
     {
         Ok(data) => data,
-        Err(_) => return Remote::Here(Some("the call was not taken".to_string())),
+        Err(CallRefusal::OutOfCredits) => return Remote::OutOfCredits,
+        Err(CallRefusal::Other(_)) => {
+            return Remote::Here(Some("the call was not taken".to_string()))
+        }
     };
     let call = match stream_call(&data) {
         Ok(call) => call,
@@ -328,6 +341,11 @@ fn status_code(status: std::process::ExitStatus) -> i32 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn credit_fallback_explains_the_local_run() {
+        assert_eq!(out_of_credits_line(), "contextstream: Your account is out of Context Credits for remote checks. Running the command locally. Add credits at https://contextstream.io/account/billing");
+    }
 
     #[test]
     fn the_commands_own_status_is_the_services() {

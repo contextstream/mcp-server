@@ -27,7 +27,7 @@
 use crate::domains::slipstream::listing_workspace;
 use crate::peer;
 use mcp_client::checkout_snapshot::{CheckoutSnapshot, SnapshotError};
-use mcp_client::command_hints::{self, CachedTool, Hints};
+use mcp_client::command_hints::{self, CachedTool, CheckMarker, Hints};
 use mcp_client::environment;
 use mcp_client::frames::{self, Delivery, Event, ExchangeError};
 use mcp_client::hosted_tools::HostedToolsAnswer;
@@ -36,8 +36,9 @@ use mcp_session::SessionManager;
 use mcp_types::tool::{ContentItem, ToolResult};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How long a listing waits for the caller's definitions.
 pub const LISTING_BUDGET: Duration = Duration::from_millis(2500);
@@ -227,12 +228,16 @@ struct Entry {
     refresh_at: Instant,
     /// What `tools/list` last showed this caller of its hosted tools.
     shown: Option<String>,
+    settings_changed: Option<SystemTime>,
 }
 
 /// The process-wide cache of each caller's hosted tools.
 #[derive(Default)]
 pub struct HostedToolsGate {
     entries: Mutex<HashMap<String, Entry>>,
+    // Serialize catalog reads with settings refreshes for the same caller. A
+    // listing started before a PUT must never overwrite its new command hints.
+    readers: [tokio::sync::Mutex<()>; 32],
 }
 
 impl HostedToolsGate {
@@ -247,18 +252,23 @@ impl HostedToolsGate {
     }
 
     /// The caller's tools, when the read is still fresh.
-    fn fresh(&self, identity: &str) -> Option<Arc<Vec<HostedTool>>> {
+    fn fresh(&self, identity: &str, changed: Option<SystemTime>) -> Option<Arc<Vec<HostedTool>>> {
         let now = Instant::now();
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(identity)
-            .filter(|entry| now < entry.refresh_at)
+            .filter(|entry| now < entry.refresh_at && changed == entry.settings_changed)
             .map(|entry| entry.read.tools())
     }
 
     /// Store one read. An unreachable API never replaces tools read before.
-    fn record(&self, identity: &str, read: Read) -> Arc<Vec<HostedTool>> {
+    fn record(
+        &self,
+        identity: &str,
+        read: Read,
+        changed: Option<SystemTime>,
+    ) -> Arc<Vec<HostedTool>> {
         let now = Instant::now();
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let shown = entries.get(identity).and_then(|entry| entry.shown.clone());
@@ -268,6 +278,7 @@ impl HostedToolsGate {
                     read: previous.read.clone(),
                     read_at: previous.read_at,
                     refresh_at: now + UNREACHABLE_RETRY,
+                    settings_changed: changed,
                     shown,
                 }
             }
@@ -275,12 +286,14 @@ impl HostedToolsGate {
                 read: Read::Unreachable,
                 read_at: now,
                 refresh_at: now + UNREACHABLE_RETRY,
+                settings_changed: changed,
                 shown,
             },
             _ => Entry {
                 read: read.clone(),
                 read_at: now,
                 refresh_at: now + KNOWN_TTL,
+                settings_changed: changed,
                 shown,
             },
         };
@@ -307,15 +320,91 @@ impl HostedToolsGate {
         workspace: Option<&str>,
         budget: Duration,
     ) -> Arc<Vec<HostedTool>> {
+        self.read_catalog(client, identity, workspace, budget, false)
+            .await
+    }
+
+    async fn read_catalog(
+        &self,
+        client: &ContextStreamClient,
+        identity: &str,
+        workspace: Option<&str>,
+        budget: Duration,
+        force: bool,
+    ) -> Arc<Vec<HostedTool>> {
+        let config = client.config().await;
+        let local = !config.is_http_transport && identity.starts_with("local:");
+        let changed = || {
+            local
+                .then(|| CheckMarker::SettingsChanged.modified(identity, &config.api_url))
+                .flatten()
+        };
+        if !force {
+            if off_by(std::env::var(ENV_SWITCH).ok().as_deref()) {
+                return Arc::new(Vec::new());
+            }
+            if let Some(tools) = self.fresh(identity, changed()) {
+                return tools;
+            }
+        }
+        let mut hash = DefaultHasher::new();
+        identity.hash(&mut hash);
+        let reader = &self.readers[hash.finish() as usize % self.readers.len()];
+        let deadline = tokio::time::Instant::now() + budget;
+        // A prefetch can have a longer deadline than tools/list. Waiting for
+        // its read must not spend the caller's budget a second time.
+        let _reading = if force {
+            reader.lock().await
+        } else {
+            match tokio::time::timeout_at(deadline, reader.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return self
+                        .entries
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(identity)
+                        .filter(|entry| entry.settings_changed == changed())
+                        .map(|entry| entry.read.tools())
+                        .unwrap_or_default()
+                }
+            }
+        };
+        if force && local {
+            CheckMarker::SettingsChanged.mark(identity, &config.api_url);
+        }
+        let changed = changed();
+        if !force {
+            if let Some(tools) = self.fresh(identity, changed) {
+                return tools;
+            }
+        }
+        // After a settings change, a failed refresh must not keep offering a
+        // disabled check. Preserve 'shown' for notifications/tools/list_changed.
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(identity)
+        {
+            if force || changed != entry.settings_changed {
+                if let Read::Known(tools) = &mut entry.read {
+                    Arc::make_mut(tools).retain(|tool| tool.name != "check");
+                }
+                entry.refresh_at = Instant::now();
+            }
+        }
         if off_by(std::env::var(ENV_SWITCH).ok().as_deref()) {
-            return Arc::new(Vec::new());
+            return self.record(identity, Read::Known(Arc::new(Vec::new())), changed);
         }
-        if let Some(tools) = self.fresh(identity) {
-            return tools;
-        }
+        let remaining = if force {
+            budget
+        } else {
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+        };
         let read = match tokio::time::timeout(
-            budget,
-            client.hosted_tools_catalog(workspace, budget),
+            remaining,
+            client.hosted_tools_catalog(workspace, remaining),
         )
         .await
         {
@@ -323,9 +412,9 @@ impl HostedToolsGate {
             _ => Read::Unreachable,
         };
         if let Read::Known(tools) = &read {
-            remember_hints(client, identity, tools).await;
+            remember_hints(client, identity, tools, changed).await;
         }
-        self.record(identity, read)
+        self.record(identity, read, changed)
     }
 
     fn mark_shown(&self, identity: &str, shown: String) {
@@ -352,7 +441,12 @@ impl HostedToolsGate {
 /// them (`mcp_client::command_hints`): written when they changed, and also when
 /// there are none any more, so that a tool taken away stops being used. A local
 /// caller only; the hosted gateway has no home folder to keep them in.
-async fn remember_hints(client: &ContextStreamClient, identity: &str, tools: &[HostedTool]) {
+async fn remember_hints(
+    client: &ContextStreamClient,
+    identity: &str,
+    tools: &[HostedTool],
+    changed: Option<SystemTime>,
+) {
     let config = client.config().await;
     if config.is_http_transport || !identity.starts_with("local:") {
         return;
@@ -378,7 +472,8 @@ async fn remember_hints(client: &ContextStreamClient, identity: &str, tools: &[H
             })
         })
         .collect();
-    let cache = command_hints::Cache::new(identity, &config.api_url, cached);
+    let mut cache = command_hints::Cache::new(identity, &config.api_url, cached);
+    cache.settings_changed = changed;
     // Best effort, and off the executor: a file that cannot be written only means no rewrite.
     let _ = tokio::task::spawn_blocking(move || command_hints::write(&cache)).await;
 }
@@ -434,6 +529,16 @@ pub async fn listing_changed(
         .await;
     let now = Value::Array(entries_for(&tools, &taken)).to_string();
     now != shown
+}
+
+/// Refresh both the advertised tools and the editor hook's disk cache after
+/// an account change, even before this caller's first tools/list.
+pub(super) async fn refresh_settings(client: &ContextStreamClient, workspace: Option<&str>) {
+    if let Some(identity) = crate::domains::slipstream::caller_identity(client).await {
+        HostedToolsGate::global()
+            .read_catalog(client, &identity, workspace, LISTING_BUDGET, true)
+            .await;
+    }
 }
 
 /// The caller's hosted tool `name`, if the API defines one.
@@ -613,6 +718,61 @@ pub async fn begin_snapshot(
     }))
 }
 
+const CREDIT_RETRY: Duration = Duration::from_secs(180);
+pub const CREDIT_MESSAGE: &str = "Your account is out of Context Credits for remote checks.";
+pub const ADD_CREDITS: &str = "Add credits at https://contextstream.io/account/billing";
+
+#[derive(Debug)]
+pub enum CallRefusal {
+    OutOfCredits,
+    Other(ToolResult),
+}
+
+impl CallRefusal {
+    fn into_result(self) -> ToolResult {
+        match self {
+            Self::OutOfCredits => ToolResult::error(format!(
+                "{CREDIT_MESSAGE} Run the command locally. {ADD_CREDITS}"
+            )),
+            Self::Other(result) => result,
+        }
+    }
+}
+
+/// Local calls (including one-shot hook processes) share a timestamp on disk.
+/// The HTTP gateway keeps only scoped, expiring entries in its own memory.
+async fn credit_cooldown(client: &ContextStreamClient, remember: bool) -> bool {
+    let Some(identity) = crate::domains::slipstream::caller_identity(client).await else {
+        return false;
+    };
+    let config = client.config().await;
+    if !config.is_http_transport {
+        if remember {
+            CheckMarker::OutOfCredits.mark(&identity, &config.api_url);
+        }
+        return CheckMarker::OutOfCredits
+            .modified(&identity, &config.api_url)
+            .and_then(|time| time.elapsed().ok())
+            .is_some_and(|age| age < CREDIT_RETRY);
+    }
+    static REFUSED: OnceLock<Mutex<HashMap<(String, String), Instant>>> = OnceLock::new();
+    let mut refused = REFUSED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let key = (identity, config.api_url);
+    if remember {
+        refused.retain(|_, at| at.elapsed() < CREDIT_RETRY);
+        if refused.len() < MAX_ENTRIES {
+            refused.insert(key, Instant::now());
+        }
+        return true;
+    }
+    refused
+        .get(&key)
+        .is_some_and(|at| at.elapsed() < CREDIT_RETRY)
+}
+
 /// Make the call to the API: its answer's data, or the result that says why
 /// there is none.
 pub async fn call_api(
@@ -621,7 +781,10 @@ pub async fn call_api(
     tool: &HostedTool,
     arguments: &Value,
     checkout: Option<Value>,
-) -> Result<Value, ToolResult> {
+) -> Result<Value, CallRefusal> {
+    if tool.name == "check" && credit_cooldown(client, false).await {
+        return Err(CallRefusal::OutOfCredits);
+    }
     let mut body = serde_json::json!({ "arguments": arguments });
     if let Some(workspace) = workspace_of(client, session).await {
         body["workspace_id"] = Value::String(workspace);
@@ -635,15 +798,21 @@ pub async fn call_api(
     {
         Ok(answer) => answer,
         Err(error) => {
-            return Err(ToolResult::error(format!(
+            return Err(CallRefusal::Other(ToolResult::error(format!(
                 "{} could not be reached: {error}",
                 tool.name
-            )))
+            ))))
         }
     };
+    if tool.name == "check" && answer.insufficient_credits() {
+        credit_cooldown(client, true).await;
+        return Err(CallRefusal::OutOfCredits);
+    }
     if !answer.is_success() {
-        return Err(ToolResult::error(answer.error_message().unwrap_or_else(
-            || format!("{} failed (HTTP {})", tool.name, answer.status),
+        return Err(CallRefusal::Other(ToolResult::error(
+            answer
+                .error_message()
+                .unwrap_or_else(|| format!("{} failed (HTTP {})", tool.name, answer.status)),
         )));
     }
     Ok(answer.data)
@@ -696,7 +865,7 @@ pub async fn run(
     }
     let data = match call_api(client, session, tool, &arguments, checkout).await {
         Ok(data) => data,
-        Err(failure) => return failure,
+        Err(failure) => return failure.into_result(),
     };
     if let Some(begun) = pending.take() {
         snapshot = match begun.finish(&tool.name).await {

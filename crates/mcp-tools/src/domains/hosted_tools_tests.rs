@@ -187,12 +187,12 @@ fn a_blip_keeps_the_tools_known_before() {
     let known = Read::Known(Arc::new(parse_catalog(
         &json!({"tools": [echo_definition("api")]}),
     )));
-    assert_eq!(gate.record("me", known).len(), 1);
-    assert_eq!(gate.record("me", Read::Unreachable).len(), 1);
-    assert_eq!(gate.fresh("me").map(|tools| tools.len()), Some(1));
-    assert!(gate.record("new", Read::Unreachable).is_empty());
+    assert_eq!(gate.record("me", known, None).len(), 1);
+    assert_eq!(gate.record("me", Read::Unreachable, None).len(), 1);
+    assert_eq!(gate.fresh("me", None).map(|tools| tools.len()), Some(1));
+    assert!(gate.record("new", Read::Unreachable, None).is_empty());
     assert!(gate
-        .record("me", Read::Known(Arc::new(Vec::new())))
+        .record("me", Read::Known(Arc::new(Vec::new())), None)
         .is_empty());
 }
 
@@ -344,6 +344,7 @@ async fn a_new_definition_after_a_listing_is_a_change() {
         Read::Known(Arc::new(parse_catalog(
             &json!({"tools": [echo_definition("api")]}),
         ))),
+        None,
     );
     assert!(listing_changed(&gate, &client, &session_for(&client), |_| false).await);
     assert_eq!(
@@ -1211,4 +1212,195 @@ async fn a_snapshot_that_cannot_be_finished_ends_the_call_though_it_may_already_
         .filter(|s| s.method == "POST")
         .count();
     assert!(posts <= 1, "{posts}");
+}
+
+#[tokio::test]
+async fn remote_checks_setting_refreshes_the_callers_listing_and_hook_hints() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let enabled = AtomicBool::new(false);
+    let (url, seen) = stub(Arc::new(move |method, path, body| {
+        let value = match (method, path) {
+            ("PUT", "/mcp/hosted-tools/enabled") => {
+                let on = body["enabled"].as_bool().unwrap();
+                enabled.store(on, Ordering::SeqCst);
+                json!({"tool":"check", "enabled":on, "available":true, "more_engines":true})
+            }
+            ("GET", "/mcp/hosted-tools") if enabled.load(Ordering::SeqCst) => {
+                json!({"tools":[{"name":"check","description":"Remote checks","input_schema":{"type":"object"},
+                    "command_hints":{"argument":"command","patterns":["^cargo check$"]}}]})
+            }
+            ("GET", "/mcp/hosted-tools") => json!({"tools":[]}),
+            _ => return (404, "{}".into())
+        };
+        (200, value.to_string())
+    })).await;
+    let config = mcp_types::Config {
+        api_url: url.clone(),
+        api_key: Some(uuid::Uuid::new_v4().to_string()),
+        default_workspace_id: Some(WORKSPACE.parse().unwrap()),
+        ..TestFixtures::test_config()
+    };
+    let client = ContextStreamClient::new(config.clone());
+    let session = SessionManager::new(client.clone(), config);
+    let gate = HostedToolsGate::global();
+    let identity = crate::domains::slipstream::caller_identity(&client)
+        .await
+        .unwrap();
+    let listing = || listing_entries(&gate, &client, &session, LISTING_BUDGET, |_| false);
+    assert!(listing().await.is_empty());
+    for on in [true, false] {
+        let result = crate::domains::remote_checks::session_action(
+            &client,
+            &session,
+            None,
+            Some(on),
+            Some(true),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        assert!(listing_changed(&gate, &client, &session, |_| false).await);
+        assert_eq!(
+            listing().await.iter().any(|tool| tool["name"] == "check"),
+            on
+        );
+        assert!(!listing_changed(&gate, &client, &session, |_| false).await);
+        let hints = command_hints::read(&identity, &url).unwrap();
+        assert_eq!(hints.tool_for("cargo check").is_some(), on);
+        let mut stale = hints;
+        stale.settings_changed = None;
+        assert!(!command_hints::write(&stale).unwrap());
+    }
+    let requests = seen.lock().unwrap();
+    let changes: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "PUT")
+        .map(|r| &r.body)
+        .collect();
+    assert_eq!(
+        changes,
+        [
+            &json!({"enabled":true,"more_engines":true}),
+            &json!({"enabled":false,"more_engines":true})
+        ]
+    );
+}
+
+#[tokio::test]
+async fn remote_checks_credit_refusal_is_cached_for_only_that_caller_and_endpoint() {
+    let (url, seen) = stub(Arc::new(|_, _, _| (402, json!({"error":{"code":"INSUFFICIENT_CREDITS","details":{"available":2,"required":20}}}).to_string()))).await;
+    let client = client_in_workspace(&url);
+    let session = session_for(&client);
+    let mut check = parse_catalog(&json!({"tools":[echo_definition("api")]})).remove(0);
+    check.name = "check".into();
+    for _ in 0..2 {
+        let result = run(&client, &session, &check, json!({})).await;
+        assert!(result.is_error);
+        assert_eq!(text_of(&result), ["Your account is out of Context Credits for remote checks. Run the command locally. Add credits at https://contextstream.io/account/billing"]);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    let mut config = client.config().await;
+    config.api_key = Some(uuid::Uuid::new_v4().to_string());
+    let other = ContextStreamClient::new(config);
+    assert!(
+        run(&other, &session_for(&other), &check, json!({}))
+            .await
+            .is_error
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    let (url2, others) = stub(Arc::new(|_, _, _| {
+        (
+            402,
+            json!({"error":{"code":"PAYMENT_REQUIRED","message":"Payment required"}}).to_string(),
+        )
+    }))
+    .await;
+    let same_account = client_in_workspace(&url2);
+    let result = run(
+        &same_account,
+        &session_for(&same_account),
+        &check,
+        json!({}),
+    )
+    .await;
+    assert_eq!(text_of(&result), ["Payment required"]);
+    assert_eq!(others.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn remote_checks_legacy_settings_use_the_separate_engine_route() {
+    let (url, seen) = stub(Arc::new(|method, path, body| {
+        let value = match (method, path) {
+            ("GET" | "PUT", "/mcp/hosted-tools/enabled") => {
+                json!({"tool":"check","enabled":true,"available":true})
+            }
+            ("GET", "/mcp/hosted-tools/more-engines") => json!({"enabled":false}),
+            ("PUT", "/mcp/hosted-tools/more-engines") => json!({"enabled":body["enabled"]}),
+            ("GET", "/mcp/hosted-tools") => json!({"tools":[]}),
+            _ => return (404, "{}".into()),
+        };
+        (200, value.to_string())
+    }))
+    .await;
+    let client = client_in_workspace(&url);
+    let read = crate::domains::remote_checks::settings(&client, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(read.more_engines, Some(false));
+    let changed = crate::domains::remote_checks::settings(&client, None, Some(true), Some(true))
+        .await
+        .unwrap();
+    assert_eq!(changed.more_engines, Some(true));
+    let engine_only = crate::domains::remote_checks::settings(&client, None, None, Some(false))
+        .await
+        .unwrap();
+    assert!(engine_only.enabled);
+    assert_eq!(engine_only.more_engines, Some(false));
+    let seen = seen.lock().unwrap();
+    let puts: Vec<_> = seen
+        .iter()
+        .filter(|r| r.method == "PUT")
+        .map(|r| (r.path.as_str(), &r.body))
+        .collect();
+    assert_eq!(
+        puts,
+        [
+            (
+                "/mcp/hosted-tools/enabled",
+                &json!({"enabled":true,"more_engines":true})
+            ),
+            ("/mcp/hosted-tools/more-engines", &json!({"enabled":true})),
+            ("/mcp/hosted-tools/more-engines", &json!({"enabled":false})),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn remote_checks_hosted_status_uses_the_projects_indexed_markers() {
+    let id = uuid::Uuid::new_v4();
+    let (url, _) = stub(Arc::new(move |_, path, _| {
+        let data = if path == "/mcp/hosted-tools/enabled" {
+            json!({"tool":"check","enabled":true,"available":true,"more_engines":false})
+        } else if path == format!("/projects/{id}/files") {
+            json!({"files":[{"path":"package.json"},{"path":"pkg/Pod.csproj"},{"path":"vendor/Gemfile"}],"total":3})
+        } else { return (404,"{}".into()); };
+        (200,data.to_string())
+    })).await;
+    let mut config = client_in_workspace(&url).config().await;
+    config.is_http_transport = true;
+    let client = ContextStreamClient::new(config);
+    let result = crate::domains::remote_checks::session_action(
+        &client,
+        &session_for(&client),
+        Some(id),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let text = text_of(&result).join("\n");
+    assert!(
+        text.contains("This project: TypeScript and JavaScript (standard) · .NET (more engines)"),
+        "{text}"
+    );
 }

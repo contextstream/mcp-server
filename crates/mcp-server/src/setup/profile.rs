@@ -284,6 +284,7 @@ pub async fn run_setup_with_profile(
             }
         }
     }
+    super::project_git::print_project_git_summary(configured_project_path, &editors_to_configure);
 
     let (index_started, awaiting_first_files) = if let Some(configured_project_path) =
         configured_project_path.filter(|_| binding_established)

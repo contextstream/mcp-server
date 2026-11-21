@@ -3207,6 +3207,10 @@ async fn run_configure_editors_flow() -> Result<()> {
                     )
                     .await?;
                 }
+                setup::print_project_git_summary(
+                    selected_project.as_ref().and(project_path),
+                    &selected_editors,
+                );
                 tokio::spawn({
                     let client = client.clone();
                     async move {

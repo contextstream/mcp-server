@@ -25,6 +25,7 @@ pub mod local_memory_import;
 pub(crate) mod mcp_config;
 mod pending_connection;
 pub mod profile;
+mod project_git;
 mod prompts;
 mod rules;
 pub mod safe_edit;
@@ -3355,6 +3356,7 @@ async fn run_setup_noninteractive(
             }
         }
     }
+    project_git::print_project_git_summary(configured_project_path, &editors_to_configure);
 
     let (index_started, awaiting_first_files) =
         if let Some(project_path) = configured_project_path.filter(|_| binding_established) {
@@ -4327,6 +4329,12 @@ async fn authenticate_api_key() -> Result<(String, String)> {
 
 /// Configure a single editor with workspace information.
 #[allow(clippy::too_many_arguments)]
+/// Say which project files setup kept out of Git and which are safe to
+/// commit, once every editor is configured.
+pub fn print_project_git_summary(project_path: Option<&Path>, editors: &[editors::Editor]) {
+    project_git::print_project_git_summary(project_path, editors);
+}
+
 pub async fn configure_editor_with_workspace(
     client: &ContextStreamClient,
     editor: &editors::Editor,

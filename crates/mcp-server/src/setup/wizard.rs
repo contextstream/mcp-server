@@ -1061,6 +1061,7 @@ async fn finish(
             install_git_capture(path);
         }
     }
+    super::project_git::print_project_git_summary(configured_project_path, &editors);
 
     if !safe_edit::is_dry_run() {
         let telemetry_client = client.clone();

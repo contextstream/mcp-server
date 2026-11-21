@@ -973,6 +973,31 @@ pub fn checkout_repository_layout(path: impl AsRef<Path>) -> Option<CheckoutRepo
     })
 }
 
+/// Where Git reads the local ignore rules for a checkout: the working-tree
+/// root that owns `.git`, and `<common Git directory>/info/exclude`, the file
+/// that is never committed. Linked worktrees share the main repository's file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitExcludeTarget {
+    pub repository_root: PathBuf,
+    pub exclude_file: PathBuf,
+}
+
+/// Resolve the exclude file for the checkout around `folder` (any folder
+/// inside it) without running Git. `Ok(None)` outside a Git checkout; an
+/// error when `.git` exists but cannot be followed.
+pub fn git_exclude_target(
+    folder: impl AsRef<Path>,
+) -> Result<Option<GitExcludeTarget>, CheckoutIdentityError> {
+    match resolve_git_layout(folder.as_ref()) {
+        Ok(layout) => Ok(Some(GitExcludeTarget {
+            repository_root: layout.repository_root,
+            exclude_file: layout.common_dir.join("info").join("exclude"),
+        })),
+        Err(CheckoutIdentityError::NotGitCheckout(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn resolve_git_layout(checkout_root: &Path) -> Result<GitLayout, CheckoutIdentityError> {
     let root = canonical_directory(checkout_root)?;
     let mut current = Some(root.as_path());

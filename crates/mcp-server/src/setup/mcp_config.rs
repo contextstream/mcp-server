@@ -4281,15 +4281,87 @@ fn write_project_mcp_config_with_transport_mode(
 
     insert_contextstream_server(&mut config, server_path, server)?;
 
-    if carries_key || contains_auth_field(&config) || contains_auth_field(&loaded.value) {
+    // Every ContextStream entry names this machine (an installation id, or a
+    // local binary path), so the file stays out of Git when it holds a key or
+    // nothing but that entry; a file with other settings stays visible.
+    let kind = classify_project_mcp_value(&config, server_path);
+    if carries_key || kind == ProjectMcpConfigKind::HoldsKey || contains_auth_field(&loaded.value) {
         safe_edit::commit(&mcp_path, &loaded, &config)?;
-        keep_secret_config_out_of_git(project_path, &mcp_path);
+        keep_project_mcp_config_out_of_git(&mcp_path, ProjectMcpConfigKind::HoldsKey);
     } else {
         safe_edit::commit_public(&mcp_path, &loaded, &config)?;
+        keep_project_mcp_config_out_of_git(&mcp_path, kind);
     }
     record_configured_evidence(editor);
 
     Ok(())
+}
+
+/// How much of a project MCP config is this machine's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectMcpConfigKind {
+    /// It holds an API key (ContextStream's, or another server's).
+    HoldsKey,
+    /// It holds only the ContextStream entry, which names this machine.
+    ContextStreamOnly,
+    /// It also holds other settings or servers, which may be the team's.
+    Shared,
+}
+
+fn classify_project_mcp_value(config: &Value, server_path: &[&str]) -> ProjectMcpConfigKind {
+    if contains_auth_field(config) {
+        return ProjectMcpConfigKind::HoldsKey;
+    }
+    let mut current = config;
+    for segment in server_path {
+        let Some(object) = current.as_object() else {
+            return ProjectMcpConfigKind::Shared;
+        };
+        if object.keys().any(|key| key != segment && key != "$schema") {
+            return ProjectMcpConfigKind::Shared;
+        }
+        let Some(next) = object.get(*segment) else {
+            return ProjectMcpConfigKind::Shared;
+        };
+        current = next;
+    }
+    match current.as_object() {
+        Some(servers) if servers.len() == 1 && servers.contains_key("contextstream") => {
+            ProjectMcpConfigKind::ContextStreamOnly
+        }
+        _ => ProjectMcpConfigKind::Shared,
+    }
+}
+
+/// The editor's project MCP config and how much of it is this machine's.
+/// `None` when the editor has none, or the file is missing, unreadable or
+/// has no ContextStream entry.
+pub(crate) fn project_mcp_config_kind(
+    editor: &Editor,
+    project_path: &Path,
+) -> Option<(PathBuf, ProjectMcpConfigKind)> {
+    let path = editor.project_mcp_config_path(project_path)?;
+    if !path.is_file() {
+        return None;
+    }
+    let server_path = project_server_map_path(editor);
+    let loaded = safe_edit::read_for_edit(&path, mcp_json_dialect(editor, &path)).ok()?;
+    server_map(&loaded.value, server_path)?.get("contextstream")?;
+    Some((path, classify_project_mcp_value(&loaded.value, server_path)))
+}
+
+/// Keep a project MCP config out of Git unless it holds settings that are
+/// not ContextStream's. `None` for such a shared file and in a dry run.
+pub(crate) fn keep_project_mcp_config_out_of_git(
+    path: &Path,
+    kind: ProjectMcpConfigKind,
+) -> Option<mcp_session::git_exclude::GitExcludeOutcome> {
+    let why = match kind {
+        ProjectMcpConfigKind::HoldsKey => super::project_git::API_KEY_REASON,
+        ProjectMcpConfigKind::ContextStreamOnly => super::project_git::MACHINE_MCP_REASON,
+        ProjectMcpConfigKind::Shared => return None,
+    };
+    super::project_git::keep_out_of_git(path, why)
 }
 
 /// Preserved credentials may belong to another server or an earlier setup.
@@ -4556,7 +4628,7 @@ pub fn refresh_embedded_api_key_in_existing_configs(
                 }
                 let changed = safe_edit::commit(&path, &loaded, &config)?;
                 if changed {
-                    keep_secret_config_out_of_git(project_root, &path);
+                    keep_project_mcp_config_out_of_git(&path, ProjectMcpConfigKind::HoldsKey);
                 }
                 Ok(changed)
             })();
@@ -4662,72 +4734,6 @@ pub(super) fn protect_non_git_secret_project_config(
     Ok(Some(entry))
 }
 
-/// A project MCP file that carries the API key must not be committed by a
-/// routine `git add -A`. Exclude it locally (`.git/info/exclude`, never the
-/// shared `.gitignore`) unless the repository already tracks or ignores it.
-/// Best-effort: outside a Git checkout, or without `git`, nothing changes.
-fn keep_secret_config_out_of_git(project_path: &Path, config_path: &Path) {
-    if safe_edit::is_dry_run() {
-        return;
-    }
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(project_path)
-            .args(args)
-            .output()
-            .ok()
-    };
-    let Some(output) = git(&["rev-parse", "--show-toplevel", "--git-path", "info/exclude"])
-        .filter(|output| output.status.success())
-    else {
-        return;
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines();
-    let (Some(top), Some(exclude)) = (lines.next(), lines.next()) else {
-        return;
-    };
-    let exclude = if Path::new(exclude).is_absolute() {
-        PathBuf::from(exclude)
-    } else {
-        project_path.join(exclude)
-    };
-    let (Ok(top), Ok(config)) = (
-        std::fs::canonicalize(top),
-        std::fs::canonicalize(config_path),
-    ) else {
-        return;
-    };
-    let Ok(relative) = config.strip_prefix(&top) else {
-        return;
-    };
-    let relative = relative.to_string_lossy().replace('\\', "/");
-    let tracked = git(&["ls-files", "--error-unmatch", "--", &relative])
-        .is_some_and(|output| output.status.success());
-    let ignored =
-        git(&["check-ignore", "-q", "--", &relative]).is_some_and(|output| output.status.success());
-    if tracked || ignored {
-        return;
-    }
-    let entry = format!("/{relative}");
-    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if existing.lines().any(|line| line.trim() == entry) {
-        return;
-    }
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str("# ContextStream: this MCP config holds an API key\n");
-    updated.push_str(&entry);
-    updated.push('\n');
-    if let Some(parent) = exclude.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&exclude, updated);
-}
-
 /// Write workspace config to .contextstream/config.json in the project.
 pub fn write_workspace_config(
     project_path: &Path,
@@ -4779,6 +4785,15 @@ pub fn write_workspace_config(
         &config,
         &["project_id", "project_name"],
     )?;
+    // `checkout_root` is this machine's path; a committed copy fails in every
+    // other clone. A tracked file (a team sharing `checkout_snapshot`) is left
+    // alone, and setup's summary says so.
+    if mcp_session::git_exclude::holds_checkout_identity(&config) {
+        super::project_git::keep_out_of_git(
+            &config_path,
+            mcp_session::git_exclude::CHECKOUT_CONFIG_REASON,
+        );
+    }
 
     Ok(())
 }
@@ -5658,8 +5673,8 @@ mod tests {
         let config = repo.path().join(".mcp.json");
         std::fs::write(&config, "{}").expect("config");
 
-        keep_secret_config_out_of_git(repo.path(), &config);
-        keep_secret_config_out_of_git(repo.path(), &config);
+        keep_project_mcp_config_out_of_git(&config, ProjectMcpConfigKind::HoldsKey);
+        keep_project_mcp_config_out_of_git(&config, ProjectMcpConfigKind::HoldsKey);
         let exclude =
             std::fs::read_to_string(repo.path().join(".git/info/exclude")).expect("exclude");
         assert_eq!(
@@ -5698,10 +5713,231 @@ mod tests {
         std::fs::write(&config, "{}").expect("config");
         assert!(git(&["add", ".mcp.json"]).status.success());
 
-        keep_secret_config_out_of_git(repo.path(), &config);
+        keep_project_mcp_config_out_of_git(&config, ProjectMcpConfigKind::HoldsKey);
         let exclude =
             std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap_or_default();
         assert!(!exclude.contains("/.mcp.json"));
+    }
+
+    /// Run the project-file writes setup makes for Claude Code (hosted, with
+    /// the key) and Cursor (hosted, no key), plus the checkout config.
+    fn write_setup_project_files(project: &Path) {
+        write_project_mcp_config_force_remote_with_auth(
+            &Editor::ClaudeCode,
+            project,
+            "cs_test_project_key",
+            Some("ws"),
+            None,
+            None,
+            None,
+            Some("cs_test_project_key"),
+        )
+        .expect("write .mcp.json");
+        write_project_mcp_config_force_remote_with_auth(
+            &Editor::Cursor,
+            project,
+            "cs_test_project_key",
+            Some("ws"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("write .cursor/mcp.json");
+        super::super::rules::write_project_rules(
+            &Editor::ClaudeCode,
+            project,
+            Some("ws"),
+            Some("Workspace"),
+            Some("demo"),
+        )
+        .expect("write CLAUDE.md");
+        write_workspace_config(project, "ws", "Workspace", Some("demo"), None)
+            .expect("write .contextstream/config.json");
+    }
+
+    fn exclude_entries(exclude: &str, entry: &str) -> usize {
+        exclude.lines().filter(|line| line.trim() == entry).count()
+    }
+
+    #[test]
+    fn setup_project_files_keep_machine_files_out_of_git_once_and_leave_rules_shareable() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = HomeGuard::isolate_under(&home);
+        let _xdg = XdgConfigGuard::isolate_under(&home);
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+        };
+        // A plain `.git` folder stands in where `git` is not installed.
+        if !git(&["init", "-q"]).is_ok_and(|out| out.status.success()) {
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+        }
+        let gitignore = "node_modules/\n";
+        std::fs::write(repo.join(".gitignore"), gitignore).unwrap();
+
+        write_setup_project_files(&repo);
+        write_setup_project_files(&repo);
+
+        let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).expect("exclude");
+        for entry in [
+            "/.mcp.json",
+            "/.cursor/mcp.json",
+            "/.contextstream/config.json",
+        ] {
+            assert_eq!(exclude_entries(&exclude, entry), 1, "{entry}:\n{exclude}");
+        }
+        assert!(
+            exclude.contains("# ContextStream: this MCP config holds an API key\n/.mcp.json\n"),
+            "{exclude}"
+        );
+        assert!(!exclude.contains("CLAUDE.md"), "{exclude}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".gitignore")).unwrap(),
+            gitignore,
+            "the shared .gitignore is left alone"
+        );
+        if let Ok(status) = git(&["status", "--porcelain", "--untracked-files=all"]) {
+            let status = String::from_utf8_lossy(&status.stdout);
+            if !status.is_empty() {
+                assert!(status.contains("CLAUDE.md"), "{status}");
+                for hidden in [".mcp.json", ".contextstream/config.json"] {
+                    assert!(!status.contains(hidden), "{hidden} visible:\n{status}");
+                }
+            }
+        }
+
+        let report = super::super::project_git::project_git_report(
+            &repo,
+            &[Editor::ClaudeCode, Editor::Cursor],
+        )
+        .expect("report in a checkout");
+        assert_eq!(
+            report.kept_out,
+            vec![
+                ".mcp.json".to_string(),
+                ".cursor/mcp.json".to_string(),
+                ".contextstream/config.json".to_string()
+            ]
+        );
+        assert_eq!(report.safe_to_commit, vec!["CLAUDE.md".to_string()]);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let exclude_after = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude_after, exclude, "the report adds nothing new");
+    }
+
+    #[test]
+    fn setup_project_files_in_a_linked_worktree_use_the_main_exclude_file() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = HomeGuard::isolate_under(&home);
+        let _xdg = XdgConfigGuard::isolate_under(&home);
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+        let main_git = temp.path().join("main").join(".git");
+        let worktree_git = main_git.join("worktrees").join("feature");
+        std::fs::create_dir_all(&worktree_git).unwrap();
+        std::fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+        let worktree = temp.path().join("feature");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+
+        write_setup_project_files(&worktree);
+        write_setup_project_files(&worktree);
+
+        let exclude =
+            std::fs::read_to_string(main_git.join("info").join("exclude")).expect("main exclude");
+        assert_eq!(exclude_entries(&exclude, "/.mcp.json"), 1, "{exclude}");
+        assert_eq!(
+            exclude_entries(&exclude, "/.contextstream/config.json"),
+            1,
+            "{exclude}"
+        );
+        assert!(!worktree_git.join("info").exists());
+        assert!(!worktree.join(".gitignore").exists());
+    }
+
+    #[test]
+    fn setup_project_files_outside_git_write_no_git_metadata() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = HomeGuard::isolate_under(&home);
+        let _xdg = XdgConfigGuard::isolate_under(&home);
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+        let folder = temp.path().join("plain");
+        std::fs::create_dir_all(&folder).unwrap();
+        if mcp_session::git_exclude_target(&folder)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            // The temp folder sits inside a checkout on this machine.
+            return;
+        }
+
+        write_setup_project_files(&folder);
+
+        assert!(folder.join(".mcp.json").is_file());
+        assert!(!folder.join(".git").exists());
+        assert!(
+            !folder.join(".gitignore").exists(),
+            "the writers leave .gitignore to the non-git fallback"
+        );
+        assert!(super::super::project_git::project_git_report(
+            &folder,
+            &[Editor::ClaudeCode, Editor::Cursor]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn project_mcp_config_with_other_servers_stays_visible_to_git() {
+        let config = json!({"mcpServers": {
+            "contextstream": {"type": "http", "url": "https://mcp.contextstream.io/mcp"},
+            "team": {"command": "team-mcp"}
+        }});
+        assert_eq!(
+            classify_project_mcp_value(&config, &["mcpServers"]),
+            ProjectMcpConfigKind::Shared
+        );
+        let ours = json!({"$schema": "x", "mcpServers": {
+            "contextstream": {"type": "http", "url": "https://mcp.contextstream.io/mcp"}
+        }});
+        assert_eq!(
+            classify_project_mcp_value(&ours, &["mcpServers"]),
+            ProjectMcpConfigKind::ContextStreamOnly
+        );
+        let keyed = json!({"mcpServers": {
+            "contextstream": {"headers": {"X-ContextStream-API-Key": "cs_live"}},
+            "team": {"command": "team-mcp"}
+        }});
+        assert_eq!(
+            classify_project_mcp_value(&keyed, &["mcpServers"]),
+            ProjectMcpConfigKind::HoldsKey
+        );
+        assert_eq!(
+            classify_project_mcp_value(
+                &json!({"editor.fontSize": 14, "context_servers": {"contextstream": {}}}),
+                &["context_servers"]
+            ),
+            ProjectMcpConfigKind::Shared
+        );
     }
 
     struct EnvVarGuard {

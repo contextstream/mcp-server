@@ -530,3 +530,98 @@ async fn setup_keeps_git_working_tree_and_windsurf_rules_free_of_bak_files() {
         "pre-existing user AGENTS.md recovery backup should live under .git/contextstream-backups/"
     );
 }
+
+/// Windows machines often have no `git` on PATH (GitHub Desktop keeps its own
+/// copy). Setup must still keep the machine-local project files out of Git,
+/// leave the shared `.gitignore` alone, and say which files are which.
+#[tokio::test]
+async fn setup_keeps_machine_local_project_files_out_of_git_without_the_git_program() {
+    const SECRET: &str = "keep-out-of-git-secret";
+    let (api_url, server) = spawn_mock_setup_server(SECRET).await;
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    init_git_repo(project.path());
+    let gitignore = "target/\n";
+    std::fs::write(project.path().join(".gitignore"), gitignore).unwrap();
+    let no_git_bin = tempfile::tempdir().unwrap();
+
+    let mut outputs = Vec::new();
+    for _ in 0..2 {
+        let home_path = home.path().to_path_buf();
+        let project_path = project.path().to_path_buf();
+        let path_without_git = no_git_bin.path().to_path_buf();
+        let url = api_url.clone();
+        outputs.push(
+            tokio::task::spawn_blocking(move || {
+                Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+                    .args([
+                        "setup",
+                        "--yes",
+                        "--editors=claude",
+                        &format!("--workspace-id={WORKSPACE_ID}"),
+                    ])
+                    .env_clear()
+                    .env("HOME", &home_path)
+                    .env("PATH", &path_without_git)
+                    .env("CONTEXTSTREAM_API_KEY", SECRET)
+                    .env("CONTEXTSTREAM_API_URL", &url)
+                    .env("CONTEXTSTREAM_NO_BROWSER", "1")
+                    .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
+                    .env("NO_COLOR", "1")
+                    .current_dir(&project_path)
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap(),
+        );
+    }
+    stop_spawned_watch_helper_if_any(home.path());
+    server.abort();
+
+    for output in &outputs {
+        assert!(
+            output.status.success(),
+            "setup failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let first = String::from_utf8_lossy(&outputs[0].stdout);
+    assert!(
+        first.contains(
+            "Kept out of Git (.git/info/exclude) · .mcp.json, .contextstream/config.json · safe to commit: CLAUDE.md"
+        ),
+        "expected the Git summary line:\n{first}"
+    );
+
+    let exclude = std::fs::read_to_string(project.path().join(".git/info/exclude")).unwrap();
+    for entry in ["/.mcp.json", "/.contextstream/config.json"] {
+        assert_eq!(
+            exclude.lines().filter(|line| line.trim() == entry).count(),
+            1,
+            "{entry} must be listed once:\n{exclude}"
+        );
+    }
+    assert!(!exclude.contains("CLAUDE.md"), "{exclude}");
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".gitignore")).unwrap(),
+        gitignore,
+        "the shared .gitignore is left alone"
+    );
+
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains("CLAUDE.md"), "{status}");
+    for hidden in [".mcp.json", ".contextstream/config.json"] {
+        assert!(
+            !status.contains(hidden),
+            "{hidden} must not be offered to git add:\n{status}"
+        );
+    }
+}

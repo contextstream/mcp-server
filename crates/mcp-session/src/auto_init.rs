@@ -1156,6 +1156,19 @@ async fn write_established_local_config(
         )
     })?;
     write_regular_text_snapshot(&config_path, existing.as_deref(), &rendered)?;
+    // The binding names this checkout on this machine; a committed copy would
+    // fail validation in every other clone. Best-effort, and a tracked file
+    // (a team that commits shared keys here) is left alone.
+    if crate::git_exclude::holds_checkout_identity(&config) {
+        let path = config_path.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::git_exclude::keep_out_of_git(&path, crate::git_exclude::CHECKOUT_CONFIG_REASON)
+        })
+        .await;
+        if let Ok(crate::git_exclude::GitExcludeOutcome::Failed { reason }) = outcome {
+            tracing::debug!(%reason, "could not keep the checkout config out of Git");
+        }
+    }
     Ok(())
 }
 
@@ -2197,6 +2210,43 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(config_path).expect("read config"))
                 .expect("parse config");
         assert_eq!(updated["custom"], json!({"nested": true}));
+    }
+
+    #[tokio::test]
+    async fn explicit_establishment_keeps_the_checkout_config_out_of_git_once() {
+        let checkout = tempdir().expect("checkout");
+        create_git_checkout(checkout.path());
+        let fingerprint = ensure_repository_fingerprint(checkout.path()).expect("identity");
+        let checkout_id = CheckoutId::for_legacy_binding(checkout.path(), &fingerprint);
+        for _ in 0..2 {
+            write_established_local_config(
+                checkout.path(),
+                Uuid::new_v4(),
+                "Engineering",
+                None,
+                None,
+                RepositoryBindingIdentity {
+                    fingerprint: &fingerprint,
+                    remote: None,
+                    checkout_id: &checkout_id,
+                    kind: CheckoutIdentityKind::Git,
+                },
+            )
+            .await
+            .expect("establish binding");
+        }
+
+        let exclude =
+            fs::read_to_string(checkout.path().join(".git/info/exclude")).expect("exclude");
+        assert_eq!(
+            exclude
+                .lines()
+                .filter(|line| line.trim() == "/.contextstream/config.json")
+                .count(),
+            1,
+            "{exclude}"
+        );
+        assert!(!checkout.path().join(".gitignore").exists());
     }
 
     #[cfg(unix)]

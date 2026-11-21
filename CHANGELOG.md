@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.89
+
+- Dependency updates (jsonwebtoken 12, clap, uuid, notify, ignore, globset, flate2, tokio-rustls, toml_edit).
+- The HTTP gateway's own JWT check: with `CONTEXTSTREAM_JWT_SECRET` set to an empty value it now rejects every bearer token (401). Before, a token signed with the empty key was accepted. A non-empty secret verifies as before.
+
 ## 1.0.88
 
 - New `capsule(action="live")` makes a Live Capsule in one call, as the web app's Capsules slide-out does: a project (or workspace) capsule with one multi-use link. The result gives the live link (`/c/<token>/live`) to paste into ChatGPT or Claude, the MCP link (`/c/<token>/mcp`) to add as a custom connector named "Live Capsule" (or "Live Capsule - <name>"), a paste-ready message, per-app steps, an `mcpServers` config and `claude mcp add` / `gemini mcp add` commands. The capsule tool can also read a Live Capsule and shows the live and MCP links the API returns.

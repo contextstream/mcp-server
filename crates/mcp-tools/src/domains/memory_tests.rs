@@ -1807,6 +1807,25 @@ mod node_type_tests {
     }
 
     #[test]
+    fn test_normalize_goal_risk_term() {
+        assert_eq!(normalize_node_type("goal").unwrap(), "Goal");
+        assert_eq!(normalize_node_type("Risk").unwrap(), "Risk");
+        assert_eq!(normalize_node_type("TERM").unwrap(), "Term");
+    }
+
+    /// Every node type the tool schema advertises must be accepted by the
+    /// validator; otherwise agents see the type in the enum and get
+    /// "Invalid node_type" back for it.
+    #[test]
+    fn test_every_advertised_node_type_normalizes() {
+        for node_type in super::VALID_NODE_TYPES {
+            let normalized = normalize_node_type(node_type)
+                .unwrap_or_else(|e| panic!("advertised node_type {node_type} rejected: {e}"));
+            assert_eq!(normalized.to_lowercase(), *node_type);
+        }
+    }
+
+    #[test]
     fn test_normalize_invalid() {
         let result = normalize_node_type("invalid_type");
         assert!(result.is_err());

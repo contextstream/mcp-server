@@ -386,6 +386,9 @@ fn normalize_node_type(input: &str) -> Result<String> {
         "constraint" => Ok("Constraint".to_string()),
         "habit" => Ok("Habit".to_string()),
         "lesson" => Ok("Lesson".to_string()),
+        "goal" => Ok("Goal".to_string()),
+        "risk" => Ok("Risk".to_string()),
+        "term" => Ok("Term".to_string()),
         _ => Err(Error::Validation(format!(
             "Invalid node_type: {} (expected one of: {})",
             input,

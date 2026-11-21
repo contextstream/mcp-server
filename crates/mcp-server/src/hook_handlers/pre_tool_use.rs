@@ -2006,16 +2006,10 @@ fn contextstream_surface_nudge(
     action: &str,
     tool_input: &Value,
 ) -> Option<String> {
+    // The plan refs, ticket refs and skill governance reminders are
+    // PostToolUse's alone, once per session after a successful call: the
+    // copies here arrived with the same result and said the same thing.
     match normalized_tool {
-        "session" if action.eq_ignore_ascii_case("capture_plan") || action.eq_ignore_ascii_case("update_plan") => {
-            Some(
-                "Plan linked_items support is available. Keep refs in indexed form and prefer kinds: doc, diagram, runbook, handoff (each with kind+id; optional title_snapshot/status_snapshot/updated_at). Team guidance is also surfaced via session(action=\"context\") instructions/team fields."
-                    .to_string(),
-            )
-        }
-        // The ticket refs reminder is PostToolUse's alone, once per session
-        // after a successful create or update: this copy arrived with the
-        // same result and repeated it on every ticket call.
         "entity" => {
             let kind = first_str(tool_input, &["kind"]).unwrap_or("").trim().to_ascii_lowercase();
             if kind == "handoff" {
@@ -2027,19 +2021,23 @@ fn contextstream_surface_nudge(
                 None
             }
         }
+        // Before the share, where a failed one is retried from: once per
+        // session (see `surface_nudge_once_token`).
         "skill" if action.eq_ignore_ascii_case("share") => Some(format!(
             "Team skill sharing reminder: share supports scope=team|public. \
              For team scope, ensure workspace_id is resolved (run {}(action=\"init\", folder_path=\"...\") first when needed).",
             session_tool_name(editor)
         )),
-        "skill" if action.eq_ignore_ascii_case("list") || action.eq_ignore_ascii_case("get") => {
-            Some(
-                "Skill governance cues are surfaced in results (scope/visibility/workspace/owner when available). Prefer these fields when choosing shared team skills; context/instructions remain the primary source for broad team guidance."
-                    .to_string(),
-            )
-        }
         _ => None,
     }
+}
+
+/// The token under which a PreToolUse reminder is shown at most once per
+/// session; `None` for one shown with every call it applies to (the handoff
+/// checklist is for the handoff being written).
+fn surface_nudge_once_token(normalized_tool: &str, action: &str) -> Option<&'static str> {
+    (normalized_tool == "skill" && action.eq_ignore_ascii_case("share"))
+        .then_some("pre-tool-nudge:skill:share")
 }
 
 fn contextstream_action(tool_input: &Value) -> String {
@@ -3198,12 +3196,18 @@ pub async fn handle() -> Result<()> {
     // ContextStream search; blocking CS tools would create a circular block.
     if is_contextstream_call {
         let action = contextstream_action_name.clone();
-        if let Some(msg) = contextstream_surface_nudge(
+        let nudge = contextstream_surface_nudge(
             &editor,
             &normalized_contextstream_tool,
             &action,
             &tool_input,
-        ) {
+        )
+        .filter(|_| {
+            surface_nudge_once_token(&normalized_contextstream_tool, &action).is_none_or(|token| {
+                super::mid_run_notices::claim_once_per_session(&input, &cwd, token)
+            })
+        });
+        if let Some(msg) = nudge {
             emit(HookDecision::AllowWithContext(msg))?;
         } else {
             emit(HookDecision::Allow)?;
@@ -4196,6 +4200,40 @@ mod tests {
         ));
         assert!(is_mcp_tool_call(&input, "", &tool));
         assert!(is_search_first_applicable("search", &tool_input));
+    }
+
+    #[test]
+    fn pre_tool_leaves_plan_ticket_and_skill_read_reminders_to_post_tool() {
+        let editor = EditorFormat::Claude;
+        let none = serde_json::json!({});
+        for (tool, action, input) in [
+            ("session", "capture_plan", none.clone()),
+            ("session", "update_plan", none.clone()),
+            ("skill", "list", none.clone()),
+            ("skill", "get", none.clone()),
+            (
+                "entity",
+                "create",
+                serde_json::json!({"kind": "ticket", "action": "create"}),
+            ),
+        ] {
+            assert_eq!(
+                contextstream_surface_nudge(&editor, tool, action, &input),
+                None,
+                "{tool} {action}"
+            );
+        }
+        let share =
+            contextstream_surface_nudge(&editor, "skill", "share", &none).expect("share reminder");
+        assert!(share.contains("scope=team|public"));
+        assert_eq!(
+            surface_nudge_once_token("skill", "share"),
+            Some("pre-tool-nudge:skill:share")
+        );
+
+        let handoff = serde_json::json!({"kind": "handoff", "action": "create"});
+        assert!(contextstream_surface_nudge(&editor, "entity", "create", &handoff).is_some());
+        assert_eq!(surface_nudge_once_token("entity", "create"), None);
     }
 
     #[test]

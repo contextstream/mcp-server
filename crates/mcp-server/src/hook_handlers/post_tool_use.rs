@@ -294,15 +294,15 @@ fn contextstream_post_tool_nudge(
     if !tool_call_succeeded(tool_response) {
         return None;
     }
+    // Every reminder but the saved handoff's is shown once per session (see
+    // `once_per_session_token`), and only where it can be acted on.
     match normalized_tool_name {
-        "session" if matches!(action, "capture_plan" | "update_plan" | "get_plan" | "list_plans") => {
-            Some(
-                "Plan refs reminder: linked_items use indexed refs. Preferred kinds: doc, diagram, runbook, handoff (kind+id required; snapshots optional). Team cues should be read from context/instructions fields first."
-                    .to_string(),
-            )
-        }
-        // Shown once per session (see `once_per_session_token`), and only
-        // where links are written: reading tickets needs no reminder.
+        // Where links are written: reading plans needs no reminder.
+        "session" if matches!(action, "capture_plan" | "update_plan") => Some(
+            "Plan refs reminder: linked_items use indexed refs. Preferred kinds: doc, diagram, runbook, handoff (kind+id required; snapshots optional). Team cues should be read from context/instructions fields first."
+                .to_string(),
+        ),
+        // Where links are written: reading tickets needs no reminder.
         "entity" if kind == "ticket" && matches!(action, "create" | "update") => Some(
             "Ticket refs reminder: linked_items support diagram. Keep links in indexed-ref form (kind+id; optional title/status/updated snapshots), not URL-only links. Team cues should be read from context/instructions fields first."
                 .to_string(),
@@ -311,8 +311,10 @@ fn contextstream_post_tool_nudge(
             "Canonical handoff saved. Do not create HANDOFF.md or a paste-only prompt as a substitute. If the user also requested a portable bundle, capsule, or share link, create a session capsule now and return both the handoff and capsule results."
                 .to_string(),
         ),
-        "skill" if matches!(action, "share" | "list" | "get" | "run") => Some(
-            "Team-skill reminder: share uses scope=team|public; prefer governance cues (scope/visibility/workspace/owner) when selecting reusable skills. Treat hooks as reinforcement, not the primary guidance source."
+        // Where a skill is chosen from results; sharing has PreToolUse's
+        // reminder, and a skill being run is already chosen.
+        "skill" if matches!(action, "list" | "get") => Some(
+            "Skill governance cues are in these results (scope/visibility/workspace/owner when available): prefer them when choosing a shared team skill to reuse. Context/instructions remain the primary source for broad team guidance."
                 .to_string(),
         ),
         _ => None,
@@ -363,11 +365,19 @@ fn self_authored_title(normalized_tool_name: &str, tool_input: &Value) -> Option
 }
 
 /// The token under which a post-tool reminder is shown at most once per
-/// session, for each tool and kind; `None` for one shown every time it
-/// applies (a saved handoff's next step is news with every save).
-fn once_per_session_token(normalized_tool_name: &str, kind: &str) -> Option<String> {
-    (normalized_tool_name == "entity" && kind == "ticket")
-        .then(|| format!("post-tool-nudge:{normalized_tool_name}:{kind}"))
+/// session, one for each tool and reminder; `None` for one shown every time
+/// it applies (a saved handoff's next step is news with every save).
+fn once_per_session_token(
+    normalized_tool_name: &str,
+    action: &str,
+    kind: &str,
+) -> Option<&'static str> {
+    match (normalized_tool_name, action, kind) {
+        ("entity", _, "ticket") => Some("post-tool-nudge:entity:ticket"),
+        ("session", "capture_plan" | "update_plan", _) => Some("post-tool-nudge:session:plan-refs"),
+        ("skill", "list" | "get", _) => Some("post-tool-nudge:skill:governance"),
+        _ => None,
+    }
 }
 
 fn absolute_path_from(path: &str, cwd: &str) -> String {
@@ -1147,9 +1157,9 @@ pub async fn handle() -> Result<()> {
         let nudge =
             contextstream_post_tool_nudge(&normalized_tool_name, &action, &kind, &tool_response)
                 .filter(|_| {
-                    once_per_session_token(&normalized_tool_name, &kind).is_none_or(|token| {
-                        super::mid_run_notices::claim_once_per_session(&input, &cwd, &token)
-                    })
+                    once_per_session_token(&normalized_tool_name, &action, &kind).is_none_or(
+                        |token| super::mid_run_notices::claim_once_per_session(&input, &cwd, token),
+                    )
                 });
         if let Some(msg) = nudge {
             // Cursor injects post-tool guidance via `postToolUse.additional_context`
@@ -2131,13 +2141,55 @@ mod tests {
     }
 
     #[test]
-    fn only_the_ticket_reminder_is_once_per_session() {
+    fn plan_and_skill_reminders_come_only_where_they_can_be_acted_on() {
+        let ok = serde_json::json!({"isError": false});
+        for (tool, action) in [
+            ("session", "capture_plan"),
+            ("session", "update_plan"),
+            ("skill", "list"),
+            ("skill", "get"),
+        ] {
+            assert!(
+                contextstream_post_tool_nudge(tool, action, "", &ok).is_some(),
+                "{tool} {action} gets its reminder"
+            );
+        }
+        for (tool, action) in [
+            ("session", "get_plan"),
+            ("session", "list_plans"),
+            ("skill", "run"),
+            ("skill", "share"),
+        ] {
+            assert!(
+                contextstream_post_tool_nudge(tool, action, "", &ok).is_none(),
+                "{tool} {action} gets no reminder"
+            );
+        }
+    }
+
+    #[test]
+    fn each_repeating_reminder_is_once_per_session_under_its_own_token() {
+        let tokens = [
+            once_per_session_token("entity", "create", "ticket"),
+            once_per_session_token("entity", "update", "ticket"),
+            once_per_session_token("session", "capture_plan", ""),
+            once_per_session_token("session", "update_plan", ""),
+            once_per_session_token("skill", "list", ""),
+            once_per_session_token("skill", "get", ""),
+        ];
         assert_eq!(
-            once_per_session_token("entity", "ticket").as_deref(),
-            Some("post-tool-nudge:entity:ticket")
+            tokens,
+            [
+                Some("post-tool-nudge:entity:ticket"),
+                Some("post-tool-nudge:entity:ticket"),
+                Some("post-tool-nudge:session:plan-refs"),
+                Some("post-tool-nudge:session:plan-refs"),
+                Some("post-tool-nudge:skill:governance"),
+                Some("post-tool-nudge:skill:governance"),
+            ]
         );
-        assert_eq!(once_per_session_token("entity", "handoff"), None);
-        assert_eq!(once_per_session_token("session", ""), None);
+        // A saved handoff's next step is news with every save.
+        assert_eq!(once_per_session_token("entity", "create", "handoff"), None);
     }
 
     #[test]

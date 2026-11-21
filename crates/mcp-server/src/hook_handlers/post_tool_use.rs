@@ -301,12 +301,12 @@ fn contextstream_post_tool_nudge(
                     .to_string(),
             )
         }
-        "entity" if kind == "ticket" && matches!(action, "create" | "update" | "get" | "list") => {
-            Some(
-                "Ticket refs reminder: linked_items support diagram. Keep links in indexed-ref form (kind+id; optional title/status/updated snapshots). Team cues should be read from context/instructions fields first."
-                    .to_string(),
-            )
-        }
+        // Shown once per session (see `once_per_session_token`), and only
+        // where links are written: reading tickets needs no reminder.
+        "entity" if kind == "ticket" && matches!(action, "create" | "update") => Some(
+            "Ticket refs reminder: linked_items support diagram. Keep links in indexed-ref form (kind+id; optional title/status/updated snapshots), not URL-only links. Team cues should be read from context/instructions fields first."
+                .to_string(),
+        ),
         "entity" if kind == "handoff" && matches!(action, "create" | "update") => Some(
             "Canonical handoff saved. Do not create HANDOFF.md or a paste-only prompt as a substitute. If the user also requested a portable bundle, capsule, or share link, create a session capsule now and return both the handoff and capsule results."
                 .to_string(),
@@ -317,6 +317,14 @@ fn contextstream_post_tool_nudge(
         ),
         _ => None,
     }
+}
+
+/// The token under which a post-tool reminder is shown at most once per
+/// session, for each tool and kind; `None` for one shown every time it
+/// applies (a saved handoff's next step is news with every save).
+fn once_per_session_token(normalized_tool_name: &str, kind: &str) -> Option<String> {
+    (normalized_tool_name == "entity" && kind == "ticket")
+        .then(|| format!("post-tool-nudge:{normalized_tool_name}:{kind}"))
 }
 
 fn absolute_path_from(path: &str, cwd: &str) -> String {
@@ -1086,9 +1094,14 @@ pub async fn handle() -> Result<()> {
     if is_contextstream_server_call(&mcp_server_name, &tool_name) {
         let action = contextstream_action(&tool_input);
         let kind = contextstream_kind(&tool_input);
-        if let Some(msg) =
+        let nudge =
             contextstream_post_tool_nudge(&normalized_tool_name, &action, &kind, &tool_response)
-        {
+                .filter(|_| {
+                    once_per_session_token(&normalized_tool_name, &kind).is_none_or(|token| {
+                        super::mid_run_notices::claim_once_per_session(&input, &cwd, &token)
+                    })
+                });
+        if let Some(msg) = nudge {
             // Cursor injects post-tool guidance via `postToolUse.additional_context`
             // (snake_case, top-level); Claude/others use the HookOutput schema.
             super::write_context_for_input(&input, msg)?;
@@ -1975,6 +1988,34 @@ mod tests {
         )
         .expect("nudge");
         assert!(msg.contains("diagram"));
+        assert!(contextstream_post_tool_nudge(
+            "entity",
+            "update",
+            "ticket",
+            &serde_json::json!({"isError": false}),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn post_tool_ticket_nudge_skips_reads_and_other_kinds() {
+        let ok = serde_json::json!({"isError": false});
+        for (action, kind) in [("list", "ticket"), ("get", "ticket"), ("create", "risk")] {
+            assert!(
+                contextstream_post_tool_nudge("entity", action, kind, &ok).is_none(),
+                "entity {action} {kind} gets no reminder"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_ticket_reminder_is_once_per_session() {
+        assert_eq!(
+            once_per_session_token("entity", "ticket").as_deref(),
+            Some("post-tool-nudge:entity:ticket")
+        );
+        assert_eq!(once_per_session_token("entity", "handoff"), None);
+        assert_eq!(once_per_session_token("session", ""), None);
     }
 
     #[test]

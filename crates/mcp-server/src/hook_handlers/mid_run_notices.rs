@@ -86,6 +86,9 @@ pub(crate) const BACKGROUND_POLL_HOOK: &str = "mid-run-poll";
 const MAX_REPORTED_RUNS: usize = 8;
 /// How long an API that answered 404 for deliveries is not asked again.
 const DELIVERIES_NOT_THERE_MS: u64 = 10 * 60 * 1000;
+/// Once-per-session reminder tokens remembered per session. Past this the
+/// oldest are forgotten, and a forgotten reminder may be shown once more.
+const MAX_SHOWN_ONCE: usize = 64;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct MidRunSessionState {
@@ -145,6 +148,10 @@ pub(crate) struct MidRunSessionState {
     /// The API said it has no delivery routes: not asked again before this.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub deliveries_not_there_until_unix_ms: u64,
+    /// Reminders a hook shows at most once per session, by token (at most
+    /// `MAX_SHOWN_ONCE`); see [`claim_once_per_session`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shown_once: Vec<String>,
     #[serde(default)]
     pub updated_at: String,
 }
@@ -253,6 +260,28 @@ fn update_session_entry<T>(
         entry.updated_at = Utc::now().to_rfc3339();
         result
     })
+}
+
+/// True the first time this session claims `token`, false every time after,
+/// so a reminder shown under it appears at most once per session. False too
+/// when the session state cannot be written: without a record, the reminder
+/// would otherwise come back with every call.
+pub(crate) fn claim_once_per_session(input: &Value, cwd: &str, token: &str) -> bool {
+    let key = session_state_key(input, cwd);
+    if read_session_entry_fast(&key)
+        .is_some_and(|entry| entry.shown_once.iter().any(|t| t == token))
+    {
+        return false;
+    }
+    update_session_entry(&key, |entry| claim_once(entry, token)).unwrap_or(false)
+}
+
+fn claim_once(entry: &mut MidRunSessionState, token: &str) -> bool {
+    if entry.shown_once.iter().any(|shown| shown == token) {
+        return false;
+    }
+    push_bounded(&mut entry.shown_once, token.to_string(), MAX_SHOWN_ONCE);
+    true
 }
 
 /// True when `path` is a scratch, temp, or agent-harness state directory that
@@ -3406,5 +3435,58 @@ mod tests {
         ] {
             assert!(!written.contains(field), "{written}");
         }
+    }
+
+    /// Run `body` with `HOME` (where session state lives) in a fresh folder.
+    fn with_temp_home(body: impl FnOnce()) {
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().expect("temp home");
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        body();
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn a_once_per_session_reminder_is_claimed_once_per_session_and_token() {
+        with_temp_home(|| {
+            let input = serde_json::json!({"session_id": "once-session-a"});
+            let token = "post-tool-nudge:entity:ticket";
+            assert!(claim_once_per_session(&input, "/repo", token));
+            assert!(!claim_once_per_session(&input, "/repo", token));
+            assert!(claim_once_per_session(
+                &input,
+                "/repo",
+                "post-tool-nudge:entity:other"
+            ));
+            // Another session has its own record.
+            let other = serde_json::json!({"session_id": "once-session-b"});
+            assert!(claim_once_per_session(&other, "/repo", token));
+        });
+    }
+
+    #[test]
+    fn once_per_session_tokens_are_bounded_and_survive_older_state_files() {
+        let mut entry = MidRunSessionState::default();
+        for n in 0..(MAX_SHOWN_ONCE + 5) {
+            assert!(claim_once(&mut entry, &format!("token-{n}")));
+        }
+        assert_eq!(entry.shown_once.len(), MAX_SHOWN_ONCE);
+        assert!(!claim_once(
+            &mut entry,
+            &format!("token-{}", MAX_SHOWN_ONCE + 4)
+        ));
+
+        let old = r#"{"last_poll_unix_ms":5,"updated_at":"t"}"#;
+        let entry: MidRunSessionState = serde_json::from_str(old).unwrap();
+        assert!(entry.shown_once.is_empty());
+        assert!(!serde_json::to_string(&entry)
+            .unwrap()
+            .contains("shown_once"));
     }
 }

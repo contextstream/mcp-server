@@ -2013,6 +2013,9 @@ fn contextstream_surface_nudge(
                     .to_string(),
             )
         }
+        // The ticket refs reminder is PostToolUse's alone, once per session
+        // after a successful create or update: this copy arrived with the
+        // same result and repeated it on every ticket call.
         "entity" => {
             let kind = first_str(tool_input, &["kind"]).unwrap_or("").trim().to_ascii_lowercase();
             if kind == "handoff" {
@@ -2020,11 +2023,6 @@ fn contextstream_surface_nudge(
                 Some(format!(
                     "Canonical handoff reminder: preserve verified facts, eliminated hypotheses, scope, branch/commit and validation state, blockers, and ordered next_steps. Omit unknown to_user_id. If the user requested a portable bundle/capsule/share link, additionally create {capsule}(action=\"create\", scope=\"session\", session_id=\"<current session id>\", purpose=\"handoff\"); do not create HANDOFF.md as a substitute."
                 ))
-            } else if kind == "ticket" {
-                Some(
-                    "Ticket linked_items support includes diagram refs. Use indexed refs (kind+id) and optional snapshots; avoid URL-only links. Team context/instructions are the primary surfacing channel for non-hook agents."
-                        .to_string(),
-                )
             } else {
                 None
             }

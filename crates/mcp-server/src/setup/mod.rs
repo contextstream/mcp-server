@@ -27,6 +27,7 @@ mod pending_connection;
 pub mod profile;
 mod project_git;
 mod prompts;
+mod remote_checks;
 mod rules;
 pub mod safe_edit;
 mod team_guidance;
@@ -2947,6 +2948,32 @@ pub async fn run_setup_with_project_overrides(
     project_name: Option<&str>,
     learning_choice: Option<bool>,
 ) -> Result<bool> {
+    run_setup_with_remote_checks(
+        non_interactive,
+        only,
+        project_path,
+        account_only,
+        workspace_id,
+        project_id,
+        project_name,
+        learning_choice,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_setup_with_remote_checks(
+    non_interactive: bool,
+    only: Option<&[editors::Editor]>,
+    project_path: Option<&Path>,
+    account_only: bool,
+    workspace_id: Option<&str>,
+    project_id: Option<&str>,
+    project_name: Option<&str>,
+    learning_choice: Option<bool>,
+    remote_checks: Option<bool>,
+) -> Result<bool> {
     if non_interactive {
         run_setup_noninteractive(
             only,
@@ -2956,10 +2983,18 @@ pub async fn run_setup_with_project_overrides(
             project_id,
             project_name,
             learning_choice,
+            remote_checks,
         )
         .await
     } else {
-        wizard::run(only, project_path, account_only, learning_choice).await
+        wizard::run(
+            only,
+            project_path,
+            account_only,
+            learning_choice,
+            remote_checks,
+        )
+        .await
     }
 }
 
@@ -3176,6 +3211,7 @@ async fn run_setup_noninteractive(
     explicit_project_id: Option<&str>,
     explicit_project_name: Option<&str>,
     explicit_learning_choice: Option<bool>,
+    remote_checks: Option<bool>,
 ) -> Result<bool> {
     let parsed_project_id = match explicit_project_id {
         Some(raw) => {
@@ -3199,6 +3235,7 @@ async fn run_setup_noninteractive(
 
     if !account_only
         && explicit_learning_choice.is_none()
+        && remote_checks.is_none()
         && try_short_circuit_healthy_noninteractive_setup(
             only,
             explicit_project_path,
@@ -3277,6 +3314,13 @@ async fn run_setup_noninteractive(
     }
 
     if editors_to_configure.is_empty() {
+        remote_checks::scripted(
+            &client,
+            project_path.as_deref(),
+            explicit_workspace_id,
+            remote_checks,
+        )
+        .await;
         persist_setup_editor_selection(&editors_to_configure)?;
         ui::say(
             ui::Mark::Warn,
@@ -3372,6 +3416,14 @@ async fn run_setup_noninteractive(
     let selected_project = project_resolution.selected_project().cloned();
     let configured_project_path =
         project_resolution.configured_project_path(project_path.as_deref());
+
+    remote_checks::scripted(
+        &client,
+        configured_project_path,
+        workspace.as_ref().map(|ws| ws.id.as_str()),
+        remote_checks,
+    )
+    .await;
 
     // Record the selected editors and transport only after workspace/project
     // preflight succeeds so an aborted `--yes` run never leaves

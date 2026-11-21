@@ -92,6 +92,25 @@ pub async fn run_setup_with_profile(
     explicit_project_path: Option<&Path>,
     account_only: bool,
 ) -> Result<()> {
+    run_setup_with_profile_options(
+        token,
+        profile_file,
+        editor_override,
+        explicit_project_path,
+        account_only,
+        None,
+    )
+    .await
+}
+
+pub async fn run_setup_with_profile_options(
+    token: Option<String>,
+    profile_file: Option<PathBuf>,
+    editor_override: Option<&[Editor]>,
+    explicit_project_path: Option<&Path>,
+    account_only: bool,
+    remote_checks: Option<bool>,
+) -> Result<()> {
     let started = Instant::now();
     print_engine_banner();
 
@@ -191,6 +210,14 @@ pub async fn run_setup_with_profile(
     if let Some(ref ws) = workspace {
         println!("{}Workspace: {}", CHECK, style(&ws.name).cyan());
     }
+
+    super::remote_checks::scripted(
+        &client,
+        project_path.as_deref(),
+        workspace.as_ref().map(|ws| ws.id.as_str()),
+        remote_checks,
+    )
+    .await;
 
     let project_resolution = if let Some(project_path) = project_path.as_deref() {
         super::resolve_setup_project_for_current_directory_with_overrides(

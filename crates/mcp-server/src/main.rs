@@ -115,6 +115,14 @@ enum Commands {
         #[arg(long, short = 'y', alias = "non-interactive")]
         yes: bool,
 
+        /// Enable remote checks, including more engines when this project needs them.
+        #[arg(long, conflicts_with = "no_remote_checks")]
+        remote_checks: bool,
+
+        /// Turn remote checks off for this account.
+        #[arg(long)]
+        no_remote_checks: bool,
+
         /// Optional deep project learning: on opens human consent; off withdraws. Omitted preserves your choice.
         #[arg(long, visible_alias = "deep-learning", value_enum)]
         account_learning: Option<ToggleValue>,
@@ -180,6 +188,22 @@ enum Commands {
         /// Show every file that would change, without writing anything.
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Show or change remote builds, tests and type-checks for this account.
+    RemoteChecks {
+        /// Omit for status, or use an engine flag alone to change only engine coverage.
+        #[arg(value_enum)]
+        action: Option<RemoteChecksAction>,
+        /// Include additional language engines.
+        #[arg(long, conflicts_with = "no_more_engines")]
+        more_engines: bool,
+        /// Use only the standard Rust, TypeScript/JavaScript, Python and Go engines.
+        #[arg(long)]
+        no_more_engines: bool,
+        /// Print machine-readable settings and project languages.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Validate editor integration health and readiness
@@ -742,6 +766,17 @@ enum AccountLearningAction {
     Status,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum RemoteChecksAction {
+    Status,
+    On,
+    Off,
+}
+
+fn explicit_toggle(on: bool, off: bool) -> Option<bool> {
+    (on || off).then_some(on)
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ToggleValue {
     On,
@@ -1076,6 +1111,7 @@ fn silence_stdout_when_quiet(quiet: bool, command: &Option<Commands>) {
             Commands::Doctor { json: true, .. }
                 | Commands::Doctor { support: true, .. }
                 | Commands::VerifyKey { json: true, .. }
+                | Commands::RemoteChecks { json: true, .. }
                 | Commands::Link { json: true, .. }
                 | Commands::Clients { .. }
                 | Commands::DetectEditors { .. }
@@ -1201,6 +1237,8 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
         }
         Some(Commands::Setup {
             yes,
+            remote_checks,
+            no_remote_checks,
             account_learning,
             profile,
             profile_file,
@@ -1230,18 +1268,20 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                     std::process::exit(1);
                 }
             };
+            let checks = explicit_toggle(remote_checks, no_remote_checks);
             let result = if profile.is_some() || profile_file.is_some() {
-                setup::profile::run_setup_with_profile(
+                setup::profile::run_setup_with_profile_options(
                     profile,
                     profile_file,
                     explicit.as_deref(),
                     project_path.as_deref(),
                     account_only,
+                    checks,
                 )
                 .await
                 .map(|_| true)
             } else {
-                setup::run_setup_with_project_overrides(
+                setup::run_setup_with_remote_checks(
                     yes,
                     explicit.as_deref(),
                     project_path.as_deref(),
@@ -1250,6 +1290,7 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                     project_id.as_deref(),
                     project_name.as_deref(),
                     account_learning.map(|choice| choice.as_bool()),
+                    checks,
                 )
                 .await
             };
@@ -1288,6 +1329,44 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
 
         Some(Commands::Http { host, port }) => {
             run_http_server(&host, port).await?;
+        }
+
+        Some(Commands::RemoteChecks {
+            action,
+            more_engines,
+            no_more_engines,
+            json,
+        }) => {
+            use mcp_tools::domains::remote_checks;
+            let more = explicit_toggle(more_engines, no_more_engines);
+            if action == Some(RemoteChecksAction::Status) && more.is_some() {
+                anyhow::bail!("Use an engine flag without 'status' to change engine coverage.");
+            }
+            let enabled = match action {
+                Some(RemoteChecksAction::On) => Some(true),
+                Some(RemoteChecksAction::Off) => Some(false),
+                _ => None,
+            };
+            let config = load_config()?;
+            let workspace = config.default_workspace_id.map(|id| id.to_string());
+            let client = mcp_client::ContextStreamClient::new(config);
+            let state =
+                match remote_checks::settings(&client, workspace.as_deref(), enabled, more).await {
+                    Err(mcp_types::Error::Http { status: 403, .. }) => {
+                        anyhow::bail!("Remote checks are unavailable for this account.")
+                    }
+                    result => result?,
+                };
+            let project =
+                remote_checks::local_languages(std::env::current_dir().ok().as_deref(), &state);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&remote_checks::report(&state, project.as_ref()))?
+                );
+            } else {
+                println!("{}", state.status_text(project.as_ref()));
+            }
         }
 
         Some(Commands::VerifyKey { json }) => {
@@ -4944,6 +5023,77 @@ mod tests {
             help.contains("CONTEXTSTREAM_ALLOW_LOCAL_MCP=1"),
             "generate-configs --help must document CONTEXTSTREAM_ALLOW_LOCAL_MCP=1:
 {help}"
+        );
+    }
+
+    #[test]
+    fn remote_checks_cli_parses_independent_choices() {
+        for (args, expected, more, json) in [
+            (vec![], None, None, false),
+            (
+                vec!["status", "--json"],
+                Some(RemoteChecksAction::Status),
+                None,
+                true,
+            ),
+            (
+                vec!["on", "--more-engines"],
+                Some(RemoteChecksAction::On),
+                Some(true),
+                false,
+            ),
+            (
+                vec!["off", "--no-more-engines"],
+                Some(RemoteChecksAction::Off),
+                Some(false),
+                false,
+            ),
+            (vec!["--no-more-engines"], None, Some(false), false),
+        ] {
+            let cli =
+                Cli::try_parse_from(["mcp", "remote-checks"].into_iter().chain(args)).unwrap();
+            let Some(Commands::RemoteChecks {
+                action,
+                more_engines,
+                no_more_engines,
+                json: output,
+            }) = cli.command
+            else {
+                panic!("remote-checks expected")
+            };
+            assert_eq!(
+                (
+                    action,
+                    explicit_toggle(more_engines, no_more_engines),
+                    output
+                ),
+                (expected, more, json)
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "mcp",
+            "remote-checks",
+            "--more-engines",
+            "--no-more-engines"
+        ])
+        .is_err());
+        for (flag, expected) in [("--remote-checks", true), ("--no-remote-checks", false)] {
+            let cli = Cli::try_parse_from(["mcp", "setup", "--yes", flag]).unwrap();
+            let Some(Commands::Setup {
+                remote_checks,
+                no_remote_checks,
+                ..
+            }) = cli.command
+            else {
+                panic!("setup expected")
+            };
+            assert_eq!(
+                explicit_toggle(remote_checks, no_remote_checks),
+                Some(expected)
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["mcp", "setup", "--remote-checks", "--no-remote-checks"]).is_err()
         );
     }
 

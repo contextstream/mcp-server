@@ -18,7 +18,14 @@ use super::{
     SetupIndexChoice, SetupTransportPreference, WorkspaceInfo,
 };
 
-const STEPS: [&str; 5] = ["Account", "Editors", "Project", "Review", "Finish"];
+const STEPS: [&str; 6] = [
+    "Account",
+    "Editors",
+    "Project",
+    "Remote checks",
+    "Review",
+    "Finish",
+];
 
 /// Print the stepper and a titled section for wizard step `step` (1-based).
 pub(super) fn print_step(step: usize, title: &str, detail: &str) {
@@ -139,6 +146,7 @@ struct Choices {
     project: ProjectPlan,
     index: IndexPlan,
     learning_state: super::account_learning::ConsentState,
+    remote_checks: Option<super::remote_checks::Step>,
     explicit_learning: bool,
     learning_choice: Option<bool>,
     /// `Some(true)` turns Claude Code auto memory off after saving; `None`
@@ -153,6 +161,7 @@ enum ReviewAction {
     Project,
     Indexing,
     AccountLearning,
+    RemoteChecks,
     ClaudeAutoMemory,
     Account,
     Exit,
@@ -207,6 +216,7 @@ pub(super) async fn run(
     explicit_project_path: Option<&Path>,
     account_only: bool,
     explicit_learning_choice: Option<bool>,
+    explicit_checks: Option<bool>,
 ) -> Result<bool> {
     prompts::require_terminal(
         "Guided setup",
@@ -280,7 +290,11 @@ pub(super) async fn run(
         None => None,
     };
 
+    let remote_checks =
+        super::remote_checks::Step::prepare(&client, project_path.as_deref(), explicit_checks)
+            .await?;
     let mut choices = Choices {
+        remote_checks,
         api_key,
         api_url,
         user_id,
@@ -303,18 +317,21 @@ pub(super) async fn run(
 
     loop {
         print_step(
-            4,
+            5,
             "Review",
             "Nothing is saved until you choose Save. Change anything first.",
         );
         print_review(&choices);
         let offer_learning_toggle =
             !choices.explicit_learning && choices.learning_state.should_prompt_in_wizard();
-        let actions = review_actions(
+        let mut actions = review_actions(
             choices.index,
             offer_learning_toggle,
             choices.claude_auto_memory_off,
         );
+        if explicit_checks.is_none() && choices.remote_checks.is_some() {
+            actions.insert(3, (ReviewAction::RemoteChecks, "Change remote checks"));
+        }
         let labels: Vec<&str> = actions.iter().map(|(_, label)| *label).collect();
         let choice = prompts::select("Ready to set up ContextStream?", &labels)?;
         match actions[choice].0 {
@@ -347,6 +364,11 @@ pub(super) async fn run(
                     choices.index = IndexPlan::from_choice(super::prompt_setup_index_choice(path)?);
                 }
             }
+            ReviewAction::RemoteChecks => {
+                if let Some(step) = choices.remote_checks.as_mut() {
+                    step.prompt()?;
+                }
+            }
             ReviewAction::AccountLearning => {
                 choices.learning_choice = Some(super::confirm(
                     learning_prompt_text(&choices.learning_state),
@@ -364,6 +386,12 @@ pub(super) async fn run(
                 choices.user_id = user_id;
                 choices.email = email;
                 choices.team_capable = load_team_capability(&choices.client).await;
+                choices.remote_checks = super::remote_checks::Step::prepare(
+                    &choices.client,
+                    choices.project_path.as_deref(),
+                    explicit_checks,
+                )
+                .await?;
                 choices.learning_state = super::account_learning::fetch_consent_state(
                     &choices.client,
                     choices.user_id.as_deref(),
@@ -405,7 +433,7 @@ pub(super) async fn run(
     }
 
     mcp_client::activation::set_installation_state_persistence_enabled(persist_after_save);
-    print_step(5, "Finishing setup", "");
+    print_step(6, "Finishing setup", "");
     let open_browser_after_finish = !choices.explicit_learning
         && choices.learning_state.should_prompt_in_wizard()
         && choices.learning_choice == Some(true);
@@ -902,6 +930,9 @@ fn print_review(choices: &Choices) {
         rows.push(ui.row("Folder", &ui.path(&display_path(path))));
     }
     rows.push(ui.row("Indexing", choices.index.summary()));
+    if let Some(step) = &choices.remote_checks {
+        rows.push(ui.row("Remote checks", step.choice.label()));
+    }
     if choices.explicit_learning || choices.learning_state.should_prompt_in_wizard() {
         rows.push(ui.row(
             "Deep project learning",
@@ -949,6 +980,7 @@ async fn finish(
         index,
         learning_state: _,
         explicit_learning: _,
+        remote_checks,
         learning_choice: _,
         claude_auto_memory_off,
     } = choices;
@@ -969,6 +1001,11 @@ async fn finish(
     }
     let configured_project_path =
         project_resolution.configured_project_path(project_path.as_deref());
+
+    if let Some(step) = remote_checks {
+        step.apply(&client, workspace.as_ref().map(|ws| ws.id.as_str()))
+            .await;
+    }
 
     super::persist_setup_editor_selection(&editors)?;
 
@@ -1495,7 +1532,7 @@ mod tests {
             Some("acme-web · matches this Git repository"),
         );
         print_step(
-            4,
+            5,
             "Review",
             "Nothing is saved until you choose Save. Change anything first.",
         );
@@ -1525,6 +1562,7 @@ mod tests {
                 version: Some("account-learning-v1".into()),
             },
             explicit_learning: false,
+            remote_checks: None,
             learning_choice: None,
             claude_auto_memory_off: None,
         };
@@ -1556,7 +1594,7 @@ mod tests {
             .unwrap();
         println!("{answered}");
 
-        print_step(5, "Finishing setup", "");
+        print_step(6, "Finishing setup", "");
         ui::say(Mark::Ok, "Project created", Some("acme-web"));
         ui::say(
             Mark::Ok,

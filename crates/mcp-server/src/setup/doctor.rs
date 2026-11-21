@@ -3552,21 +3552,28 @@ pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -
         return Ok(report.has_failures());
     }
 
-    let learning = if report.credentials.status == CheckStatus::Pass {
-        match doctor_client_config() {
-            Ok(config) => tokio::time::timeout(
+    let (learning, checks) = if let Some(client) = (report.credentials.status == CheckStatus::Pass)
+        .then(doctor_client_config)
+        .and_then(Result::ok)
+        .map(ContextStreamClient::new)
+    {
+        let (learning, checks) = tokio::join!(
+            tokio::time::timeout(
                 std::time::Duration::from_secs(3),
-                ContextStreamClient::new(config).account_learning_status(),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .map(|v| super::account_learning::status_label(&v))
-            .unwrap_or("Unavailable"),
-            Err(_) => "Unavailable",
-        }
+                client.account_learning_status()
+            ),
+            client.remote_checks()
+        );
+        (
+            learning
+                .ok()
+                .and_then(Result::ok)
+                .map(|v| super::account_learning::status_label(&v))
+                .unwrap_or("Unavailable"),
+            checks.map(|s| s.state()).unwrap_or("status unavailable"),
+        )
     } else {
-        "Unavailable"
+        ("Unavailable", "status unavailable")
     };
     let ui = super::ui::ui();
     println!();
@@ -3598,6 +3605,11 @@ pub async fn run_doctor(mut options: DoctorOptions, json: bool, support: bool) -
         ui.muted(&format!(
             "Deep project learning: {learning} (status only; Account → Privacy controls consent)"
         ))
+    );
+    println!(
+        "{}  {}",
+        super::ui::GUTTER,
+        ui.muted(&format!("Remote checks: {checks}"))
     );
     if let Some(project_link) = &report.project_link {
         print_check(project_link, "");

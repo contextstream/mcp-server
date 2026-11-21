@@ -54,6 +54,9 @@ pub struct CreateDecisionParams {
     pub category: Option<String>,
     pub tags: Option<Vec<String>>,
     pub session_id: Option<String>,
+    /// Sent only when the caller set it; the API's default stands otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_personal: Option<bool>,
 }
 
 /// Body for `POST /memory/decisions/:id/actions`.
@@ -105,6 +108,9 @@ pub struct CreateLessonParams {
     pub severity: Option<String>,
     pub category: Option<String>,
     pub keywords: Option<Vec<String>>,
+    /// Sent only when the caller set it; the API's default stands otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_personal: Option<bool>,
 }
 
 /// Body for `PATCH /lessons/:id`. Every field is optional.
@@ -254,6 +260,7 @@ impl ContextStreamClient {
             "category": params.category,
             "tags": params.tags,
             "session_id": params.session_id,
+            "is_personal": params.is_personal,
         }));
         let result = self.post("/memory/decisions", body).await?;
         self.invalidate_memory_read_caches();
@@ -360,6 +367,7 @@ impl ContextStreamClient {
             "severity": params.severity,
             "category": params.category,
             "keywords": params.keywords,
+            "is_personal": params.is_personal,
         }));
         let result = self.post("/lessons", body).await?;
         self.invalidate_memory_read_caches();

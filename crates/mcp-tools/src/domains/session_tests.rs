@@ -8990,3 +8990,217 @@ async fn get_plan_opens_a_plan_by_the_start_of_its_id() {
         "{lines:?}"
     );
 }
+
+mod is_personal_passthrough_tests {
+    // An agent passing is_personal:false had it dropped by capture, so a note
+    // meant for the team was saved personal by default.
+    use super::{SessionTool, TestFixtures, ToolHandler};
+    use mcp_client::ContextStreamClient;
+    use mcp_session::SessionManager;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const WORKSPACE: &str = "22222222-2222-4222-8222-222222222222";
+    const PROJECT: &str = "44444444-4444-4444-8444-444444444444";
+    const CREATED: &str = "33333333-3333-4333-8333-333333333333";
+
+    /// Answers every request with a created item (a 404 for a request line
+    /// containing `missing`) until the client goes quiet; returns each
+    /// request's line and JSON body.
+    fn serve(
+        listener: tokio::net::TcpListener,
+        missing: Option<&'static str>,
+    ) -> tokio::task::JoinHandle<Vec<(String, Value)>> {
+        tokio::spawn(async move {
+            let mut requests = Vec::new();
+            while let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
+            {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 8192];
+                let (head_end, length) = loop {
+                    let read = socket.read(&mut buffer).await.expect("read request");
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length || read == 0 {
+                            break (end, length);
+                        }
+                    } else if read == 0 {
+                        break (request.len(), 0);
+                    }
+                };
+                let text = String::from_utf8_lossy(&request).to_string();
+                let line = text.lines().next().unwrap_or_default().to_string();
+                let body_start = (head_end + 4).min(request.len());
+                let body_end = (body_start + length).min(request.len());
+                let body =
+                    serde_json::from_slice(&request[body_start..body_end]).unwrap_or(Value::Null);
+                let not_found = missing.is_some_and(|route| line.contains(route));
+                requests.push((line, body));
+                let reply = json!({"success": true, "data": {
+                    "id": CREATED, "title": "created", "name": "team", "workspace_id": WORKSPACE,
+                    "project_id": PROJECT, "items": []
+                }})
+                .to_string();
+                let (status, reply) = if not_found {
+                    ("404 Not Found", json!({"error": "not found"}).to_string())
+                } else {
+                    ("200 OK", reply)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            requests
+        })
+    }
+
+    async fn session_tool() -> (SessionTool, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{}", listener.local_addr().expect("listener addr"));
+        config.api_key = Some("test-key".to_string());
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        (
+            SessionTool::new(client, session, mcp_types::atlas_layer::noop_layer()),
+            listener,
+        )
+    }
+
+    /// The body of the one POST whose request line contains `route`.
+    async fn posted_body(call: Value, route: &str) -> Value {
+        posted_body_with(call, route, None).await
+    }
+
+    async fn posted_body_with(call: Value, route: &str, missing: Option<&'static str>) -> Value {
+        let (tool, listener) = session_tool().await;
+        let server = serve(listener, missing);
+        tool.execute(call).await.expect("the call succeeds");
+        let requests = server.await.expect("server");
+        let posts: Vec<&Value> = requests
+            .iter()
+            .filter(|(line, _)| line.starts_with("POST ") && line.contains(route))
+            .map(|(_, body)| body)
+            .collect();
+        assert_eq!(posts.len(), 1, "{requests:?}");
+        posts[0].clone()
+    }
+
+    #[tokio::test]
+    async fn capture_sends_is_personal_only_when_given() {
+        let call = |is_personal: Option<bool>| {
+            let mut call = json!({"action": "capture", "event_type": "note",
+                "title": "Team note", "content": "Shared with the team.",
+                "workspace_id": WORKSPACE, "project_id": PROJECT});
+            if let Some(is_personal) = is_personal {
+                call["is_personal"] = json!(is_personal);
+            }
+            call
+        };
+        let shared = posted_body(call(Some(false)), "/api/v1/memory/events").await;
+        assert_eq!(shared["is_personal"], json!(false), "{shared}");
+        let personal = posted_body(call(Some(true)), "/api/v1/memory/events").await;
+        assert_eq!(personal["is_personal"], json!(true), "{personal}");
+        let omitted = posted_body(call(None), "/api/v1/memory/events").await;
+        assert!(omitted.get("is_personal").is_none(), "{omitted}");
+    }
+
+    #[tokio::test]
+    async fn capture_lesson_sends_is_personal_only_when_given() {
+        // Each call is a new lesson: the tool drops a repeat within two minutes.
+        let call = |is_personal: Option<bool>, run: &str| {
+            let mut call = json!({"action": "capture_lesson",
+                "title": format!("Quote paths with spaces ({run})"),
+                "trigger": "A path with a space broke the command",
+                "impact": "The build failed", "prevention": "Quote every path",
+                "workspace_id": WORKSPACE, "project_id": PROJECT});
+            if let Some(is_personal) = is_personal {
+                call["is_personal"] = json!(is_personal);
+            }
+            call
+        };
+        let shared = posted_body(call(Some(false), "typed shared"), "/api/v1/lessons").await;
+        assert_eq!(shared["is_personal"], json!(false), "{shared}");
+        let omitted = posted_body(call(None, "typed default"), "/api/v1/lessons").await;
+        assert!(omitted.get("is_personal").is_none(), "{omitted}");
+
+        // An API without /lessons stores the lesson as an event; the flag goes along.
+        let lessons = Some("/api/v1/lessons");
+        let fallback = posted_body_with(
+            call(Some(false), "event shared"),
+            "/api/v1/memory/events",
+            lessons,
+        )
+        .await;
+        assert_eq!(fallback["is_personal"], json!(false), "{fallback}");
+        assert_eq!(fallback["event_type"], "lesson", "{fallback}");
+        let omitted = posted_body_with(
+            call(None, "event default"),
+            "/api/v1/memory/events",
+            lessons,
+        )
+        .await;
+        assert!(omitted.get("is_personal").is_none(), "{omitted}");
+    }
+
+    #[tokio::test]
+    async fn a_typed_decision_capture_sends_is_personal_only_when_given() {
+        let call = |is_personal: Option<bool>| {
+            let mut call = json!({"action": "capture", "event_type": "decision",
+                "title": "Use Postgres", "content": "Postgres for the store.",
+                "rationale": "It is what the team runs.",
+                "workspace_id": WORKSPACE, "project_id": PROJECT});
+            if let Some(is_personal) = is_personal {
+                call["is_personal"] = json!(is_personal);
+            }
+            call
+        };
+        let shared = posted_body(call(Some(false)), "/api/v1/memory/decisions").await;
+        assert_eq!(shared["is_personal"], json!(false), "{shared}");
+        let omitted = posted_body(call(None), "/api/v1/memory/decisions").await;
+        assert!(omitted.get("is_personal").is_none(), "{omitted}");
+    }
+
+    #[test]
+    fn the_capture_actions_advertise_is_personal() {
+        let client = ContextStreamClient::new(TestFixtures::test_config());
+        let session = Arc::new(SessionManager::new(
+            client.clone(),
+            TestFixtures::test_config(),
+        ));
+        let schemas = [
+            SessionTool::new(
+                client.clone(),
+                session.clone(),
+                mcp_types::atlas_layer::noop_layer(),
+            )
+            .input_schema(),
+            super::SessionCaptureTool::new(client.clone(), session.clone()).input_schema(),
+            super::SessionCaptureLessonTool::new(client, session).input_schema(),
+        ];
+        for schema in schemas {
+            assert_eq!(
+                schema["properties"]["is_personal"]["type"], "boolean",
+                "{schema}"
+            );
+        }
+    }
+}

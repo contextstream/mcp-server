@@ -3201,6 +3201,9 @@ pub struct CreateDecisionInput {
     pub category: Option<String>,
     pub tags: Option<Vec<String>>,
     pub session_id: Option<String>,
+    /// Passed to the API only when given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_personal: Option<bool>,
 }
 
 /// Input for `memory(action="decision_action")`.
@@ -3430,6 +3433,7 @@ pub async fn execute_create_decision(
         category: input.category.clone(),
         tags: input.tags.clone(),
         session_id: input.session_id.clone(),
+        is_personal: input.is_personal,
     };
 
     match client.create_decision(params).await {
@@ -3516,6 +3520,7 @@ pub async fn execute_create_decision(
                         "source": "create_decision_fallback",
                         "structured": structured,
                     })),
+                    is_personal: input.is_personal,
                     ..Default::default()
                 })
                 .await?;
@@ -4809,6 +4814,7 @@ impl MemoryTool {
                     category: input.category,
                     tags: input.tags,
                     session_id: input.session_id,
+                    is_personal: input.is_personal,
                 };
                 execute_create_decision(&self.client, self.session.as_ref(), decision_input).await
             }
@@ -7651,7 +7657,7 @@ impl ToolHandler for MemoryTool {
             // Personal flag
             .boolean(
                 "is_personal",
-                "Mark as personal (for create/list on todos, diagrams, docs)",
+                "Mark as personal (for create/list on todos, diagrams, docs; create_event; create_decision). Omit for the default.",
                 false,
             )
             .build()

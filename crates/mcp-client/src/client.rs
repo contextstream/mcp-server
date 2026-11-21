@@ -13955,6 +13955,11 @@ impl ContextStreamClient {
         if let Some(tags) = params.tags {
             body["tags"] = serde_json::json!(tags);
         }
+        // An agent's is_personal:false was dropped, so a capture meant for the
+        // team became personal by default.
+        if let Some(is_personal) = params.is_personal {
+            body["is_personal"] = serde_json::json!(is_personal);
+        }
 
         let result = self.post("/memory/events", body).await?;
         self.invalidate_memory_read_caches();
@@ -14060,7 +14065,8 @@ impl ContextStreamClient {
                 "category": category,
                 "tags": tags,
                 "source": "lesson_capture"
-            }
+            },
+            "is_personal": params.is_personal,
         }));
 
         let result = self.post("/memory/events", body).await?;
@@ -20740,6 +20746,9 @@ pub struct SessionCaptureParams {
     pub provenance: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_refs: Option<Vec<serde_json::Value>>,
+    /// Sent only when the caller set it; the API's default stands otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_personal: Option<bool>,
 }
 
 impl SessionCaptureParams {
@@ -20758,6 +20767,7 @@ impl SessionCaptureParams {
             "session_id": self.session_id,
             "provenance": self.provenance,
             "code_refs": self.code_refs,
+            "is_personal": self.is_personal,
         }))
     }
 }
@@ -21022,6 +21032,9 @@ pub struct SessionCaptureLessonParams {
     pub workspace_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
+    /// Sent only when the caller set it; the API's default stands otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_personal: Option<bool>,
 }
 
 impl SessionCaptureLessonParams {
@@ -21039,6 +21052,7 @@ impl SessionCaptureLessonParams {
             "keywords": self.keywords,
             "workspace_id": workspace_id,
             "project_id": project_id,
+            "is_personal": self.is_personal,
         }))
     }
 }

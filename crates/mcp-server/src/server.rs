@@ -3554,24 +3554,30 @@ mod tests {
             // (ticket_id, create), and `channel` for start_loop. Additive
             // only: without them it is the v1.2 contract
             // (loop_ticket_inputs_only_add_to_the_session_schemas).
+            // Advanced for `is_personal` on the captures, which the API
+            // accepts and the tool dropped. Additive only
+            // (is_personal_only_adds_to_the_capture_schemas).
             "session",
-            "991725fa0e81b80a5cc9821373571fe5d7ceb5071bf4cd4faf4a921cf8391a9e",
+            "e7ba0bdee769737f888a0adb582a5d3a8c9b30c366b15bb0556fe2156094f4f6",
         ),
         (
+            // Advanced for `is_personal`, as for `session`.
             "session_capture",
-            "f71dde4140dc8ddb7f0a234aa6b0753245183a983039ee079a37037df1220b53",
+            "9a0a89688b0e4360483fc450c6c50df793d99344084e0f46bc76f662bbe74a88",
         ),
         (
+            // Advanced for `is_personal`, as for `session`.
             "session_capture_lesson",
-            "e14ad74849d35160cb0ebfb04a92cf6b90598c9ae1d1bf78ec28901b109c8c66",
+            "3ffb8d6de86ad71bf96f1375c38d269c633899a2837833922f6f420d7d1db0b3",
         ),
         (
             // Advanced for plan loops: loop_status and list_loops, and the
             // loop inputs. Additive only, as for `session`.
             // Advanced for the tickets on a loop: loop_tickets and the two
             // ticket inputs, and `channel`. Additive only, as for `session`.
+            // Advanced for `is_personal`, which a twin lists as its tool does.
             "session_read",
-            "988bdcf3a414ff68870b4f0cee738455171e985214f91538baef17e5a89153f0",
+            "0dd68782fb5e496b826eb442b8b5d5b9e247e27f2527da3ed66e2a4e019b2d98",
         ),
         (
             "session_remember",
@@ -3887,6 +3893,9 @@ mod tests {
     /// What contract v1.3 (tickets on a loop) added to them.
     const LOOP_TICKET_ACTIONS: &[&str] = &["attach_ticket", "detach_ticket", "loop_tickets"];
     const LOOP_TICKET_PARAMS: &[&str] = &["ticket_id", "create", "channel"];
+    /// What the captures' visibility added to `session` and its twin after
+    /// contract v1.3: the earlier contracts are compared without it.
+    const CAPTURE_VISIBILITY_PARAMS: &[&str] = &["is_personal"];
 
     /// The contract hash of `name`'s listed schema without `actions` and
     /// `params`, each of which it must list today.
@@ -3922,6 +3931,11 @@ mod tests {
         // contracts plan loops v1.2 gave them, so every loop action, every
         // plan action and every other parameter is unchanged.
         let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        let params: Vec<&str> = LOOP_TICKET_PARAMS
+            .iter()
+            .chain(CAPTURE_VISIBILITY_PARAMS)
+            .copied()
+            .collect();
         for (name, before) in [
             (
                 "session",
@@ -3933,7 +3947,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                schema_contract_without(&tools, name, LOOP_TICKET_ACTIONS, LOOP_TICKET_PARAMS),
+                schema_contract_without(&tools, name, LOOP_TICKET_ACTIONS, &params),
                 before,
                 "{name}"
             );
@@ -3974,6 +3988,7 @@ mod tests {
         let params: Vec<&str> = LOOP_PARAMS
             .iter()
             .chain(LOOP_TICKET_PARAMS)
+            .chain(CAPTURE_VISIBILITY_PARAMS)
             .copied()
             .collect();
         let tools = contextstream_tools_list(&test_registry(Config::default()), None);
@@ -3992,6 +4007,41 @@ mod tests {
                 before,
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn is_personal_only_adds_to_the_capture_schemas() {
+        // The captures (capture, capture_lesson, a typed decision) dropped
+        // an agent's is_personal although the API takes it. Advertising it
+        // added one optional boolean; without it each schema is exactly the
+        // contract it had before.
+        let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        for (name, before) in [
+            (
+                "session",
+                "991725fa0e81b80a5cc9821373571fe5d7ceb5071bf4cd4faf4a921cf8391a9e",
+            ),
+            (
+                "session_capture",
+                "f71dde4140dc8ddb7f0a234aa6b0753245183a983039ee079a37037df1220b53",
+            ),
+            (
+                "session_capture_lesson",
+                "e14ad74849d35160cb0ebfb04a92cf6b90598c9ae1d1bf78ec28901b109c8c66",
+            ),
+            (
+                "session_read",
+                "988bdcf3a414ff68870b4f0cee738455171e985214f91538baef17e5a89153f0",
+            ),
+        ] {
+            let mut schema = tool_by_name(&tools, name)["inputSchema"].clone();
+            let properties = schema["properties"]
+                .as_object_mut()
+                .expect("schema properties");
+            let is_personal = properties.remove("is_personal").expect(name);
+            assert_eq!(is_personal["type"], "boolean", "{name}");
+            assert_eq!(schema_contract_hash(&schema), before, "{name}");
         }
     }
 

@@ -10734,6 +10734,9 @@ pub struct SessionCaptureInput {
     pub session_id: Option<String>,
     pub provenance: Option<Value>,
     pub code_refs: Option<Vec<Value>>,
+    /// Passed to the API only when given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_personal: Option<bool>,
 }
 
 /// `event_type` as one of the event types memory advertises, `default` when
@@ -10810,6 +10813,7 @@ impl ToolHandler for SessionCaptureTool {
             session_id: input.session_id,
             provenance: input.provenance,
             code_refs: input.code_refs,
+            is_personal: input.is_personal,
         };
         // A snapshot taken without a session_id belongs to the session init
         // started, so `resume` with that id finds it, as the rules describe
@@ -10942,6 +10946,11 @@ impl ToolHandler for SessionCaptureTool {
             )
             .array("tags", "Tags for categorization", "string", false)
             .string("session_id", "Session identifier", false)
+            .boolean(
+                "is_personal",
+                "true: only you see it; false: the workspace's team does. Omit for the default.",
+                false,
+            )
             .object(
                 "provenance",
                 "Source provenance (repo, branch, commit_sha, pr_url, issue_url, slack_thread_url)",
@@ -12633,6 +12642,9 @@ pub struct SessionCaptureLessonInput {
     pub keywords: Option<Vec<String>>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
+    /// Passed to the API only when given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_personal: Option<bool>,
 }
 
 /// `[PARTIAL]` lines stated whenever the typed `/lessons` endpoints answer
@@ -12834,6 +12846,7 @@ impl ToolHandler for SessionCaptureLessonTool {
             severity: input.severity.clone(),
             category: input.category.clone(),
             keywords: input.keywords.clone(),
+            is_personal: input.is_personal,
         };
         let mut partial_note: Option<&str> = None;
         let mut result = match self.client.create_lesson(typed.clone()).await {
@@ -12850,6 +12863,7 @@ impl ToolHandler for SessionCaptureLessonTool {
                     keywords: input.keywords.clone(),
                     workspace_id: scope.workspace_id,
                     project_id: scope.project_id,
+                    is_personal: input.is_personal,
                 };
                 match self.client.session_capture_lesson(params.clone()).await {
                     Ok(result) => result,
@@ -12976,6 +12990,11 @@ impl ToolHandler for SessionCaptureLessonTool {
             .array("keywords", "Keywords for matching", "string", false)
             .uuid("workspace_id", "Workspace ID", false)
             .uuid("project_id", "Project ID", false)
+            .boolean(
+                "is_personal",
+                "true: only you see it; false: the workspace's team does. Omit for the default.",
+                false,
+            )
             .build()
     }
 }
@@ -17651,6 +17670,7 @@ impl ToolHandler for SessionTool {
                         category: input.category,
                         tags: input.tags,
                         session_id: input.session_id,
+                        is_personal: input.is_personal,
                     };
                     return crate::domains::memory::execute_create_decision(
                         &self.client,
@@ -17677,6 +17697,7 @@ impl ToolHandler for SessionTool {
                     session_id: input.session_id,
                     provenance: input.provenance,
                     code_refs: input.code_refs,
+                    is_personal: input.is_personal,
                 };
                 let tool = SessionCaptureTool::new(self.client.clone(), self.session.clone());
                 tool.execute(serde_json::to_value(&capture_input).unwrap())
@@ -17778,6 +17799,7 @@ impl ToolHandler for SessionTool {
                     session_id: input.session_id,
                     provenance: Some(provenance),
                     code_refs: input.code_refs,
+                    is_personal: input.is_personal,
                 };
                 let tool = SessionCaptureTool::new(self.client.clone(), self.session.clone());
                 let mut result = tool
@@ -17822,6 +17844,7 @@ impl ToolHandler for SessionTool {
                     keywords: input.keywords,
                     workspace_id: input.workspace_id,
                     project_id: input.project_id,
+                    is_personal: input.is_personal,
                 };
                 let tool = SessionCaptureLessonTool::new(self.client.clone(), self.session.clone());
                 tool.execute(serde_json::to_value(&lesson_input).unwrap())
@@ -18082,6 +18105,7 @@ impl ToolHandler for SessionTool {
                             keywords: input.keywords.clone(),
                             workspace_id: input.workspace_id.clone(),
                             project_id: input.project_id.clone(),
+                            is_personal: input.is_personal,
                         };
                         let captured =
                             SessionCaptureLessonTool::new(self.client.clone(), self.session.clone())
@@ -18814,6 +18838,11 @@ impl ToolHandler for SessionTool {
                 "account_mode",
                 "Execution mode for set_account_mode or per-turn override: team, personal, or auto",
                 &["team", "personal", "auto"],
+                false,
+            )
+            .boolean(
+                "is_personal",
+                "For capture, capture_lesson and capture_plan: true keeps it to you, false shares it with the workspace's team. Omit for the default.",
                 false,
             )
             .string_enum(

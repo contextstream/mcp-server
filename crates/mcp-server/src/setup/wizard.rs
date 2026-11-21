@@ -290,9 +290,13 @@ pub(super) async fn run(
         None => None,
     };
 
-    let remote_checks =
-        super::remote_checks::Step::prepare(&client, project_path.as_deref(), explicit_checks)
-            .await?;
+    let remote_checks = super::remote_checks::Step::prepare(
+        &client,
+        project_path.as_deref(),
+        explicit_checks,
+        true,
+    )
+    .await?;
     let mut choices = Choices {
         remote_checks,
         api_key,
@@ -390,6 +394,7 @@ pub(super) async fn run(
                     &choices.client,
                     choices.project_path.as_deref(),
                     explicit_checks,
+                    false,
                 )
                 .await?;
                 choices.learning_state = super::account_learning::fetch_consent_state(

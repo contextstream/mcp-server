@@ -1400,7 +1400,9 @@ async fn remote_checks_hosted_status_uses_the_projects_indexed_markers() {
     .unwrap();
     let text = text_of(&result).join("\n");
     assert!(
-        text.contains("This project: TypeScript and JavaScript (standard) · .NET (more engines)"),
+        text.contains(
+            "This project: TypeScript and JavaScript (runs remotely) · .NET (runs remotely with extra engines)"
+        ),
         "{text}"
     );
 }

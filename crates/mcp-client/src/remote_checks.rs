@@ -243,9 +243,9 @@ impl ProjectLanguages {
     pub fn summary(&self) -> String {
         let mut groups = Vec::new();
         for (group, label) in [
-            (&self.standard, "standard"),
-            (&self.more, "more engines"),
-            (&self.local, "local only"),
+            (&self.standard, "runs remotely"),
+            (&self.more, "runs remotely with extra engines"),
+            (&self.local, "runs on your machine"),
         ] {
             if !group.is_empty() {
                 groups.push(format!("{} ({label})", group.join(", ")));
@@ -273,7 +273,7 @@ impl RemoteChecks {
     pub fn price_line(&self) -> String {
         match &self.pricing {
             Some(price) if !self.credits.as_ref().is_some_and(|c| c.no_charge) => format!(
-                "{} {} per 10 s of run time. Exact repeats, local checks and checks that never start are free.",
+                "{} {} per 10 s of run time. Exact repeats and checks that run on your machine are free.",
                 price.credits_per_10s, price.unit
             ),
             _ => "Remote checks are free for this account.".into(),
@@ -303,11 +303,11 @@ impl RemoteChecks {
             None => "unknown",
         };
         let mut lines = vec![
-            format!("Remote checks: {} · More engines: {more}", self.state()),
+            format!("Remote checks: {} · Extra engines: {more}", self.state()),
             self.price_line(),
         ];
         lines.extend(self.balance_line());
-        for (extra, label) in [(false, "Standard"), (true, "More engines")] {
+        for (extra, label) in [(false, "Standard engines"), (true, "Extra engines")] {
             let names: Vec<_> = self
                 .languages
                 .iter()
@@ -378,11 +378,11 @@ mod tests {
         assert_eq!(project.recommendation(), (true, false));
         let status = state.status_text(Some(&project));
         for phrase in [
-            "Remote checks: off · More engines: off",
+            "Remote checks: off · Extra engines: off",
             "20 Context Credits per 10 s of run time",
             "You have 41,200 credits",
-            "Sample (standard)",
-            "Rust (local only)",
+            "Sample (runs remotely)",
+            "Rust (runs on your machine)",
         ] {
             assert!(status.contains(phrase), "{status}");
         }

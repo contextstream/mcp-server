@@ -12,11 +12,6 @@ use super::{prompts, safe_edit, wizard};
 
 const BENEFIT: &str =
     "Run builds, tests and type-checks on your own warm remote machine. Slow commands can finish in a fraction of the time.";
-const OPTIONS: [&str; 3] = [
-    "Turn on standard engines",
-    "Turn on standard and more engines",
-    "Keep checks local",
-];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Choice {
@@ -36,8 +31,8 @@ impl Choice {
 
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Standard => "On · standard engines",
-            Self::More => "On · standard and more engines",
+            Self::Standard => "On",
+            Self::More => "On · with extra engines",
             Self::Off => "Off",
         }
     }
@@ -74,6 +69,7 @@ impl Step {
         client: &ContextStreamClient,
         folder: Option<&Path>,
         explicit: Option<bool>,
+        in_wizard: bool,
     ) -> Result<Option<Self>> {
         let state = match client.remote_checks_status().await {
             Ok(state) => state,
@@ -83,6 +79,10 @@ impl Step {
             }
         };
         let project = local_languages(folder, &state);
+        // The step keeps its place in the wizard's numbering even when there is nothing to choose.
+        if in_wizard {
+            wizard::print_step(4, "Remote checks", BENEFIT);
+        }
         if state.enabled && explicit != Some(false) {
             ui::say(Mark::Ok, &on_line(&state, project.as_ref()), None);
             return Ok(None);
@@ -116,7 +116,6 @@ impl Step {
     }
 
     pub(super) fn prompt(&mut self) -> Result<()> {
-        wizard::print_step(4, "Remote checks", BENEFIT);
         let ui = ui::ui();
         println!("{}{}", ui::GUTTER, self.state.price_line());
         if let Some(balance) = self.state.balance_line() {
@@ -144,13 +143,7 @@ impl Step {
             .position(|choice| *choice == self.choice)
             .unwrap_or(2);
         let recommended = Choice::recommended(self.project.as_ref());
-        let options: [String; 3] = std::array::from_fn(|i| {
-            if choices[i] == recommended {
-                format!("{} (recommended)", OPTIONS[i])
-            } else {
-                OPTIONS[i].to_owned()
-            }
-        });
+        let options = option_labels(self.project.as_ref(), recommended);
         self.choice = choices[prompts::select_with_default(
             "Where should checks run?",
             &options.each_ref().map(String::as_str),
@@ -177,8 +170,8 @@ impl Step {
         match settings(client, workspace, Some(enabled), more).await {
             Ok(state) => {
                 let line = match (state.enabled, state.more_engines) {
-                    (true, Some(true)) => "Remote checks: on (standard and more engines)",
-                    (true, Some(false)) => "Remote checks: on (standard engines)",
+                    (true, Some(true)) => "Remote checks: on, with extra engines",
+                    (true, Some(false)) => "Remote checks: on",
                     (true, None) => "Remote checks: on",
                     (false, _) => "Remote checks: off",
                 };
@@ -187,6 +180,29 @@ impl Step {
             Err(error) => report_error(&error),
         }
     }
+}
+
+/// The three answers, worded for this project: the extra engines are named by the languages that need them here, and
+/// the recommended one says so.
+fn option_labels(project: Option<&ProjectLanguages>, recommended: Choice) -> [String; 3] {
+    let extra = match project.map(|project| project.more.as_slice()) {
+        Some(more) if !more.is_empty() => {
+            format!("Turn on, with extra engines for {}", more.join(", "))
+        }
+        _ => "Turn on, with extra engines (Java, .NET, Ruby, PHP, C/C++ and more)".to_owned(),
+    };
+    let labels = [
+        (Choice::Standard, "Turn on".to_owned()),
+        (Choice::More, extra),
+        (Choice::Off, "Keep checks on this machine".to_owned()),
+    ];
+    labels.map(|(choice, label)| {
+        if choice == recommended {
+            format!("{label} (recommended)")
+        } else {
+            label
+        }
+    })
 }
 
 fn report_error(error: &mcp_types::Error) {
@@ -207,7 +223,7 @@ pub(super) async fn scripted(
     choice: Option<bool>,
 ) {
     if let Some(choice) = choice {
-        if let Ok(Some(step)) = Step::prepare(client, folder, Some(choice)).await {
+        if let Ok(Some(step)) = Step::prepare(client, folder, Some(choice), false).await {
             step.apply(client, workspace).await;
         }
     }
@@ -229,6 +245,27 @@ mod tests {
         assert_eq!(Choice::recommended(Some(&project)), Choice::More);
         project.standard.clear();
         assert_eq!(Choice::recommended(Some(&project)), Choice::More);
+    }
+
+    #[test]
+    fn the_answers_name_the_projects_languages_and_mark_the_recommendation() {
+        let project = ProjectLanguages {
+            standard: vec!["Rust".into()],
+            more: vec!["Ruby".into(), "PHP".into()],
+            local: vec![],
+        };
+        assert_eq!(
+            option_labels(Some(&project), Choice::More),
+            [
+                "Turn on".to_owned(),
+                "Turn on, with extra engines for Ruby, PHP (recommended)".to_owned(),
+                "Keep checks on this machine".to_owned(),
+            ]
+        );
+        let labels = option_labels(None, Choice::Off);
+        assert_eq!(labels[0], "Turn on");
+        assert!(labels[1].starts_with("Turn on, with extra engines (Java"));
+        assert_eq!(labels[2], "Keep checks on this machine (recommended)");
     }
 
     #[test]

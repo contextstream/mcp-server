@@ -4,9 +4,8 @@
 //! It goes in the `hello` of a call that runs a command on a checkout
 //! snapshot, and holds facts about the machine and nothing of the checkout: the
 //! operating system and CPU architecture names, the CPU count, whether the
-//! process runs as root, the time zone's name, and the first line of
-//! `<tool> --version` for each tool the API's request names (`versions`: data
-//! from the API, no list of tools lives here). Nothing else about the machine,
+//! process runs as root, the time zone's name, and a version line for each
+//! tool the API's request names in `versions`. Nothing else about the machine,
 //! its variables or its files is read or sent. A tool's line is cleaned before
 //! it is sent (see [`redact`]): words in it that look like paths are left out,
 //! the user name, the home folder's name and the host name are replaced, and
@@ -23,8 +22,10 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::LazyLock;
 use std::time::Duration;
 
+use regex::Regex;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -86,7 +87,7 @@ async fn describe_using(
     let (program, folder) = (&program, &folder);
     let answers = futures::future::join_all(names.iter().map(|name| async move {
         let program = program(name.as_str())?;
-        version_of(program.as_os_str(), folder, PROBE_LIMIT, hidden).await
+        version_of(name, program.as_os_str(), folder, PROBE_LIMIT, hidden).await
     }))
     .await;
     let versions: Map<String, Value> = names
@@ -200,19 +201,24 @@ fn is_program(file: &Path) -> bool {
     file.is_file()
 }
 
-/// What `<program> --version` printed: its first non-empty line, or past a
-/// banner the first with a number in it (standard output, else standard
-/// error; see [`first_line`]), cleaned by [`redact`]. `None` when it is not
-/// there, fails, prints nothing, is nothing but paths or is not done in `limit`.
+/// Run Zig with `version` and other tools with `--version`. Read a version
+/// line from standard output, then standard error, and redact it. Return
+/// `None` if the probe fails, times out or has no usable version line.
 async fn version_of(
+    tool: &str,
     program: &OsStr,
     folder: &Path,
     limit: Duration,
     hidden: &Names,
 ) -> Option<String> {
+    let arg = if tool == "zig" {
+        "version"
+    } else {
+        "--version"
+    };
     let mut command = Command::new(program);
     command
-        .arg("--version")
+        .arg(arg)
         .current_dir(folder)
         // A probe must never install or ask about installing anything.
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
@@ -229,8 +235,11 @@ async fn version_of(
         if !status.ok()?.success() {
             return None;
         }
-        let line = first_line(&out).or_else(|| first_line(&err))?;
-        redact(&line, hidden)
+        let line = version_line(tool, &out).or_else(|| version_line(tool, &err))?;
+        // The worker compares Elixir's full line, including this product name.
+        let product_label = (tool == "elixir" && line.contains(" (compiled with Erlang/OTP "))
+            .then_some("Erlang/OTP");
+        redact_with_product_label(&line, hidden, product_label)
     };
     tokio::time::timeout(limit, run).await.ok().flatten()
 }
@@ -247,10 +256,32 @@ async fn read_some(mut pipe: impl AsyncRead + Unpin) -> Vec<u8> {
     kept
 }
 
+/// Match the worker's version line for Zig and Elixir.
+fn version_line(tool: &str, output: &[u8]) -> Option<String> {
+    let is_version: fn(&str) -> bool = match tool {
+        "zig" => |line| line.bytes().any(|byte| byte.is_ascii_digit()),
+        "elixir" => |line| {
+            line.strip_prefix("Elixir ")
+                .and_then(|version| version.as_bytes().first())
+                .is_some_and(u8::is_ascii_digit)
+        },
+        _ => return first_line(output),
+    };
+    // The worker strips terminal control sequences before selecting a line.
+    static ANSI: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("valid CSI escape sequence regex")
+    });
+    let text = String::from_utf8_lossy(output);
+    ANSI.replace_all(&text, "")
+        .lines()
+        .find(|line| is_version(line))
+        .map(str::to_owned)
+}
+
 /// The line of `output` that says a version, trimmed: the first line that is
 /// not blank, or, when that one holds no digit, the first of the eight after
 /// it that does. Gradle starts with a rule of dashes and names itself on the
-/// next line; every other tool asked says it on its first.
+/// next line.
 pub fn first_line(output: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(output);
     let mut lines = text
@@ -277,9 +308,17 @@ pub fn first_line(output: &[u8]) -> Option<String> {
 /// words, spaces are collapsed to one, and the rest is cut to 200 characters.
 /// `None` when nothing is left.
 pub fn redact(line: &str, hidden: &Names) -> Option<String> {
+    redact_with_product_label(line, hidden, None)
+}
+
+fn redact_with_product_label(
+    line: &str,
+    hidden: &Names,
+    product_label: Option<&str>,
+) -> Option<String> {
     let kept: Vec<&str> = line
         .split_whitespace()
-        .filter(|word| !looks_like_path(word))
+        .filter(|word| Some(*word) == product_label || !looks_like_path(word))
         .collect();
     let cleaned = hidden.hide_in(&kept.join(" "));
     (!cleaned.is_empty()).then(|| cleaned.chars().take(MAX_LINE_CHARS).collect())

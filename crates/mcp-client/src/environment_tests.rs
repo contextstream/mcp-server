@@ -94,6 +94,21 @@ fn a_tools_answer_is_its_first_non_blank_line() {
 }
 
 #[test]
+fn zig_and_elixir_require_a_matching_version_line() {
+    assert_eq!(
+        version_line("zig", b"\x1b[33mToolchain ready\x1b[0m\n"),
+        None
+    );
+    assert_eq!(
+        version_line(
+            "elixir",
+            b"Erlang/OTP 28\nElixir preview 1.99\n Elixir 1.99\nElixir  1.99\nElixir \n",
+        ),
+        None
+    );
+}
+
+#[test]
 fn a_line_is_cut_to_two_hundred_characters_after_it_is_cleaned() {
     let none = Names::default();
     let long = "x".repeat(5000);
@@ -445,7 +460,14 @@ async fn ask(script: &str, limit: Duration) -> Option<String> {
         &format!("#!/bin/sh\n{script}\n"),
     );
     for _ in 0..3 {
-        let answer = version_of(file.as_os_str(), scratch.path(), limit, &Names::default()).await;
+        let answer = version_of(
+            "faketool",
+            file.as_os_str(),
+            scratch.path(),
+            limit,
+            &Names::default(),
+        )
+        .await;
         if answer.is_some() {
             return answer;
         }
@@ -510,6 +532,7 @@ async fn a_tool_that_fails_is_missing_or_is_slow_has_no_version() {
     assert_eq!(ask("exit 0", limit).await, None);
     assert_eq!(
         version_of(
+            "no-such-program",
             scratch.path().join("no-such-program").as_os_str(),
             scratch.path(),
             limit,
@@ -544,6 +567,7 @@ async fn a_tool_is_asked_in_the_folder_it_is_given() {
     let mut answer = None;
     for _ in 0..3 {
         answer = version_of(
+            "faketool",
             named.as_os_str(),
             &folder,
             Duration::from_secs(5),
@@ -565,6 +589,7 @@ async fn a_tool_is_asked_in_the_folder_it_is_given() {
     let mut answer = None;
     for _ in 0..3 {
         answer = version_of(
+            "pathtool",
             pathy.as_os_str(),
             &folder,
             Duration::from_secs(5),
@@ -626,6 +651,52 @@ async fn the_environment_holds_the_machine_and_the_tools_asked_about() {
     // No tools named: the key is there and empty.
     let none = describe_using(&json!({"cwd": "pkg"}), &repo, |_| None, &Names::default()).await;
     assert_eq!(none["versions"], json!({}));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn zig_and_elixir_probes_send_the_workers_version_lines() {
+    let scratch = tempfile::tempdir().unwrap();
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let installed = scratch.path().join("installed");
+    plant(
+        &installed,
+        "zig",
+        r#"#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = version ] || exit 1
+printf '\033[33mToolchain ready\033[0m\n  0.15.2  \n0.16.0\n'
+"#,
+    );
+    plant(
+        &installed,
+        "elixir",
+        r#"#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = --version ] || exit 1
+printf '%s\n' 'Erlang/OTP 28 [erts-16.1] [smp:4:4]' 'Elixir preview 1.99.0' ' Elixir 1.99.0'
+printf '\033[32mElixir 1.19.5 (compiled with Erlang/OTP 28)\033[0m /opt/build Erlang/OTP/local\nElixir 1.20.0\n'
+"#,
+    );
+    let path = path_of(&[&installed]);
+    let request = json!({"versions": ["zig", "elixir"]});
+    let expected = json!({
+        "zig": "0.15.2",
+        "elixir": "Elixir 1.19.5 (compiled with Erlang/OTP 28)",
+    });
+    let mut environment = Value::Null;
+    for _ in 0..3 {
+        environment = describe_using(
+            &request,
+            &repo,
+            |name| find_program(name, Some(path.as_os_str()), &repo),
+            &Names::default(),
+        )
+        .await;
+        if environment["versions"] == expected {
+            break;
+        }
+    }
+    assert_eq!(environment["versions"], expected);
 }
 
 #[tokio::test]

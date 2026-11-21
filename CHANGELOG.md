@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.91
+
+- The `check` tool reports Zig's version from `zig version` and Elixir's from the `Elixir` line of `elixir --version`, as the remote worker records them, so Zig and Elixir checks can run remotely instead of falling back to the local machine.
+
 ## 1.0.90
 
 - `memory(action="create_node")` accepts the `goal`, `risk` and `term` node types its schema lists. Before, `risk` and `term` were refused with "Invalid node_type".

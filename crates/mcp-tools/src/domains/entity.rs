@@ -39,6 +39,7 @@
 //! entity(kind="goal",     action="create", body={"objective": "Ship 100 customers", "period": "2026-Q2"})
 //! entity(kind="key_result", action="create", body={"goal_id": "<uuid>", "title": "MAU > 10k", "target_value": 10000})
 //! entity(kind="incident", action="update", id="<uuid>", body={"status": "mitigated"})
+//! entity(kind="incident", action="update", id="<uuid>", body={"status": "resolved", "resolved_at": "2026-11-21T14:05:00Z"})
 //! entity(kind="risk",     action="list",   query={"impact": "severe", "status": "open"})
 //! ```
 
@@ -1007,7 +1008,8 @@ const ENTITY_TOOL_REFERENCE: &str = "Structured taxonomy entities — tickets, h
                 body.assignees=[{user_id?, email?, handle?, name?, entity_type=human|agent, role?}] (an agent is {entity_type: agent, handle, name}; [] clears them); \
                 body.linked_items=[{kind=doc|diagram|plan|task|todo|handoff|runbook|capsule, id, \
                 title_snapshot?, status_snapshot?, updated_at?}]) · \
-                'log an incident' / 'open a sev1' (kind=incident) · \
+                'log an incident' / 'open a sev1' (kind=incident; body.started_at, detected_at, \
+                mitigated_at, resolved_at, closed_at take RFC3339 times, else they follow the status) · \
                 'track this release' / 'log a deployment' (kind=release) · \
                 'start an experiment' / 'A/B test' (kind=experiment) · \
                 'create an OKR' / 'new goal this quarter' (kind=goal, then kind=key_result for KRs) · \
@@ -1514,7 +1516,11 @@ impl ToolHandler for EntityTool {
                  handoff; to_user_id is optional and must be omitted rather than invented. \
                  For kind=ticket: assignees (hybrid user_id/email/handle plus name, entity_type human|agent; [] clears them) \
                  and linked_items (indexed refs: kind+id+title_snapshot+status_snapshot+updated_at; \
-                 no URLs). Linked kinds: doc, diagram, plan, task, todo, handoff, runbook, capsule.",
+                 no URLs). Linked kinds: doc, diagram, plan, task, todo, handoff, runbook, capsule. \
+                 For kind=incident: title, summary, severity (sev1-4), status, services_affected, \
+                 and the times started_at, detected_at, mitigated_at, resolved_at, closed_at \
+                 (RFC3339) on create and update; a lifecycle time left out follows the status \
+                 (status=resolved stamps resolved_at).",
                 false,
             )
             .object(
@@ -2125,6 +2131,31 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(reference.contains("not the session's current project"));
+    }
+
+    #[test]
+    fn the_body_documents_the_incident_times() {
+        // The API takes an incident's lifecycle times on create and update,
+        // but the body said only "Free-form; see API schema".
+        let session = Arc::new(SessionManager::new(
+            ContextStreamClient::new(Config::default()),
+            Config::default(),
+        ));
+        let tool = EntityTool::new(ContextStreamClient::new(Config::default()), session);
+        let schema = tool.input_schema();
+        let body = schema["properties"]["body"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        for field in [
+            "started_at",
+            "detected_at",
+            "mitigated_at",
+            "resolved_at",
+            "closed_at",
+            "RFC3339",
+        ] {
+            assert!(body.contains(field), "{field}: {body}");
+        }
     }
 
     #[test]

@@ -149,7 +149,7 @@ Every workspace-scoped call below must include `workspace_id="<current_workspace
 - "list handoffs" / "pending handoffs for me" → `entity(kind="handoff", action="list", query={"to_user_id": "<me>", "status": "pending"})`
 - "share this with the other project" / "coordination inbox" / "ack coordination" → `coordination(action="inbox"|"share"|"ack")`. Distinct from handoffs. When `[COORDINATION]` appears, read it before continuing and ack after using it via `coordination(action="ack", notice_id="...")`.
 - `[CONTEXTAGENTS]` in a `context()` result or a hook → the workspace's owner turned on automatic ContextAgent runs: start the `agents(action="run", ..., automatic=true)` call it names yourself, without asking, keep working, and fold its `get_run` result into your answer. Only when it appears.
-- "log incident" / "open incident" / "sev1" → `entity(kind="incident", action="create", body={"title": "...", "severity": "sev1|sev2|sev3|sev4", "status": "detected", "services_affected": ["..."]})`
+- "log incident" / "open incident" / "sev1" → `entity(kind="incident", action="create", body={"title": "...", "severity": "sev1|sev2|sev3|sev4", "status": "detected", "services_affected": ["..."], "started_at": "<RFC3339>"})`. Create and update take `started_at`, `detected_at`, `mitigated_at`, `resolved_at`, `closed_at`; one left out follows the status.
 - "list incidents" / "active incidents" → `entity(kind="incident", action="list", query={"status": "investigating"})`
 - "create release" / "track release" / "deployment" → `entity(kind="release", action="create", body={"version": "1.4.0", "status": "planned", "environments": ["prod"], "git_ref": "..."})`
 - "list releases" / "recent deploys" → `entity(kind="release", action="list", query={"status": "released"})`
@@ -4518,6 +4518,25 @@ mod tests {
             !rules.contains("`entity(kind=\"handoff\""),
             "Claude must never be taught an unexposed bare entity tool name"
         );
+    }
+
+    #[test]
+    fn the_incident_example_names_its_lifecycle_times() {
+        // The API takes them on create and update; the example showed none.
+        let rules = generate_rule_content(&Editor::Codex, None, None, RulesMode::Bootstrap);
+        let line = rules
+            .lines()
+            .find(|line| line.contains("entity(kind=\"incident\", action=\"create\""))
+            .expect("the incident example");
+        for field in [
+            "started_at",
+            "detected_at",
+            "mitigated_at",
+            "resolved_at",
+            "closed_at",
+        ] {
+            assert!(line.contains(field), "{field}: {line}");
+        }
     }
 
     #[test]

@@ -290,14 +290,47 @@ fn upgrade_options_for_restriction(current_plan: &str, required_tier: &str) -> V
 /// Cursor and other JS MCP clients reject arrays with
 /// `expected record, received array`. List endpoints that unwrap
 /// `ApiResponse.data` into a bare array have to be coerced here.
+///
+/// Every structured result, and every transport's payload, passes through
+/// here, so this is also where [`drop_unavailable_current_truth`] runs.
 pub fn as_structured_object(data: impl Serialize) -> Option<Value> {
-    let value = serde_json::to_value(data).ok()?;
+    let mut value = serde_json::to_value(data).ok()?;
+    drop_unavailable_current_truth(&mut value);
     Some(match value {
         Value::Null => serde_json::json!({}),
         Value::Object(_) => value,
         Value::Array(items) => serde_json::json!({ "items": items }),
         other => serde_json::json!({ "value": other }),
     })
+}
+
+/// Remove, at any depth, a `current_truth` object whose `availability` is
+/// `unavailable`. The API attaches that stub (`unavailable_reason:
+/// canonical_source_projection_missing`, ...) to every decision, lesson and
+/// coordination item while it has no projection to offer, which repeats the
+/// same say-nothing object once per row. A `current_truth` that is available
+/// (or that says nothing about its availability) is kept.
+pub fn drop_unavailable_current_truth(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map
+                .get("current_truth")
+                .is_some_and(current_truth_is_unavailable)
+            {
+                map.remove("current_truth");
+            }
+            map.values_mut().for_each(drop_unavailable_current_truth);
+        }
+        Value::Array(items) => items.iter_mut().for_each(drop_unavailable_current_truth),
+        _ => {}
+    }
+}
+
+fn current_truth_is_unavailable(current_truth: &Value) -> bool {
+    current_truth
+        .get("availability")
+        .and_then(Value::as_str)
+        .is_some_and(|availability| availability.trim().eq_ignore_ascii_case("unavailable"))
 }
 
 /// Whether MCP responses should include structured content payloads.
@@ -636,6 +669,59 @@ mod tests {
             assert_eq!(text, "Hello, world!");
         } else {
             panic!("Expected text content");
+        }
+    }
+
+    #[test]
+    fn an_unavailable_current_truth_stub_is_dropped_at_any_depth() {
+        let stub = serde_json::json!({
+            "availability": "unavailable",
+            "unavailable_reason": "canonical_source_projection_missing",
+            "source": null
+        });
+        let structured = as_structured_object(serde_json::json!({
+            "current_truth": stub.clone(),
+            "decisions": {"items": [
+                {"id": "d1", "title": "Use Postgres", "current_truth": stub.clone()},
+                {"id": "d2", "metadata": {"current_truth": stub.clone(), "category": "db"}}
+            ]}
+        }))
+        .expect("structured");
+        let text = structured.to_string();
+        assert!(!text.contains("current_truth"), "{text}");
+        assert_eq!(structured["decisions"]["items"][0]["title"], "Use Postgres");
+        assert_eq!(
+            structured["decisions"]["items"][1]["metadata"]["category"],
+            "db"
+        );
+
+        // A bare array (wrapped as items) and with_structured go the same way.
+        let listed = as_structured_object(serde_json::json!([{"id": "l1", "current_truth": stub}]))
+            .expect("structured");
+        assert_eq!(listed, serde_json::json!({"items": [{"id": "l1"}]}));
+    }
+
+    #[test]
+    fn an_available_current_truth_is_kept() {
+        let resolved = serde_json::json!({
+            "availability": "resolved",
+            "value": "Postgres 16",
+            "source": {"kind": "node", "id": "n1"}
+        });
+        let result = ToolResult::with_structured(
+            "ok",
+            serde_json::json!({"items": [
+                {"id": "d1", "current_truth": resolved.clone()},
+                {"id": "d2", "current_truth": {"value": "no availability field"}}
+            ]}),
+        );
+        if structured_content_enabled() {
+            let structured = result.structured_content.expect("structured");
+            assert_eq!(structured["items"][0]["current_truth"], resolved);
+            assert_eq!(
+                structured["items"][1]["current_truth"]["value"],
+                "no availability field"
+            );
         }
     }
 }

@@ -685,3 +685,186 @@ async fn setup_then_uninstall_restores_claude_auto_memory_and_cleans_settings() 
     stop_spawned_watch_helper_if_any(&home_seeded);
     server.abort();
 }
+
+async fn run_cli(
+    args: &[&str],
+    home: &Path,
+    project: &Path,
+    api_url: &str,
+    api_key: &'static str,
+) -> std::process::Output {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let (home, project, api_url) = (
+        home.to_path_buf(),
+        project.to_path_buf(),
+        api_url.to_string(),
+    );
+    tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+            .args(&args)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("CONTEXTSTREAM_API_URL", &api_url)
+            .env("CONTEXTSTREAM_API_KEY", api_key)
+            .env("CONTEXTSTREAM_NO_BROWSER", "1")
+            .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
+            .env("NO_COLOR", "1")
+            .env_remove("CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY")
+            .env_remove("CONTEXTSTREAM_ALLOW_LOCAL_MEMORY")
+            .current_dir(&project)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+fn auto_memory_setting(settings_path: &Path) -> Option<Value> {
+    let settings: Value =
+        serde_json::from_str(&std::fs::read_to_string(settings_path).unwrap()).unwrap();
+    settings.get("autoMemoryEnabled").cloned()
+}
+
+/// An `autoMemoryEnabled: true` the person set is their choice: plain setup
+/// (no flag) and `doctor --repair` keep it and say so. Where the key is not
+/// set, setup still writes `false`, and says which file and key, how many
+/// local memories stop loading, how to import them and how to undo it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_and_repair_keep_an_explicit_true_and_explain_turning_off_an_unset_key() {
+    const SECRET: &str = "cs_test_explicit_true_auto_memory";
+    let (api_url, server) = spawn_mock_keepmem_server(SECRET).await;
+    let setup_args = [
+        "setup",
+        "--yes",
+        "--editors=claude",
+        "--workspace-id=11111111-1111-4111-8111-111111111111",
+    ];
+
+    // 1. Explicit true, no flag.
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("explicit-true");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    init_git_repo(&project);
+    let settings_path = home.join(".claude/settings.json");
+    std::fs::write(
+        &settings_path,
+        "{\n  \"model\": \"opus\",\n  \"autoMemoryEnabled\": true\n}\n",
+    )
+    .unwrap();
+
+    let setup = run_cli(&setup_args, &home, &project, &api_url, SECRET).await;
+    let stdout = String::from_utf8_lossy(&setup.stdout);
+    assert!(
+        setup.status.success(),
+        "setup failed:\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    assert_eq!(
+        auto_memory_setting(&settings_path),
+        Some(Value::Bool(true)),
+        "setup must keep an explicit autoMemoryEnabled: true"
+    );
+    assert!(
+        stdout.contains("Claude auto memory kept on")
+            && stdout.contains("you set autoMemoryEnabled: true in ~/.claude/settings.json"),
+        "setup must say it kept the person's choice:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Claude auto memory off"),
+        "setup must not claim it turned auto memory off:\n{stdout}"
+    );
+
+    for repair_args in [
+        &["doctor", "--repair"][..],
+        &[
+            "doctor",
+            "--repair",
+            "--scope",
+            "global",
+            "--editors",
+            "claude",
+        ][..],
+    ] {
+        let repair = run_cli(repair_args, &home, &project, &api_url, SECRET).await;
+        assert!(
+            repair.status.success(),
+            "{repair_args:?} failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&repair.stdout),
+            String::from_utf8_lossy(&repair.stderr)
+        );
+        assert_eq!(
+            auto_memory_setting(&settings_path),
+            Some(Value::Bool(true)),
+            "{repair_args:?} must not flip an explicit autoMemoryEnabled: true"
+        );
+    }
+
+    let doctor = run_cli(&["doctor", "--json"], &home, &project, &api_url, SECRET).await;
+    let report: Value = serde_json::from_slice(&doctor.stdout).unwrap_or_else(|error| {
+        panic!(
+            "doctor --json parse failed ({error}):\n{}",
+            String::from_utf8_lossy(&doctor.stdout)
+        )
+    });
+    let check = report["editors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|editor| editor["editor"] == "claude")
+        .and_then(|editor| {
+            editor["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["surface"] == "claude_auto_memory")
+                .cloned()
+        })
+        .expect("claude_auto_memory check");
+    assert_eq!(check["status"], "pass", "{check}");
+    assert!(check.get("fix").is_none_or(Value::is_null), "{check}");
+    stop_spawned_watch_helper_if_any(&home);
+
+    // 2. Key not set, one local memory: setup turns it off and explains.
+    let temp_unset = tempfile::tempdir().unwrap();
+    let home_unset = temp_unset.path().join("home");
+    let project_unset = temp_unset.path().join("unset");
+    std::fs::create_dir_all(home_unset.join(".claude/projects/demo/memory")).unwrap();
+    std::fs::write(
+        home_unset.join(".claude/projects/demo/memory/pref.md"),
+        "---\nname: pref\n---\nTabs.\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(&project_unset).unwrap();
+    init_git_repo(&project_unset);
+    let unset_settings = home_unset.join(".claude/settings.json");
+    std::fs::write(&unset_settings, "{\n  \"model\": \"opus\"\n}\n").unwrap();
+
+    let setup = run_cli(&setup_args, &home_unset, &project_unset, &api_url, SECRET).await;
+    let stdout = String::from_utf8_lossy(&setup.stdout);
+    assert!(
+        setup.status.success(),
+        "setup failed:\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    assert_eq!(
+        auto_memory_setting(&unset_settings),
+        Some(Value::Bool(false))
+    );
+    for expected in [
+        "Claude auto memory off",
+        "set autoMemoryEnabled: false in ~/.claude/settings.json",
+        "Claude Code stops loading its 1 local memory file (1 project)",
+        "contextstream-mcp import-local-memory",
+        "--keep-claude-auto-memory",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "setup output must contain {expected:?}:\n{stdout}"
+        );
+    }
+
+    stop_spawned_watch_helper_if_any(&home_unset);
+    server.abort();
+}

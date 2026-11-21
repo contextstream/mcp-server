@@ -2795,11 +2795,23 @@ pub(crate) fn keep_claude_auto_memory() -> bool {
         || mcp_client::activation::keep_claude_auto_memory_preference().unwrap_or(false)
 }
 
-/// Setup default: when Claude Code is configured, turn its auto memory off.
-/// While it is on, Claude Code's system prompt saves "remember" requests and
-/// preferences to local files that ContextStream, other machines and Codex
-/// never see. Respects `--keep-claude-auto-memory` (persisting the preference
-/// in `~/.contextstream/installation.json`) and dry-run, and never prompts.
+/// What a `setup --dry-run` preview folds into Claude Code's settings for
+/// setup's auto memory default.
+pub(crate) fn setup_dry_run_auto_memory() -> hooks::DryRunAutoMemory {
+    if safe_edit::is_dry_run() && !keep_claude_auto_memory() {
+        hooks::DryRunAutoMemory::DefaultOff
+    } else {
+        hooks::DryRunAutoMemory::Leave
+    }
+}
+
+/// Setup default: when Claude Code is configured and its settings do not say
+/// otherwise, turn its auto memory off. While it is on, Claude Code's system
+/// prompt saves "remember" requests and preferences to local files that
+/// ContextStream, other machines and Codex never see. An explicit
+/// `autoMemoryEnabled: true` is the person's choice and stays. Respects
+/// `--keep-claude-auto-memory` (persisting the preference in
+/// `~/.contextstream/installation.json`) and dry-run, and never prompts.
 pub(crate) fn apply_claude_auto_memory_default(editors: &[editors::Editor]) {
     if explicit_keep_claude_auto_memory_requested() {
         if !safe_edit::is_dry_run() {
@@ -2814,28 +2826,93 @@ pub(crate) fn apply_claude_auto_memory_default(editors: &[editors::Editor]) {
         return;
     }
     if safe_edit::is_dry_run() {
-        if hooks::claude_auto_memory_setting() != Some(hooks::ClaudeAutoMemory::Off) {
-            ui::say(
+        match hooks::claude_auto_memory_setting() {
+            Some(hooks::ClaudeAutoMemory::Off) => {}
+            Some(hooks::ClaudeAutoMemory::On) => print_claude_auto_memory_kept_on(),
+            _ => ui::say(
                 ui::Mark::Info,
                 "Would turn Claude auto memory off",
-                Some("memories and preferences go to ContextStream"),
-            );
+                Some(&format!(
+                    "autoMemoryEnabled: false in {}",
+                    hooks::claude_code_settings_display()
+                )),
+            ),
         }
         return;
     }
-    match hooks::disable_claude_auto_memory() {
-        Ok(true) => ui::say(
-            ui::Mark::Ok,
-            "Claude auto memory off",
-            Some("memories and preferences go to ContextStream"),
-        ),
-        Ok(false) => {}
+    match hooks::default_claude_auto_memory_off() {
+        Ok(hooks::AutoMemoryDefault::TurnedOff) => print_claude_auto_memory_turned_off(),
+        Ok(hooks::AutoMemoryDefault::KeptExplicitOn) => print_claude_auto_memory_kept_on(),
+        Ok(hooks::AutoMemoryDefault::AlreadyOff) => {}
         Err(error) => ui::say(
             ui::Mark::Warn,
             "Claude auto memory is still on",
             Some(&error.to_string()),
         ),
     }
+}
+
+/// Say that setup wrote `autoMemoryEnabled: false`, what that stops, how to
+/// bring local memories over, and how to keep auto memory on instead.
+pub(crate) fn print_claude_auto_memory_turned_off() {
+    let settings = hooks::claude_code_settings_display();
+    ui::say(
+        ui::Mark::Ok,
+        "Claude auto memory off",
+        Some(&format!("set autoMemoryEnabled: false in {settings}")),
+    );
+    let ui = ui::ui();
+    let (files, projects) = hooks::count_claude_auto_memory_files();
+    let stops = if files == 0 {
+        "Claude Code stops saving memories to local files".to_string()
+    } else {
+        format!(
+            "Claude Code stops loading its {files} local memory file{} ({projects} project{})",
+            if files == 1 { "" } else { "s" },
+            if projects == 1 { "" } else { "s" }
+        )
+    };
+    println!(
+        "{}    {}",
+        ui::GUTTER,
+        ui.faint(&format!(
+            "{stops}; memories and preferences go to ContextStream instead."
+        ))
+    );
+    if files > 0 {
+        println!(
+            "{}    {}",
+            ui::GUTTER,
+            ui.faint("Bring them over: contextstream-mcp import-local-memory")
+        );
+    }
+    println!(
+        "{}    {}",
+        ui::GUTTER,
+        ui.faint(&format!(
+            "Undo: set \"autoMemoryEnabled\": true in {settings}; setup and doctor --repair keep an explicit true. Skip this step on later setups: --keep-claude-auto-memory."
+        ))
+    );
+}
+
+/// Say that an explicit `autoMemoryEnabled: true` was kept, and how
+/// ContextStream's hook treats Claude's local memory writes meanwhile.
+pub(crate) fn print_claude_auto_memory_kept_on() {
+    ui::say(
+        ui::Mark::Info,
+        "Claude auto memory kept on",
+        Some(&format!(
+            "you set autoMemoryEnabled: true in {}",
+            hooks::claude_code_settings_display()
+        )),
+    );
+    println!(
+        "{}    {}",
+        ui::GUTTER,
+        ui::ui().faint(
+            "Claude Code keeps loading its local memories; ContextStream's hook still sends new memory writes to ContextStream. To let Claude write local memories too: setup --keep-claude-auto-memory."
+        )
+    );
 }
 
 pub async fn run_setup_with_learning_choice(
@@ -3310,9 +3387,8 @@ async fn run_setup_noninteractive(
                 .iter()
                 .any(mcp_config::editor_supports_remote_mcp);
 
-    let _dry_run_auto_memory_guard = hooks::setup_dry_run_auto_memory_off_guard(
-        safe_edit::is_dry_run() && !keep_claude_auto_memory(),
-    );
+    let _dry_run_auto_memory_guard =
+        hooks::setup_dry_run_auto_memory_off_guard(setup_dry_run_auto_memory());
     for editor in &editors_to_configure {
         configure_editor_with_workspace_and_project_name(
             &client,

@@ -905,10 +905,21 @@ fn build_claude_hooks_update(
     Ok(updated)
 }
 
-static SETUP_DRY_RUN_DISABLE_CLAUDE_AUTO_MEMORY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// What a `setup --dry-run` preview folds into Claude Code's settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DryRunAutoMemory {
+    /// Leave `autoMemoryEnabled` as it is.
+    Leave = 0,
+    /// Setup's default: `false` unless the person set `true`.
+    DefaultOff = 1,
+    /// The person chose off in the wizard: `false` whatever it was.
+    ChosenOff = 2,
+}
 
-pub(crate) struct SetupDryRunAutoMemoryGuard(bool);
+static SETUP_DRY_RUN_DISABLE_CLAUDE_AUTO_MEMORY: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(DryRunAutoMemory::Leave as u8);
+
+pub(crate) struct SetupDryRunAutoMemoryGuard(u8);
 
 impl Drop for SetupDryRunAutoMemoryGuard {
     fn drop(&mut self) {
@@ -920,14 +931,23 @@ impl Drop for SetupDryRunAutoMemoryGuard {
 /// preview during `setup --dry-run` so the dry-run plan records one combined
 /// `~/.claude/settings.json` operation instead of two conflicting snapshots of
 /// an unwritten file.
-pub(crate) fn setup_dry_run_auto_memory_off_guard(enabled: bool) -> SetupDryRunAutoMemoryGuard {
-    let previous =
-        SETUP_DRY_RUN_DISABLE_CLAUDE_AUTO_MEMORY.swap(enabled, std::sync::atomic::Ordering::SeqCst);
+pub(crate) fn setup_dry_run_auto_memory_off_guard(
+    mode: DryRunAutoMemory,
+) -> SetupDryRunAutoMemoryGuard {
+    let previous = SETUP_DRY_RUN_DISABLE_CLAUDE_AUTO_MEMORY
+        .swap(mode as u8, std::sync::atomic::Ordering::SeqCst);
     SetupDryRunAutoMemoryGuard(previous)
 }
 
-fn setup_dry_run_auto_memory_off_enabled() -> bool {
-    SETUP_DRY_RUN_DISABLE_CLAUDE_AUTO_MEMORY.load(std::sync::atomic::Ordering::SeqCst)
+/// Whether the dry-run preview of `settings` turns auto memory off.
+fn setup_dry_run_turns_auto_memory_off(settings: &Value) -> bool {
+    match SETUP_DRY_RUN_DISABLE_CLAUDE_AUTO_MEMORY.load(std::sync::atomic::Ordering::SeqCst) {
+        mode if mode == DryRunAutoMemory::ChosenOff as u8 => true,
+        mode if mode == DryRunAutoMemory::DefaultOff as u8 => {
+            claude_auto_memory_in(settings) != ClaudeAutoMemory::On
+        }
+        _ => false,
+    }
 }
 
 /// Install Claude Code hooks into ~/.claude/settings.json.
@@ -941,7 +961,7 @@ fn install_claude_code_hooks(api_key: Option<&str>) -> Result<()> {
     // Merge into the existing hooks object in place, so unknown event names
     // and unparseable entries are preserved rather than replaced wholesale.
     let mut updated = build_claude_hooks_update(&loaded, &settings_path, api_key)?;
-    if safe_edit::is_dry_run() && setup_dry_run_auto_memory_off_enabled() {
+    if safe_edit::is_dry_run() && setup_dry_run_turns_auto_memory_off(&loaded.value) {
         updated["autoMemoryEnabled"] = Value::Bool(false);
     }
 
@@ -967,12 +987,6 @@ pub enum ClaudeAutoMemory {
     DefaultOn,
 }
 
-impl ClaudeAutoMemory {
-    pub fn is_on(self) -> bool {
-        !matches!(self, Self::Off)
-    }
-}
-
 fn claude_auto_memory_in(settings: &Value) -> ClaudeAutoMemory {
     match settings.get("autoMemoryEnabled").and_then(Value::as_bool) {
         Some(false) => ClaudeAutoMemory::Off,
@@ -989,8 +1003,50 @@ pub fn claude_auto_memory_setting() -> Option<ClaudeAutoMemory> {
     Some(claude_auto_memory_in(&loaded.value))
 }
 
+/// The Claude Code settings file, as the person would type it
+/// (`~/.claude/settings.json`).
+pub fn claude_code_settings_display() -> String {
+    claude_code_settings_path()
+        .map(|path| super::wizard::display_path(&path))
+        .unwrap_or_else(|| "~/.claude/settings.json".to_string())
+}
+
+/// What setup's auto memory default did to `autoMemoryEnabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoMemoryDefault {
+    /// The key was not set (Claude Code's default is on); it is now `false`.
+    TurnedOff,
+    /// It was `false` already.
+    AlreadyOff,
+    /// The person set `autoMemoryEnabled: true`; it stays.
+    KeptExplicitOn,
+}
+
+/// Setup's and `doctor --repair`'s default: write `autoMemoryEnabled: false`
+/// only where the key is not set. An explicit `true` is the person's choice
+/// and is never overwritten here; only an explicit choice in the setup
+/// wizard ([`disable_claude_auto_memory`]) changes it.
+pub fn default_claude_auto_memory_off() -> Result<AutoMemoryDefault> {
+    let settings_path = claude_code_settings_path()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine Claude Code settings path"))?;
+    let loaded = safe_edit::read_for_edit(&settings_path, safe_edit::JsonDialect::Strict)?;
+    match claude_auto_memory_in(&loaded.value) {
+        ClaudeAutoMemory::Off => Ok(AutoMemoryDefault::AlreadyOff),
+        ClaudeAutoMemory::On => Ok(AutoMemoryDefault::KeptExplicitOn),
+        ClaudeAutoMemory::DefaultOn => {
+            warn_on_nonstandard_syntax(&loaded, &settings_path);
+            let mut updated = loaded.value.clone();
+            updated["autoMemoryEnabled"] = Value::Bool(false);
+            safe_edit::commit(&settings_path, &loaded, &updated)?;
+            Ok(AutoMemoryDefault::TurnedOff)
+        }
+    }
+}
+
 /// Set `autoMemoryEnabled: false` in the user's Claude settings, rewriting
-/// only that key. Returns `true` when the file changed.
+/// only that key, whatever it was. Only for the person's explicit choice;
+/// defaults go through [`default_claude_auto_memory_off`]. Returns `true`
+/// when the file changed.
 pub fn disable_claude_auto_memory() -> Result<bool> {
     let settings_path = claude_code_settings_path()
         .ok_or_else(|| anyhow::anyhow!("Could not determine Claude Code settings path"))?;
@@ -4967,9 +5023,32 @@ mod tests {
         );
 
         let settings = claude.join("settings.json");
+        // The default fills in a missing key only.
+        let unset = "{\n  \"model\": \"opus\"\n}\n";
+        std::fs::write(&settings, unset).unwrap();
+        assert_eq!(
+            default_claude_auto_memory_off().expect("default"),
+            AutoMemoryDefault::TurnedOff
+        );
+        let written = std::fs::read_to_string(&settings).unwrap();
+        assert!(written.contains("\"model\": \"opus\""), "{written}");
+        assert_eq!(claude_auto_memory_setting(), Some(ClaudeAutoMemory::Off));
+        assert_eq!(
+            default_claude_auto_memory_off().expect("default again"),
+            AutoMemoryDefault::AlreadyOff
+        );
+
+        // An explicit `true` is the person's choice: the default keeps it.
         let original = "{\n  \"model\": \"opus\",\n  \"autoMemoryEnabled\": true\n}\n";
         std::fs::write(&settings, original).unwrap();
         assert_eq!(claude_auto_memory_setting(), Some(ClaudeAutoMemory::On));
+        assert_eq!(
+            default_claude_auto_memory_off().expect("default keeps true"),
+            AutoMemoryDefault::KeptExplicitOn
+        );
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
+
+        // Only an explicit choice (the wizard's review) turns it off.
         assert!(disable_claude_auto_memory().expect("disable"));
         let written = std::fs::read_to_string(&settings).unwrap();
         assert!(written.contains("\"model\": \"opus\""), "{written}");

@@ -231,9 +231,8 @@ pub async fn run_setup_with_profile(
         // fails to configure.
         write_setup_transport_marker(transport_preference)?;
     }
-    let _dry_run_auto_memory_guard = super::hooks::setup_dry_run_auto_memory_off_guard(
-        safe_edit::is_dry_run() && !super::keep_claude_auto_memory(),
-    );
+    let _dry_run_auto_memory_guard =
+        super::hooks::setup_dry_run_auto_memory_off_guard(super::setup_dry_run_auto_memory());
     for editor in &editors_to_configure {
         super::configure_editor_with_workspace_and_project_name(
             &client,

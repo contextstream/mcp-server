@@ -856,17 +856,20 @@ async fn pick_project(
 }
 
 /// Default for the Claude auto memory choice: off whenever Claude Code is
-/// being set up and auto memory is on (its system prompt otherwise saves
-/// memories and preferences to local files), unless setup was told to keep
-/// it. `None` when the choice does not apply. Review can change it.
+/// being set up and its settings leave auto memory at Claude Code's default
+/// (its system prompt otherwise saves memories and preferences to local
+/// files), unless setup was told to keep it. An explicit
+/// `autoMemoryEnabled: true` is the person's choice, so it defaults to kept.
+/// `None` when the choice does not apply. Review can change it.
 fn claude_auto_memory_default(editors: &[editors::Editor]) -> Option<bool> {
     if !editors.contains(&editors::Editor::ClaudeCode) {
         return None;
     }
-    if !super::hooks::claude_auto_memory_setting().is_some_and(|setting| setting.is_on()) {
-        return None;
+    match super::hooks::claude_auto_memory_setting() {
+        Some(super::hooks::ClaudeAutoMemory::DefaultOn) => Some(!super::keep_claude_auto_memory()),
+        Some(super::hooks::ClaudeAutoMemory::On) => Some(false),
+        Some(super::hooks::ClaudeAutoMemory::Off) | None => None,
     }
-    Some(!super::keep_claude_auto_memory())
 }
 
 fn print_review(choices: &Choices) {
@@ -979,7 +982,11 @@ async fn finish(
         // partial setup remains repairable with the same connection mode.
         super::write_setup_transport_marker(transport)?;
         let _dry_run_auto_memory_guard = super::hooks::setup_dry_run_auto_memory_off_guard(
-            safe_edit::is_dry_run() && claude_auto_memory_off == Some(true),
+            if safe_edit::is_dry_run() && claude_auto_memory_off == Some(true) {
+                super::hooks::DryRunAutoMemory::ChosenOff
+            } else {
+                super::hooks::DryRunAutoMemory::Leave
+            },
         );
         for editor in &editors {
             // One editor failing (a locked or malformed config file) must not
@@ -1008,7 +1015,10 @@ async fn finish(
             ui::say(
                 Mark::Info,
                 "Would turn Claude auto memory off",
-                Some("memories and preferences go to ContextStream"),
+                Some(&format!(
+                    "autoMemoryEnabled: false in {}",
+                    super::hooks::claude_code_settings_display()
+                )),
             );
         } else {
             if let Err(error) =
@@ -1016,8 +1026,11 @@ async fn finish(
             {
                 tracing::warn!(%error, "could not clear keep_claude_auto_memory preference");
             }
+            // The person chose off in review, so an explicit `true` changes
+            // too; the default never reaches here for one.
             match super::hooks::disable_claude_auto_memory() {
-                Ok(_) => ui::say(
+                Ok(true) => super::print_claude_auto_memory_turned_off(),
+                Ok(false) => ui::say(
                     Mark::Ok,
                     "Claude auto memory off",
                     Some("memories and preferences go to ContextStream"),
@@ -1338,6 +1351,40 @@ mod tests {
         assert_eq!(label(Some(false)), Some("Turn Claude auto memory off"));
         assert_eq!(label(None), None);
         assert!(claude_auto_memory_default(&[editors::Editor::Cursor]).is_none());
+    }
+
+    #[test]
+    fn claude_auto_memory_defaults_off_only_where_the_person_left_it_unset() {
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        let previous_keep = std::env::var_os("CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY");
+        std::env::set_var("HOME", temp.path());
+        std::env::remove_var("CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY");
+        let settings = temp.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let claude = [editors::Editor::ClaudeCode];
+
+        std::fs::write(&settings, "{\"model\": \"opus\"}").unwrap();
+        assert_eq!(claude_auto_memory_default(&claude), Some(true));
+        std::fs::write(&settings, "{\"autoMemoryEnabled\": true}").unwrap();
+        assert_eq!(
+            claude_auto_memory_default(&claude),
+            Some(false),
+            "an explicit true defaults to kept"
+        );
+        std::fs::write(&settings, "{\"autoMemoryEnabled\": false}").unwrap();
+        assert_eq!(claude_auto_memory_default(&claude), None);
+
+        match previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Some(keep) = previous_keep {
+            std::env::set_var("CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY", keep);
+        }
     }
 
     #[test]

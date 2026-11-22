@@ -256,17 +256,27 @@ fn hook_binary_path() -> String {
 
 /// Build the managed block for one hook.
 ///
-/// Fire-and-forget + fail-open: the capture runs detached (`&`) with stdio
-/// silenced, and the block always `exit 0`s. `pre-push` is special-cased to
-/// read the ref list from stdin *before* backgrounding the network call.
+/// Most hooks are fire-and-forget + fail-open: capture runs detached (`&`) with
+/// stdio silenced and preserves the user hook's exit status. `pre-push` runs
+/// synchronously so verification gates can abort `git push` on non-zero exit,
+/// while guarding with `command -v` so a missing binary fails open.
 fn managed_block(name: &str, binary: &str) -> String {
     let bin = shell_quote(binary);
     let hook_cmd = format!("git-{name}");
     let inner = if name == "pre-push" {
         format!(
             "contextstream_previous_status=$?\n\
+             if [ \"$contextstream_previous_status\" -ne 0 ]; then\n\
+             \texit \"$contextstream_previous_status\"\n\
+             fi\n\
              contextstream_refs=\"$(cat)\"\n\
-             ( printf '%s' \"$contextstream_refs\" | {bin} hook {hook_cmd} \"$@\" >/dev/null 2>&1 & ) || true\n\
+             if command -v {bin} >/dev/null 2>&1; then\n\
+             \tprintf '%s' \"$contextstream_refs\" | {bin} hook {hook_cmd} \"$@\" >/dev/null\n\
+             \tcontextstream_hook_status=$?\n\
+             \tif [ \"$contextstream_hook_status\" -ne 0 ]; then\n\
+             \t\texit \"$contextstream_hook_status\"\n\
+             \tfi\n\
+             fi\n\
              exit \"$contextstream_previous_status\"\n"
         )
     } else {
@@ -937,6 +947,99 @@ mod tests {
         let pre_push = managed_block("pre-push", "/path/to/bin");
         assert!(pre_push.contains("contextstream_refs=\"$(cat)\""));
         assert!(pre_push.contains("printf '%s'"));
+        assert!(pre_push.contains("command -v \"/path/to/bin\" >/dev/null 2>&1"));
+        assert!(!pre_push.contains("& ) || true"));
+        assert!(pre_push.contains("exit \"$contextstream_hook_status\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_push_managed_block_runs_synchronously_and_propagates_nonzero_exit() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let blocking_bin = temp.path().join("blocking-bin");
+        let allowing_bin = temp.path().join("allowing-bin");
+        let args_log = temp.path().join("seen-stdin.txt");
+
+        std::fs::write(
+            &blocking_bin,
+            "#!/bin/sh\necho 'Verification gate blocked (push)' >&2\necho '{\"ignored\":true}'\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&blocking_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::fs::write(
+            &allowing_bin,
+            format!(
+                "#!/bin/sh\ncat > {}\necho '{{}}'\nexit 0\n",
+                shell_quote(args_log.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&allowing_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let blocking_hook = temp.path().join("pre-push-block");
+        std::fs::write(
+            &blocking_hook,
+            format!(
+                "#!/bin/sh\ntrue\n{}",
+                managed_block("pre-push", blocking_bin.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+
+        let mut child = Command::new("sh")
+            .arg(&blocking_hook)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"refs/heads/main 1111 2222\n")
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Verification gate blocked (push)"));
+        assert!(
+            out.stdout.is_empty(),
+            "hook stdout must not leak to git push"
+        );
+
+        let allowing_hook = temp.path().join("pre-push-allow");
+        std::fs::write(
+            &allowing_hook,
+            format!(
+                "#!/bin/sh\ntrue\n{}",
+                managed_block("pre-push", allowing_bin.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+
+        let mut child = Command::new("sh")
+            .arg(&allowing_hook)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"refs/heads/main aaaa bbbb\n")
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&args_log).unwrap(),
+            "refs/heads/main aaaa bbbb"
+        );
     }
 
     #[cfg(unix)]

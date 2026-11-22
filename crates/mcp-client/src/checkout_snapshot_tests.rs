@@ -1032,3 +1032,124 @@ async fn a_symlinked_folder_is_named_by_the_folder_it_leads_to() {
     );
     assert_eq!(named_as(&link).await, named_as(&real).await);
 }
+
+#[tokio::test]
+async fn compute_target_tree_matches_checkout_snapshot_and_withholds_secrets() {
+    let outside = tempfile::tempdir().unwrap();
+    assert_eq!(compute_target_tree(outside.path()).await, None);
+
+    // Unborn empty repo -> EMPTY_TREE.
+    let unborn = tempfile::tempdir().unwrap();
+    git_ok(unborn.path(), &["init", "-q"]);
+    assert_eq!(
+        compute_target_tree(unborn.path()).await.as_deref(),
+        Some(EMPTY_TREE)
+    );
+
+    // Clean committed repo -> HEAD^{tree}.
+    let repo = repo_with_history();
+    let dir = repo.path();
+    let head_tree = git_ok(dir, &["rev-parse", "HEAD^{tree}"]);
+    assert_eq!(
+        compute_target_tree(dir).await.as_deref(),
+        Some(head_tree.as_str())
+    );
+
+    // Dirty checkout with withheld .env, .contextignore, node_modules, Cargo target.
+    write(dir, "a.txt", "alpha, modified\n");
+    write(dir, ".env", "API_KEY=secret\n");
+    write(dir, ".contextignore", "private.txt\n");
+    write(dir, "private.txt", "do not include\n");
+    write(dir, "web/node_modules/pkg/index.js", "ignored\n");
+    write(
+        dir,
+        "target/CACHEDIR.TAG",
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    );
+    write(dir, "target/debug/bin", "compiled\n");
+
+    let snapshot = CheckoutSnapshot::capture(dir).await.unwrap();
+    let computed = compute_target_tree(dir).await.expect("dirty target tree");
+    assert_eq!(computed, snapshot.target_tree);
+    assert_ne!(computed, head_tree);
+    // .git/index must remain untouched by compute_target_tree.
+    assert!(git_ok(dir, &["diff", "--cached", "--name-only"]).is_empty());
+}
+
+#[tokio::test]
+async fn compute_repo_key_matches_check_tool_sanitization() {
+    assert_eq!(
+        repo_key("My Repo! v2", &"a1b2c3d4".repeat(8)),
+        "my-repo-v2-a1b2c3d4"
+    );
+    assert_eq!(repo_key("___", &"01234567".repeat(8)), "repo-01234567");
+    let long = "a".repeat(60);
+    assert_eq!(
+        repo_key(&long, &"deadbeef".repeat(8)),
+        format!("{}-deadbeef", "a".repeat(40))
+    );
+
+    let repo = repo_with_history();
+    git_ok(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/org/Test_Repo.git",
+        ],
+    );
+    let snapshot = CheckoutSnapshot::capture(repo.path()).await.unwrap();
+    let key = compute_repo_key(repo.path()).await.expect("repo_key");
+    assert_eq!(key, repo_key(&snapshot.repo_name, &snapshot.origin_sha256));
+}
+
+#[tokio::test]
+async fn compute_target_tree_excludes_python_caches_and_virtualenvs() {
+    let repo = repo_with_history();
+    let dir = repo.path();
+    let head_tree = git_ok(dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // Untracked Python caches at root and nested depths.
+    write(dir, "__pycache__/mod.cpython-312.pyc", "pyc\n");
+    write(dir, "pkg/__pycache__/sub.cpython-312.pyc", "pyc\n");
+    write(dir, ".mypy_cache/3.12/pkg.meta.json", "{}\n");
+    write(dir, "pkg/.mypy_cache/CACHEDIR.TAG", "tag\n");
+    write(dir, ".ruff_cache/0.5.0/cache", "ruff\n");
+    write(dir, "pkg/.ruff_cache/0.5.0/cache", "ruff\n");
+    write(dir, ".pytest_cache/v/cache/lastfailed", "{}\n");
+    write(dir, "pkg/.pytest_cache/README.md", "pytest\n");
+
+    // Top-level and 1-level-nested virtualenvs with pyvenv.cfg.
+    write(dir, ".venv/pyvenv.cfg", "home = /usr/bin\n");
+    write(dir, ".venv/lib/python3.12/site.py", "site\n");
+    write(dir, "sub/venv/pyvenv.cfg", "home = /usr/bin\n");
+    write(dir, "sub/venv/bin/python", "bin\n");
+
+    // With only Python caches and virtualenvs present, target_tree stays HEAD^{tree}.
+    let snapshot_clean = CheckoutSnapshot::capture(dir).await.unwrap();
+    assert!(
+        snapshot_clean.overlay.is_empty(),
+        "{:?}",
+        snapshot_clean.overlay
+    );
+    assert_eq!(snapshot_clean.target_tree, head_tree);
+    assert_eq!(
+        compute_target_tree(dir).await.as_deref(),
+        Some(head_tree.as_str())
+    );
+
+    // Real source changes (and dirs without pyvenv.cfg) ARE included while caches/venvs stay excluded.
+    write(dir, "sub/not_a_venv/keep.py", "print('hi')\n");
+    let snapshot_dirty = CheckoutSnapshot::capture(dir).await.unwrap();
+    assert_eq!(
+        paths(&snapshot_dirty.overlay),
+        vec![("sub/not_a_venv/keep.py".to_string(), "100644".to_string())]
+    );
+    let expected = reference_tree(dir, &["sub/not_a_venv/keep.py"], &[]);
+    assert_eq!(snapshot_dirty.target_tree, expected);
+    assert_eq!(
+        compute_target_tree(dir).await.as_deref(),
+        Some(expected.as_str())
+    );
+}

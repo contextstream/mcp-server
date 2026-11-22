@@ -38,6 +38,7 @@ pub mod retry;
 pub mod run_progress;
 pub mod studio;
 pub mod ticket;
+pub mod verification_gates;
 
 pub use cache::{Cache, CacheKey};
 pub use client::resolve_capsule_share_token_str;
@@ -252,6 +253,9 @@ pub use ticket::{
     normalize_assignees, normalize_linked_items_with_allowed_kinds, normalize_ticket_body,
     normalize_ticket_linked_items, summarize_ticket_linked_items, ticket_fields_not_saved,
     TicketLinkedSummary, ASSIGNEE_ENTITY_TYPES, LINKED_ITEM_KINDS, PLAN_LINKED_ITEM_KINDS,
+};
+pub use verification_gates::{
+    GatePolicy, GatePolicyResponse, ReceiptCheckResult, GATE_POLICY_CACHE_TTL,
 };
 
 /// Process-wide lock for tests that read or mutate environment variables

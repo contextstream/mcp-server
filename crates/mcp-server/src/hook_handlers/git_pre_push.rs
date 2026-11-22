@@ -12,10 +12,14 @@
 //! a pushed range counts as pushed too, not only the newest one.
 
 use anyhow::Result;
+use mcp_client::checkout_snapshot::compute_repo_key;
+use mcp_client::command_hints;
+use mcp_client::verification_gates::cached_gate_policy;
 use mcp_client::CaptureVcsLocalEventParams;
+use std::path::Path;
 use std::time::Duration;
 
-use super::{git_common, write_stdout_json, HookOutput};
+use super::{common, git_common, post_tool_use, verification_gate, write_stdout_json, HookOutput};
 
 /// Most commits one event names, across all refs.
 const MAX_PUSHED_COMMITS: usize = 50;
@@ -211,16 +215,127 @@ async fn push_event_params(root: &str, stdin: &str, args: &[String]) -> CaptureV
     }
 }
 
+async fn resolve_push_target_trees(root: &str, stdin: &str) -> Vec<String> {
+    let updates = parse_push_updates(stdin);
+    let mut trees = Vec::new();
+    if !updates.is_empty() {
+        for update in updates {
+            let spec = format!("{}^{{tree}}", update.local_sha);
+            if let Some(tree) = git_common::run_git(
+                root,
+                &["rev-parse", "-q", "--verify", &spec],
+                Duration::from_millis(800),
+            )
+            .await
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| is_object_id(s))
+            {
+                if !trees.contains(&tree) {
+                    trees.push(tree);
+                }
+            }
+        }
+    } else if stdin.trim().is_empty() {
+        if let Some(tree) = git_common::run_git(
+            root,
+            &["rev-parse", "-q", "--verify", "HEAD^{tree}"],
+            Duration::from_millis(800),
+        )
+        .await
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| is_object_id(s))
+        {
+            trees.push(tree);
+        }
+    }
+    trees
+}
+
+/// Enforce `require_verified_tree_before_push` for the ref updates in `stdin`.
+/// Returns `Some(error_message)` when the push must be blocked, or `None` to
+/// allow (including fail-open on offline/404/timeout or `CONTEXTSTREAM_HOSTED_TOOLS=off`).
+pub async fn enforce_push_gate(root: &str, stdin: &str) -> Option<String> {
+    if command_hints::switched_off(std::env::var(command_hints::ENV_SWITCH).ok().as_deref()) {
+        return None;
+    }
+
+    let (api_url, api_key, workspace_id, project_id) =
+        if let Some(cfg) = post_tool_use::find_project_config(root, root) {
+            (
+                cfg.api_url,
+                cfg.api_key,
+                Some(cfg.workspace_id.to_string()),
+                Some(cfg.project_id.to_string()),
+            )
+        } else {
+            let cfg = common::load_config(root);
+            if !cfg.is_configured() {
+                return None;
+            }
+            (cfg.api_url, cfg.api_key, cfg.workspace_id, cfg.project_id)
+        };
+
+    if api_key.is_empty() || (workspace_id.is_none() && project_id.is_none()) {
+        return None;
+    }
+
+    let identity = command_hints::local_identity(&api_key);
+    let client = verification_gate::build_client(
+        &api_url,
+        &api_key,
+        workspace_id.as_deref(),
+        project_id.as_deref(),
+    );
+    let policy_resp = cached_gate_policy(
+        &client,
+        &identity,
+        workspace_id.as_deref(),
+        project_id.as_deref(),
+        verification_gate::GATE_CHECK_TIMEOUT,
+    )
+    .await?;
+    if !policy_resp.policy.require_verified_tree_before_push {
+        return None;
+    }
+
+    let trees = resolve_push_target_trees(root, stdin).await;
+    if trees.is_empty() {
+        return None;
+    }
+    let repo_key = compute_repo_key(Path::new(root)).await;
+    for tree in trees {
+        let resp = match client
+            .check_receipts(
+                &tree,
+                "push",
+                workspace_id.as_deref(),
+                project_id.as_deref(),
+                repo_key.as_deref(),
+                verification_gate::GATE_CHECK_TIMEOUT,
+            )
+            .await
+        {
+            Ok(Some(resp)) => resp,
+            _ => continue,
+        };
+        if resp.gate_enabled && !resp.allowed {
+            return Some(verification_gate::format_block_message("push", &resp));
+        }
+    }
+    None
+}
+
 pub async fn handle() -> Result<()> {
     if let Some(root) = git_common::repo_root().await {
+        let stdin = git_common::read_stdin_raw();
+        let args = git_common::hook_args();
         if git_common::should_capture(&root, "push") {
-            let params = push_event_params(
-                &root,
-                &git_common::read_stdin_raw(),
-                &git_common::hook_args(),
-            )
-            .await;
+            let params = push_event_params(&root, &stdin, &args).await;
             git_common::capture(&root, params).await;
+        }
+        if let Some(msg) = enforce_push_gate(&root, &stdin).await {
+            eprintln!("{msg}");
+            std::process::exit(1);
         }
     }
 
@@ -524,5 +639,166 @@ refs/heads/dead 0000000000000000000000000000000000000000 refs/heads/dead 2222222
         let range = pushed_commit_range(&work, &updates, Some("origin")).await;
         assert_eq!(range.len(), MAX_PUSHED_COMMITS);
         assert_eq!(range[0], newest, "the tip comes first");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn enforce_push_gate_blocks_unverified_tree_allows_verified_and_fails_open() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let _guard = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var_os("HOME");
+        let prev_switch = std::env::var_os(command_hints::ENV_SWITCH);
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        std::env::remove_var(command_hints::ENV_SWITCH);
+
+        let (_temp, work, first) = repository_with_remote();
+        let work_dir = Path::new(&work);
+        let second = commit(work_dir, "second");
+        let second_tree = git(work_dir, &["rev-parse", &format!("{second}^{{tree}}")]);
+
+        let ws = uuid::Uuid::new_v4();
+        let proj = uuid::Uuid::new_v4();
+        let fingerprint =
+            mcp_session::checkout_identity::ensure_repository_fingerprint(work_dir).unwrap();
+        let canonical_root = std::fs::canonicalize(work_dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        std::fs::create_dir_all(work_dir.join(".contextstream")).unwrap();
+        std::fs::write(
+            work_dir.join(".contextstream/config.json"),
+            serde_json::json!({
+                "workspace_id": ws.to_string(),
+                "project_id": proj.to_string(),
+                "checkout_root": canonical_root,
+                "repository_fingerprint": fingerprint.as_str(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        async fn spawn_server(
+            ws: uuid::Uuid,
+            proj: uuid::Uuid,
+            tree_clone: String,
+            allowed: bool,
+            status_line: &'static str,
+        ) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let body = if req.contains("/gate-policy") {
+                        serde_json::json!({
+                            "success": true,
+                            "data": {
+                                "workspace_id": ws.to_string(),
+                                "project_id": proj.to_string(),
+                                "inherited": false,
+                                "policy": {
+                                    "require_verified_tree_before_push": true,
+                                    "required_command_families": ["cargo test"],
+                                    "receipt_ttl_secs": 3600
+                                }
+                            }
+                        })
+                        .to_string()
+                    } else {
+                        serde_json::json!({
+                            "success": true,
+                            "data": {
+                                "allowed": allowed,
+                                "gate": "push",
+                                "gate_enabled": true,
+                                "workspace_id": ws.to_string(),
+                                "project_id": proj.to_string(),
+                                "repo_key": "work-12345678",
+                                "target_tree": tree_clone,
+                                "ttl_secs": 3600,
+                                "missing_command_families": if allowed { Vec::<String>::new() } else { vec!["cargo test".to_string()] },
+                                "required_command_families": ["cargo test"]
+                            }
+                        })
+                        .to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        let write_mcp = |url: &str, key: &str| {
+            std::fs::write(
+                work_dir.join(".mcp.json"),
+                serde_json::json!({
+                    "mcpServers": {
+                        "contextstream": {
+                            "env": {
+                                "CONTEXTSTREAM_API_KEY": key,
+                                "CONTEXTSTREAM_API_URL": url
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+
+        let stdin = format!("refs/heads/main {second} refs/heads/main {first}\n");
+
+        // 1. Unverified tree is blocked with actionable message.
+        let url_block = spawn_server(ws, proj, second_tree.clone(), false, "200 OK").await;
+        write_mcp(&url_block, "key-block");
+        let blocked = enforce_push_gate(&work, &stdin)
+            .await
+            .expect("unverified push must block");
+        assert!(blocked.contains("push"), "{blocked}");
+        assert!(blocked.contains("cargo test"), "{blocked}");
+        assert!(
+            blocked.contains("contextstream-mcp run -- cargo test"),
+            "{blocked}"
+        );
+
+        // 2. Verified tree is allowed.
+        let url_allow = spawn_server(ws, proj, second_tree.clone(), true, "200 OK").await;
+        write_mcp(&url_allow, "key-allow");
+        assert_eq!(enforce_push_gate(&work, &stdin).await, None);
+
+        // 3. Deletion-only stdin is never blocked.
+        let deletion_stdin = format!("refs/heads/old {ZERO} refs/heads/old {first}\n");
+        let url_del = spawn_server(ws, proj, second_tree.clone(), false, "200 OK").await;
+        write_mcp(&url_del, "key-del");
+        assert_eq!(enforce_push_gate(&work, &deletion_stdin).await, None);
+
+        // 4. 404 / offline fails open.
+        let url_404 = spawn_server(ws, proj, second_tree.clone(), false, "404 Not Found").await;
+        write_mcp(&url_404, "key-404");
+        assert_eq!(enforce_push_gate(&work, &stdin).await, None);
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_switch {
+            Some(v) => std::env::set_var(command_hints::ENV_SWITCH, v),
+            None => std::env::remove_var(command_hints::ENV_SWITCH),
+        }
     }
 }

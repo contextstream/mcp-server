@@ -1058,6 +1058,7 @@ fn is_known_contextstream_windsurf_tool(normalized_tool: &str) -> bool {
             | "instruct"
             | "flash"
             | "ram"
+            | "progress"
     ) || normalized_tool.starts_with("search_")
         || normalized_tool.starts_with("session_")
 }
@@ -2458,6 +2459,23 @@ pub async fn handle() -> Result<()> {
     let tool_lower = tool.to_ascii_lowercase();
     // A run this session has open hears that a tool call starts (no network).
     super::run_progress::tool_started(&input, &cwd, &tool);
+    let is_contextstream_call =
+        is_contextstream_tool_call(&editor, &input, &mcp_server_name, &tool, &tool_input);
+    // Verification gates run before command_rewrite::rewritten_bash so blocked
+    // git push / gh pr create / completion calls cannot be rewritten and skipped.
+    if let Some(msg) = super::verification_gate::check_pre_tool_use(
+        &input,
+        &tool_lower,
+        &tool_input,
+        &cwd,
+        is_contextstream_call,
+        &normalized_contextstream_tool,
+    )
+    .await
+    {
+        write_output(&editor, HookDecision::BlockWithMessage(msg))?;
+        return Ok(());
+    }
     // A shell command that a tool the account has says it takes is handed to
     // `contextstream-mcp run`, which sends it there or runs it here. Nothing
     // else about the call changes, and a command no tool takes is left alone.
@@ -2472,8 +2490,6 @@ pub async fn handle() -> Result<()> {
             return Ok(());
         }
     }
-    let is_contextstream_call =
-        is_contextstream_tool_call(&editor, &input, &mcp_server_name, &tool, &tool_input);
     let is_mcp_tool = is_mcp_tool_call(&input, &mcp_server_name, &tool);
     let record_state_change = is_likely_state_changing_tool(
         &tool_lower,
@@ -5158,5 +5174,28 @@ mod tests {
         assert_eq!(shell_code_search("ps aux | grep agy"), None);
         assert_eq!(shell_code_search("grep -n fn src/main.rs"), None);
         assert_eq!(shell_code_search("cargo test && ls"), None);
+    }
+
+    #[test]
+    fn windsurf_progress_tool_without_server_name_is_detected() {
+        let input = serde_json::json!({
+            "hook_event_name": "pre_mcp_tool_use",
+            "tool_info": {
+                "mcp_tool_name": "progress",
+                "mcp_tool_arguments": {
+                    "status": "completed"
+                }
+            }
+        });
+        let tool = extract_tool_name(&input);
+        let tool_input = extract_tool_input(&input);
+        assert_eq!(tool, "progress");
+        assert!(is_contextstream_tool_call(
+            &EditorFormat::Windsurf,
+            &input,
+            "",
+            &tool,
+            &tool_input
+        ));
     }
 }

@@ -50,6 +50,7 @@ pub mod task_completed;
 pub mod task_created;
 pub mod teammate_idle;
 pub mod user_prompt_submit;
+pub(crate) mod verification_gate;
 pub(crate) mod working_set;
 
 use anyhow::Result;

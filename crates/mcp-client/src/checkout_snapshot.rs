@@ -285,6 +285,62 @@ pub fn origin_digest(origin: &str) -> String {
     hex::encode(Sha256::digest(origin.trim().as_bytes()))
 }
 
+const MAX_REPO_NAME_CHARS: usize = 40;
+
+/// The worker's workspace key for a repository: its folder's base name
+/// lower-cased, runs outside `[a-z0-9._-]` collapsed to `-`, trimmed of
+/// `-._`, truncated to 40 bytes, then `-` and the first 8 hex characters of
+/// `origin_sha256`. Matches ContextStream's `check_tool::repo_key`.
+pub fn repo_key(name: &str, origin_sha256: &str) -> String {
+    let base = name.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    let lowered: String = base
+        .chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+    let mut cleaned = String::new();
+    let mut in_run = false;
+    for c in lowered.chars() {
+        if matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '-') {
+            cleaned.push(c);
+            in_run = false;
+        } else if !in_run {
+            cleaned.push('-');
+            in_run = true;
+        }
+    }
+    let mut name = cleaned
+        .trim_matches(|c| matches!(c, '-' | '.' | '_'))
+        .to_string();
+    if name.is_empty() {
+        name = "repo".to_string();
+    }
+    if name.len() > MAX_REPO_NAME_CHARS {
+        name.truncate(MAX_REPO_NAME_CHARS);
+    }
+    let digest_prefix = &origin_sha256[..origin_sha256.len().min(8)];
+    format!("{name}-{digest_prefix}")
+}
+
+/// Compute the canonical `repo_key` for the git repository containing `cwd`,
+/// matching what `CheckoutSnapshot` + `/hosted-tools/check/call` produce.
+/// Returns `None` outside a git repository.
+pub async fn compute_repo_key(cwd: &Path) -> Option<String> {
+    let top = git(cwd, &[], None, &["rev-parse", "--show-toplevel"])
+        .await
+        .ok()?;
+    let repo = PathBuf::from(text(&top));
+    let origin = git(&repo, &[], None, &["config", "--get", "remote.origin.url"])
+        .await
+        .map(|out| text(&out))
+        .unwrap_or_default();
+    let folder_name = repo
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let origin_sha256 = repository_digest(&repo, &origin).await;
+    Some(repo_key(&folder_name, &origin_sha256))
+}
+
 /// The lowercase hex SHA-256 that names the repository at `repo` (its top folder)
 /// for the service: of its trimmed `origin` URL when it has one, so every copy of
 /// a repository is the same one; with no `origin`, of `root:` and the ids of its
@@ -367,11 +423,61 @@ fn without_verbatim_prefix(path: &str) -> String {
 
 /// Pathspecs for the untracked folders an installer or a build makes itself.
 fn left_to_the_service(repo: &Path) -> Vec<String> {
-    let mut specs = vec![":(exclude,glob)**/node_modules/**".to_string()];
+    let mut specs = vec![
+        ":(exclude,glob)**/node_modules/**".to_string(),
+        ":(exclude,glob)**/__pycache__/**".to_string(),
+        ":(exclude,glob)**/.mypy_cache/**".to_string(),
+        ":(exclude,glob)**/.ruff_cache/**".to_string(),
+        ":(exclude,glob)**/.pytest_cache/**".to_string(),
+    ];
     if repo.join("target").join("CACHEDIR.TAG").is_file() {
         specs.push(":(exclude,glob)target/**".to_string());
     }
+    let mut venvs = BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(repo) {
+        for entry in entries.flatten() {
+            let name1 = entry.file_name();
+            let name1_str = name1.to_string_lossy();
+            if name1_str == ".git" || !entry.path().is_dir() {
+                continue;
+            }
+            let path1 = entry.path();
+            if path1.join("pyvenv.cfg").is_file() {
+                venvs.insert(name1_str.into_owned());
+                continue;
+            }
+            if matches!(
+                name1_str.as_ref(),
+                "node_modules" | "__pycache__" | ".mypy_cache" | ".ruff_cache" | ".pytest_cache"
+            ) {
+                continue;
+            }
+            if let Ok(sub_entries) = std::fs::read_dir(&path1) {
+                for sub in sub_entries.flatten() {
+                    let path2 = sub.path();
+                    if path2.is_dir() && path2.join("pyvenv.cfg").is_file() {
+                        let name2 = sub.file_name();
+                        venvs.insert(format!("{}/{}", name1_str, name2.to_string_lossy()));
+                    }
+                }
+            }
+        }
+    }
+    for rel in venvs {
+        specs.push(format!(":(exclude,glob){rel}/**"));
+    }
     specs
+}
+
+/// Convert exclude pathspecs into include globs for checking tracked files inside excluded folders.
+fn tracked_specs(excludes: &[String]) -> Vec<String> {
+    excludes
+        .iter()
+        .filter_map(|spec| {
+            spec.strip_prefix(":(exclude,glob)")
+                .map(|rest| format!(":(glob){rest}"))
+        })
+        .collect()
 }
 
 /// The credential-looking reason to keep an uncommitted file out, if any.
@@ -835,29 +941,29 @@ async fn overlay(
     .iter()
     .map(|s| s.to_string())
     .collect();
-    args.extend(left_to_the_service(repo));
+    let excludes = left_to_the_service(repo);
+    args.extend(excludes.iter().cloned());
     // Tracked files in those folders still count (a vendored node_modules):
     // with no untracked files, git lists only them, without walking an install.
     // The two questions are asked together.
     let untracked_args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut tracked_cmd_args: Vec<String> = [
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=no",
+        "--no-renames",
+        "--ignore-submodules=all",
+        "--",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    tracked_cmd_args.extend(tracked_specs(&excludes));
+    let tracked_args: Vec<&str> = tracked_cmd_args.iter().map(String::as_str).collect();
     let (status, tracked) = tokio::join!(
         git(repo, &[], None, &untracked_args),
-        git(
-            repo,
-            &[],
-            None,
-            &[
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=no",
-                "--no-renames",
-                "--ignore-submodules=all",
-                "--",
-                ":(glob)**/node_modules/**",
-                ":(glob)target/**",
-            ],
-        ),
+        git(repo, &[], None, &tracked_args),
     );
     let status = status?;
     let tracked = tracked?;
@@ -1064,6 +1170,95 @@ async fn finish_target_tree(
     }
     let out = git(&env.repo, &vars, None, &["write-tree"]).await?;
     Ok(text(&out))
+}
+
+/// Compute the checkout's `target_tree` OID without modifying `.git/index` or
+/// `.git/objects`, using the exact same exclusions (`node_modules`, Cargo
+/// `target`, `.contextignore`/`.contextstream/ignore`, and credential files) as
+/// [`CheckoutSnapshot`]. Returns `None` when `cwd` is outside a git repository
+/// or on git failure.
+pub async fn compute_target_tree(cwd: &Path) -> Option<String> {
+    let top = git(cwd, &[], None, &["rev-parse", "--show-toplevel"])
+        .await
+        .ok()?;
+    let repo = PathBuf::from(text(&top));
+    let (status_res, head_res) = tokio::join!(
+        git(
+            &repo,
+            &[],
+            None,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+                "--ignore-submodules=all",
+            ],
+        ),
+        git(
+            &repo,
+            &[],
+            None,
+            &["rev-parse", "-q", "--verify", "HEAD^{tree}"]
+        ),
+    );
+    let base_tree = match head_res {
+        Ok(out) if is_oid(&text(&out)) => text(&out),
+        _ => EMPTY_TREE.to_string(),
+    };
+    // Clean fast-path: no working tree or index changes at all.
+    if matches!(&status_res, Ok(bytes) if bytes.is_empty()) {
+        return Some(base_tree);
+    }
+
+    let real_objects = git(
+        &repo,
+        &[],
+        None,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+    )
+    .await
+    .ok()?;
+    let real_objects = PathBuf::from(text(&real_objects));
+    let temp = tempfile::tempdir().ok()?;
+    let private_objects = temp.path().join("objects");
+    std::fs::create_dir_all(&private_objects).ok()?;
+    let env = GitEnv {
+        repo,
+        objects: vec![
+            (
+                "GIT_OBJECT_DIRECTORY".to_string(),
+                private_objects.to_string_lossy().to_string(),
+            ),
+            (
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES".to_string(),
+                real_objects.to_string_lossy().to_string(),
+            ),
+        ],
+    };
+    let relaxed_limits = Limits {
+        files: usize::MAX,
+        total_bytes: u64::MAX,
+        file_bytes: u64::MAX,
+    };
+    let (prepared, listed) = tokio::join!(
+        prepare_scratch_index(&env, temp.path(), &base_tree),
+        overlay(&env, relaxed_limits),
+    );
+    let (entries, deletes, _withheld) = listed.ok()?;
+    if entries.is_empty() && deletes.is_empty() {
+        return Some(base_tree);
+    }
+    prepared.ok()?;
+    finish_target_tree(&env, temp.path(), &entries, &deletes)
+        .await
+        .ok()
 }
 
 #[cfg(test)]

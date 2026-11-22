@@ -318,7 +318,7 @@ async fn stdio_check_surfaces_downstream_ts_rust_go_contract_breakages() {
                                         "tool_result": true
                                     }
                                 },
-                                "call": { "id": "00000000-0000-4000-8000-000000000001", "expires_at": "2030-01-01T00:00:00Z" }
+                                "call": { "id": "00000000-0000-4000-8000-000000000042", "expires_at": "2030-01-01T00:00:00Z" }
                             }
                         }))
                     }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.94
+
+- Remote checks ask Go its version with `go version` and Java with `--version`, then `-version` for Java 8, the way the workers do, so Go and Java 8 sessions can be matched to the right toolchain. A session reports at most 32 tool versions (was 16), enough for every language remote checks run.
+
 ## 1.0.93
 
 - Declined remote checks show the worker's reason. `contextstream-mcp run -v` also shows the remote call ID.

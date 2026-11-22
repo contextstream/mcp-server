@@ -1,7 +1,7 @@
 # Data handling and controls
 
-This document describes the open-source client's default network behavior. The
-setup wizard prints the same material before it writes configuration.
+This document describes the open-source client's network behavior. The setup
+wizard summarizes its data controls before writing configuration.
 
 ## Defaults
 
@@ -11,9 +11,14 @@ setup wizard prints the same material before it writes configuration.
 | MCP transcript exchange saving | on | User/assistant exchanges supplied to `context` when transcript saving applies | `CONTEXTSTREAM_TRANSCRIPTS_ENABLED=false` or `contextstream-mcp configure --transcripts off` |
 | Hook transcript saving | on | Supported editor lifecycle exchange payloads | `CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED=false` or `contextstream-mcp configure --hook-transcripts off` |
 | Project indexing | setup-dependent | Files matched after ignore rules, plus index metadata: with each batch, the checkout's credential-free repository identity and fingerprint, branch, commit SHA and time, whether the tree is dirty, and random installation and machine IDs (never a hostname or local path) | Skip indexing; exclude paths with gitignore-style rules in `.contextstream/ignore` (relative to the project root) or in a `.contextignore` in any folder (files excluded after indexing are dropped on the next complete index; local search fallbacks skip them too, and so does the local snapshot refresh of hosted hits, so a checkout's rules also hide hits that another checkout of the same project uploaded earlier); files over 5 MiB are never indexed (`index` and `setup` say how many were left out and name the first few; `.contextignore` is not needed for them); use `delete(action="project.purge", project_id=...)` to de-index server-side content (it cannot be undone, so it runs only through the `delete` tool, after the person confirms) |
-| Checkout snapshot | off until a tool that the API defines for your account asks for one (none is defined for any account today); never on the hosted gateway | What your checkout holds on top of its last commit, as git sees it: the commit's tree id; for each changed, added or deleted path its name, mode and content hash; and the checkout's folder path, so the tool's output names your files. The content of the changed and added files goes with the request, in a git pack; a file of the last commit goes only when the tool's service says it lacks it, and nothing else is ever given out. The repository is named by its folder name and a SHA-256 of its `origin` URL or, with no `origin`, of the ids of its first commits (before its first commit, of its folder path); the name holds the digest only, never the URL, the ids or the path. All three are digests that someone who can guess the input can confirm, and the folder path can include your home folder's name. Left out: everything `.gitignore` leaves out, `node_modules` folders, Cargo's `target` folder, files listed in `.contextstream/ignore` or a `.contextignore`, and uncommitted files that look like credentials (a secret file name such as `.env`, or a private key or service-account key inside); the snapshot lists the paths it withheld. Nothing is written to your repository | `CONTEXTSTREAM_CHECKOUT_SNAPSHOT=off`; `"checkout_snapshot": false` in `.contextstream/config.json` (commit it to turn snapshots off for everyone in the project); `CONTEXTSTREAM_CHECKOUT_SNAPSHOT_REPOS` limits snapshots to repositories whose `origin` URL or folder name starts with one of the comma-separated prefixes |
-| Tools the API defines for your account | the list is read when a session starts; a tool is called only when you or your assistant call it (none is defined for any account today); never on the hosted gateway | Reading the list sends what every API request carries, plus the workspace ID. A call sends the tool's arguments as your assistant gave them and the workspace ID; a tool whose definition asks for a checkout snapshot also sends what the Checkout snapshot row describes. To a tool that answers over a stream, the call itself carries only the repository's folder name and a digest of its `origin` URL or, with no `origin`, of its first commits' ids or its folder path (never the URL, the ids or the path), and the rest goes over the stream; the call is made while the rest is being prepared. When the API answers a call with a stream, this server opens it (a `wss` address the API names; redirects are not followed) with a token that is valid for that one call, never your API key, and sends: the run's description from the API (an id, the command or arguments the tool defines, a folder inside the repository, time limits and a repository key), the checkout snapshot with the content of the changed files, answers to the service's requests for the last commit's file list or file contents, and the values of the environment variables the API names (never one whose name looks like a credential, nor a value that holds a login in a URL; a run's description may also name variables that keep the call on your machine: when your session sets one of them the stream is not opened, nothing is sent and your assistant is told to run the command itself, and those names are only looked up here, never sent), and a description of your local environment, so the service can tell whether it can reproduce it: the operating system and CPU architecture names, the CPU count, whether the process runs as root, the time zone's name, and the first line that `<tool> --version` prints (`go version` for Go and `zig version` for Zig; for Java `--version`, or `-version` when that fails, as Java 8 does; past a banner such as Gradle's rule of dashes, the first line with a number in it) for each tool the run's description from the API names (at most 32). A tool is found only in the folders of your own `PATH` that are outside the repository, never in the repository or the command's folder, and is run directly, without a shell, in the command's folder, for at most two seconds, with its installers told not to install anything; a version manager that picks the version by folder may therefore run, and one that installs a missing version on first use may begin to (the time limit cuts it short). Nothing else about your variables, paths or files is part of that description; a tool's version line is cleaned first: words in it that look like paths (they contain a slash or a backslash, or start with `~`) are left out, except the plain `os/arch` word that ends Go's line (such as `linux/amd64`), your user name, your home folder's name and your host name are replaced with `<redacted>` (names of fewer than three characters excepted), and what is left is cut to 200 characters. A command sent by `run` is also marked as one whose output is taken when it ends, so the service may hold the output until it has decided the result. What the service answers is returned to your assistant, and its heartbeats show as progress notifications. When the service does not run a call, your assistant is told to run it itself | `CONTEXTSTREAM_HOSTED_TOOLS=off` reads no list and offers no such tool; `CONTEXTSTREAM_HOSTED_ENV=off` sends no description of your environment (the service then treats it as unknown) and asks no tool for its version; the Checkout snapshot switches stop what a call sends of your checkout (the call is then not made) |
-| Command routing (Claude Code) | off until a tool that the API defines for your account lists the shell commands it takes (none does for any account today); never on the hosted gateway | The server keeps that tool's name and the command patterns it lists in `~/.contextstream/hosted-command-hints-<account digest>.json` (no credential; tied to your account and API address; used for 12 hours). When Claude Code is about to run a shell command that one of the patterns matches as a whole, the editor hook changes the call so that your shell runs `contextstream-mcp run --tool <name> -- '<your command>'` instead, and Claude Code shows that changed command. The hook grants no permission: Claude Code asks about, allows or refuses the changed command as it would any other, and an allow rule you wrote for the original command does not cover it. `run` sends the command to the tool, with the descriptions of your checkout and your environment that the previous row lists, prints what comes back as it arrives, and ends with the command's own exit status after one line that says it ran remotely. When no tool takes the command, the tool declines, or it cannot be reached, `run` runs your command right there, in your folder, with `bash -c`, as you typed it (bash, as the host and ContextCode run it; where bash is not installed, `run` says so and runs nothing). A command no pattern matches is never changed, and patterns that would take everyday commands (`ls`, `git status`, `pwd`, `cat README.md`) are ignored | `CONTEXTSTREAM_HOSTED_TOOLS=off` (no hints are kept, the hook changes nothing and `run` runs everything here); `CONTEXTSTREAM_HOOK_ENABLED=false` or removing the managed Claude Code hook; the Checkout snapshot switches stop what is sent of your checkout |
+| Checkout snapshot | Sent when a local hosted check opens a stream, including automatic preparation and opted-in speculative runs | Tree IDs, changed or deleted paths, changed file contents and the local checkout root. The worker can ask for the base tree's listing and files. See [Checkout snapshots](#checkout-snapshots) | `CONTEXTSTREAM_CHECKOUT_SNAPSHOT=off`, `"checkout_snapshot": false` in `.contextstream/config.json`, or a prefix allowlist in `CONTEXTSTREAM_CHECKOUT_SNAPSHOT_REPOS` |
+| Tools the API defines for your account | Available according to the account's settings. `check` runs when called or when an enabled hook schedules work | Tool arguments and workspace scope. A streamed tool can also send the checkout and the environment described below. See [Tool calls and environment](#tool-calls-and-environment) | `CONTEXTSTREAM_HOSTED_TOOLS=off` or turn off remote checks for your account. `CONTEXTSTREAM_HOSTED_ENV=off` omits the environment description and version probes |
+| Command routing (Claude Code) | With the managed hook and a tool whose command hints match | The hook passes the command to `contextstream-mcp run`, which sends it with the normal hosted-check payload when a tool takes it. See [Tool calls and environment](#tool-calls-and-environment) | `CONTEXTSTREAM_HOSTED_TOOLS=off` or `CONTEXTSTREAM_HOOK_ENABLED=false` |
+| Preparation (`:prepare`) | Background call from supported local hooks when `check` is available | Repository identity, workspace scope when known, detected language IDs and the normal snapshot stream | `CONTEXTSTREAM_HOSTED_TOOLS=off` or disable checkout snapshots |
+| Speculative checks | Off until opted in | Changed paths for planning and the normal snapshot stream for each admitted check | `CONTEXTSTREAM_SPECULATIVE_CHECKS=off` overrides the account setting. The hosted-tool and snapshot switches also apply |
+| Contract checks | On for eligible hosted MCP checks | Changed path names and bounded, filtered file contents for consumer checks | `CONTEXTSTREAM_CONTRACT_CHECK=off` skips the consumer check. The primary check keeps its normal payload |
+| Verification gates | Off until set in workspace or project policy | Scope for the policy lookup. An enabled gate also sends the gate name, target tree ID and repository key when known | `GET` and `PUT /api/v1/mcp/hosted-tools/gate-policy`. `CONTEXTSTREAM_HOSTED_TOOLS=off` disables the local receipt lookups |
+| Verification maps | Read when the project is planned or the map is opened | Planning sends paths and scope. Saving a map sends its directory rules and revision | Edit the project's Verification Map in Capsules or through the API |
 | Editor lifecycle hooks | selected supported editors | Hook-specific MCP requests documented by generated rules | `CONTEXTSTREAM_HOOK_ENABLED=false` or uninstall/update the managed hooks |
 | Mid-run coordination notices | on where hooks are installed | While a session makes tool calls, at most every 35 s a detached background request asks for new coordination notices: session id, workspace/project scope, folder path, agent handle (`CONTEXTSTREAM_AGENT_NAME` or an `agent-<name>` scratch-folder name), and on the first request a 500-character task summary. Without hooks, the local MCP server makes the same request and adds notices to the next ContextStream tool result | `CONTEXTSTREAM_MID_RUN_NOTICES=0`; interval `CONTEXTSTREAM_NOTICE_POLL_SECS` (5–300) |
 | Live run progress | sent when your assistant calls the `progress` tool; where hooks are installed and you turned it on (`CONTEXTSTREAM_RUN_PROGRESS_AUTO=on`; off by default), also the signals in [Live run progress from the hooks](#live-run-progress-from-the-hooks) | The report as your assistant wrote it: a title, the step it is on, its checklist, a percentage, links it opened (PR, preview, deploy), what it waits on and a final summary; the workspace and project, and the ticket, loop, plan and step ids the report names; a run key (on the local server, a random id made for the MCP process plus the ticket id; on the hosted gateway, a digest of the session or caller plus the ticket id; or the key your assistant gave); the agent: the name you configured (`CONTEXTSTREAM_AGENT_NAME` or an `agent-<name>` scratch-folder name), else the name the MCP client gives itself with four characters of the session part ("Claude Code 3fa9") and an id made of the client name and eight of them, so two sessions are two agents; never a folder, user or host name. Workspace members who can read the project see it live. After a report, the local MCP server sends a background request every 30 s with only the workspace, project, run key and agent (no step and none of your assistant's words), so the run is shown as live while the session is open; it stops when the run is reported finished, when the MCP process exits, or after four hours without a report. The hosted gateway sends no background request, except in the workspaces its operator lists in `CONTEXTSTREAM_RUN_PROGRESS_SIGNS_WORKSPACES` (none by default): there a tool call of a session it can tell apart (by the session header or `Mcp-Session-Id`, never by a name alone) counts as a sign of life for that session's own default run, the one its reports that name no run and no ticket go to. At most once a minute, under your own key or sign-in, the gateway reads that run and, when it is open, not waiting and reported on within four hours, sends a bare report with only the workspace, the run id and the run's agent. It does so only once the API has said whose that key or sign-in is: the gateway asks the API for the account (`GET /auth/me`, under your own key or sign-in) when you connect, and again after a report of yours was recorded under a key or sign-in it has no such answer for, at most once a minute. No other answer of the API counts, and a refusal ends it. The gateway remembers the answer as two digests (of the key or token, and of the account id), never the key, the token or the id: for ten minutes, or, for a key or sign-in a run was reported under, for as long as that run can get a sign (four hours). Signs are counted by that account: sixty a minute in a workspace, whatever keys and sessions it uses. Runs reported under your own `run_key` or on a ticket get no such sign | `CONTEXTSTREAM_RUN_PROGRESS=off` (the tool then answers that reporting is off and sends nothing) |
@@ -21,6 +26,208 @@ setup wizard prints the same material before it writes configuration.
 | Usage metadata | on | A random installation ID stored in `~/.contextstream/installation.json` (never derived from a hostname, username, path or hardware), plus the client name and version, OS family and version, and CPU architecture, go in `X-ContextStream-*` headers on the server's API requests; `init` adds the editors setup configured. Two events posted to `/api/v1/activation/events` add workspace, project and session IDs: `first_mcp_action_succeeded` (once per session; tool name and operation category) and `mcp_connection_failed` (stage, error code, HTTP status). The metadata carries no file contents, queries, tool arguments or paths | `CONTEXTSTREAM_ACTIVATION_EVENTS=off` turns off the headers, the `init` fields and the events; the original `CONTEXTSTREAM_ACTIVATION_SCHEMA_VERSION=0` still works |
 | Session header (Claude Code, hosted server) | on where setup wrote Claude Code's hosted entry; the agent name only where you also turned on signs of life (`CONTEXTSTREAM_RUN_PROGRESS_SIGNS=on`; off by default) | One header, `X-ContextStream-Client-Session`, with a random id that `contextstream-mcp hook mcp-headers` prints when Claude Code connects (its `headersHelper`). Never derived from a hostname, username, path, key or the editor's session id. With signs of life on, also `X-ContextStream-Agent-Name` with your agent's name (`CONTEXTSTREAM_AGENT_NAME`, else `AGENT_NAME`, else the name in an `agent-<name>` working folder), on every request of that session whatever the workspace. See [The session header](#the-session-header-claude-code) | `CONTEXTSTREAM_RUN_PROGRESS=off` (the command then prints no header); without `CONTEXTSTREAM_RUN_PROGRESS_SIGNS=on` no name is sent |
 | Local Git capture | on | Event type; commit SHA/time; branch/ref names; aggregate additions, deletions and files changed; first-line commit subject bounded to 256 characters and redacted; opaque `checkout-v1:<uuid>`; canonical credential-free repository remote; optional session/agent label | `CONTEXTSTREAM_GIT_CAPTURE=off`, or set `.contextstream/config.json` `git_capture.enabled=false`; restrict `git_capture.events` |
+
+## Remote checks and verification
+
+### Checkout snapshots
+
+The initial HTTP request identifies the repository by its checkout folder name
+and a SHA-256 digest of its `origin` URL. Without an origin, the input to the
+digest is the sorted IDs of the repository's initial commits, or the resolved
+checkout path before the first commit. The request sends the digest and folder
+name. Someone who can guess the input can confirm it against the digest.
+
+If the API issues a stream, the stream sends the last commit's tree ID, the
+snapshot tree ID, the absolute checkout root (which can include your username),
+the repository-relative paths, Git modes and blob IDs of changed and added
+files, and deleted path names. It sends a Git pack with the changed and added
+blobs, including a changed symlink's target text. The worker can request the
+base tree's full file listing and blobs from that tree or the changed set. The
+client refuses other objects and builds the snapshot without changing your
+Git index or object store. The hosted MCP gateway cannot take a snapshot of
+your machine.
+
+The change pack excludes Git-ignored untracked files and skips untracked
+files in generated directories such as `node_modules` and a cache-tagged
+Cargo `target` directory. Tracked changes in those directories can still
+be sent. The client skips changed files excluded by `.contextstream/ignore`
+or a `.contextignore`.
+For changed regular files, the client also checks credential filenames and
+looks for private keys, service-account keys and AWS access key pairs in the
+first 256 KiB of files up to 1 MiB. Those filters apply to the changed-file
+pack. The worker can still request a withheld path's committed version from
+the base tree, and deleted path names are sent separately. Withheld-file
+reasons stay local on the streamed `check` path. A tool that takes an HTTP
+snapshot attachment receives the repository identity, both tree IDs, change
+counts and withheld path names and reasons.
+
+`CONTEXTSTREAM_CHECKOUT_SNAPSHOT=off` stops snapshots. You can also commit
+`"checkout_snapshot": false` in `.contextstream/config.json`, or restrict
+eligible repositories with `CONTEXTSTREAM_CHECKOUT_SNAPSHOT_REPOS`.
+
+### Tool calls and environment
+
+The tool catalog request carries the workspace ID when known. The initial
+call sends the tool arguments, workspace scope when known, and the repository
+identity for a streamed check. The stream uses a token for that call. Your API
+key authenticates the HTTP request. The stream also carries the run details
+from the API, including the command, repository key, working directory within
+the repository and time limits.
+
+For `check`, `run`, `:prepare` and speculative checks, the stream can include
+values for environment variables the API requests. The client filters
+credential-like names and values with URL logins and forwards up to 32 values
+of up to 4 KiB each. If a variable the API marks as local-only is set, the client
+declines to open the stream after the initial request. The variable's value
+stays local. By default the stream also includes the OS and CPU architecture,
+CPU count, whether the process runs as root, the time zone and up to 32 tool
+versions. `CONTEXTSTREAM_HOSTED_ENV=off` removes that description and skips
+the probes. Forwarding requested environment variables uses its own filter.
+
+The client probes a tool found on `PATH` outside the repository, running it
+directly in the command's folder for up to two seconds with install-suppression
+settings. It uses `go version` for Go, `zig version` for Zig and tries
+`java --version` followed by `java -version` for Java. Most tools use
+`--version`. It skips banner lines, removes path-like words apart from
+Go's trailing OS/architecture, redacts the user, home folder and host names
+when they are at least three characters long, and keeps up to 200 characters
+per version line. A version manager can still pick a version based on the
+folder and may try to install a missing version within the time limit.
+
+In Claude Code, the managed hook can route a matching shell command through
+`contextstream-mcp run`. It uses command hints cached locally by credential
+digest and API address and leaves shell permissions to the client. If the
+remote check declines or is unavailable, `run` runs the command locally.
+For a supported failing check with structured failure details, the client
+can send a follow-up to `/api/v1/mcp/hosted-tools/calls/<call_id>/diagnose`
+with those details, the base comparison if available, the time budget and
+any known workspace, project and repository key. The text report can cite
+matching context. The hosted service can turn repeated failures or a failure
+followed by a passing check into a workspace lesson, using scrubbed check
+metadata already received by the service.
+
+### Preparation and speculative checks
+
+A supported session-start hook or post-edit hook can start `:prepare` in the
+background when remote checks are available. The HTTP call sends the repository
+identity, workspace ID when known, the `:prepare` request and language IDs
+inferred from local marker filenames. If the API issues a stream, the client
+sends a checkout snapshot with the current changes and the usual environment
+fields described above. The worker can fetch missing base tree data over
+that stream, materialize the checkout and prepare dependencies. There is no
+check command from your session to run. Preparation costs no credits and
+failures are silent.
+
+Opted-in speculative checks start after a successful edit reported by the
+post-tool hook and a debounce period. The snapshot is of the checkout at that
+point, so it can include other uncommitted changes. When a workspace is
+configured, the planner receives its ID, the project ID when configured, the
+repository key, up to 128 repository-relative changed or deleted paths from
+the snapshot, and targeted scope. The client sends no file contents to the
+planner. A background check admitted to run sends the selected command,
+working directory when applicable, speculative flag and credit limit, local
+opt-in when used, repository identity and workspace scope. Each check then
+uses the normal snapshot and environment stream. The local credit limits
+control execution. The planning request can still happen when those limits
+have been reached.
+
+### Contract checks
+
+After a successful hosted MCP `check` with recorded changes and a workspace,
+the client can make a second request to
+`POST /api/v1/mcp/hosted-tools/contract-check`. The request carries the workspace
+ID, the session's project ID when known, the checkout folder name and origin
+digest, and up to 200 distinct repository-relative paths from the snapshot.
+This list includes changed, added and deleted paths. The API can receive
+those names even if their contents are ineligible.
+
+For selected changed and added files, the request also carries the path,
+Git mode, SHA-256 digest and full UTF-8 contents of the blob from that
+snapshot, encoded as base64. The client sends at most 24 files, up to 64 KiB
+each and 512 KiB of decoded file bytes in total. Selection covers OpenAPI
+and Swagger documents, protobuf, GraphQL, Avro, SQL and TypeScript declaration
+files, and paths under `contracts/`, `openapi/`, `swagger/`, `api/`, `routes/`,
+`handlers/`, `schema/`, `schemas/`, `types/`, `sdk/` and `proto/`. When the
+snapshot has at most 24 added or changed files, ordinary `.ts`, `.tsx`, `.rs`,
+`.go` and `.py` files are also candidates.
+
+The client supplies contents only for eligible regular UTF-8 files. It
+skips symlinks, snapshot exclusions, oversized files and recognized secret
+filenames such as `.env` variants other than standard templates, `id_rsa`,
+`.npmrc`, `credentials.json` and key files. It scans the full text of eligible
+blobs for private-key blocks, service-account JSON containing a private key,
+and AWS access key pairs. A match withholds the entire blob. Other embedded
+values can still be present in the bytes. The primary check's snapshot has
+already been sent according to the ordinary snapshot rules.
+
+ContextStream looks up consumers in the same workspace using project graph
+links and matching indexed contract paths, and uses each consumer's GitHub
+connection to resolve its default branch. The MCP can open up to four
+consumer streams. Each stream sends the API's run details, the consumer's
+tree ID, and the contract bytes the API mapped to that consumer's paths.
+The client sends an empty Git pack and no local environment values or tool
+versions. If the worker needs consumer base files, the client ends the stream
+without supplying them. The worker applies the change to a temporary copy.
+The client reports a consumer as unverified when the worker cannot show
+it applied the overlay. A consumer check that runs is billed as a normal
+check, subject to the usual cache and billing rules. The secondary request
+is skipped for automatic preparation, speculative checks and shell `run`.
+
+### Receipts and gate checks
+
+The hosted service can record a passing receipt from a verified, signed
+usage report for a remote run that exited successfully. The receipt includes the
+call, workspace and actor IDs, repository key, target tree ID, command digest,
+command family or engine, exit code and verification time. It is created by
+the service from the hosted run. The client makes no separate receipt upload.
+A receipt for the primary check is about that run. Consumer contract outcomes
+come back separately after it. Use required check families when the policy
+needs proof that particular checks ran. The receipt lookup accepts any fresh
+passing receipt for the tree when no families are required.
+
+Local gate lookups send the workspace and project IDs when known to
+`GET /api/v1/mcp/hosted-tools/gate-policy`. The policy can be cached on disk
+for 45 seconds. When it enables the gate, a second request to
+`GET /api/v1/mcp/hosted-tools/receipts/check` adds the gate name, exact Git
+tree ID and repository key when available. Git's `pre-push` hook uses the trees
+of the refs Git is sending. The editor's pre-tool gate uses the checkout tree,
+computed locally with the snapshot exclusions. The requests carry no file
+contents, checkout path, shell command text or task text. A push can also send
+its ordinary metadata when Git capture is enabled. The local hook lets the
+action proceed if the policy or receipt lookup fails.
+
+### Verification maps
+
+For targeted `verify`, the planning request carries the workspace ID, any
+resolved project ID and repository digest, the normalized repository-relative
+changed paths and the scope. Those paths can come from the input, a local
+snapshot or Git status and diff. The planning request carries path names even
+when snapshot uploads are disabled. If the planner returns a trace ID, the
+client sends it with subsequent hosted checks so ContextStream can tie their
+outcomes to the plan. Each remote check still sends its regular check payload.
+
+The service can store edited directory names, planned commands and working
+directories in a project trace and link eligible hosted calls to it.
+Suggestions come from your recent traced checks that found regressions.
+Opening the map reads stored rules by workspace and project. Saving it sends
+those IDs, the revision and the complete rule list of directory, command
+and working directory to `PUT /api/v1/mcp/hosted-tools/verification-map/<project>`.
+The web app transfers no local file contents when it saves a map. A project's
+Live Capsule can show its verification rules.
+
+### Capsule and handoff summaries
+
+ContextStream builds verification summaries for capsules and handoffs from
+stored receipts and check metadata. These can include tree and commit IDs,
+command families, status, known base failure counts and timestamps. Reading
+the summary causes no checkout upload. A handoff can compare a target tree
+stored in its metadata.
+
+Creating a Review Capsule from a local MCP session is a separate, explicit
+upload. The client sends the repository name, commit range, review text and
+selected Git diff hunks or excerpts after local secret filtering, with the
+workspace and project scope. The review can carry receipt information from
+the hosted service.
 
 ## Live run progress from the hooks
 

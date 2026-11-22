@@ -323,6 +323,35 @@ fn a_call_is_given_its_limits_plus_slack() {
     );
 }
 
+#[test]
+fn hello_forwards_optional_prepare_and_languages_fields() {
+    let request = json!({
+        "id": "mc-1234",
+        "repo_key": "repo-12345678",
+        "cwd": "",
+        "command": ":prepare",
+        "timeout_s": 600,
+        "wait_s": 5,
+        "prepare": true,
+        "languages": ["rust", "typescript"],
+    });
+    let frame = hello(&request, Map::new(), Map::new(), Delivery::ToolResult).unwrap();
+    assert_eq!(frame["prepare"], json!(true));
+    assert_eq!(frame["languages"], json!(["rust", "typescript"]));
+
+    let without = json!({
+        "id": "mc-1234",
+        "repo_key": "repo-12345678",
+        "cwd": "",
+        "command": "cargo test",
+        "timeout_s": 600,
+        "wait_s": 60,
+    });
+    let plain = hello(&without, Map::new(), Map::new(), Delivery::ToolResult).unwrap();
+    assert!(plain.get("prepare").is_none());
+    assert!(plain.get("languages").is_none());
+}
+
 #[tokio::test]
 async fn a_call_sends_its_hello_and_pack_answers_needs_and_returns_the_result() {
     let repo = changed_repo(0);

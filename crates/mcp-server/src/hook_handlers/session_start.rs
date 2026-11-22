@@ -209,6 +209,7 @@ pub async fn handle() -> Result<()> {
     } else {
         output_text
     };
+    super::prewarm::maybe_spawn(&cwd);
     super::write_context_and_notice_for_input(
         &input,
         output_text,

@@ -355,6 +355,17 @@ pub fn hello(
     if let Some(pipefail) = request.get("pipefail").filter(|value| value.is_boolean()) {
         hello.insert("pipefail".into(), pipefail.clone());
     }
+    if let Some(prepare) = request.get("prepare").filter(|value| value.is_boolean()) {
+        hello.insert("prepare".into(), prepare.clone());
+    }
+    if let Some(languages) = request.get("languages").and_then(Value::as_array) {
+        let strings: Vec<Value> = languages
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|lang| Value::String(lang.to_string()))
+            .collect();
+        hello.insert("languages".into(), Value::Array(strings));
+    }
     for (key, value) in fields {
         hello.insert(key, value);
     }

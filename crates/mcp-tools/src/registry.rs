@@ -2782,6 +2782,26 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
             parallel_safe: false,
             batch_safe: false,
         },
+        "verify" => DiscoveryHints {
+            aliases: &[
+                "ms_verify",
+                "run checks",
+                "verify changes",
+                "targeted tests",
+                "smart tests",
+            ],
+            tags: &["verify", "tests", "checks", "graph", "targeted", "ci"],
+            when_to_use: "Run graph-driven verification checks for your changed files (selecting only impacted tests when safe, or automatically escalating to full suite for lockfiles, migrations, auth, shared fixtures, or high blast radius).",
+            avoid_when: "Do not use for searching code or reading memory; use search or memory instead.",
+            examples: &[
+                "verify my current changes",
+                "run targeted tests for src/billing.ts",
+                "run full verification suite",
+            ],
+            latency_class: "slow",
+            parallel_safe: false,
+            batch_safe: false,
+        },
         _ => DiscoveryHints {
             aliases: &[],
             tags: default_category_tags(metadata.category),
@@ -2866,6 +2886,8 @@ const STANDARD_TOOLS: &[&str] = &[
     "coordination",
     // Live run progress: what an agent is doing now, for people watching.
     "progress",
+    // Graph-driven smart verification checks (`ms_verify` alias).
+    "verify",
     // Context Feeds
     "feed",
     // Integrations
@@ -2978,6 +3000,8 @@ const CONSOLIDATED_TOOLS: &[&str] = &[
     "coordination",
     // Live run progress (report, get, list).
     "progress",
+    // Graph-driven smart verification checks (`ms_verify` alias).
+    "verify",
     "feed",
     "media",
     "skill",

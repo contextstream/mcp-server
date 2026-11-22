@@ -177,6 +177,29 @@ fn matches_marker(names: &HashSet<String>, marker: &str) -> bool {
     })
 }
 
+/// Detect canonical language IDs (`"rust"`, `"typescript"`, `"python"`, ...)
+/// matching `names` against `catalog`.
+pub fn detect_language_ids(names: &HashSet<String>, catalog: &[Language]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for lang in catalog {
+        if lang.markers.iter().any(|m| matches_marker(names, m))
+            && !ids.iter().any(|id| id == &lang.id)
+        {
+            ids.push(lang.id.clone());
+        }
+    }
+    ids
+}
+
+/// Detect canonical language IDs present in `folder` using the built-in catalog.
+pub fn local_language_ids(folder: &Path) -> Vec<String> {
+    let Ok(names) = project_filenames(folder) else {
+        return Vec::new();
+    };
+    let catalog = builtin_languages();
+    detect_language_ids(&names, &catalog)
+}
+
 #[derive(Debug, Default, Serialize, PartialEq)]
 pub struct ProjectLanguages {
     pub standard: Vec<String>,
@@ -358,6 +381,14 @@ mod tests {
         assert_eq!(actual.more, [".NET"]);
         assert_eq!(actual.local, ["Clojure"]);
         assert_eq!(actual.recommendation(), (true, true));
+        assert_eq!(
+            detect_language_ids(&names, &builtin_languages()),
+            ["rust", "typescript", "dotnet"]
+        );
+        assert_eq!(
+            local_language_ids(root.path()),
+            ["rust", "typescript", "dotnet"]
+        );
         assert_eq!(indexed_filename("lib/Core.csproj"), Some("Core.csproj"));
         assert_eq!(indexed_filename("node_modules/Gemfile"), None);
         assert_eq!(indexed_filename("a/b/go.mod"), None);

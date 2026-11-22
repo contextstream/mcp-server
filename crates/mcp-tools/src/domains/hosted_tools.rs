@@ -2382,6 +2382,230 @@ fn result_from(name: &str, data: &Value, output: String) -> ToolResult {
     }
 }
 
+const PREWARM_DEDUP_TTL: Duration = Duration::from_secs(600);
+const PREWARM_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
+const PREWARM_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+const PREWARM_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+const PREWARM_HINTS_BUDGET: Duration = Duration::from_secs(3);
+
+/// Compute the worker workspace key (`repoKey`), matching `contextstream` `check_tool::repo_key` byte-for-byte.
+pub fn prepare_repo_key(repo_name: &str, origin_sha256: &str) -> String {
+    let base = repo_name
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let lowered: String = base
+        .chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect();
+    let mut cleaned = String::new();
+    let mut in_run = false;
+    for c in lowered.chars() {
+        if matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '-') {
+            cleaned.push(c);
+            in_run = false;
+        } else if !in_run {
+            cleaned.push('-');
+            in_run = true;
+        }
+    }
+    let mut name = cleaned
+        .trim_matches(|c| matches!(c, '-' | '.' | '_'))
+        .to_string();
+    if name.is_empty() {
+        name = "repo".to_string();
+    }
+    if name.len() > 40 {
+        name.truncate(40);
+    }
+    let prefix: String = origin_sha256.chars().take(8).collect();
+    format!("{name}-{prefix}")
+}
+
+fn default_prewarm_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|home| home.join(".contextstream").join("prewarm"))
+}
+
+fn prewarm_stamp_path(
+    dir: &std::path::Path,
+    repo_key: &str,
+    base_tree: &str,
+) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(
+        format!("{repo_key}\0{base_tree}").as_bytes(),
+    ));
+    dir.join(format!("{digest}.stamp"))
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn prewarm_dedup_active(stamp_path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(stamp_path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        // Symlink or non-regular file: treat as blocked/active so we never write through symlinks.
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(stamp_path) else {
+        return false;
+    };
+    let Some(until) = text.trim().parse::<u64>().ok() else {
+        return false;
+    };
+    now_unix_secs() < until
+}
+
+fn write_prewarm_stamp(stamp_path: &std::path::Path, ttl: Duration) {
+    use std::io::Write;
+    let Some(parent) = stamp_path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if std::fs::symlink_metadata(stamp_path).is_ok_and(|meta| !meta.is_file()) {
+        return;
+    }
+    let until = now_unix_secs().saturating_add(ttl.as_secs().max(1));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(".prewarm-{}-{nonce}.tmp", std::process::id()));
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+    else {
+        return;
+    };
+    if file.write_all(until.to_string().as_bytes()).is_err() || file.sync_all().is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    drop(file);
+    if std::fs::rename(&tmp_path, stamp_path).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
+/// Asynchronously pre-warm the remote worker workspace for `folder`, silently ignoring all errors.
+pub async fn fire_and_forget_prepare(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    folder: &std::path::Path,
+) {
+    let dedup_dir = default_prewarm_dir();
+    fire_and_forget_prepare_with(
+        client,
+        session,
+        folder,
+        dedup_dir.as_deref(),
+        PREWARM_DEDUP_TTL,
+    )
+    .await;
+}
+
+/// Testable implementation of [`fire_and_forget_prepare`] with configurable dedup directory and TTL.
+pub async fn fire_and_forget_prepare_with(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    folder: &std::path::Path,
+    dedup_dir: Option<&std::path::Path>,
+    ttl: Duration,
+) {
+    if off_by(std::env::var(ENV_SWITCH).ok().as_deref()) {
+        return;
+    }
+    let Some(identity) = crate::domains::slipstream::caller_identity(client).await else {
+        return;
+    };
+    let Some(cache) = command_hints_for_run(client, session, &identity, PREWARM_HINTS_BUDGET).await
+    else {
+        return;
+    };
+    if cache.tool_named("check").is_none() {
+        return;
+    }
+    let Ok(start) = CheckoutSnapshot::begin(folder).await else {
+        return;
+    };
+    let checkout_identity = start.identity();
+    let Ok(snapshot) = start.complete().await else {
+        return;
+    };
+    let repo_key = prepare_repo_key(&snapshot.repo_name, &snapshot.origin_sha256);
+    let stamp_path = dedup_dir.map(|dir| prewarm_stamp_path(dir, &repo_key, &snapshot.base_tree));
+    if let Some(path) = stamp_path.as_deref() {
+        if prewarm_dedup_active(path) {
+            return;
+        }
+    }
+    let languages = mcp_client::remote_checks::local_language_ids(&snapshot.root);
+    let mut arguments = serde_json::json!({
+        "command": ":prepare",
+        "prepare": true,
+        "wait_seconds": 5,
+    });
+    if !languages.is_empty() {
+        arguments["languages"] = serde_json::json!(languages);
+    }
+    let mut body = serde_json::json!({
+        "arguments": arguments,
+        "checkout": checkout_identity,
+    });
+    if let Some(workspace) = workspace_of(client, session).await {
+        body["workspace_id"] = Value::String(workspace);
+    }
+
+    let failure_backoff = ttl.min(PREWARM_FAILURE_BACKOFF);
+    let Ok(answer) = client
+        .hosted_tool_call("check", &body, PREWARM_CALL_TIMEOUT)
+        .await
+    else {
+        if let Some(path) = stamp_path.as_deref() {
+            write_prewarm_stamp(path, failure_backoff);
+        }
+        return;
+    };
+    if !answer.is_success() {
+        if let Some(path) = stamp_path.as_deref() {
+            write_prewarm_stamp(path, failure_backoff);
+        }
+        return;
+    }
+    let Ok(call) = stream_call(&answer.data) else {
+        if let Some(path) = stamp_path.as_deref() {
+            write_prewarm_stamp(path, failure_backoff);
+        }
+        return;
+    };
+    let (events, _inbox) = tokio::sync::mpsc::unbounded_channel();
+    let succeeded = match tokio::time::timeout(
+        PREWARM_STREAM_TIMEOUT,
+        drive_stream(&call, &snapshot, Delivery::ToolResult, events),
+    )
+    .await
+    {
+        Ok(Ok(frame)) => {
+            frame.get("ran").and_then(Value::as_bool) == Some(true)
+                && frame.get("exit").and_then(Value::as_i64).unwrap_or(0) == 0
+        }
+        _ => false,
+    };
+    if let Some(path) = stamp_path.as_deref() {
+        write_prewarm_stamp(path, if succeeded { ttl } else { failure_backoff });
+    }
+}
+
 #[cfg(test)]
 #[path = "hosted_tools_tests.rs"]
 mod tests;

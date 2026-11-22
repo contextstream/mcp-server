@@ -1646,16 +1646,13 @@ struct StubReq {
     body: Value,
 }
 
-async fn stub_with_headers(
-    respond: Arc<
-        dyn Fn(
-                &StubReq,
-            )
-                -> std::pin::Pin<Box<dyn std::future::Future<Output = (u16, String)> + Send>>
-            + Send
-            + Sync,
-    >,
-) -> (String, Arc<StdMutex<Vec<StubReq>>>) {
+type StubResponder = Arc<
+    dyn Fn(&StubReq) -> std::pin::Pin<Box<dyn std::future::Future<Output = (u16, String)> + Send>>
+        + Send
+        + Sync,
+>;
+
+async fn stub_with_headers(respond: StubResponder) -> (String, Arc<StdMutex<Vec<StubReq>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let seen = Arc::new(StdMutex::new(Vec::new()));
@@ -2416,7 +2413,7 @@ assertion `left == right` failed: new_panic_detail
     for target_len in [550usize, 700, 1200, 2048, 3072, 4096, 14700] {
         let mut raw = raw_494.to_string();
         while raw.len() < target_len {
-            if raw.len() % 3 == 0 {
+            if raw.len().is_multiple_of(3) {
                 raw.push_str(padded_new);
             } else {
                 raw.push_str(filler_line);
@@ -2833,4 +2830,211 @@ lastError: new_failure_in_tests/new.test.ts new case
         fp_sliced.contains("lastError: new_failure_in_tests/new.test.ts new case"),
         "fp lowercase ident error was swallowed:\n{fp_sliced}"
     );
+}
+
+async fn prepare_stream_api(answer: Value) -> (String, Arc<StdMutex<Vec<Seen>>>) {
+    let mut definition = echo_definition("stream");
+    definition["name"] = json!("check");
+    definition["attachments"] = json!(["checkout_snapshot"]);
+    definition["command_hints"] = json!({"argument": "command", "patterns": ["^cargo check$"]});
+    stub(Arc::new(move |method, path, _| match (method, path) {
+        ("GET", "/mcp/hosted-tools") => (200, json!({"tools": [definition.clone()]}).to_string()),
+        ("POST", "/mcp/hosted-tools/check/call") => (200, answer.to_string()),
+        _ => (404, "{}".to_string()),
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn fire_and_forget_prepare_sends_languages_dedups_by_repo_and_base_tree_and_swallows_errors()
+{
+    let (ws_url, sockets) = frames_service(vec![Step::Json(json!({
+        "type": "result", "ran": true, "prepared": true, "exit": 0, "warm": false
+    }))])
+    .await;
+    let (url, api_seen) = prepare_stream_api(json!({
+        "stream": {
+            "url": ws_url,
+            "token": "call-token-prep",
+            "protocol": "frames/1",
+            "request": {
+                "id": "call-prep-1",
+                "repo_key": "repo-key-1",
+                "cwd": "",
+                "command": ":prepare",
+                "prepare": true,
+                "languages": ["rust", "typescript"],
+                "timeout_s": 600,
+                "wait_s": 5,
+            }
+        },
+        "call": {"id": "call-prep-1"}
+    }))
+    .await;
+    let client = client_in_workspace(&url);
+    let (repo, session) = changed_checkout(&client).await;
+    std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    std::fs::write(repo.path().join("package.json"), "{\"name\":\"x\"}\n").unwrap();
+    let dedup = tempfile::tempdir().unwrap();
+
+    // Prime command_hints cache via listing so command_hints_for_run knows `check` is enabled.
+    let _ = check_tool(&client, &session).await;
+
+    // 1) First :prepare triggers POST + WS with prepare=true & detected languages.
+    fire_and_forget_prepare_with(
+        &client,
+        &session,
+        repo.path(),
+        Some(dedup.path()),
+        Duration::from_secs(600),
+    )
+    .await;
+    let calls_after_first: Vec<Seen> = api_seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.method == "POST")
+        .cloned()
+        .collect();
+    assert_eq!(calls_after_first.len(), 1);
+    assert_eq!(
+        calls_after_first[0].body["arguments"]["command"],
+        ":prepare"
+    );
+    assert_eq!(calls_after_first[0].body["arguments"]["prepare"], true);
+    assert_eq!(calls_after_first[0].body["arguments"]["wait_seconds"], 5);
+    assert_eq!(
+        calls_after_first[0].body["arguments"]["languages"],
+        json!(["rust", "typescript"])
+    );
+    {
+        let sock = sockets.lock().unwrap();
+        assert_eq!(sock.len(), 1);
+        assert_eq!(sock[0].hello["prepare"], json!(true));
+        assert_eq!(sock[0].hello["languages"], json!(["rust", "typescript"]));
+    }
+
+    // 2) Second :prepare on same (repo_key, base_tree) within 10m TTL is deduplicated.
+    fire_and_forget_prepare_with(
+        &client,
+        &session,
+        repo.path(),
+        Some(dedup.path()),
+        Duration::from_secs(600),
+    )
+    .await;
+    assert_eq!(
+        api_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.method == "POST")
+            .count(),
+        1
+    );
+    assert_eq!(sockets.lock().unwrap().len(), 1);
+
+    // 3) Changing base_tree (a new commit) invalidates dedup and triggers a new :prepare.
+    std::fs::write(repo.path().join("new.txt"), "commit\n").unwrap();
+    git_here(repo.path(), &["add", "new.txt"]);
+    git_here(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "second",
+        ],
+    );
+    fire_and_forget_prepare_with(
+        &client,
+        &session,
+        repo.path(),
+        Some(dedup.path()),
+        Duration::from_secs(600),
+    )
+    .await;
+    assert_eq!(
+        api_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.method == "POST")
+            .count(),
+        2
+    );
+    assert_eq!(sockets.lock().unwrap().len(), 2);
+
+    // 4) Silent error swallowing across 402, 429, 500, and worker exit-75 / closed WS.
+    for status in [402u16, 429, 500] {
+        let (err_url, err_seen) = stub(Arc::new(move |method, path, _| {
+            if method == "GET" && path == "/mcp/hosted-tools" {
+                (
+                    200,
+                    json!({"tools": [{
+                        "name": "check",
+                        "description": "Remote checks",
+                        "input_schema": {"type": "object"},
+                        "transport": {"kind": "stream"},
+                        "attachments": ["checkout_snapshot"],
+                        "command_hints": {"argument": "command", "patterns": ["^cargo check$"]}
+                    }]})
+                    .to_string(),
+                )
+            } else {
+                (status, json!({"error": {"message": "ignored"}}).to_string())
+            }
+        }))
+        .await;
+        let err_client = client_in_workspace(&err_url);
+        let (err_repo, err_session) = changed_checkout(&err_client).await;
+        let _ = check_tool(&err_client, &err_session).await;
+        fire_and_forget_prepare_with(
+            &err_client,
+            &err_session,
+            err_repo.path(),
+            Some(dedup.path()),
+            Duration::from_secs(600),
+        )
+        .await;
+        assert_eq!(
+            err_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.method == "POST")
+                .count(),
+            1
+        );
+    }
+    let (busy_ws, busy_sockets) = frames_service(vec![Step::Json(json!({
+        "type": "result", "ran": false, "exit": 75
+    }))])
+    .await;
+    let (busy_url, busy_seen) = prepare_stream_api(stream_answer(&busy_ws, "frames/1")).await;
+    let busy_client = client_in_workspace(&busy_url);
+    let (busy_repo, busy_session) = changed_checkout(&busy_client).await;
+    let _ = check_tool(&busy_client, &busy_session).await;
+    fire_and_forget_prepare_with(
+        &busy_client,
+        &busy_session,
+        busy_repo.path(),
+        Some(dedup.path()),
+        Duration::from_secs(600),
+    )
+    .await;
+    assert_eq!(
+        busy_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.method == "POST")
+            .count(),
+        1
+    );
+    assert_eq!(busy_sockets.lock().unwrap().len(), 1);
 }

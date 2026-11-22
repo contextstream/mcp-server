@@ -135,6 +135,11 @@ pub fn build_registry(
     // Agent Coach Kit: registered everywhere, visible only on the coach
     // surface (`/coach`, or CONTEXTSTREAM_TOOL_SURFACE_PROFILE=coach).
     domains::coach::register_coach_tools(&mut registry, client.clone());
+    domains::remote_checks::register_remote_checks_tools(
+        &mut registry,
+        Arc::new(client.clone()),
+        session.clone(),
+    );
     domains::skill::register_skill_tools(&mut registry, client, session.clone());
     // Compatibility chart/job surfaces self-gate when no provider is available.
     domains::charts::register_charts_tools(&mut registry, session.clone());
@@ -2349,12 +2354,17 @@ async fn handle_request_dispatch(
                         return handle_router_operations(id, registry, arguments);
                     }
                     "execute_operation" => {
+                        let op_includes_structured = include_workflow_contract
+                            || matches!(
+                                arguments.get("name").and_then(|v| v.as_str()),
+                                Some("verify" | "ms_verify")
+                            );
                         let context = mcp_tools::wire_tokens::WireResponseContext::stdio_jsonrpc(
                             id.clone(),
                             None,
                             None,
                         )
-                        .with_structured_content(include_workflow_contract)
+                        .with_structured_content(op_includes_structured)
                         .with_observation(wire_observation.clone());
                         return mcp_tools::wire_tokens::run_with_wire_response_context(
                             context,
@@ -2397,12 +2407,17 @@ async fn handle_request_dispatch(
                         .await;
                     }
                     "execute_operation" => {
+                        let op_includes_structured = include_workflow_contract
+                            || matches!(
+                                arguments.get("name").and_then(|v| v.as_str()),
+                                Some("verify" | "ms_verify")
+                            );
                         let context = mcp_tools::wire_tokens::WireResponseContext::stdio_jsonrpc(
                             id.clone(),
                             None,
                             None,
                         )
-                        .with_structured_content(include_workflow_contract)
+                        .with_structured_content(op_includes_structured)
                         .with_observation(wire_observation.clone());
                         return mcp_tools::wire_tokens::run_with_wire_response_context(
                             context,
@@ -2472,10 +2487,13 @@ async fn handle_request_dispatch(
 
             // A hosted tool's result carries its own structured part (how the run went), which
             // the caller is meant to read; review-credential `capsule` responses also carry
-            // structured verdict/validation problems when returned.
+            // structured verdict/validation problems when returned, and `verify` / `ms_verify`
+            // carries structured tier/escalation/commands diagnostics. The structured parts of the
+            // other tools stay off this wire.
             let include_structured = include_workflow_contract
                 || hosted_tool.is_some()
-                || (review_cred_only && tool_name == "capsule");
+                || (review_cred_only && tool_name == "capsule")
+                || matches!(tool_name, "verify" | "ms_verify");
 
             // MCP lists an unknown tool as a protocol error (#368).
             if registry.get(tool_name).is_none() && hosted_tool.is_none() {
@@ -3397,6 +3415,7 @@ mod tests {
         "session_remember",
         "skill",
         "vcs",
+        "verify",
         "workspace",
         "workspace_read",
     ];
@@ -3659,6 +3678,11 @@ mod tests {
         (
             "vcs",
             "7c3fb5e6aedda38da89c1384c341d4d05dbd15ba7445439f4301836170aea3a6",
+        ),
+        (
+            // Phase 2.1 graph-driven smart target selection (`verify` / `ms_verify`).
+            "verify",
+            "75c84c9c83f400ea7666b882b827294e12941462e58b4ec5dd6f0b9f9870dd05",
         ),
         (
             "workspace",
@@ -6389,5 +6413,65 @@ mod review_go_ahead {
             .await;
         println!("router mode, setting absent: {}", said(&outcome));
         assert_eq!(deletes(&seen).len(), 1, "{:?}", seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn stdio_tools_call_preserves_structured_content_for_verify_and_ms_verify() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"verify_wire_smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "#[test]\nfn smoke() { assert_eq!(2 + 2, 4); }\n",
+        )
+        .unwrap();
+
+        let (url, _) = api().await;
+        let config = Config {
+            api_url: url,
+            api_key: Some("test-api-key".to_string()),
+            ..Config::default()
+        };
+        let raw_client = ContextStreamClient::new(config.clone());
+        let client = Arc::new(raw_client.clone());
+        let session = Arc::new(SessionManager::new(raw_client.clone(), config.clone()));
+        let registry = Arc::new(build_registry(&config, raw_client.clone(), session.clone()));
+        let telemetry = AgenticTelemetry::new(raw_client, session.clone());
+
+        for tool_name in ["verify", "ms_verify"] {
+            let req = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": {
+                        "scope": "full",
+                        "cwd": temp.path().to_string_lossy()
+                    }
+                }
+            });
+            let raw_resp = handle_request(
+                &registry,
+                &client,
+                &session,
+                &telemetry,
+                req,
+                mcp_tools::wire_tokens::WireTokenObservation::default(),
+            )
+            .await;
+            let resp: serde_json::Value =
+                serde_json::from_str(&raw_resp).expect("jsonrpc response");
+            let structured = resp["result"]["structuredContent"]
+                .as_object()
+                .unwrap_or_else(|| panic!("missing structuredContent for {tool_name}: {resp}"));
+            assert_eq!(structured["tier"], "full");
+            assert_eq!(structured["scope"], "full");
+            assert_eq!(structured["passed"], true);
+        }
     }
 }

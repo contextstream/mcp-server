@@ -34,6 +34,7 @@ pub mod post_tool_use;
 pub mod post_tool_use_failure;
 pub mod pre_compact;
 pub mod pre_tool_use;
+pub(crate) mod prewarm;
 pub(crate) mod prompt_state;
 mod resume_intent;
 pub(crate) mod run_progress;
@@ -699,6 +700,8 @@ pub async fn dispatch_hook(name: &str) -> Result<()> {
         mid_run_notices::BACKGROUND_POLL_HOOK => mid_run_notices::run_background_poll().await,
         // Detached keep-alive of a session's runs, started by a hook.
         run_progress::BEAT_HOOK => run_progress::run_beater().await,
+        // Detached predictive workspace pre-warming (`:prepare`).
+        prewarm::PREPARE_HOOK => prewarm::run_background_prepare().await,
         // Codex `PostToolUse` and `Stop`: live progress only.
         run_progress::EVENT_HOOK => run_progress::handle_event_hook().await,
         "permission-request" => permission_request::handle().await,

@@ -1232,6 +1232,7 @@ pub async fn handle() -> Result<()> {
         super::dirty_drain::drain_best_effort(std::time::Duration::from_millis(1200)).await;
     }
 
+    super::prewarm::maybe_spawn(&cwd);
     if mirror_notes.is_empty() {
         write_stdout_json(&HookOutput::empty())?;
     } else {

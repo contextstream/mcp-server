@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.93
 
 - Declined remote checks show the worker's reason. `contextstream-mcp run -v` also shows the remote call ID.
 - `contextstream-mcp run` fetches missing or stale command hints, including in sessions using the hosted MCP. If the catalog is unavailable, commands run locally and skip catalog requests for 30 seconds.

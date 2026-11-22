@@ -1116,9 +1116,14 @@ pub async fn uninstall(
                 .dim()
             );
         }
-        // Only when there is something left: on a machine that never signed in
-        // the note names a directory that does not exist.
-        if dirs::home_dir().is_some_and(|home| home.join(".contextstream").is_dir()) {
+        // Only when there is something left: the sign-in's credentials file. The
+        // directory alone proves nothing, since uninstall itself may create it
+        // (its installation lock) on a machine that never signed in.
+        if dirs::home_dir().is_some_and(|home| {
+            home.join(".contextstream")
+                .join("credentials.json")
+                .is_file()
+        }) {
             println!();
             println!(
                 "  {}",

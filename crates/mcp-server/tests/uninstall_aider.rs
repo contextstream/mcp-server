@@ -206,5 +206,10 @@ fn uninstall_mentions_credentials_only_when_there_are_some_to_leave() {
         "nothing was ever signed in, so there is nothing left to name"
     );
     std::fs::create_dir_all(home.join(".contextstream")).unwrap();
+    assert!(
+        !said(run(&home, &project, &["uninstall", "--scope", "all"])),
+        "the directory alone (uninstall's own lock) holds no credentials"
+    );
+    std::fs::write(home.join(".contextstream").join("credentials.json"), "{}").unwrap();
     assert!(said(run(&home, &project, &["uninstall", "--scope", "all"])));
 }

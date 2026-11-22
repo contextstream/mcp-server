@@ -138,13 +138,13 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
         name: "graph_read",
         tool: "graph",
         title: "Read Code & Knowledge Graph",
-        description: "Read ContextStream code and knowledge graphs without changing anything: \
-                      dependencies, impact, usages, call_path, related items, item paths, \
-                      code decisions, contradictions, cached code_drift, circular_dependencies, \
-                      unused_code, complexity_metrics, quality_trends, quality_history and \
-                      quality_freshness. Same arguments as graph(action=...) for these actions. \
-                      Use this for every read; use `graph` only for ingest, quality_snapshot, \
-                      outbox ops or code_drift with refresh=true.",
+        description: "Read ContextStream code, knowledge, product/design and business ops graphs \
+                      without changing anything: dependencies, impact, usages, call_path, related, \
+                      path, decisions, contradictions, cached code_drift, quality metrics, \
+                      lineage, meeting_brief, universal_impact and entity_search. Same arguments as \
+                      graph(action=...) for these actions. Use this for every read; use `graph` \
+                      only for writes (ingest, quality_snapshot, entity_upsert, relation_upsert, \
+                      event_ingest, install_domain_pack, outbox ops or code_drift refresh=true).",
         actions: &[
             "dependencies",
             "impact",
@@ -161,6 +161,10 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
             "quality_trends",
             "quality_history",
             "quality_freshness",
+            "lineage",
+            "meeting_brief",
+            "universal_impact",
+            "entity_search",
         ],
     },
 ];
@@ -692,8 +696,10 @@ mod tests {
                             "related", "path", "decisions", "contradictions",
                             "code_drift", "circular_dependencies", "unused_code",
                             "complexity_metrics", "quality_trends", "quality_history",
-                            "quality_freshness", "ingest", "outbox_status",
-                            "outbox_canary", "quality_snapshot"
+                            "quality_freshness", "lineage", "meeting_brief",
+                            "universal_impact", "entity_search", "ingest", "outbox_status",
+                            "outbox_canary", "quality_snapshot", "entity_upsert",
+                            "relation_upsert", "event_ingest", "install_domain_pack"
                         ]
                     },
                     "target_id": {"type": "string"},
@@ -728,9 +734,23 @@ mod tests {
         tool.execute(json!({"action": "code_drift", "refresh": false}))
             .await
             .expect("explicit refresh=false code_drift read runs");
+        for new_read in ["lineage", "meeting_brief", "universal_impact", "entity_search"] {
+            tool.execute(json!({"action": new_read}))
+                .await
+                .expect(new_read);
+        }
 
         // Write/trigger actions are refused.
-        for write_action in ["ingest", "quality_snapshot", "outbox_canary", "outbox_status"] {
+        for write_action in [
+            "ingest",
+            "quality_snapshot",
+            "outbox_canary",
+            "outbox_status",
+            "entity_upsert",
+            "relation_upsert",
+            "event_ingest",
+            "install_domain_pack",
+        ] {
             let err = tool
                 .execute(json!({"action": write_action}))
                 .await
@@ -751,6 +771,6 @@ mod tests {
             "{refresh_err}"
         );
 
-        assert_eq!(inner.calls.lock().unwrap().len(), 4);
+        assert_eq!(inner.calls.lock().unwrap().len(), 8);
     }
 }

@@ -894,6 +894,35 @@ pub struct GraphInput {
     pub target_node_id: Option<String>,
     // Code-drift: recompute findings on demand before returning.
     pub refresh: Option<bool>,
+    // Unified Entity Spine, Feature Lineage, Pre-Meeting Brief, Business Ops & Universal Ripple
+    pub entity_id: Option<String>,
+    pub query: Option<String>,
+    pub kind: Option<String>,
+    pub target_kind: Option<String>,
+    pub canonical_name: Option<String>,
+    pub aliases: Option<Vec<String>>,
+    pub external_refs: Option<Value>,
+    pub attributes: Option<Value>,
+    pub status: Option<String>,
+    pub from_entity_id: Option<String>,
+    pub to_entity_id: Option<String>,
+    pub relation_type: Option<String>,
+    pub evidence_quote: Option<String>,
+    pub event_type: Option<String>,
+    pub metric_name: Option<String>,
+    pub metric_value: Option<f64>,
+    pub payload: Option<Value>,
+    pub severity: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub domain_pack: Option<String>,
+    pub meeting_id: Option<String>,
+    pub calendar_event_id: Option<String>,
+    pub title: Option<String>,
+    pub attendees: Option<Vec<String>>,
+    pub agenda: Option<String>,
+    pub direction: Option<String>,
+    pub include_code: Option<bool>,
+    pub include_linked_workspaces: Option<bool>,
 }
 
 /// Unified graph tool handler.
@@ -2974,8 +3003,298 @@ impl GraphTool {
                 }
                 Ok(output)
             }
+            "lineage" => {
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": scope.project_id,
+                    "entity_id": input.entity_id,
+                    "query": input.query.or(input.target_id),
+                    "kind": input.kind,
+                    "max_depth": input.max_depth,
+                });
+                let result: Value = self.client.post("/graph/lineage", body).await?;
+                let total = result.get("total_items").and_then(Value::as_u64).unwrap_or(0);
+                let warnings = result
+                    .get("drift_warnings")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let mut text = format!(
+                    "Feature lineage: {} linked artifact(s), {} drift warning(s).",
+                    total, warnings
+                );
+                if let Some(arr) = result.get("drift_warnings").and_then(Value::as_array) {
+                    for w in arr.iter().take(5) {
+                        if let Some(msg) = w.get("message").and_then(Value::as_str) {
+                            text.push_str(&format!("\n- [DRIFT] {}", msg));
+                        }
+                    }
+                }
+                let mut output = ToolResult::with_structured(text, result);
+                if let Some(note) = scope.note.as_deref() {
+                    output = output.with_prefix(format!("{}\n", note));
+                }
+                Ok(output)
+            }
+            "meeting_brief" => {
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": scope.project_id,
+                    "meeting_id": input.meeting_id,
+                    "calendar_event_id": input.calendar_event_id,
+                    "title": input.title.or(input.query),
+                    "attendees": input.attendees.unwrap_or_default(),
+                    "agenda": input.agenda,
+                });
+                let result: Value = self.client.post("/graph/meeting-brief", body).await?;
+                let text = result
+                    .get("rendered_brief")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "Pre-meeting brief generated.".to_string());
+                let mut output = ToolResult::with_structured(text, result);
+                if let Some(note) = scope.note.as_deref() {
+                    output = output.with_prefix(format!("{}\n", note));
+                }
+                Ok(output)
+            }
+            "universal_impact" => {
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": scope.project_id,
+                    "entity_id": input.entity_id,
+                    "target_id": input.target_id,
+                    "target_kind": input.target_kind.or(input.kind),
+                    "query": input.query,
+                    "max_depth": input.max_depth,
+                    "direction": input.direction,
+                    "include_code": input.include_code.unwrap_or(true),
+                    "include_linked_workspaces": input.include_linked_workspaces.unwrap_or(false),
+                });
+                let result: Value = self.client.post("/graph/universal-impact", body).await?;
+                let risk = result
+                    .get("risk_level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("low");
+                let total = result
+                    .get("total_impacted")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let anomalies = result
+                    .get("active_anomalies")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let cross_ws = result
+                    .get("cross_workspace_impacts")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let mut text = format!(
+                    "Universal impact: risk={}, {} impacted ({} cross-workspace), {} active anomaly(ies).",
+                    risk, total, cross_ws, anomalies
+                );
+                if let Some(arr) = result.get("active_anomalies").and_then(Value::as_array) {
+                    for a in arr.iter().take(5) {
+                        if let Some(s) = a.as_str() {
+                            text.push_str(&format!("\n- [ANOMALY] {}", s));
+                        }
+                    }
+                }
+                let mut output = ToolResult::with_structured(text, result);
+                if let Some(note) = scope.note.as_deref() {
+                    output = output.with_prefix(format!("{}\n", note));
+                }
+                Ok(output)
+            }
+            "entity_search" => {
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": scope.project_id,
+                    "query": input.query.or(input.target_id),
+                    "kind": input.kind,
+                    "status": input.status,
+                    "limit": input.limit,
+                });
+                let result: Value = self.client.post("/graph/entities/search", body).await?;
+                let count = result.get("count").and_then(Value::as_u64).unwrap_or(0);
+                let mut text = format!("Found {} canonical entity(ies).", count);
+                if let Some(arr) = result.get("entities").and_then(Value::as_array) {
+                    for e in arr.iter().take(10) {
+                        let k = e.get("kind").and_then(Value::as_str).unwrap_or("entity");
+                        let n = e.get("canonical_name").and_then(Value::as_str).unwrap_or("");
+                        let st = e.get("status").and_then(Value::as_str).unwrap_or("active");
+                        text.push_str(&format!("\n- [{}] {} ({})", k, n, st));
+                    }
+                }
+                let mut output = ToolResult::with_structured(text, result);
+                if let Some(note) = scope.note.as_deref() {
+                    output = output.with_prefix(format!("{}\n", note));
+                }
+                Ok(output)
+            }
+            "entity_upsert" => {
+                let kind = input.kind.ok_or_else(|| {
+                    Error::Validation("kind is required for entity_upsert".to_string())
+                })?;
+                let canonical_name = input.canonical_name.ok_or_else(|| {
+                    Error::Validation("canonical_name is required for entity_upsert".to_string())
+                })?;
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": scope.project_id,
+                    "kind": kind,
+                    "canonical_name": canonical_name,
+                    "aliases": input.aliases.unwrap_or_default(),
+                    "external_refs": input.external_refs,
+                    "attributes": input.attributes,
+                    "status": input.status,
+                });
+                let result: Value = self.client.post("/graph/entities", body).await?;
+                let id = result.get("id").and_then(Value::as_str).unwrap_or("unknown");
+                Ok(ToolResult::with_structured(
+                    format!("Upserted canonical entity ({id})."),
+                    result,
+                ))
+            }
+            "relation_upsert" => {
+                let from_entity_id = input.from_entity_id.ok_or_else(|| {
+                    Error::Validation("from_entity_id is required for relation_upsert".to_string())
+                })?;
+                let to_entity_id = input.to_entity_id.ok_or_else(|| {
+                    Error::Validation("to_entity_id is required for relation_upsert".to_string())
+                })?;
+                let relation_type = input.relation_type.ok_or_else(|| {
+                    Error::Validation("relation_type is required for relation_upsert".to_string())
+                })?;
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": scope.project_id,
+                    "from_entity_id": from_entity_id,
+                    "to_entity_id": to_entity_id,
+                    "relation_type": relation_type,
+                    "evidence_quote": input.evidence_quote,
+                });
+                let result: Value = self.client.post("/graph/entities/relations", body).await?;
+                Ok(ToolResult::with_structured(
+                    format!("Upserted entity relation ({relation_type})."),
+                    result,
+                ))
+            }
+            "event_ingest" => {
+                let entity_id = input.entity_id.ok_or_else(|| {
+                    Error::Validation("entity_id is required for event_ingest".to_string())
+                })?;
+                let event_type = input.event_type.ok_or_else(|| {
+                    Error::Validation("event_type is required for event_ingest".to_string())
+                })?;
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": scope.project_id,
+                    "entity_id": entity_id,
+                    "event_type": event_type,
+                    "severity": input.severity,
+                    "payload": input.payload,
+                    "metric_name": input.metric_name,
+                    "metric_value": input.metric_value,
+                    "idempotency_key": input.idempotency_key,
+                });
+                let result: Value = self.client.post("/graph/entities/events", body).await?;
+                let triggered = result
+                    .get("triggered_anomalies")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let materialized = result
+                    .get("materialized_edges")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                Ok(ToolResult::with_structured(
+                    format!(
+                        "Ingested event '{event_type}': {triggered} anomaly rule(s) triggered, {materialized} edge(s) materialized."
+                    ),
+                    result,
+                ))
+            }
+            "install_domain_pack" => {
+                let domain_pack = input.domain_pack.ok_or_else(|| {
+                    Error::Validation(
+                        "domain_pack is required for install_domain_pack".to_string(),
+                    )
+                })?;
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": scope.project_id,
+                    "domain_pack": domain_pack,
+                });
+                let result: Value = self.client.post("/graph/entities/domain-packs", body).await?;
+                let installed = result
+                    .get("installed_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                Ok(ToolResult::with_structured(
+                    format!("Installed domain pack '{domain_pack}' ({installed} schemas)."),
+                    result,
+                ))
+            }
             _ => Err(Error::Validation(format!(
-                "Unknown action: {}. Available actions: related, dependencies, impact, ingest, outbox_status, outbox_canary, call_path, path, circular_dependencies, unused_code, complexity_metrics, quality_trends, quality_history, quality_freshness, quality_snapshot, contradictions, code_drift, decisions, usages.",
+                "Unknown action: {}. Available actions: related, dependencies, impact, ingest, outbox_status, outbox_canary, call_path, path, circular_dependencies, unused_code, complexity_metrics, quality_trends, quality_history, quality_freshness, quality_snapshot, contradictions, code_drift, decisions, usages, lineage, meeting_brief, universal_impact, entity_search, entity_upsert, relation_upsert, event_ingest, install_domain_pack.",
                 input.action
             ))),
         }
@@ -3263,6 +3582,14 @@ impl ToolHandler for GraphTool {
             "code_drift",
             "decisions",
             "usages",
+            "lineage",
+            "meeting_brief",
+            "universal_impact",
+            "entity_search",
+            "entity_upsert",
+            "relation_upsert",
+            "event_ingest",
+            "install_domain_pack",
         ];
 
         SchemaBuilder::new()
@@ -3366,6 +3693,35 @@ impl ToolHandler for GraphTool {
             // Path fields
             .uuid("source_node_id", "Source node UUID (for path)", false)
             .uuid("target_node_id", "Target node UUID (for path)", false)
+            // Entity Spine, Lineage, Pre-Meeting Brief, Business Ops & Universal Ripple fields
+            .uuid("entity_id", "Canonical entity UUID (lineage, universal_impact, event_ingest)", false)
+            .string("query", "Search or seed query (lineage, universal_impact, entity_search)", false)
+            .string("kind", "Entity kind (okr, prd, design, feature, sku, warehouse, shipment, order, event, customer, etc.)", false)
+            .string("target_kind", "Optional seed kind for universal_impact", false)
+            .string("canonical_name", "Canonical entity name (entity_upsert)", false)
+            .array("aliases", "Entity aliases (entity_upsert)", "string", false)
+            .object("external_refs", "External refs e.g. file_path, figma_key, sku_code (entity_upsert)", false)
+            .object("attributes", "Live entity state attributes (entity_upsert)", false)
+            .string("status", "Entity status: active, at_risk, blocked, archived", false)
+            .uuid("from_entity_id", "Source entity UUID (relation_upsert)", false)
+            .uuid("to_entity_id", "Target entity UUID (relation_upsert)", false)
+            .string("relation_type", "Typed relation e.g. OWNS, IMPLEMENTED_BY, STOCKOUT_RISK, DELAYED_BY", false)
+            .string("evidence_quote", "Supporting quote grounding a relation (relation_upsert)", false)
+            .string("event_type", "Operational event type (event_ingest)", false)
+            .string("metric_name", "Numeric metric name for anomaly rules (event_ingest)", false)
+            .number("metric_value", "Numeric metric value (event_ingest)", false)
+            .object("payload", "Operational event payload (event_ingest)", false)
+            .string("severity", "Event severity: info, warning, high, critical (event_ingest)", false)
+            .string("idempotency_key", "Idempotency key to deduplicate events (event_ingest)", false)
+            .string("domain_pack", "Domain pack: product_design, ecommerce_inventory, logistics_supply_chain, events_field_ops, crm_revenue", false)
+            .uuid("meeting_id", "Meeting session UUID (meeting_brief)", false)
+            .uuid("calendar_event_id", "Calendar event UUID (meeting_brief)", false)
+            .string("title", "Meeting title (meeting_brief)", false)
+            .array("attendees", "Attendee names or emails (meeting_brief)", "string", false)
+            .string("agenda", "Meeting agenda (meeting_brief)", false)
+            .string("direction", "Traversal direction for universal_impact: downstream, upstream, or both", false)
+            .boolean("include_code", "Bridge into code graph callers & cross-service edges (universal_impact)", false)
+            .boolean("include_linked_workspaces", "Include ACL-checked linked workspaces (universal_impact)", false)
             .build()
     }
 }

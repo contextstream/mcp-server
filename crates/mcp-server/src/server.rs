@@ -3433,14 +3433,14 @@ mod tests {
         ),
         (
             "graph",
-            "a86ddb1fff028415180c19a8a61492418ed9bd2ca22a3f0dd59e4eaeee74c4ca",
+            "f1985dc87954613095bc46816f46341f3b926bef7256f8a04f0333064e3c1148",
         ),
         (
-            // Read-only twin of `graph` (readOnlyHint: true) exposing the 15
-            // pure-read graph actions without approval prompts and refusing
-            // `code_drift` with `refresh: true`.
+            // Read-only twin of `graph` (readOnlyHint: true) exposing pure-read
+            // code, knowledge, lineage, meeting_brief, universal_impact & entity_search
+            // actions without approval prompts and refusing `code_drift` refresh=true.
             "graph_read",
-            "e413b4fba525035f221d5f08f857fd35a06394c72a3896f68651a739af2bb943",
+            "f3177444ffb51f0f920da54a9a376f0c83bd620be02ee67e64fb5a60202d3480",
         ),
         (
             // Advanced when the `feeds` bundle joined the `bundle` enum

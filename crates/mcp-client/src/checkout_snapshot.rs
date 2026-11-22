@@ -874,6 +874,32 @@ impl CheckoutSnapshot {
         .await
     }
 
+    /// Read a changed blob from the same immutable snapshot used by the check.
+    pub async fn read_overlay_blob(&self, entry: &Entry, max_bytes: usize) -> Option<Vec<u8>> {
+        if !is_oid(&entry.oid) || !matches!(entry.mode.as_str(), "100644" | "100755") {
+            return None;
+        }
+        let size = git(
+            &self.git.repo,
+            &self.git.objects,
+            None,
+            &["cat-file", "-s", &entry.oid],
+        )
+        .await
+        .ok()?;
+        if text(&size).parse::<usize>().ok()? > max_bytes {
+            return None;
+        }
+        git(
+            &self.git.repo,
+            &self.git.objects,
+            None,
+            &["cat-file", "blob", &entry.oid],
+        )
+        .await
+        .ok()
+    }
+
     async fn base_blobs(&self) -> Result<Vec<String>, SnapshotError> {
         let rows = self.listing().await?;
         Ok(rows

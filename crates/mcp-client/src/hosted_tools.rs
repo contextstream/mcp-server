@@ -54,7 +54,7 @@ impl HostedToolsAnswer {
             .map(str::to_string)
     }
 
-    fn from_body(status: u16, body: Value) -> Self {
+    pub(crate) fn from_body(status: u16, body: Value) -> Self {
         let data = match &body {
             Value::Object(map) if map.contains_key("success") && map.contains_key("data") => {
                 map.get("data").cloned().unwrap_or(Value::Null)

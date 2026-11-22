@@ -19,6 +19,7 @@ pub mod graph;
 pub mod grounding;
 pub mod help;
 pub mod hosted_tools;
+pub mod hosted_tools_contract;
 pub mod index_keeper;
 pub mod integrations;
 pub(crate) mod linked_workspaces;
@@ -50,6 +51,8 @@ pub mod workspace_drift;
 
 #[cfg(test)]
 mod coached_rules_tests;
+#[cfg(test)]
+mod hosted_tools_contract_tests;
 #[cfg(test)]
 mod parity_eval_tests;
 #[cfg(test)]

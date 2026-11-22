@@ -21,6 +21,7 @@ pub mod client;
 pub mod client_session;
 pub mod coach;
 pub mod command_hints;
+pub mod contract_check;
 pub mod credit_hold;
 pub mod deliveries;
 pub mod environment;

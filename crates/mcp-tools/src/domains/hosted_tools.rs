@@ -1062,7 +1062,7 @@ pub async fn run(
     }
     let workspace_id = workspace_of(client, session).await;
     let project_id = project_of(client, session).await;
-    match tool.transport {
+    let mut result = match tool.transport {
         Transport::Api => result_from(&tool.name, &data, String::new()),
         Transport::Stream => match run_stream(
             &tool.name,
@@ -1083,7 +1083,18 @@ pub async fn run(
             }
             Streamed::NotRun(result) => result,
         },
+    };
+    if tool.name == "check" {
+        crate::domains::hosted_tools_contract::verify_consumer_contracts(
+            client,
+            session,
+            &arguments,
+            snapshot.as_ref(),
+            &mut result,
+        )
+        .await;
     }
+    result
 }
 
 /// The stream an API answer names for a call.

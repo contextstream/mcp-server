@@ -338,7 +338,7 @@ pub(crate) async fn maybe_safety_card_for_edit(
         }
     }
 
-    let client = reqwest::Client::builder()
+    let client = mcp_client::http::client_builder()
         .timeout(COLD_FETCH_TIMEOUT)
         .connect_timeout(Duration::from_millis(80))
         .build()

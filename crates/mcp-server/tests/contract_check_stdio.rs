@@ -98,6 +98,7 @@ async fn spawn_consumer_ws_server(
             let mut buf = FrameBuffer::default();
             let mut got_hello = false;
             let mut got_pack = false;
+            let mut overlay_files = 0usize;
             while !(got_hello && got_pack) {
                 if let Some(Ok(Message::Binary(bytes))) = ws.next().await {
                     buf.push(&bytes);
@@ -105,6 +106,8 @@ async fn spawn_consumer_ws_server(
                         if kind == b'J' {
                             let hello: Value = serde_json::from_slice(&payload).unwrap();
                             assert!(hello["contract_overlay"].is_array());
+                            overlay_files =
+                                hello["contract_overlay"].as_array().map_or(0, Vec::len);
                             got_hello = true;
                         } else if kind == b'D' {
                             got_pack = true;
@@ -127,6 +130,7 @@ async fn spawn_consumer_ws_server(
                     "type": "result",
                     "ran": true,
                     "exit": exit_code,
+                    "contract_overlay_applied": overlay_files,
                 }))
                 .unwrap()
                 .as_slice(),
@@ -199,6 +203,7 @@ async fn spawn_mcd_consumer(
                     assert_eq!(frame["warm"], true);
                     assert_eq!(frame["exit"], 101);
                     assert_eq!(frame["ran"], true);
+                    assert_eq!(frame["contract_overlay_applied"], 1);
                     break;
                 }
             }

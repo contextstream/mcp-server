@@ -315,6 +315,13 @@ async fn run_single_consumer(
         };
     };
 
+    // A worker from before contract checks ignores `contract_overlay` and runs the consumer's plain tree,
+    // so a result counts only when the worker acknowledges every overlay file it was sent.
+    let sent_overlay = spec
+        .request
+        .get("contract_overlay")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let repo_label = target
         .project_name
@@ -385,6 +392,28 @@ async fn run_single_consumer(
                     exit_code: frame.get("exit").and_then(Value::as_i64).map(|e| e as i32),
                     timed_out: false,
                     refused_reason: Some(reason),
+                    errors: Vec::new(),
+                };
+            }
+            let applied = frame
+                .get("contract_overlay_applied")
+                .and_then(Value::as_u64);
+            if sent_overlay > 0 && applied != Some(sent_overlay as u64) {
+                return ConsumerContractOutcome {
+                    project_id: target.project_id,
+                    project_name: target.project_name,
+                    repo_key: target.repo_key,
+                    default_branch: target.default_branch,
+                    language: target.language,
+                    command: target.command,
+                    ran: false,
+                    passed: false,
+                    exit_code: None,
+                    timed_out: false,
+                    refused_reason: Some(
+                        "the check host has not been updated for contract checks yet, so the changed contract was not applied"
+                            .to_string(),
+                    ),
                     errors: Vec::new(),
                 };
             }

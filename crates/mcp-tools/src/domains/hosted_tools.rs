@@ -969,6 +969,17 @@ pub async fn call_api(
     arguments: &Value,
     checkout: Option<Value>,
 ) -> Result<Value, CallRefusal> {
+    call_api_with_trace(client, session, tool, arguments, checkout, None).await
+}
+
+async fn call_api_with_trace(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    tool: &HostedTool,
+    arguments: &Value,
+    checkout: Option<Value>,
+    verification_trace_id: Option<uuid::Uuid>,
+) -> Result<Value, CallRefusal> {
     if tool.name == "check" && credit_cooldown(client, false).await {
         return Err(CallRefusal::OutOfCredits);
     }
@@ -978,6 +989,9 @@ pub async fn call_api(
     }
     if let Some(checkout) = checkout {
         body["checkout"] = checkout;
+    }
+    if let Some(trace) = verification_trace_id {
+        body["verification_trace_id"] = serde_json::json!(trace);
     }
     let answer = match client
         .hosted_tool_call(&tool.name, &body, CALL_TIMEOUT)
@@ -1012,6 +1026,16 @@ pub async fn run(
     session: &SessionManager,
     tool: &HostedTool,
     arguments: Value,
+) -> ToolResult {
+    run_with_trace(client, session, tool, arguments, None).await
+}
+
+pub(crate) async fn run_with_trace(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    tool: &HostedTool,
+    arguments: Value,
+    verification_trace_id: Option<uuid::Uuid>,
 ) -> ToolResult {
     let streamed = tool.transport == Transport::Stream;
     let workspace = workspace_of(client, session).await.unwrap_or_default();
@@ -1050,7 +1074,16 @@ pub async fn run(
             return done;
         }
     }
-    let data = match call_api(client, session, tool, &arguments, checkout).await {
+    let data = match call_api_with_trace(
+        client,
+        session,
+        tool,
+        &arguments,
+        checkout,
+        verification_trace_id,
+    )
+    .await
+    {
         Ok(data) => data,
         Err(failure) => return failure.into_result(),
     };

@@ -96,6 +96,7 @@ pub struct PlanCheckCommand {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PlanCheckResponse {
+    pub verification_trace_id: Option<uuid::Uuid>,
     pub tier: String,
     pub reason: String,
     pub escalation_reasons: Vec<String>,

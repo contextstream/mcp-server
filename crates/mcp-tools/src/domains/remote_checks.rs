@@ -394,6 +394,7 @@ impl ToolHandler for VerifyTool {
         let mut plan_covering_tests: Vec<String> = Vec::new();
         let mut plan_co_changed_tests: Vec<String> = Vec::new();
         let mut downstream_count: usize = 0;
+        let mut verification_trace_id = None;
 
         let (reason, mut commands) = if scope == "full" {
             escalation_reasons.push("scope_full".to_string());
@@ -428,6 +429,7 @@ impl ToolHandler for VerifyTool {
                 Ok(Ok(answer)) if answer.is_success() => {
                     match serde_json::from_value::<PlanCheckResponse>(answer.data) {
                         Ok(plan) => {
+                            verification_trace_id = plan.verification_trace_id;
                             tier = if plan.tier.is_empty() {
                                 "full".to_string()
                             } else {
@@ -561,13 +563,27 @@ impl ToolHandler for VerifyTool {
                 .filter(|p| p.is_dir())
                 .unwrap_or_else(|| exec_dir.clone());
 
-            let outcome = if let Some(ref tool) = hosted_check {
+            let map_cwd = (cmd.tier == "verification_map").then(|| resolve_map_cwd(&exec_dir, cmd));
+            let outcome = if matches!(map_cwd, Some(None)) {
+                ExecOutcome::Executed {
+                    passed: false,
+                    exit_code: Some(75),
+                    ran_remotely: false,
+                    output_tail: "The Verification Map command or working directory is no longer usable in this checkout.".into(),
+                }
+            } else if let Some(ref tool) = hosted_check {
                 let args = match cmd.cwd.as_deref().filter(|s| !s.is_empty()) {
                     Some(sub) => json!({ "command": cmd.command, "cwd": sub }),
                     None => json!({ "command": cmd.command }),
                 };
-                let remote_res =
-                    super::hosted_tools::run(&self.client, &self.session, tool, args).await;
+                let remote_res = super::hosted_tools::run_with_trace(
+                    &self.client,
+                    &self.session,
+                    tool,
+                    args,
+                    verification_trace_id,
+                )
+                .await;
                 interpret_hosted_check_outcome(&remote_res)
             } else {
                 ExecOutcome::FallbackLocal
@@ -581,7 +597,12 @@ impl ToolHandler for VerifyTool {
                     output_tail,
                 } => (passed, exit_code, ran_remotely, output_tail),
                 ExecOutcome::FallbackLocal => {
-                    let local = run_local_command(&cmd.command, &cmd_cwd, LOCAL_CMD_TIMEOUT).await;
+                    let local = run_local_command(
+                        &cmd.command,
+                        map_cwd.flatten().as_deref().unwrap_or(&cmd_cwd),
+                        LOCAL_CMD_TIMEOUT,
+                    )
+                    .await;
                     let tail = format_local_output(&local);
                     (
                         !local.timed_out && local.exit_code == 0,
@@ -968,6 +989,27 @@ fn interpret_hosted_check_outcome(result: &ToolResult) -> ExecOutcome {
     }
 }
 
+fn resolve_map_cwd(root: &Path, cmd: &PlanCheckCommand) -> Option<PathBuf> {
+    if cmd.command.is_empty()
+        || !cmd
+            .command
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b" ._/-:".contains(&byte))
+    {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let relative = Path::new(cmd.cwd.as_deref().unwrap_or_default());
+    if !relative
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let directory = root.join(relative).canonicalize().ok()?;
+    (directory.is_dir() && directory.starts_with(&root)).then_some(directory)
+}
+
 async fn run_local_command(command: &str, cwd: &Path, timeout: Duration) -> LocalRunOutcome {
     let mut cmd = if cfg!(windows) {
         let mut c = tokio::process::Command::new("cmd");
@@ -1050,11 +1092,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let handle = tokio::spawn(async move {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 let resp_body = response_json.clone();
+                let calls = calls.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     let n = socket.read(&mut buf).await.unwrap_or(0);
@@ -1065,7 +1109,15 @@ mod tests {
                             json!({"success": true, "data": {"tools": []}}).to_string(),
                         )
                     } else if req.contains("POST /api/v1/mcp/hosted-tools/plan-check") {
-                        (status, resp_body.to_string())
+                        let response = match resp_body.as_array() {
+                            Some(plans) => {
+                                let index =
+                                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                &plans[index.min(plans.len() - 1)]
+                            }
+                            None => &resp_body,
+                        };
+                        (status, response.to_string())
                     } else {
                         (
                             404,
@@ -1205,6 +1257,58 @@ mod tests {
             structured["commands_run"][0]["command"],
             "cargo test -p alpha"
         );
+    }
+
+    #[tokio::test]
+    async fn ms_verify_uses_an_edited_verification_map_on_its_next_run() {
+        let fixture = init_cargo_workspace_fixture();
+        let ws = Uuid::new_v4();
+        let response = |package: &str| {
+            json!({
+                "success": true,
+                "data": {
+                    "tier": "targeted",
+                    "verification_trace_id": Uuid::new_v4(),
+                    "commands": [{
+                        "command": format!("cargo test -p {package}"), "language": "project",
+                        "tier": "verification_map"
+                    }]
+                }
+            })
+        };
+        let (api_url, _server) =
+            spawn_mock_plan_check_server(200, json!([response("alpha"), response("beta")])).await;
+        let config = Config {
+            api_url,
+            api_key: Some("test-key".into()),
+            default_workspace_id: Some(ws),
+            ..Config::default()
+        };
+        let raw_client = ContextStreamClient::new(config.clone());
+        let client = Arc::new(raw_client.clone());
+        let session = Arc::new(SessionManager::new(raw_client, config.clone()));
+        let mut registry = ToolRegistry::new(&config);
+        register_remote_checks_tools(&mut registry, client, session);
+        for package in ["alpha", "beta"] {
+            let result = registry
+                .execute(
+                    "ms_verify",
+                    json!({
+                        "changed_paths": ["crates/alpha/src/lib.rs"],
+                        "cwd": fixture.path().to_string_lossy(),
+                    }),
+                )
+                .await
+                .expect("invoke ms_verify");
+            assert!(!result.is_error, "{:?}", result.content);
+            let output = result.structured_content.expect("structured output");
+            assert_eq!(
+                output["commands_run"][0]["command"],
+                format!("cargo test -p {package}")
+            );
+            assert_eq!(output["commands_run"][0]["tier"], "verification_map");
+            assert_eq!(output["passed"], true);
+        }
     }
 
     #[tokio::test]

@@ -1194,19 +1194,37 @@ async fn run_stream(
     };
     let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
     // The service's heartbeats keep the caller's own clock from running out
-    // (clients that reset their timeout on progress). What the service says in
-    // them is not passed on.
+    // (clients that reset their timeout on progress). Plain heartbeats pass on
+    // nothing the service said; structured stage progress updates forward the
+    // step, total, and sanitized stage message.
     let peer = peer::current().filter(peer::CallPeer::reports_progress);
     let started = Instant::now();
     let pump = async {
+        let mut active_stage: Option<(u64, u64)> = None;
         while let Some(event) = inbox.recv().await {
-            if let (Event::Heartbeat, Some(peer)) = (event, &peer) {
-                peer.progress(
-                    started.elapsed().as_secs_f64().max(1.0),
-                    None,
-                    Some("still running"),
-                )
-                .await;
+            let Some(peer) = &peer else {
+                continue;
+            };
+            match event {
+                Event::Heartbeat => {
+                    let (progress, total) = match active_stage {
+                        Some((step, total)) => (step as f64, Some(total as f64)),
+                        None => (started.elapsed().as_secs_f64().clamp(0.1, 0.9), None),
+                    };
+                    peer.progress(progress, total, Some("still running")).await;
+                }
+                Event::StageProgress {
+                    stage,
+                    step,
+                    total,
+                    message,
+                } => {
+                    active_stage = Some((step, total));
+                    let summary = message.unwrap_or_else(|| format!("[{step}/{total}] {stage}"));
+                    peer.progress(step as f64, Some(total as f64), Some(&summary))
+                        .await;
+                }
+                Event::Output(_) => {}
             }
         }
     };

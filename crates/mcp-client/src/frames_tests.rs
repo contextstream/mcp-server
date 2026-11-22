@@ -681,3 +681,77 @@ async fn an_address_that_is_not_wss_is_not_connected_to() {
         );
     }
 }
+
+#[tokio::test]
+async fn stage_progress_info_frames_parse_into_stage_progress_events() {
+    let repo = changed_repo(0);
+    let snapshot = CheckoutSnapshot::capture(repo.path()).await.unwrap();
+    let hello = hello_for(&snapshot).await;
+    let (client, mut worker) = pair().await;
+    let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+
+    let service = tokio::spawn(async move {
+        worker.recv().await.unwrap();
+        worker.recv().await.unwrap();
+        worker
+            .send_json(json!({"type": "info", "text": "accepted by host-1"}))
+            .await;
+        worker
+            .send_json(json!({
+                "type": "info",
+                "stage": "pnpm\u{1b} lint",
+                "step": 1,
+                "total": 3,
+                "message": "Running\0 stage 1/3: pnpm lint"
+            }))
+            .await;
+        worker
+            .send_json(json!({
+                "type": "info",
+                "stage": "pnpm test",
+                "step": 3,
+                "total": 3
+            }))
+            .await;
+        // Invalid stage numbers fall back to plain Heartbeat.
+        worker
+            .send_json(json!({"type": "info", "stage": "bad", "step": 0, "total": 2}))
+            .await;
+        worker
+            .send_json(json!({"type": "info", "stage": "bad", "step": 3, "total": 2}))
+            .await;
+        worker
+            .send_json(json!({"type": "result", "ran": true, "exit": 0}))
+            .await;
+    });
+
+    exchange(client, &hello, &snapshot, Duration::from_secs(30), events)
+        .await
+        .unwrap();
+    service.await.unwrap();
+
+    let mut got = Vec::new();
+    while let Ok(event) = seen.try_recv() {
+        got.push(event);
+    }
+    assert_eq!(
+        got,
+        vec![
+            Event::Heartbeat,
+            Event::StageProgress {
+                stage: "pnpm lint".to_string(),
+                step: 1,
+                total: 3,
+                message: Some("Running stage 1/3: pnpm lint".to_string()),
+            },
+            Event::StageProgress {
+                stage: "pnpm test".to_string(),
+                step: 3,
+                total: 3,
+                message: None,
+            },
+            Event::Heartbeat,
+            Event::Heartbeat,
+        ]
+    );
+}

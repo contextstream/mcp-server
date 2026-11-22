@@ -986,6 +986,76 @@ async fn heartbeats_become_progress_and_pass_on_nothing_the_service_said() {
 }
 
 #[tokio::test]
+async fn stage_progress_frames_forward_step_total_and_message_with_progress_token() {
+    let (ws_url, _) = frames_service(vec![
+        Step::Json(json!({"type": "info", "text": "accepted by host-9"})),
+        Step::Json(json!({
+            "type": "info",
+            "stage": "pnpm lint",
+            "step": 1,
+            "total": 3,
+            "message": "[1/3] pnpm lint"
+        })),
+        Step::Json(json!({"type": "info", "beat": true, "text": "still working (20 s)"})),
+        Step::Json(json!({
+            "type": "info",
+            "stage": "pnpm typecheck",
+            "step": 2,
+            "total": 3,
+            "message": "[2/3] pnpm typecheck"
+        })),
+        Step::Json(json!({
+            "type": "info",
+            "stage": "pnpm test",
+            "step": 3,
+            "total": 3
+        })),
+        Step::Json(made_result()),
+    ])
+    .await;
+    let (url, _) = stream_api(stream_answer(&ws_url, "frames/1")).await;
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let channel = Arc::new(Recording::default());
+    let peer = crate::peer::CallPeer::new(channel.clone(), Some(json!("chain-tok-42")), false);
+    let result = crate::peer::run_with_call_peer(
+        peer,
+        run(
+            &client,
+            &session,
+            &tool,
+            json!({"command": "pnpm lint && pnpm typecheck && pnpm test"}),
+        ),
+    )
+    .await;
+    assert_eq!(text_of(&result), ["1 test failed"]);
+    let sent = channel.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 5, "{sent:?}");
+    let mut last = 0.0;
+    for (method, params) in &sent {
+        assert_eq!(method, "notifications/progress");
+        assert_eq!(params["progressToken"], "chain-tok-42");
+        let progress = params["progress"].as_f64().unwrap();
+        assert!(progress > last, "progress must increase: {sent:?}");
+        last = progress;
+        assert!(!params.to_string().contains("host-9"));
+    }
+    assert_eq!(sent[0].1["message"], "still running");
+    assert_eq!(sent[1].1["progress"], 1.0);
+    assert_eq!(sent[1].1["total"], 3.0);
+    assert_eq!(sent[1].1["message"], "[1/3] pnpm lint");
+    assert_eq!(sent[2].1["total"], 3.0);
+    assert_eq!(sent[2].1["message"], "still running");
+    assert_eq!(sent[3].1["progress"], 2.0);
+    assert_eq!(sent[3].1["total"], 3.0);
+    assert_eq!(sent[3].1["message"], "[2/3] pnpm typecheck");
+    assert_eq!(sent[4].1["progress"], 3.0);
+    assert_eq!(sent[4].1["total"], 3.0);
+    assert_eq!(sent[4].1["message"], "[3/3] pnpm test");
+}
+
+#[tokio::test]
 async fn a_call_given_up_on_is_picked_up_by_the_same_call_asked_again() {
     let (ws_url, sockets) = frames_service(vec![Step::Json(made_result())]).await;
     let (url, api_seen) = stream_api(stream_answer(&ws_url, "frames/1")).await;

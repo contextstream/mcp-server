@@ -70,6 +70,39 @@ pub enum Event {
     Output(Vec<u8>),
     /// The service is still working on it.
     Heartbeat,
+    /// Stage progress from a multi-step check.
+    StageProgress {
+        stage: String,
+        step: u64,
+        total: u64,
+        message: Option<String>,
+    },
+}
+
+fn stage_progress_from_info(frame: &Value) -> Option<Event> {
+    let stage = frame
+        .get("stage")
+        .and_then(Value::as_str)
+        .and_then(display_text)
+        .map(|s| s.chars().take(80).collect::<String>())?;
+    let step = frame
+        .get("step")
+        .and_then(Value::as_u64)
+        .filter(|&s| s >= 1)?;
+    let total = frame
+        .get("total")
+        .and_then(Value::as_u64)
+        .filter(|&t| t >= step)?;
+    let message = frame
+        .get("message")
+        .and_then(Value::as_str)
+        .and_then(display_text);
+    Some(Event::StageProgress {
+        stage,
+        step,
+        total,
+        message,
+    })
 }
 
 /// The worker's explanation when it declined a run. A command that ran and
@@ -551,7 +584,9 @@ where
                             send_frame(&sink, b'D', &data).await?;
                         }
                         Some("info") => {
-                            let _ = events.send(Event::Heartbeat);
+                            let event =
+                                stage_progress_from_info(&message).unwrap_or(Event::Heartbeat);
+                            let _ = events.send(event);
                         }
                         Some("result") => {
                             // Closing is a courtesy; the call is done either way.

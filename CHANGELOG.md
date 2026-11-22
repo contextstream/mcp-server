@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.95
+
+- `verify` (also `ms_verify`) picks the checks an edit needs from the project graph, and widens to the full suite for lockfiles, migrations and auth code, and when a task completes.
+- A failed remote check lists its new failures first, apart from the ones the base already had, and names a matching lesson, decision or commit when there is one.
+- Remote checks run `&&` chains of verification commands from one upload, and report each stage as MCP progress.
+- Verification gates: when a workspace or project turns them on, push, pull requests and task completion wait for a server-verified green check of the exact tree, and name the check that is missing.
+- Contract checks: when a check's change touches a shared contract (OpenAPI, protobuf, GraphQL, Avro, SQL or type declarations), the workspace's projects that consume it are type-checked on their default branch with the change applied, and their compiler errors come back with the check. A consumer whose worker could not apply the change is reported unverified, never passed. `CONTEXTSTREAM_CONTRACT_CHECK=off` turns this off.
+- Speculative checks (opt in with `CONTEXTSTREAM_SPECULATIVE_CHECKS=on`): after a save and a short pause, the check runs in the background within an hourly credit cap, so the explicit check that follows can come straight from cache.
+- `capsule` makes Review Capsules with secrets redacted, and capsules and handoffs show their verification state.
+- Verification maps: the directory-to-command map learned from your checks can be read and edited, and an edit takes effect at once.
+- `uninstall` mentions leftover credentials only when a credentials file exists.
+
 ## 1.0.94
 
 - Remote checks ask Go its version with `go version` and Java with `--version`, then `-version` for Java 8, the way the workers do, so Go and Java 8 sessions can be matched to the right toolchain. A session reports at most 32 tool versions (was 16), enough for every language remote checks run.

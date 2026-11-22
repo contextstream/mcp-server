@@ -82,6 +82,98 @@ days), happens only when you ask for it. You can revoke a link at any time.
 When someone pastes a live link, the agent reads it with
 `capsule(action="live_read")`.
 
+Use `capsule(action="create", review=...)` in a local MCP session to make a
+Review Capsule from Git changes with secret redaction. Capsules and handoffs
+can show the verification state of the indexed tree.
+
+## Check your changes
+
+Turn on remote checks with `contextstream-mcp remote-checks on` or
+`session(action="remote_checks", enabled=true)`. In a local MCP session,
+`check` runs supported tests, lints, type checks and builds on a worker using
+a snapshot of your checkout. From a shell, use `contextstream-mcp run -- <command>`.
+If the worker declines the check, `run` runs the command on your machine.
+
+- **Run the checks your edit needs.** Use `verify` (also callable as
+  `ms_verify`) in a local MCP session. It uses the project's dependency and test
+  graph to choose checks. It widens the run for changes such as lockfiles,
+  migrations, auth code, shared fixtures or configuration, and when the graph
+  finds broad impact or cannot map the changes to tests. Ask for `scope="full"`
+  to run the full suite before completing a task. Checks run remotely when
+  available, with a local fallback. To choose checks by directory, open
+  **Verification Map** in the workspace's **Capsules** panel. Saved rules take
+  effect on the next targeted call and the panel flags stale rules.
+- **Check more commands in one run.** Supported `&&` chains use one checkout
+  upload and report each stage to MCP clients that request progress. Try
+  `npx prisma generate && npx tsc --noEmit` or
+  `npx svelte-kit sync && npx svelte-check`. Checks also cover tools such as
+  `tsgo`, Oxlint, Oxfmt in check mode, `vue-tsc --noEmit`, `astro check`,
+  `ty check`, Pyrefly, Basedpyright, `cargo fmt --check` and `go tool staticcheck`.
+  Run Prettier with `--check`, `-c`, `--list-different` or `-l` through
+  `npx`, `pnpm exec`, `yarn exec`, `npm exec` or the project's
+  `node_modules/.bin`. Use the project's pinned Prettier version. The worker
+  declines write flags such as `--write` and `-w`.
+- **See what broke.** When base-tree results are available, failure diagnostics
+  put new failures ahead of existing ones. The report can cite a matching
+  lesson, decision or commit.
+- **Check consumers of a shared contract.** After a successful hosted MCP
+  `check`, ContextStream can check affected, indexed projects in the same
+  workspace. It applies eligible changed contract files to each reachable
+  consumer's default branch in the worker and returns compiler errors with
+  your result. If the worker cannot apply the change, the consumer is reported
+  as unverified.
+- **Prepare before the first check.** Supported local editor hooks can send a
+  free `:prepare` call in the background to set up the worker's checkout and
+  dependencies. A busy worker or failed preparation leaves the next check to
+  start as usual. Remote checks can report up to 32 local tool versions.
+  They use `go version` for Go and try `java --version` followed by
+  `java -version` for Java.
+- **Check saves in the background.** Speculative checks are off until you
+  opt in. With remote checks enabled, set `CONTEXTSTREAM_SPECULATIVE_CHECKS=on`
+  for the editor hooks, or set `speculative_checks` with `enabled` in
+  `PUT /api/v1/mcp/hosted-tools/enabled` for your account. After a supported
+  edit and a pause, the hook can run up to three checks. A matching cached
+  result costs no credits. The hosted service defaults to 100 speculative
+  credits per account per hour in addition to the client's limits below.
+  Explicit checks can still run when the speculative budget is spent.
+- **Require a passing receipt.** Workspace owners and admins can set a gate
+  for pushes, pull-request creation or completion through
+  `GET` and `PUT /api/v1/mcp/hosted-tools/gate-policy`. Gates start off.
+  An enabled gate names the missing check families when the exact Git tree
+  lacks a fresh passing receipt. Git's managed `pre-push` hook checks the
+  trees being pushed, including from a terminal. Setup installs the hook
+  where Git capture is enabled. [How the hooks apply gates](docs/clients.md#remote-checks-and-verification-hooks).
+
+### Remote check environment variables
+
+Set these in the environment of the local MCP process, editor hooks or shell
+that runs the check.
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `CONTEXTSTREAM_HOSTED_TOOLS` | Unset, so available hosted tools can be used | `off` disables hosted check execution, command routing, background preparation, speculative checks and local receipt gates. |
+| `CONTEXTSTREAM_CONTRACT_CHECK` | On | `off` skips the consumer check. |
+| `CONTEXTSTREAM_SPECULATIVE_CHECKS` | Follows the account setting, which starts off | `on` opts in locally when `check` is available. `off` overrides the account setting. |
+| `CONTEXTSTREAM_SPECULATIVE_DEBOUNCE_MS` | `3000` | Milliseconds to wait after a supported edit. `0` removes the wait. |
+| `CONTEXTSTREAM_SPECULATIVE_HOURLY_CAP` | `30` | Local speculative credits per hour across repositories for the configured credential and API. `0` stops background execution. |
+| `CONTEXTSTREAM_SPECULATIVE_REPO_HOURLY_CAP` | `15` | Local speculative credits per repository per hour. `0` stops background execution. |
+| `CONTEXTSTREAM_CHECKOUT_SNAPSHOT` | Allowed when a local call needs a snapshot | `off` disables checkout snapshots for hosted checks, speculative checks and `:prepare`. |
+| `CONTEXTSTREAM_CHECKOUT_SNAPSHOT_REPOS` | All repositories eligible | Limit snapshots to repositories whose origin URL or checkout folder name starts with a listed prefix. Use commas or spaces between prefixes. |
+| `CONTEXTSTREAM_HOSTED_ENV` | On | `off` omits the streamed environment description and tool-version probes. |
+| `CONTEXTSTREAM_HOOK_ENABLED` | On for installed editor hooks | `off` disables editor hook activity, including automatic preparation, speculative checks and editor-side gates. Git hooks have separate controls. |
+| `CONTEXTSTREAM_SESSION_INIT_ENABLED` | On | `false` disables the session-start hook, including its `:prepare` trigger. |
+| `CONTEXTSTREAM_POSTWRITE_ENABLED` | On | `false` disables the post-write indexing path and its `:prepare` trigger. Speculative scheduling happens before this switch is read. |
+| `CONTEXTSTREAM_GIT_CAPTURE` | Follows the repository setting, then the global default | `off` stops Git event capture and skips managed hook installation. An already installed `pre-push` hook can still check receipts. |
+| `CONTEXTSTREAM_GIT_CAPTURE_DEFAULT` | On | Sets the fallback for Git capture when the repository and `CONTEXTSTREAM_GIT_CAPTURE` leave it unset. |
+
+The hooks also read the usual connection settings. `CONTEXTSTREAM_API_KEY`,
+`CONTEXTSTREAM_WORKSPACE_ID` and `CONTEXTSTREAM_PROJECT_ID` have no built-in
+value. The hooks can read them from local configuration.
+`CONTEXTSTREAM_API_URL` defaults to `https://api.contextstream.io` when local
+configuration supplies no address.
+
+[What remote checks and verification send](docs/data-handling.md#remote-checks-and-verification).
+
 ## Benchmarks
 
 Each benchmark runs through the production API, is registered before its results

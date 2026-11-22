@@ -100,6 +100,32 @@ checkout. Use `setup` when you want those.
 Codex reads the key from the environment each time it starts, instead of
 storing it.
 
+## Remote checks and verification hooks
+
+Use a local MCP connection to run `check` or `verify` against your checkout.
+You can also run a supported command with `contextstream-mcp run -- <command>`
+from the checkout, including when your editor uses the hosted MCP connection.
+Claude Code's managed Bash hook can route matching shell commands this way.
+
+The managed session-start hooks in Claude Code and Cursor can send
+`:prepare` in the background. With speculative checks on, a managed
+post-tool hook can also schedule checks after it sees a successful supported
+edit. A save that the hook doesn't observe won't schedule a check. Codex's
+managed editor hooks handle notices and optional live progress. Use the local
+MCP tool or the shell command for explicit checks in Codex.
+
+When a verification gate is enabled, the managed pre-tool hooks can check
+`git push`, `gh pr create`, `progress` reports marked `completed`, and
+`entity` ticket updates to `resolved` or `closed`. These checks apply to the
+calls the hook sees. Git's separate `pre-push` hook can block a push from any
+editor or a terminal. It checks the committed trees Git is sending. Setup
+installs it where Git capture is enabled. To refresh the managed Git hooks
+in an existing checkout, run `contextstream-mcp git-hooks` there. It
+preserves any existing user hooks. When a receipt is missing, the gate
+reports the check to run before you retry.
+
+[What remote checks and verification send](data-handling.md#remote-checks-and-verification).
+
 ## One-click install
 
 VS Code asks for your API key when it first starts the server and keeps it in

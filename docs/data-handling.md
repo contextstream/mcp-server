@@ -36,6 +36,8 @@ and a SHA-256 digest of its `origin` URL. Without an origin, the input to the
 digest is the sorted IDs of the repository's initial commits, or the resolved
 checkout path before the first commit. The request sends the digest and folder
 name. Someone who can guess the input can confirm it against the digest.
+The repository key used for worker and gate requests combines a cleaned
+folder name with a prefix of that digest.
 
 If the API issues a stream, the stream sends the last commit's tree ID, the
 snapshot tree ID, the absolute checkout root (which can include your username),
@@ -70,9 +72,10 @@ eligible repositories with `CONTEXTSTREAM_CHECKOUT_SNAPSHOT_REPOS`.
 The tool catalog request carries the workspace ID when known. The initial
 call sends the tool arguments, workspace scope when known, and the repository
 identity for a streamed check. The stream uses a token for that call. Your API
-key authenticates the HTTP request. The stream also carries the run details
-from the API, including the command, repository key, working directory within
-the repository and time limits.
+key authenticates the HTTP request. The client opens the API's WebSocket
+address without following redirects. The stream also carries the run details
+from the API, including the command, repository key, working directory
+within the repository and time limits.
 
 For `check`, `run`, `:prepare` and speculative checks, the stream can include
 values for environment variables the API requests. The client filters
@@ -88,16 +91,21 @@ The client probes a tool found on `PATH` outside the repository, running it
 directly in the command's folder for up to two seconds with install-suppression
 settings. It uses `go version` for Go, `zig version` for Zig and tries
 `java --version` followed by `java -version` for Java. Most tools use
-`--version`. It skips banner lines, removes path-like words apart from
-Go's trailing OS/architecture, redacts the user, home folder and host names
-when they are at least three characters long, and keeps up to 200 characters
-per version line. A version manager can still pick a version based on the
-folder and may try to install a missing version within the time limit.
+`--version`. The client looks past banner lines and selects the version line
+that starts with `Elixir` for Elixir. It removes path-like words, with
+exceptions for Go's trailing OS/architecture and Elixir's `Erlang/OTP` label,
+redacts user, home folder and host names of at least three characters, and
+keeps up to 200 characters per version line. A version manager can still
+pick a version based on the folder and may try to install a missing version
+within the time limit.
 
 In Claude Code, the managed hook can route a matching shell command through
 `contextstream-mcp run`. It uses command hints cached locally by credential
-digest and API address and leaves shell permissions to the client. If the
-remote check declines or is unavailable, `run` runs the command locally.
+digest and API address for up to 12 hours and leaves shell permissions to the
+client. The hook shows the rewritten command. The runner prints remote
+output as it arrives and returns the command's exit status. If the remote
+check declines or is unavailable, `run` runs the command locally with Bash
+on macOS and Linux or `cmd` on Windows.
 For a supported failing check with structured failure details, the client
 can send a follow-up to `/api/v1/mcp/hosted-tools/calls/<call_id>/diagnose`
 with those details, the base comparison if available, the time budget and
@@ -169,21 +177,25 @@ The client sends an empty Git pack and no local environment values or tool
 versions. If the worker needs consumer base files, the client ends the stream
 without supplying them. The worker applies the change to a temporary copy.
 The client reports a consumer as unverified when the worker cannot show
-it applied the overlay. A consumer check that runs is billed as a normal
-check, subject to the usual cache and billing rules. The secondary request
-is skipped for automatic preparation, speculative checks and shell `run`.
+it applied the overlay. An unverified consumer is reported separately from a
+compiler failure. A consumer check that runs is billed as a normal check,
+subject to the usual cache and billing rules. The secondary request is
+skipped for automatic preparation, speculative checks and shell `run`.
 
 ### Receipts and gate checks
 
 The hosted service can record a passing receipt from a verified, signed
-usage report for a remote run that exited successfully. The receipt includes the
-call, workspace and actor IDs, repository key, target tree ID, command digest,
-command family or engine, exit code and verification time. It is created by
-the service from the hosted run. The client makes no separate receipt upload.
-A receipt for the primary check is about that run. Consumer contract outcomes
-come back separately after it. Use required check families when the policy
-needs proof that particular checks ran. The receipt lookup accepts any fresh
-passing receipt for the tree when no families are required.
+usage report for a remote run that exited successfully. The receipt includes
+the call, workspace and actor IDs, repository key, target tree ID, command
+digest, command family when available, engine when available, exit code
+and verification time. The service creates it from the hosted run. The
+client makes no separate receipt upload. A receipt for the primary check
+is about that run. Consumer contract outcomes come back separately after it.
+
+The receipt lookup matches the workspace, tree and repository key when
+provided. With no required check families it accepts any fresh passing
+receipt for that tree, which can include a qualifying `:prepare` run. Set
+required check families when the policy needs proof that particular checks ran.
 
 Local gate lookups send the workspace and project IDs when known to
 `GET /api/v1/mcp/hosted-tools/gate-policy`. The policy can be cached on disk

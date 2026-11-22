@@ -93,6 +93,7 @@ Turn on remote checks with `contextstream-mcp remote-checks on` or
 `check` runs supported tests, lints, type checks and builds on a worker using
 a snapshot of your checkout. From a shell, use `contextstream-mcp run -- <command>`.
 If the worker declines the check, `run` runs the command on your machine.
+[Supported toolchains](https://machinestream.io/docs/support).
 
 - **Run the checks your edit needs.** Use `verify` (also callable as
   `ms_verify`) in a local MCP session. It uses the project's dependency and test
@@ -104,7 +105,8 @@ If the worker declines the check, `run` runs the command on your machine.
   **Verification Map** in the workspace's **Capsules** panel. Saved rules take
   effect on the next targeted call and the panel flags stale rules.
 - **Check more commands in one run.** Supported `&&` chains use one checkout
-  upload and report each stage to MCP clients that request progress. Try
+  upload and stop on the first failure. The MCP reports stages as they run
+  when the client supplies a progress token. Try
   `npx prisma generate && npx tsc --noEmit` or
   `npx svelte-kit sync && npx svelte-check`. Checks also cover tools such as
   `tsgo`, Oxlint, Oxfmt in check mode, `vue-tsc --noEmit`, `astro check`,
@@ -120,8 +122,9 @@ If the worker declines the check, `run` runs the command on your machine.
   `check`, ContextStream can check affected, indexed projects in the same
   workspace. It applies eligible changed contract files to each reachable
   consumer's default branch in the worker and returns compiler errors with
-  your result. If the worker cannot apply the change, the consumer is reported
-  as unverified.
+  your result. The worker needs the consumer's default-branch tree from a
+  previous check. A consumer whose change cannot be applied is reported as
+  unverified.
 - **Prepare before the first check.** Supported local editor hooks can send a
   free `:prepare` call in the background to set up the worker's checkout and
   dependencies. A busy worker or failed preparation leaves the next check to
@@ -139,10 +142,11 @@ If the worker declines the check, `run` runs the command on your machine.
 - **Require a passing receipt.** Workspace owners and admins can set a gate
   for pushes, pull-request creation or completion through
   `GET` and `PUT /api/v1/mcp/hosted-tools/gate-policy`. Gates start off.
-  An enabled gate names the missing check families when the exact Git tree
-  lacks a fresh passing receipt. Git's managed `pre-push` hook checks the
-  trees being pushed, including from a terminal. Setup installs the hook
-  where Git capture is enabled. [How the hooks apply gates](docs/clients.md#remote-checks-and-verification-hooks).
+  Set `required_command_families` to require specific checks. An enabled
+  gate names what is missing when the exact Git tree lacks a fresh passing
+  receipt. Git's managed `pre-push` hook checks the trees being pushed,
+  including from a terminal. Setup installs the hook where Git capture
+  is enabled. [How the hooks apply gates](docs/clients.md#remote-checks-and-verification-hooks).
 
 ### Remote check environment variables
 
@@ -165,6 +169,8 @@ that runs the check.
 | `CONTEXTSTREAM_POSTWRITE_ENABLED` | On | `false` disables the post-write indexing path and its `:prepare` trigger. Speculative scheduling happens before this switch is read. |
 | `CONTEXTSTREAM_GIT_CAPTURE` | Follows the repository setting, then the global default | `off` stops Git event capture and skips managed hook installation. An already installed `pre-push` hook can still check receipts. |
 | `CONTEXTSTREAM_GIT_CAPTURE_DEFAULT` | On | Sets the fallback for Git capture when the repository and `CONTEXTSTREAM_GIT_CAPTURE` leave it unset. |
+| `CONTEXTSTREAM_CAPSULE_ENABLED` | On for regular sessions | `off` hides the capsule tool in those sessions, including Review Capsule creation. |
+| `CONTEXTSTREAM_HTTP_LOCAL_FILES` | Off for HTTP connections | `allow` is a self-hosted gateway setting for access to the gateway's own filesystem. Use a local client to check your checkout. |
 
 The hooks also read the usual connection settings. `CONTEXTSTREAM_API_KEY`,
 `CONTEXTSTREAM_WORKSPACE_ID` and `CONTEXTSTREAM_PROJECT_ID` have no built-in

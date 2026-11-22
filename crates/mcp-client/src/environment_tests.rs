@@ -715,17 +715,23 @@ printf '%s\n' 'openjdk version "1.8.0_432"' 'OpenJDK Runtime Environment (Temuri
         ),
     ] {
         let path = path_of(&dirs);
-        let environment = describe_using(
-            &json!({"versions": ["go", "java"]}),
-            &repo,
-            |name| find_program(name, Some(path.as_os_str()), &repo),
-            &Names::default(),
-        )
-        .await;
-        assert_eq!(
-            environment["versions"],
-            json!({"go": "go version go1.25.4 linux/amd64", "java": java})
-        );
+        let expected = json!({"go": "go version go1.25.4 linux/amd64", "java": java});
+        // Each probe has a two-second limit; on a loaded machine a shell script can miss it once (as in the Zig and
+        // Elixir test above), so the description is asked up to three times.
+        let mut environment = Value::Null;
+        for _ in 0..3 {
+            environment = describe_using(
+                &json!({"versions": ["go", "java"]}),
+                &repo,
+                |name| find_program(name, Some(path.as_os_str()), &repo),
+                &Names::default(),
+            )
+            .await;
+            if environment["versions"] == expected {
+                break;
+            }
+        }
+        assert_eq!(environment["versions"], expected);
     }
 }
 

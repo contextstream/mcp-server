@@ -539,6 +539,10 @@ pub struct ContextCapsuleResponse {
     /// externally (Phase 3 — plan-step-16).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readiness: Option<ContextCapsuleReadiness>,
+    /// Populated by the backend when this capsule is a code review capsule.
+    /// Generic callers discriminate review capsules via `review.is_some()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<serde_json::Value>,
 }
 
 /// Readiness assessment for a capsule — surfaces whether it has enough
@@ -1882,5 +1886,575 @@ mod tests {
         assert!(Precedence::Critical < Precedence::High);
         assert!(Precedence::High < Precedence::Normal);
         assert!(Precedence::Normal < Precedence::Low);
+    }
+}
+
+// ===========================================================================
+// Review Capsules (`0a290693`)
+// ===========================================================================
+
+/// Contract version for Review Capsules (`ReviewInput.contract_version`).
+pub const REVIEW_CAPSULE_CONTRACT_VERSION: u32 = 1;
+
+/// Request body for `POST /api/v1/capsules/review`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateReviewCapsuleRequest {
+    pub project_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub review: ReviewInput,
+}
+
+/// Structured diff + brief input sent to `POST /api/v1/capsules/review`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewInput {
+    pub contract_version: u32,
+    pub repo: String,
+    pub base: String,
+    pub head: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_base: Option<String>,
+    #[serde(default)]
+    pub two_dot: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub task: String,
+    #[serde(default)]
+    pub claims: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_lines: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_chars: Option<usize>,
+    pub files: Vec<ReviewFileInput>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+impl ReviewFileStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+            Self::Renamed => "renamed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSkipReason {
+    Binary,
+    Undecodable,
+    Excluded,
+    TooLarge,
+}
+
+impl ReviewSkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::Undecodable => "undecodable",
+            Self::Excluded => "excluded",
+            Self::TooLarge => "too_large",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewFileInput {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub status: ReviewFileStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<ReviewSkipReason>,
+    #[serde(default)]
+    pub add: u32,
+    #[serde(default)]
+    pub del: u32,
+    #[serde(default)]
+    pub hunks: Vec<ReviewHunkInput>,
+    #[serde(default)]
+    pub excerpts: Vec<ReviewExcerptInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewHunkInput {
+    pub old_start: u32,
+    pub new_start: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewExcerptInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub first_line: u32,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ReviewSummary {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub digest: String,
+    #[serde(default)]
+    pub contract_version: u32,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub base: String,
+    #[serde(default)]
+    pub head: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub files: usize,
+    #[serde(default)]
+    pub files_shown: usize,
+    #[serde(default)]
+    pub add: u32,
+    #[serde(default)]
+    pub del: u32,
+    #[serde(default)]
+    pub parts: usize,
+    #[serde(default)]
+    pub chars: usize,
+    #[serde(default)]
+    pub claims: usize,
+    #[serde(default)]
+    pub evidence: usize,
+    #[serde(default)]
+    pub redactions: u64,
+    #[serde(default)]
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewRedaction {
+    pub at: String,
+    pub rule: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ReviewLinks {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<String>,
+}
+
+/// Response from `POST /api/v1/capsules/review`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewCapsuleCreateResponse {
+    pub capsule_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub review: ReviewSummary,
+    #[serde(default)]
+    pub redactions: Vec<ReviewRedaction>,
+    #[serde(default)]
+    pub links: ReviewLinks,
+}
+
+pub type ReviewLineRange = (u32, u32);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewManifestHunk {
+    pub id: String,
+    #[serde(default)]
+    pub new: Vec<ReviewLineRange>,
+    #[serde(default)]
+    pub old: Vec<ReviewLineRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewManifestExcerpt {
+    pub id: String,
+    pub path: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub first: u32,
+    pub last: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewManifestFile {
+    pub id: u32,
+    pub path: String,
+    #[serde(default)]
+    pub old_path: Option<String>,
+    pub status: ReviewFileStatus,
+    #[serde(default)]
+    pub add: u32,
+    #[serde(default)]
+    pub del: u32,
+    #[serde(default)]
+    pub skipped: Option<String>,
+    #[serde(default)]
+    pub parts: Vec<u32>,
+    #[serde(default)]
+    pub hunks: Vec<ReviewManifestHunk>,
+    #[serde(default)]
+    pub excerpts: Vec<ReviewManifestExcerpt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewManifestPart {
+    pub n: u32,
+    pub chars: usize,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewManifest {
+    pub contract_version: u32,
+    pub digest: String,
+    pub label: String,
+    pub source: String,
+    pub repo: String,
+    pub base: String,
+    #[serde(default)]
+    pub merge_base: Option<String>,
+    pub head: String,
+    #[serde(default)]
+    pub two_dot: bool,
+    #[serde(default)]
+    pub title: String,
+    pub task: String,
+    #[serde(default)]
+    pub claims: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub context_lines: Option<u32>,
+    pub part_chars: usize,
+    #[serde(default)]
+    pub add: u32,
+    #[serde(default)]
+    pub del: u32,
+    #[serde(default)]
+    pub files: Vec<ReviewManifestFile>,
+    #[serde(default)]
+    pub redactions: Vec<ReviewRedaction>,
+    #[serde(default)]
+    pub parts: Vec<ReviewManifestPart>,
+    #[serde(default)]
+    pub total_chars: usize,
+}
+
+impl ReviewManifest {
+    pub fn digest16(&self) -> &str {
+        &self.digest[..self.digest.len().min(16)]
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewCredentialStatus {
+    pub answer: bool,
+    pub answers_left: i64,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ReviewOpenUse {
+    #[serde(default)]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub part: Option<String>,
+    #[serde(default)]
+    pub answer: Option<String>,
+}
+
+/// Response from both `GET /api/v1/capsules/:id/review` and `GET /api/v1/capsules/review/open`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewCapsuleManifestResponse {
+    #[serde(default)]
+    pub capsule_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    pub review: ReviewSummary,
+    pub manifest: ReviewManifest,
+    #[serde(default)]
+    pub links: Option<ReviewLinks>,
+    #[serde(default)]
+    pub credential: Option<ReviewCredentialStatus>,
+    #[serde(default, rename = "use")]
+    pub use_instructions: Option<ReviewOpenUse>,
+}
+
+/// One fetched prompt part (`GET .../prompt.md[?part=N]`) plus response verification headers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewPromptPart {
+    pub markdown: String,
+    #[serde(default)]
+    pub digest: Option<String>,
+    #[serde(default)]
+    pub part: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// Request body for `POST .../answers`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewAnswerRequest {
+    pub answer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+}
+
+/// 201 Created response payload for `POST .../answers`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewAnswerSuccess {
+    pub valid: bool,
+    #[serde(default)]
+    pub verdict: Option<String>,
+    #[serde(default)]
+    pub must: usize,
+    #[serde(default)]
+    pub should: usize,
+    pub status: String,
+    #[serde(default)]
+    pub review_id: Option<Uuid>,
+}
+
+/// Outcome of posting a review answer (`201 Created` vs `422 REVIEW_ANSWER_INVALID`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ReviewAnswerOutcome {
+    Accepted(ReviewAnswerSuccess),
+    Invalid {
+        message: String,
+        problems: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewFindingItem {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub n: u32,
+    #[serde(default)]
+    pub what: String,
+    #[serde(default)]
+    pub hunk: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub old: bool,
+    #[serde(default)]
+    pub claim: String,
+    #[serde(default)]
+    pub why: String,
+    #[serde(default)]
+    pub fix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewClaimStatus {
+    pub state: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewAnswerEntry {
+    pub review_id: Uuid,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub findings: serde_json::Value,
+    #[serde(default)]
+    pub verdict: Option<String>,
+    #[serde(default)]
+    pub headline: Option<String>,
+    #[serde(default)]
+    pub claims: Option<std::collections::BTreeMap<String, ReviewClaimStatus>>,
+    #[serde(default)]
+    pub not_in_the_capsule: Option<String>,
+    #[serde(default)]
+    pub reviewer: Option<String>,
+    #[serde(default)]
+    pub by: Option<String>,
+    #[serde(default)]
+    pub for_this_digest: bool,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+/// Response from `GET /api/v1/capsules/:id/review/answers`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewAnswersListResponse {
+    pub capsule_id: String,
+    pub digest: String,
+    #[serde(default)]
+    pub answers: Vec<ReviewAnswerEntry>,
+}
+
+/// Request body for `POST /api/v1/capsules/:id/review/credentials`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateReviewCredentialRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_hours: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_answers: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ReviewCredentialUse {
+    #[serde(default)]
+    pub header: String,
+    #[serde(default)]
+    pub open: String,
+    #[serde(default)]
+    pub part: String,
+    #[serde(default)]
+    pub answer: String,
+}
+
+/// Response from `POST /api/v1/capsules/:id/review/credentials`.
+/// Custom `Debug` redacts `credential` so secrets are never written to logs.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewCredentialResponse {
+    pub credential: String,
+    pub credential_id: Uuid,
+    pub capsule_id: String,
+    pub digest: String,
+    pub answer: bool,
+    pub max_answers: i64,
+    pub expires_at: String,
+    #[serde(default)]
+    pub shown_once: bool,
+    #[serde(default, rename = "use")]
+    pub use_instructions: ReviewCredentialUse,
+}
+
+impl std::fmt::Debug for ReviewCredentialResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReviewCredentialResponse")
+            .field("credential", &"[REDACTED]")
+            .field("credential_id", &self.credential_id)
+            .field("capsule_id", &self.capsule_id)
+            .field("digest", &self.digest)
+            .field("answer", &self.answer)
+            .field("max_answers", &self.max_answers)
+            .field("expires_at", &self.expires_at)
+            .field("shown_once", &self.shown_once)
+            .field("use_instructions", &self.use_instructions)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod review_capsule_type_tests {
+    use super::*;
+
+    #[test]
+    fn context_capsule_response_deserializes_review_discriminator() {
+        let with_review: ContextCapsuleResponse = serde_json::from_value(serde_json::json!({
+            "capsule_id": "cap_123",
+            "purpose": "review",
+            "review": { "label": "rc-repo-deadbeef-12345678", "digest": "a".repeat(64) }
+        }))
+        .unwrap();
+        assert!(with_review.review.is_some());
+
+        let legacy: ContextCapsuleResponse = serde_json::from_value(serde_json::json!({
+            "capsule_id": "cap_456",
+            "purpose": "review"
+        }))
+        .unwrap();
+        assert!(legacy.review.is_none());
+    }
+
+    #[test]
+    fn review_credential_response_redacts_secret_in_debug() {
+        let resp = ReviewCredentialResponse {
+            credential: "capsule_0123456789abcdef0123456789abcdef".to_string(),
+            credential_id: Uuid::nil(),
+            capsule_id: "cap_1".to_string(),
+            digest: "d".repeat(64),
+            answer: true,
+            max_answers: 3,
+            expires_at: "2026-11-23T00:00:00Z".to_string(),
+            shown_once: true,
+            use_instructions: ReviewCredentialUse::default(),
+        };
+        let debug = format!("{resp:?}");
+        assert!(!debug.contains("capsule_0123456789abcdef0123456789abcdef"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn review_input_round_trips_cleanly() {
+        let input = ReviewInput {
+            contract_version: REVIEW_CAPSULE_CONTRACT_VERSION,
+            repo: "contextstream".to_string(),
+            base: "a".repeat(40),
+            head: "b".repeat(40),
+            merge_base: Some("c".repeat(40)),
+            two_dot: false,
+            title: Some("Add review capsules".to_string()),
+            task: "Verify diff packaging".to_string(),
+            claims: vec!["Secrets are scrubbed".to_string()],
+            evidence: vec!["cargo test passes".to_string()],
+            context_lines: Some(3),
+            part_chars: Some(24_000),
+            files: vec![ReviewFileInput {
+                path: "src/lib.rs".to_string(),
+                old_path: None,
+                status: ReviewFileStatus::Modified,
+                skipped: None,
+                add: 1,
+                del: 0,
+                hunks: vec![ReviewHunkInput {
+                    old_start: 1,
+                    new_start: 1,
+                    heading: Some("fn main()".to_string()),
+                    lines: vec!["+let x = 1;".to_string()],
+                }],
+                excerpts: vec![],
+            }],
+        };
+        let json = serde_json::to_value(&input).unwrap();
+        let decoded: ReviewInput = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, input);
     }
 }

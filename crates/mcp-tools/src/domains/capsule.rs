@@ -11,7 +11,8 @@ use mcp_client::{
 use mcp_types::{
     api::{
         ContextCapsuleAuditEventResponse, ContextCapsuleChunkResponse, ContextCapsuleResponse,
-        ContextCapsuleShareResponse,
+        ContextCapsuleShareResponse, CreateReviewCredentialRequest, ReviewAnswerOutcome,
+        ReviewAnswerRequest, ReviewCapsuleCreateResponse, ReviewCapsuleManifestResponse,
     },
     tool::{ToolAnnotations, ToolCategory, ToolMetadata, ToolResult},
     Error, Result,
@@ -54,6 +55,9 @@ pub(crate) const VALID_ACTIONS: &[&str] = &[
     "schedule",
     "schedule_list",
     "schedule_delete",
+    "review_answer",
+    "review_answers",
+    "review_credential",
     "explain",
 ];
 pub(crate) const VALID_GRAPHS: &[&str] = &["explorer", "knowledge", "code"];
@@ -212,6 +216,40 @@ pub struct CapsuleInput {
     /// For `action="live_read"`: the share's unlock key, sent as
     /// `X-Capsule-Key`, when the link was minted with require_unlock_key.
     pub unlock_key: Option<String>,
+    /// For `action="create"`: package a local git diff (`base..head`) and
+    /// review prompt into a scrubbed, digest-verified Review Capsule.
+    pub review: Option<serde_json::Value>,
+    /// For `action="open"` on a review capsule: prompt part (`"1"`, `"2"`, ...,
+    /// or `"all"`). Accepts JSON string or non-negative integer.
+    #[serde(default, deserialize_with = "deserialize_optional_part")]
+    pub part: Option<String>,
+    /// For `action="review_answer"`: strict structured review answer text.
+    pub answer: Option<String>,
+    /// For `action="review_answer"`: optional reviewer name/label.
+    pub reviewer: Option<String>,
+    /// For `action="review_credential"`: whether the credential can submit answers.
+    pub allow_answer: Option<bool>,
+    /// For `action="review_credential"`: credential lifetime in hours.
+    pub expires_in_hours: Option<i64>,
+    /// For `action="review_credential"`: max answers permitted (when allow_answer=true).
+    pub max_answers: Option<i64>,
+}
+
+fn deserialize_optional_part<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = Option::<Value>::deserialize(deserializer)?;
+    match val {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(_) => Err(serde::de::Error::custom(
+            "part must be a string ('1', 'all') or integer",
+        )),
+    }
 }
 
 pub struct CapsuleTool {
@@ -292,14 +330,557 @@ impl CapsuleTool {
         }
         Ok(())
     }
+
+    async fn is_review_credential_only(&self) -> bool {
+        if mcp_client::get_task_auth_override().is_some_and(|a| a.is_review_credential_only()) {
+            return true;
+        }
+        self.client.config().await.is_review_credential_only()
+    }
+
+    async fn resolve_review_project_id(&self, input: &CapsuleInput) -> Result<Uuid> {
+        if let Some(explicit) = Self::parse_uuid(&input.project_id, "project_id")? {
+            return Ok(explicit);
+        }
+        if let Some(folder) = input
+            .folder_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(id) = ContextStreamClient::tracked_project_id_for_folder(folder) {
+                return Ok(id);
+            }
+        }
+        if let Some(session) = self.session.as_deref() {
+            let state = session.state().await;
+            if let Some(folder) = state.folder_path.as_deref() {
+                if let Some(id) = ContextStreamClient::tracked_project_id_for_folder(folder) {
+                    return Ok(id);
+                }
+            }
+            if let Some(id) = state.project_id {
+                return Ok(id);
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Some(cwd_str) = cwd.to_str() {
+                if let Some(id) = ContextStreamClient::tracked_project_id_for_folder(cwd_str) {
+                    return Ok(id);
+                }
+            }
+        }
+        let cfg = self.client.config().await;
+        if let Some(id) = cfg.default_project_id {
+            return Ok(id);
+        }
+        drop(cfg);
+        if let Some(session) = self.session.as_deref() {
+            if let Ok(resolved) = super::scope::resolve_write_scope(
+                &self.client,
+                session,
+                input.workspace_id.as_deref(),
+                input.project_id.as_deref(),
+            )
+            .await
+            {
+                if let Some(id) = resolved.project_id {
+                    return Ok(id);
+                }
+            }
+        }
+        Err(Error::Validation(
+            "project_id is required to create a review capsule (pass project_id, pass folder_path for an indexed repo, or run init first)."
+                .to_string(),
+        ))
+    }
+
+    async fn create_review_capsule_action(&self, input: &CapsuleInput) -> Result<ToolResult> {
+        if let Some(purpose) = input
+            .purpose
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !purpose.eq_ignore_ascii_case("review") {
+                return Err(Error::Validation(format!(
+                    "action=create with review only supports purpose='review' (or omit purpose), got '{}'",
+                    purpose
+                )));
+            }
+        }
+
+        // Hosted fail-closed refusal BEFORE touching git or making any API calls.
+        let cfg = self.client.config().await;
+        if !cfg.local_files_allowed() || mcp_client::local_files_denied() {
+            return Err(Error::Validation(
+                "Creating a code review capsule from local commits (`review`) is unavailable on the hosted MCP gateway because local git repositories cannot be accessed here. Create a non-review capsule without `review`, or run `capsule(action=\"create\", review=...)` from a local stdio ContextStream MCP session."
+                    .to_string(),
+            ));
+        }
+        drop(cfg);
+
+        let review_val = input.review.clone().ok_or_else(|| {
+            Error::Validation("review object is required for review capsule creation".to_string())
+        })?;
+        let review_input: super::review_capsule::ReviewToolInput =
+            serde_json::from_value(review_val)
+                .map_err(|e| Error::Validation(format!("Invalid review payload: {e}")))?;
+
+        let workspace_id = Self::parse_uuid(&input.workspace_id, "workspace_id")?;
+        let project_id = self.resolve_review_project_id(input).await?;
+
+        let (req, _repo_root) = super::review_capsule::build_review_capsule_request(
+            review_input,
+            project_id,
+            workspace_id,
+            input.name.clone(),
+            input.folder_path.as_deref(),
+        )
+        .await?;
+
+        let created: ReviewCapsuleCreateResponse = self.client.create_review_capsule(req).await?;
+        let digest16: String = created.review.digest.chars().take(16).collect();
+        let mut lines = vec![
+            format!(
+                "✓ Review capsule {} created · digest={} · {} ({}..{})",
+                created.capsule_id,
+                digest16,
+                created.review.repo,
+                created.review.base,
+                created.review.head
+            ),
+            format!(
+                "Diff packaged locally: {} file(s) ({} shown), +{} -{} lines across {} part(s).",
+                created.review.files,
+                created.review.files_shown,
+                created.review.add,
+                created.review.del,
+                created.review.parts
+            ),
+        ];
+        if !created.redactions.is_empty() {
+            let mut by_rule: std::collections::BTreeMap<&str, u32> =
+                std::collections::BTreeMap::new();
+            for item in &created.redactions {
+                *by_rule.entry(item.rule.as_str()).or_insert(0) += item.count;
+            }
+            let summary: Vec<String> = by_rule
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            lines.push(format!(
+                "Redactions ({}): {}",
+                created.redactions.len(),
+                summary.join(", ")
+            ));
+        }
+        if let Some(url) = created.links.review.as_deref() {
+            lines.push(format!("Review URL: {url}"));
+        }
+        if let Some(url) = created.links.prompt.as_deref() {
+            lines.push(format!("Prompt URL: {url}"));
+        }
+        if let Some(url) = created.links.part.as_deref() {
+            lines.push(format!("Part URL: {url}"));
+        }
+        if let Some(url) = created.links.answers.as_deref() {
+            lines.push(format!("Answers URL: {url}"));
+        }
+        if let Some(url) = created.links.credentials.as_deref() {
+            lines.push(format!("Credentials URL: {url}"));
+        }
+        lines.push(format!(
+            "Next: open with capsule(action=\"open\", capsule_id=\"{}\") or mint a scoped reviewer key with capsule(action=\"review_credential\", capsule_id=\"{}\").",
+            created.capsule_id, created.capsule_id
+        ));
+
+        Ok(ToolResult::with_structured(
+            lines.join("\n"),
+            serde_json::to_value(created).unwrap_or_default(),
+        ))
+    }
+
+    async fn open_review_capsule_action(
+        &self,
+        capsule_id: Option<&str>,
+        part: Option<&str>,
+        review_cred_only: bool,
+    ) -> Result<ToolResult> {
+        let manifest_resp: ReviewCapsuleManifestResponse = if review_cred_only {
+            self.client.open_review_capsule_by_credential(None).await?
+        } else {
+            let cap_id = capsule_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::Validation("capsule_id is required".to_string()))?;
+            self.client.get_review_capsule(cap_id).await?
+        };
+
+        let resolved_capsule_id = manifest_resp
+            .capsule_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| capsule_id.map(str::trim).filter(|s| !s.is_empty()))
+            .unwrap_or("(credential-bound)")
+            .to_string();
+
+        let digest = if !manifest_resp.manifest.digest.trim().is_empty() {
+            manifest_resp.manifest.digest.clone()
+        } else {
+            manifest_resp.review.digest.clone()
+        };
+        let digest16: String = digest.chars().take(16).collect();
+
+        let mut sorted_parts = manifest_resp.manifest.parts.clone();
+        sorted_parts.sort_by_key(|p| p.n);
+        let total_parts = sorted_parts.len().max(1);
+
+        let requested_part = part.map(str::trim).filter(|s| !s.is_empty());
+        let fetch_all = requested_part.is_none()
+            || requested_part.is_some_and(|s| s.eq_ignore_ascii_case("all"));
+
+        let mut fetched_parts: Vec<serde_json::Value> = Vec::new();
+        let mut markdown_chunks: Vec<String> = Vec::new();
+
+        if fetch_all {
+            if sorted_parts.is_empty() {
+                let fetched = if review_cred_only {
+                    self.client
+                        .open_review_capsule_prompt_by_credential(None, Some("all"))
+                        .await?
+                } else {
+                    self.client
+                        .get_review_capsule_prompt(&resolved_capsule_id, Some("all"))
+                        .await?
+                };
+                if let Some(hdr_digest) = fetched.digest.as_deref() {
+                    if !digest.is_empty() && hdr_digest != digest {
+                        return Err(Error::Tool(format!(
+                            "Review capsule digest mismatch on prompt header: expected {}, got {}",
+                            digest, hdr_digest
+                        )));
+                    }
+                }
+                let computed_sha = super::review_capsule::sha256_hex(&fetched.markdown);
+                if let Some(hdr_sha) = fetched.sha256.as_deref() {
+                    if hdr_sha != computed_sha {
+                        return Err(Error::Tool(format!(
+                            "Review capsule prompt SHA-256 mismatch against X-Capsule-Part-SHA256 header: expected {}, computed {}",
+                            hdr_sha, computed_sha
+                        )));
+                    }
+                }
+                fetched_parts.push(serde_json::json!({
+                    "part": "all",
+                    "sha256": computed_sha,
+                    "markdown": fetched.markdown,
+                }));
+                markdown_chunks.push(fetched.markdown);
+            } else {
+                for mp in &sorted_parts {
+                    let part_arg = mp.n.to_string();
+                    let fetched = if review_cred_only {
+                        self.client
+                            .open_review_capsule_prompt_by_credential(None, Some(&part_arg))
+                            .await?
+                    } else {
+                        self.client
+                            .get_review_capsule_prompt(&resolved_capsule_id, Some(&part_arg))
+                            .await?
+                    };
+                    if let Some(hdr_digest) = fetched.digest.as_deref() {
+                        if !digest.is_empty() && hdr_digest != digest {
+                            return Err(Error::Tool(format!(
+                                "Review capsule digest mismatch on part {}: expected {}, got {}",
+                                mp.n, digest, hdr_digest
+                            )));
+                        }
+                    }
+                    let computed_sha = super::review_capsule::sha256_hex(&fetched.markdown);
+                    if !mp.sha256.is_empty() && computed_sha != mp.sha256 {
+                        return Err(Error::Tool(format!(
+                            "Review capsule part {} SHA-256 mismatch against manifest: expected {}, computed {}",
+                            mp.n, mp.sha256, computed_sha
+                        )));
+                    }
+                    if let Some(hdr_sha) = fetched.sha256.as_deref() {
+                        if hdr_sha != computed_sha {
+                            return Err(Error::Tool(format!(
+                                "Review capsule part {} SHA-256 mismatch against X-Capsule-Part-SHA256 header: expected {}, computed {}",
+                                mp.n, hdr_sha, computed_sha
+                            )));
+                        }
+                    }
+                    fetched_parts.push(serde_json::json!({
+                        "part": mp.n,
+                        "of": total_parts,
+                        "sha256": computed_sha,
+                        "markdown": fetched.markdown,
+                    }));
+                    markdown_chunks.push(fetched.markdown);
+                }
+            }
+        } else {
+            let specific = requested_part.unwrap_or_default();
+            let part_num = specific.parse::<u32>().map_err(|_| {
+                Error::Validation(format!(
+                    "Invalid review capsule part '{}': expected a positive part number or 'all'",
+                    specific
+                ))
+            })?;
+            if part_num == 0 {
+                return Err(Error::Validation(
+                    "Invalid review capsule part '0': parts are 1-indexed".to_string(),
+                ));
+            }
+            let expected_mp = if !sorted_parts.is_empty() {
+                Some(
+                    sorted_parts
+                        .iter()
+                        .find(|p| p.n == part_num)
+                        .ok_or_else(|| {
+                            Error::Validation(format!(
+                                "Review capsule {} has parts 1..={}; part {} does not exist",
+                                resolved_capsule_id,
+                                sorted_parts.len(),
+                                part_num
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
+            let part_arg = part_num.to_string();
+            let fetched = if review_cred_only {
+                self.client
+                    .open_review_capsule_prompt_by_credential(None, Some(&part_arg))
+                    .await?
+            } else {
+                self.client
+                    .get_review_capsule_prompt(&resolved_capsule_id, Some(&part_arg))
+                    .await?
+            };
+            if let Some(hdr_digest) = fetched.digest.as_deref() {
+                if !digest.is_empty() && hdr_digest != digest {
+                    return Err(Error::Tool(format!(
+                        "Review capsule digest mismatch on part {}: expected {}, got {}",
+                        part_num, digest, hdr_digest
+                    )));
+                }
+            }
+            let computed_sha = super::review_capsule::sha256_hex(&fetched.markdown);
+            if let Some(mp) = expected_mp {
+                if !mp.sha256.is_empty() && computed_sha != mp.sha256 {
+                    return Err(Error::Tool(format!(
+                        "Review capsule part {} SHA-256 mismatch against manifest: expected {}, computed {}",
+                        part_num, mp.sha256, computed_sha
+                    )));
+                }
+            }
+            if let Some(hdr_sha) = fetched.sha256.as_deref() {
+                if hdr_sha != computed_sha {
+                    return Err(Error::Tool(format!(
+                        "Review capsule part {} SHA-256 mismatch against X-Capsule-Part-SHA256 header: expected {}, computed {}",
+                        part_num, hdr_sha, computed_sha
+                    )));
+                }
+            }
+            fetched_parts.push(serde_json::json!({
+                "part": part_num,
+                "of": total_parts,
+                "sha256": computed_sha,
+                "markdown": fetched.markdown,
+            }));
+            markdown_chunks.push(fetched.markdown);
+        }
+
+        let header = format!(
+            "CAPSULE: {digest16}\nCapsule ID: {}\nRepo: {} ({}..{})\nFiles: {} ({} shown) | +{} -{} lines | Verified part(s): {}",
+            resolved_capsule_id,
+            manifest_resp.review.repo,
+            manifest_resp.review.base,
+            manifest_resp.review.head,
+            manifest_resp.review.files,
+            manifest_resp.review.files_shown,
+            manifest_resp.review.add,
+            manifest_resp.review.del,
+            fetched_parts.len()
+        );
+        let body = markdown_chunks.join("\n\n---\n\n");
+        let text = if body.is_empty() {
+            header
+        } else {
+            format!("{header}\n\n{body}")
+        };
+        let structured = serde_json::json!({
+            "capsule_id": manifest_resp.capsule_id,
+            "name": manifest_resp.name,
+            "created_at": manifest_resp.created_at,
+            "digest": digest,
+            "digest16": digest16,
+            "review": manifest_resp.review,
+            "manifest": manifest_resp.manifest,
+            "links": manifest_resp.links,
+            "parts": fetched_parts,
+        });
+        Ok(ToolResult::with_structured(text, structured))
+    }
+
+    async fn review_answer_action(
+        &self,
+        input: &CapsuleInput,
+        review_cred_only: bool,
+    ) -> Result<ToolResult> {
+        let answer = input
+            .answer
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::Validation("answer is required for action=review_answer".to_string())
+            })?
+            .to_string();
+
+        if review_cred_only
+            && (input
+                .capsule_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+                || input
+                    .share_token
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                || input.url.as_deref().is_some_and(|s| !s.trim().is_empty()))
+        {
+            return Err(Error::Validation(
+                "Do not pass capsule_id, share_token, or url when authenticating with a review credential; X-Capsule-Credential identifies the capsule."
+                    .to_string(),
+            ));
+        }
+
+        let req = ReviewAnswerRequest {
+            answer,
+            reviewer: input
+                .reviewer
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        };
+
+        let outcome = if review_cred_only {
+            self.client
+                .post_review_answer_by_credential(None, req)
+                .await?
+        } else {
+            let capsule_id = Self::require_capsule_id(input)?;
+            self.client.post_review_answer(&capsule_id, req).await?
+        };
+
+        match outcome {
+            ReviewAnswerOutcome::Accepted(ok) => {
+                let text = format!(
+                    "✓ Review answer recorded · verdict={} · status={} · review_id={}\nFindings: must={} | should={}",
+                    ok.verdict.as_deref().unwrap_or("?"),
+                    ok.status,
+                    ok.review_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    ok.must,
+                    ok.should,
+                );
+                Ok(ToolResult::with_structured(
+                    text,
+                    serde_json::to_value(ok).unwrap_or_default(),
+                ))
+            }
+            ReviewAnswerOutcome::Invalid { message, problems } => {
+                let mut lines = vec![format!("Review answer rejected: {message}")];
+                for p in &problems {
+                    lines.push(format!("- {p}"));
+                }
+                let structured = serde_json::json!({
+                    "valid": false,
+                    "error": "REVIEW_ANSWER_INVALID",
+                    "message": message,
+                    "problems": problems,
+                });
+                let mut result = ToolResult::with_structured(lines.join("\n"), structured);
+                result.is_error = true;
+                Ok(result)
+            }
+        }
+    }
+
+    async fn review_answers_action(&self, input: &CapsuleInput) -> Result<ToolResult> {
+        let capsule_id = Self::require_capsule_id(input)?;
+        let resp = self.client.list_review_answers(&capsule_id).await?;
+        let mut lines = vec![format!(
+            "Review answers for capsule {} (digest {}): {} recorded.",
+            resp.capsule_id,
+            resp.digest.chars().take(16).collect::<String>(),
+            resp.answers.len()
+        )];
+        for ans in &resp.answers {
+            let verdict = ans.verdict.as_deref().unwrap_or("?");
+            let by = ans.by.as_deref().unwrap_or("?");
+            let for_digest = ans.for_this_digest;
+            let headline = ans
+                .headline
+                .as_deref()
+                .or(ans.summary.as_deref())
+                .unwrap_or("");
+            lines.push(format!(
+                "- verdict={verdict} | by={by} | for_this_digest={for_digest} | {headline}"
+            ));
+        }
+        Ok(ToolResult::with_structured(
+            lines.join("\n"),
+            serde_json::to_value(resp).unwrap_or_default(),
+        ))
+    }
+
+    async fn review_credential_action(&self, input: &CapsuleInput) -> Result<ToolResult> {
+        let capsule_id = Self::require_capsule_id(input)?;
+        let req = CreateReviewCredentialRequest {
+            name: input
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            answer: input.allow_answer,
+            expires_in_hours: input.expires_in_hours,
+            max_answers: input.max_answers,
+        };
+        let resp = self
+            .client
+            .create_review_credential(&capsule_id, req)
+            .await?;
+        let text = format!(
+            "✓ Review credential minted · credential_id={} · capsule={} · digest={}\nCredential (shown once, send via X-Capsule-Credential): {}\nPermissions: allow_answer={} | max_answers={} | expires_at={}",
+            resp.credential_id,
+            resp.capsule_id,
+            resp.digest.chars().take(16).collect::<String>(),
+            resp.credential,
+            resp.answer,
+            resp.max_answers,
+            resp.expires_at,
+        );
+        Ok(ToolResult::with_structured(
+            text,
+            serde_json::to_value(resp).unwrap_or_default(),
+        ))
+    }
 }
 
 /// Routing summary advertised as the tool description (<= 1024 chars).
-const CAPSULE_TOOL_DESCRIPTION: &str = "ContextCapsule: portable, shareable snapshots of project or session context. LIVE CAPSULE: to let ChatGPT, Claude, Gemini or any AI app read the project live (a live capsule, connector or MCP link), call action=live: one call returns a live link to paste and an MCP link to add as a connector. Read a pasted /c/<token>/live or /mcp link with action=live_read. Also: a pasted /c/<token> link or capsule_<uuid> token (action=open); a capsule, bundle or share link (action=create; session creates mint a safe share); a paste-ready prompt (action=bootstrap_prompt); share-token graphs (action=graph); list/audit.\n\nHandoffs MUST create `entity(kind=\"handoff\", action=\"create\", ...)`; if a bundle or link is also wanted, create the entity AND this capsule and return both (a capsule is not a replacement). Never HANDOFF.md, a scratch prompt, or prose.\n\nNot for turn-by-turn retrieval (use `context`). Results must include the capsule id plus Agent URL / Dashboard URL links. Full reference: the `action` parameter.";
+const CAPSULE_TOOL_DESCRIPTION: &str = "ContextCapsule: portable, shareable snapshots of project or session context and self-contained code-review packets. LIVE CAPSULE: call action=live for ChatGPT, Claude, Gemini or any AI app (action=live_read reads /live or /mcp links). REVIEW CAPSULE: pass review={base,head,task,...} to action=create (scrubs secrets locally from git diff), open with action=open, answer with action=review_answer (list with review_answers; mint reviewer key with review_credential). Also: open a /c/<token> link or capsule_<uuid> (action=open); create/share/bootstrap_prompt/graph/list/audit.\n\nHandoffs MUST create `entity(kind=\"handoff\", action=\"create\", ...)`; if a bundle or link is also wanted, create the entity AND this capsule and return both (a capsule is not a replacement). Never HANDOFF.md, a scratch prompt, or prose.\n\nNot for turn-by-turn retrieval (use `context`). Full reference: the `action` parameter.";
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const CAPSULE_TOOL_REFERENCE: &str = "ContextCapsule: portable, shareable, hydrate-on-demand snapshots of project or session context.\n\nLive Capsule (the default way to give an AI app the project):\n- A Live Capsule is one capsule of the project (or workspace) plus one multi-use link that stays current. Its live index (`/c/<token>/live`) is small Markdown pages a chat opens by following links; its MCP door (`/c/<token>/mcp`) is a remote MCP server (Streamable HTTP, 7 read-only tools, no sign-in: the link is its own key) that Claude, ChatGPT, Gemini, Cursor, VS Code, Windsurf or Claude Code adds as a custom connector. The app shows it as \"Live Capsule\" or \"Live Capsule - <name>\".\n- User wants ChatGPT, Claude, Gemini, another AI app or a teammate without ContextStream to read the project, asks for a live capsule, a connector or MCP link, or \"share the project with <AI>\" → action=live. One call creates the capsule and the link. Optional: name, scope=project|workspace (project when one is known), expires_in_days 1-30 (default 7), notes for the reader. Defaults are safe for a link anyone holding it can read: no file contents (include_code=none), no personal items, standard redaction, read-only, at most 7 days; .env and key files are never served. Use include_code=lazy, include_personal=true or more than 7 days only when the user asked, with allow_risky_policy=true.\n- Give the user the live link, the MCP link, the connector name and the paste-ready message (all in the result text; structured: live_url, mcp_url, connector_name, paste_prompt, connector_prompt, mcp_config, gemini_command, claude_code_command). Gemini does not open pasted links: give it the MCP link as a connector. Revoke with delete(action=\"capsule.revoke_share\", share_id=<share id>).\n- User pastes a /c/<token>/live (any page) or /c/<token>/mcp link, or you need the live state of a capsule's project → action=live_read, url=<link>. page=home (start here), tree (path), file (path, start_line, end_line; 200 lines a page), search (query), symbols (query), knowledge (kind=decisions|constraints|lessons|plans|tasks|docs, query), item (item_id=kind:uuid). Every page names its next steps as links; pass any of them back as url. Reads are rate-limited per link (120 a minute, 20 searches a minute) and audited for the owner.\n- Every share result (action=share, or a session create's auto-share) also lists its Live link and MCP link. A single-use link's live index lasts only the first open's one-hour window, so make a Live Capsule (action=live) for a link an app keeps reading.\n\nUse capsule when:\n- User pastes a /c/<token> link or capsule_<uuid> token → action=open, url=<paste> (a /live or /mcp link is read as with live_read)\n- User explicitly asks for a capsule, portable bundle, share link, team link, or external-agent link → action=create; session creates automatically mint a safe share by default, so call action=share only for a different/additional policy\n- User asks for an end-of-session capsule or shareable summary → action=create, scope=session, session_id=<current session id> (or transcript_id=<uuid>). Return the capsule id plus Agent URL + Dashboard URL links; pass audience=\"self\" only when the user explicitly requests no share link\n- User wants to bootstrap a fresh agent with project state → action=open after action=create\n- User asks for a paste-ready capsule prompt (\"bootstrap prompt\", \"prompt for ChatGPT/Claude\", \"summarize this capsule for a fresh agent\") → action=bootstrap_prompt — returns Markdown the agent can paste verbatim into another LLM\n- User wants files / knowledge / code graphs from a share token → action=graph (share_token or url)\n- User wants to list or audit capsules → action=list, list_shares, audit\n\nHandoff routing:\n- A generic request to create/prepare a handoff, hand work over, or continue in another agent/session MUST create `entity(kind=\"handoff\", action=\"create\", ...)` as the durable handoff.\n- If that handoff also needs a portable bundle, capsule, or share link, create the entity AND this capsule; return both results. Capsule is the artifact, not a replacement for the handoff entity.\n- Never replace either tool call with HANDOFF.md, a scratch prompt, a generic document/event, or prose alone.\n\nDo NOT use capsule for normal turn-by-turn retrieval — use `context` instead.\nDo NOT satisfy a session-capsule request with a prose summary only; default shared results must include the created capsule id plus Agent URL / Dashboard URL links. If audience=\"self\" is passed or auto-share fails, still return the capsule id and explain the missing share link.\n\nSession capsules default to a snapshot handoff with the full transcript available as lazy chunks and owner-only transcript access enforced by the API. Session create results include share links by default; audience=\"self\" opts out. Team share links are authenticated and reusable by default; external_agent/public_link/support shares are token-gated and single-use by default. After action=open with hydrate=false (default), follow up with action=chunk for lazy sections (chunk_ids present, no inline data). For share tokens, action=graph returns JSON (explorer|knowledge|code).";
+const CAPSULE_TOOL_REFERENCE: &str = "ContextCapsule: portable, shareable, hydrate-on-demand snapshots of project or session context.\n\nLive Capsule (the default way to give an AI app the project):\n- A Live Capsule is one capsule of the project (or workspace) plus one multi-use link that stays current. Its live index (`/c/<token>/live`) is small Markdown pages a chat opens by following links; its MCP door (`/c/<token>/mcp`) is a remote MCP server (Streamable HTTP, 7 read-only tools, no sign-in: the link is its own key) that Claude, ChatGPT, Gemini, Cursor, VS Code, Windsurf or Claude Code adds as a custom connector. The app shows it as \"Live Capsule\" or \"Live Capsule - <name>\".\n- User wants ChatGPT, Claude, Gemini, another AI app or a teammate without ContextStream to read the project, asks for a live capsule, a connector or MCP link, or \"share the project with <AI>\" → action=live. One call creates the capsule and the link. Optional: name, scope=project|workspace (project when one is known), expires_in_days 1-30 (default 7), notes for the reader. Defaults are safe for a link anyone holding it can read: no file contents (include_code=none), no personal items, standard redaction, read-only, at most 7 days; .env and key files are never served. Use include_code=lazy, include_personal=true or more than 7 days only when the user asked, with allow_risky_policy=true.\n- Give the user the live link, the MCP link, the connector name and the paste-ready message (all in the result text; structured: live_url, mcp_url, connector_name, paste_prompt, connector_prompt, mcp_config, gemini_command, claude_code_command). Gemini does not open pasted links: give it the MCP link as a connector. Revoke with delete(action=\"capsule.revoke_share\", share_id=<share id>).\n- User pastes a /c/<token>/live (any page) or /c/<token>/mcp link, or you need the live state of a capsule's project → action=live_read, url=<link>. page=home (start here), tree (path), file (path, start_line, end_line; 200 lines a page), search (query), symbols (query), knowledge (kind=decisions|constraints|lessons|plans|tasks|docs, query), item (item_id=kind:uuid). Every page names its next steps as links; pass any of them back as url. Reads are rate-limited per link (120 a minute, 20 searches a minute) and audited for the owner.\n- Every share result (action=share, or a session create's auto-share) also lists its Live link and MCP link. A single-use link's live index lasts only the first open's one-hour window, so make a Live Capsule (action=live) for a link an app keeps reading.\n\nReview Capsule (self-contained code-review packet from local git commits):\n- Build a scrubbed review packet from local git refs (`base..head`) → action=create with `review={base, head?, two_dot?, title?, task, claims?, evidence?, context_lines?, part_chars?, exclude?, excerpts?}` (local stdio only; unavailable on hosted MCP gateway). Omit `review` for standard project/session capsules (including legacy `purpose=\"review\"`).\n- Open a review capsule and verify part SHA-256 digests → action=open (`capsule_id` + optional `part=\"1\"|...|\"all\"` for members; omit `capsule_id` when using a scoped `X-Capsule-Credential`).\n- Post a strict review answer (`CAPSULE:`, `VERDICT:`, `CLAIM C#:`, `FINDING`/`NONE`, `NOT IN THE CAPSULE:`) → action=review_answer, `answer=<text>` (`capsule_id` for members, omitted for `X-Capsule-Credential`), optional `reviewer`.\n- List recorded review answers (members only) → action=review_answers, `capsule_id=<id>`.\n- Mint a scoped reviewer credential shown once (members only) → action=review_credential, `capsule_id=<id>`, optional `allow_answer`, `expires_in_hours`, `max_answers`.\n\nUse capsule when:\n- User pastes a /c/<token> link or capsule_<uuid> token → action=open, url=<paste> (a /live or /mcp link is read as with live_read)\n- User explicitly asks for a capsule, portable bundle, share link, team link, or external-agent link → action=create; session creates automatically mint a safe share by default, so call action=share only for a different/additional policy\n- User asks for an end-of-session capsule or shareable summary → action=create, scope=session, session_id=<current session id> (or transcript_id=<uuid>). Return the capsule id plus Agent URL + Dashboard URL links; pass audience=\"self\" only when the user explicitly requests no share link\n- User wants to bootstrap a fresh agent with project state → action=open after action=create\n- User asks for a paste-ready capsule prompt (\"bootstrap prompt\", \"prompt for ChatGPT/Claude\", \"summarize this capsule for a fresh agent\") → action=bootstrap_prompt — returns Markdown the agent can paste verbatim into another LLM\n- User wants files / knowledge / code graphs from a share token → action=graph (share_token or url)\n- User wants to list or audit capsules → action=list, list_shares, audit\n\nHandoff routing:\n- A generic request to create/prepare a handoff, hand work over, or continue in another agent/session MUST create `entity(kind=\"handoff\", action=\"create\", ...)` as the durable handoff.\n- If that handoff also needs a portable bundle, capsule, or share link, create the entity AND this capsule; return both results. Capsule is the artifact, not a replacement for the handoff entity.\n- Never replace either tool call with HANDOFF.md, a scratch prompt, a generic document/event, or prose alone.\n\nDo NOT use capsule for normal turn-by-turn retrieval — use `context` instead.\nDo NOT satisfy a session-capsule request with a prose summary only; default shared results must include the created capsule id plus Agent URL / Dashboard URL links. If audience=\"self\" is passed or auto-share fails, still return the capsule id and explain the missing share link.\n\nSession capsules default to a snapshot handoff with the full transcript available as lazy chunks and owner-only transcript access enforced by the API. Session create results include share links by default; audience=\"self\" opts out. Team share links are authenticated and reusable by default; external_agent/public_link/support shares are token-gated and single-use by default. After action=open with hydrate=false (default), follow up with action=chunk for lazy sections (chunk_ids present, no inline data). For share tokens, action=graph returns JSON (explorer|knowledge|code).";
 
 /// Actions whose workspace and project the API client takes from the process
 /// defaults when the call names none. A hosted session keeps the scope `init`
@@ -574,7 +1155,14 @@ impl CapsuleTool {
         let mut input: CapsuleInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
         let action = input.action.to_lowercase();
-        if SCOPE_DEFAULTED_ACTIONS.contains(&action.as_str()) {
+        let review_cred_only = self.is_review_credential_only().await;
+        if review_cred_only && !matches!(action.as_str(), "open" | "review_answer") {
+            return Err(Error::Tool(
+                "This connection holds only a review credential and is limited to opening and answering one review capsule (`capsule` actions `open` and `review_answer`)."
+                    .to_string(),
+            ));
+        }
+        if !review_cred_only && SCOPE_DEFAULTED_ACTIONS.contains(&action.as_str()) {
             let defaults =
                 super::scope::read_scope_defaults(&self.client, self.session.as_deref()).await;
             fill_scope_defaults(&mut input, defaults);
@@ -582,12 +1170,13 @@ impl CapsuleTool {
 
         match action.as_str() {
             "open"
-                if input
-                    .url
-                    .as_deref()
-                    .or(input.share_token.as_deref())
-                    .and_then(live_page_of_url)
-                    .is_some() =>
+                if !review_cred_only
+                    && input
+                        .url
+                        .as_deref()
+                        .or(input.share_token.as_deref())
+                        .and_then(live_page_of_url)
+                        .is_some() =>
             {
                 // A /c/<token>/live (or /mcp) link is the Live Capsule's index,
                 // not the capsule: read the page it names.
@@ -596,6 +1185,55 @@ impl CapsuleTool {
             "live" => self.create_live_capsule(&input).await,
             "live_read" => self.read_live_page(&input).await,
             "open" => {
+                if review_cred_only {
+                    if input
+                        .capsule_id
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                        || input
+                            .share_token
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                        || input.url.as_deref().is_some_and(|s| !s.trim().is_empty())
+                    {
+                        return Err(Error::Validation(
+                            "Do not pass capsule_id, share_token, or url when authenticating with a review credential; X-Capsule-Credential identifies the capsule."
+                                .to_string(),
+                        ));
+                    }
+                    if input.hydrate == Some(true)
+                        || is_context_doc_format(input.format.as_deref())
+                        || is_stream_format(input.format.as_deref())
+                    {
+                        return Err(Error::Validation(
+                            "Review capsules open as verified markdown parts only; hydrate and stream/context_doc formats are not supported in review-credential mode."
+                                .to_string(),
+                        ));
+                    }
+                    return self
+                        .open_review_capsule_action(None, input.part.as_deref(), true)
+                        .await;
+                }
+
+                if input.part.is_some()
+                    && input
+                        .capsule_id
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                    && input.share_token.is_none()
+                    && input.url.is_none()
+                    && !is_context_doc_format(input.format.as_deref())
+                    && !is_stream_format(input.format.as_deref())
+                {
+                    return self
+                        .open_review_capsule_action(
+                            input.capsule_id.as_deref(),
+                            input.part.as_deref(),
+                            false,
+                        )
+                        .await;
+                }
+
                 if is_context_doc_format(input.format.as_deref()) {
                     let response = self
                         .client
@@ -695,7 +1333,7 @@ impl CapsuleTool {
                             hydrate: input.hydrate,
                         })
                         .await?;
-                    if cache_eligible {
+                    if cache_eligible && r.review.is_none() {
                         if let (Some(ws), Some(cap_id)) =
                             (workspace_for_cache, input.capsule_id.as_deref())
                         {
@@ -722,6 +1360,15 @@ impl CapsuleTool {
                     }
                     r
                 };
+                if response.review.is_some() {
+                    return self
+                        .open_review_capsule_action(
+                            Some(&response.capsule_id),
+                            input.part.as_deref(),
+                            false,
+                        )
+                        .await;
+                }
                 let text = format!(
                     "{}\n\n{}",
                     format_capsule_open_headline(&response),
@@ -830,6 +1477,9 @@ impl CapsuleTool {
                 ))
             }
             "create" => {
+                if input.review.is_some() {
+                    return self.create_review_capsule_action(&input).await;
+                }
                 if matches!(input.scope.as_deref(), Some("session"))
                     && input
                         .session_id
@@ -1235,6 +1885,9 @@ impl CapsuleTool {
                 let text = format_ack_summary(&response);
                 Ok(ToolResult::with_structured(text, response))
             }
+            "review_answer" => self.review_answer_action(&input, review_cred_only).await,
+            "review_answers" => self.review_answers_action(&input).await,
+            "review_credential" => self.review_credential_action(&input).await,
             "explain" => Ok(ToolResult::text(
                 "ContextCapsule packages ContextStream context into a portable artifact. Use `context` for normal turn-by-turn retrieval and `capsule` when you need a shareable, renderable, lazy-hydrated handoff or snapshot. A Live Capsule (action=live) is a capsule plus one multi-use link that any AI app reads live: paste its live link into ChatGPT or Claude, or add its MCP link as a custom connector in Claude, ChatGPT, Gemini, Cursor or any MCP app. Read a live link yourself with action=live_read.".to_string(),
             )),
@@ -1250,6 +1903,9 @@ impl CapsuleTool {
 #[async_trait]
 impl ToolHandler for CapsuleTool {
     async fn execute(&self, input: Value) -> Result<ToolResult> {
+        if self.is_review_credential_only().await {
+            return self.execute_action(input).await;
+        }
         // By-id capsule calls name the workspace (else project) they are made
         // in, so the API routes them to its region (#361).
         let named = |key: &str| {
@@ -1490,6 +2146,121 @@ impl ToolHandler for CapsuleTool {
             .string(
                 "unlock_key",
                 "For action=live_read on a keyed share: the unlock key, sent as the X-Capsule-Key header.",
+                false,
+            )
+            .property(
+                "review",
+                serde_json::json!({
+                    "type": "object",
+                    "description": "For action=create: package a local git diff (`base..head`) and review instructions into a scrubbed Review Capsule (local stdio only; unavailable on hosted gateway).",
+                    "properties": {
+                        "base": {
+                            "type": "string",
+                            "description": "Base git commit, branch, or tag ref."
+                        },
+                        "head": {
+                            "type": "string",
+                            "description": "Head git commit, branch, or tag ref (defaults to HEAD)."
+                        },
+                        "two_dot": {
+                            "type": "boolean",
+                            "description": "When true, compare base..head directly instead of merge-base three-dot diff."
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Optional one-line title for the review capsule."
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "Review task prompt describing what to inspect and decide."
+                        },
+                        "claims": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Ordered claims (C1, C2, ...) that reviewers must evaluate."
+                        },
+                        "evidence": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Supporting checks, commands, or test output lines."
+                        },
+                        "context_lines": {
+                            "type": "integer",
+                            "description": "Number of unified diff context lines per hunk (default 3, max 50)."
+                        },
+                        "part_chars": {
+                            "type": "integer",
+                            "description": "Target maximum characters per markdown prompt part (4000..=200000)."
+                        },
+                        "exclude": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Additional repo-relative glob patterns to exclude from the diff."
+                        },
+                        "excerpts": {
+                            "type": "array",
+                            "description": "Additional bounded file excerpts for files shown in the diff.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {
+                                        "type": "string",
+                                        "description": "Repo-relative file path shown in the diff."
+                                    },
+                                    "first_line": {
+                                        "type": "integer",
+                                        "description": "1-based first line number."
+                                    },
+                                    "last_line": {
+                                        "type": "integer",
+                                        "description": "1-based last line number (required when lines is omitted)."
+                                    },
+                                    "lines": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Explicit excerpt lines (alternative to reading from git show at head)."
+                                    },
+                                    "name": {
+                                        "type": "string",
+                                        "description": "Optional identifier heading for the excerpt."
+                                    }
+                                },
+                                "required": ["path", "first_line"]
+                            }
+                        }
+                    },
+                    "required": ["base", "task"]
+                }),
+                false,
+            )
+            .string(
+                "part",
+                "For action=open on a review capsule: 1-based part number ('1', '2', ...) or 'all' (default fetches and verifies all parts in order).",
+                false,
+            )
+            .string(
+                "answer",
+                "For action=review_answer: structured review response (CAPSULE:, VERDICT:, CLAIM C#:, FINDING/NONE, NOT IN THE CAPSULE:).",
+                false,
+            )
+            .string(
+                "reviewer",
+                "For action=review_answer: optional reviewer label.",
+                false,
+            )
+            .boolean(
+                "allow_answer",
+                "For action=review_credential: allow the minted X-Capsule-Credential to post review answers (default true).",
+                false,
+            )
+            .integer(
+                "expires_in_hours",
+                "For action=review_credential: lifetime of the minted credential in hours.",
+                false,
+            )
+            .integer(
+                "max_answers",
+                "For action=review_credential: maximum number of answers allowed (when allow_answer=true).",
                 false,
             )
             .build()

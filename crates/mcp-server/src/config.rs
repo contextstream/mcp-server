@@ -21,6 +21,7 @@ pub fn load_limited_config() -> Result<Config> {
     let mut config = load_config_with_credentials(false)?;
     config.api_key = None;
     config.jwt = None;
+    config.capsule_credential = None;
     config.transcripts_enabled = false;
     config.hook_transcripts_enabled = false;
     Ok(config)
@@ -71,16 +72,22 @@ fn enum_env<T: std::str::FromStr>(name: &str, known: &str) -> Option<T> {
 }
 
 fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
-    let has_env_auth = credential_env("CONTEXTSTREAM_API_KEY").is_some()
+    let capsule_credential = credential_env("CONTEXTSTREAM_CAPSULE_CREDENTIAL");
+    let has_env_auth = capsule_credential.is_some()
+        || credential_env("CONTEXTSTREAM_API_KEY").is_some()
         || credential_env("CONTEXTSTREAM_JWT").is_some();
-    let saved_credentials = if !has_env_auth || std::env::var("CONTEXTSTREAM_API_URL").is_err() {
+    let saved_credentials = if capsule_credential.is_none()
+        && (!has_env_auth || std::env::var("CONTEXTSTREAM_API_URL").is_err())
+    {
         load_saved_credentials()
     } else {
         None
     };
 
-    // Try to load saved credentials if env vars not set.
-    if !has_env_auth {
+    // Try to load saved credentials if env vars not set (never when
+    // CONTEXTSTREAM_CAPSULE_CREDENTIAL is present — credential-only
+    // reviewer mode must not inherit ~/.contextstream/credentials.json).
+    if capsule_credential.is_none() && !has_env_auth {
         if let Some(saved) = saved_credentials.as_ref() {
             if !saved.api_key.trim().is_empty() {
                 std::env::set_var("CONTEXTSTREAM_API_KEY", &saved.api_key);
@@ -95,30 +102,56 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
         std::env::set_var("CONTEXTSTREAM_API_URL", &api_url);
     }
 
-    let api_key = credential_env("CONTEXTSTREAM_API_KEY");
-    let jwt = credential_env("CONTEXTSTREAM_JWT");
+    let review_cred_only = capsule_credential.is_some();
+    let api_key = if review_cred_only {
+        None
+    } else {
+        credential_env("CONTEXTSTREAM_API_KEY")
+    };
+    let jwt = if review_cred_only {
+        None
+    } else {
+        credential_env("CONTEXTSTREAM_JWT")
+    };
     let allow_header_auth = parse_bool_env("CONTEXTSTREAM_ALLOW_HEADER_AUTH");
 
     // Check for credentials
-    if require_credentials && api_key.is_none() && jwt.is_none() && !allow_header_auth {
+    if require_credentials
+        && api_key.is_none()
+        && jwt.is_none()
+        && capsule_credential.is_none()
+        && !allow_header_auth
+    {
         return Err(anyhow!(
-            "Missing credentials: Set CONTEXTSTREAM_API_KEY or CONTEXTSTREAM_JWT for authentication"
+            "Missing credentials: Set CONTEXTSTREAM_API_KEY, CONTEXTSTREAM_JWT, or CONTEXTSTREAM_CAPSULE_CREDENTIAL for authentication"
         ));
     }
 
-    let default_workspace_id = std::env::var("CONTEXTSTREAM_WORKSPACE_ID")
-        .ok()
-        .and_then(|s| Uuid::parse_str(&s).ok());
+    let default_workspace_id = if review_cred_only {
+        None
+    } else {
+        std::env::var("CONTEXTSTREAM_WORKSPACE_ID")
+            .ok()
+            .and_then(|s| Uuid::parse_str(&s).ok())
+    };
 
-    let default_project_id = std::env::var("CONTEXTSTREAM_PROJECT_ID")
-        .ok()
-        .and_then(|s| Uuid::parse_str(&s).ok());
+    let default_project_id = if review_cred_only {
+        None
+    } else {
+        std::env::var("CONTEXTSTREAM_PROJECT_ID")
+            .ok()
+            .and_then(|s| Uuid::parse_str(&s).ok())
+    };
 
     let user_agent = std::env::var("CONTEXTSTREAM_USER_AGENT")
         .unwrap_or_else(|_| format!("contextstream-mcp-rust/{}", VERSION));
 
-    let toolset = enum_env::<Toolset>("CONTEXTSTREAM_TOOLSET", "light, standard or complete")
-        .unwrap_or_default();
+    let toolset = if review_cred_only {
+        Toolset::Standard
+    } else {
+        enum_env::<Toolset>("CONTEXTSTREAM_TOOLSET", "light, standard or complete")
+            .unwrap_or_default()
+    };
 
     let log_level = enum_env::<LogLevel>("CONTEXTSTREAM_LOG_LEVEL", "quiet, normal or verbose")
         .unwrap_or_default();
@@ -127,11 +160,13 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
         enum_env::<OutputFormat>("CONTEXTSTREAM_OUTPUT_FORMAT", "compact or pretty")
             .unwrap_or_default();
 
-    let context_pack_enabled = parse_bool_env_default("CONTEXTSTREAM_CONTEXT_PACK", true);
+    let context_pack_enabled =
+        !review_cred_only && parse_bool_env_default("CONTEXTSTREAM_CONTEXT_PACK", true);
     let show_timing = parse_bool_env("CONTEXTSTREAM_SHOW_TIMING");
-    let progressive_mode = parse_bool_env("CONTEXTSTREAM_PROGRESSIVE_MODE");
-    let router_mode = parse_bool_env("CONTEXTSTREAM_ROUTER_MODE");
-    let consolidated_mode = parse_bool_env_default("CONTEXTSTREAM_CONSOLIDATED", true);
+    let progressive_mode = !review_cred_only && parse_bool_env("CONTEXTSTREAM_PROGRESSIVE_MODE");
+    let router_mode = !review_cred_only && parse_bool_env("CONTEXTSTREAM_ROUTER_MODE");
+    let consolidated_mode =
+        review_cred_only || parse_bool_env_default("CONTEXTSTREAM_CONSOLIDATED", true);
     let auto_hide_integrations =
         parse_bool_env_default("CONTEXTSTREAM_AUTO_HIDE_INTEGRATIONS", true);
 
@@ -150,15 +185,21 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
     // privacy edge-cases (regulated data) or explicit user opt-out. If this
     // returns false the assistant can still READ existing transcripts, it
     // just stops writing new ones.
-    let transcripts_enabled = parse_bool_env_default("CONTEXTSTREAM_TRANSCRIPTS_ENABLED", true);
+    let transcripts_enabled =
+        !review_cred_only && parse_bool_env_default("CONTEXTSTREAM_TRANSCRIPTS_ENABLED", true);
     let hook_transcripts_enabled =
-        parse_bool_env_default("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED", true);
-    let capsule_enabled = parse_bool_env_default("CONTEXTSTREAM_CAPSULE_ENABLED", true);
+        !review_cred_only && parse_bool_env_default("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED", true);
+    let capsule_enabled =
+        review_cred_only || parse_bool_env_default("CONTEXTSTREAM_CAPSULE_ENABLED", true);
 
-    let tool_surface_profile = std::env::var("CONTEXTSTREAM_TOOL_SURFACE_PROFILE")
-        .ok()
-        .and_then(|s| s.parse::<ToolSurfaceProfile>().ok())
-        .unwrap_or_else(|| infer_tool_surface_profile(&user_agent));
+    let tool_surface_profile = if review_cred_only {
+        ToolSurfaceProfile::ReviewCredential
+    } else {
+        std::env::var("CONTEXTSTREAM_TOOL_SURFACE_PROFILE")
+            .ok()
+            .and_then(|s| s.parse::<ToolSurfaceProfile>().ok())
+            .unwrap_or_else(|| infer_tool_surface_profile(&user_agent))
+    };
 
     let account_mode_preference =
         enum_env::<AccountModePreference>("CONTEXTSTREAM_ACCOUNT_MODE", "auto, team or personal")
@@ -174,25 +215,33 @@ fn load_config_with_credentials(require_credentials: bool) -> Result<Config> {
     // Agent runs priced at most this many credits start without a quote. Unset, empty or not
     // a whole number of credits: 0, which always quotes. The variable's first name is read
     // when the current one is not set.
-    let slipstream_auto_accept_max_credits =
+    let slipstream_auto_accept_max_credits = if review_cred_only {
+        0
+    } else {
         std::env::var(mcp_tools::domains::slipstream::AUTO_ACCEPT_ENV)
             .or_else(|_| std::env::var(mcp_tools::domains::slipstream::LEGACY_AUTO_ACCEPT_ENV))
             .ok()
             .and_then(|value| value.trim().parse::<u32>().ok())
-            .unwrap_or(0);
+            .unwrap_or(0)
+    };
 
     // The most one call may spend (mcp_tools::spend): unset, none; anything but a whole number
     // of credits, 0.
-    let max_spend_credits = mcp_tools::spend::ceiling_from(
-        std::env::var(mcp_tools::spend::MAX_SPEND_ENV)
-            .ok()
-            .as_deref(),
-    );
+    let max_spend_credits = if review_cred_only {
+        None
+    } else {
+        mcp_tools::spend::ceiling_from(
+            std::env::var(mcp_tools::spend::MAX_SPEND_ENV)
+                .ok()
+                .as_deref(),
+        )
+    };
 
     Ok(Config {
         api_url,
         api_key,
         jwt,
+        capsule_credential,
         default_workspace_id,
         default_project_id,
         user_agent,
@@ -353,6 +402,148 @@ mod tests {
             "http://localhost:9999".to_string()
         );
         std::env::remove_var("CONTEXTSTREAM_API_URL");
+    }
+
+    #[test]
+    fn capsule_credential_ignores_saved_credentials_and_ambient_member_keys_and_forces_review_profile(
+    ) {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let cs_dir = temp.path().join(".contextstream");
+        std::fs::create_dir_all(&cs_dir).unwrap();
+        std::fs::write(
+            cs_dir.join("credentials.json"),
+            r#"{"api_url":"https://saved.example.com","api_key":"cbiq_saved_disk_key"}"#,
+        )
+        .unwrap();
+
+        struct EnvRestore {
+            saved: Vec<(&'static str, Option<String>)>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (k, v) in self.saved.drain(..) {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let keys = [
+            "HOME",
+            "USERPROFILE",
+            "CONTEXTSTREAM_API_URL",
+            "CONTEXTSTREAM_API_KEY",
+            "CONTEXTSTREAM_JWT",
+            "CONTEXTSTREAM_CAPSULE_CREDENTIAL",
+            "CONTEXTSTREAM_WORKSPACE_ID",
+            "CONTEXTSTREAM_PROJECT_ID",
+            "CONTEXTSTREAM_TOOLSET",
+            "CONTEXTSTREAM_ROUTER_MODE",
+            "CONTEXTSTREAM_PROGRESSIVE_MODE",
+            "CONTEXTSTREAM_TRANSCRIPTS_ENABLED",
+            "CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED",
+            "CONTEXTSTREAM_CONTEXT_PACK",
+            "CONTEXTSTREAM_TOOL_SURFACE_PROFILE",
+        ];
+        let _restore = EnvRestore {
+            saved: keys.iter().map(|k| (*k, std::env::var(k).ok())).collect(),
+        };
+
+        std::env::set_var("HOME", temp.path());
+        std::env::set_var("USERPROFILE", temp.path());
+        std::env::set_var("CONTEXTSTREAM_API_URL", "http://127.0.0.1:9999");
+        std::env::set_var("CONTEXTSTREAM_API_KEY", "cbiq_ambient_member_key");
+        std::env::set_var("CONTEXTSTREAM_JWT", "ambient.jwt.token");
+        std::env::set_var(
+            "CONTEXTSTREAM_CAPSULE_CREDENTIAL",
+            "  capsule_env_only_tok  ",
+        );
+        std::env::set_var(
+            "CONTEXTSTREAM_WORKSPACE_ID",
+            "11111111-1111-4111-8111-111111111111",
+        );
+        std::env::set_var(
+            "CONTEXTSTREAM_PROJECT_ID",
+            "22222222-2222-4222-8222-222222222222",
+        );
+        std::env::set_var("CONTEXTSTREAM_TOOLSET", "light");
+        std::env::set_var("CONTEXTSTREAM_ROUTER_MODE", "true");
+        std::env::set_var("CONTEXTSTREAM_PROGRESSIVE_MODE", "true");
+        std::env::set_var("CONTEXTSTREAM_TRANSCRIPTS_ENABLED", "true");
+        std::env::set_var("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED", "true");
+        std::env::set_var("CONTEXTSTREAM_CONTEXT_PACK", "true");
+        std::env::set_var("CONTEXTSTREAM_TOOL_SURFACE_PROFILE", "default");
+
+        let cfg = load_config().expect("capsule credential should satisfy load_config");
+        assert_eq!(
+            cfg.capsule_credential.as_deref(),
+            Some("capsule_env_only_tok")
+        );
+        assert!(cfg.api_key.is_none());
+        assert!(cfg.jwt.is_none());
+        assert!(cfg.default_workspace_id.is_none());
+        assert!(cfg.default_project_id.is_none());
+        assert_eq!(
+            cfg.tool_surface_profile,
+            ToolSurfaceProfile::ReviewCredential
+        );
+        assert!(cfg.is_review_credential_only());
+        assert!(cfg.capsule_enabled);
+        assert!(!cfg.router_mode);
+        assert!(!cfg.progressive_mode);
+        assert!(!cfg.transcripts_enabled);
+        assert!(!cfg.hook_transcripts_enabled);
+        assert!(!cfg.context_pack_enabled);
+
+        // Even when CONTEXTSTREAM_API_URL is unset, capsule_credential must skip
+        // load_saved_credentials() completely (never reading api_url or api_key from disk).
+        std::env::remove_var("CONTEXTSTREAM_API_URL");
+        let cfg_default_url = load_config().expect("capsule credential without API_URL override");
+        assert_ne!(cfg_default_url.api_url, "https://saved.example.com");
+        assert!(cfg_default_url.api_key.is_none());
+    }
+
+    #[test]
+    fn blank_capsule_credential_without_other_auth_still_errors_for_limited_mode() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        struct EnvRestore {
+            saved: Vec<(&'static str, Option<String>)>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (k, v) in self.saved.drain(..) {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let keys = [
+            "HOME",
+            "USERPROFILE",
+            "CONTEXTSTREAM_API_URL",
+            "CONTEXTSTREAM_API_KEY",
+            "CONTEXTSTREAM_JWT",
+            "CONTEXTSTREAM_CAPSULE_CREDENTIAL",
+            "CONTEXTSTREAM_ALLOW_HEADER_AUTH",
+        ];
+        let _restore = EnvRestore {
+            saved: keys.iter().map(|k| (*k, std::env::var(k).ok())).collect(),
+        };
+        std::env::set_var("HOME", temp.path());
+        std::env::set_var("USERPROFILE", temp.path());
+        std::env::set_var("CONTEXTSTREAM_API_URL", "http://127.0.0.1:9999");
+        std::env::remove_var("CONTEXTSTREAM_API_KEY");
+        std::env::remove_var("CONTEXTSTREAM_JWT");
+        std::env::remove_var("CONTEXTSTREAM_ALLOW_HEADER_AUTH");
+        std::env::set_var("CONTEXTSTREAM_CAPSULE_CREDENTIAL", "   ");
+
+        let err = load_config().unwrap_err();
+        assert!(err.to_string().contains("Missing credentials"), "{err}");
     }
 }
 

@@ -253,6 +253,7 @@ impl TestFixtures {
             api_url: "https://mock.contextstream.io".to_string(),
             api_key: Some("cbiq_fixture".to_string()),
             jwt: None,
+            capsule_credential: None,
             default_workspace_id: Some(Uuid::new_v4()),
             default_project_id: Some(Uuid::new_v4()),
             user_agent: "mcp-test/0.1.0".to_string(),

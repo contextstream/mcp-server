@@ -34,6 +34,7 @@ pub mod read_only;
 pub mod reminder;
 pub mod remote_checks;
 pub(crate) mod result_cache;
+pub mod review_capsule;
 pub mod run_deliveries;
 pub(crate) mod scope;
 pub(crate) mod scope_resolution;

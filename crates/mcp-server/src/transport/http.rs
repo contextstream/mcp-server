@@ -958,10 +958,12 @@ async fn handle_jsonrpc(
                 surface_profile_from_initialize_params(&request.params),
                 state.registry.default_tool_surface_profile(),
             );
-            state
-                .telemetry
-                .update_initialize_hints(&request.params)
-                .await;
+            if surface_profile != ToolSurfaceProfile::ReviewCredential {
+                state
+                    .telemetry
+                    .update_initialize_hints(&request.params)
+                    .await;
+            }
             run_with_tool_surface_profile(surface_profile, || {
                 handle_initialize_method(&state, &request.params)
             })
@@ -1127,8 +1129,6 @@ async fn serve_mcp_message(
     let path_profile = matched_path
         .as_ref()
         .and_then(|path| path_surface_profile(path.as_str()));
-    let force_full_surface = path_profile == Some(ToolSurfaceProfile::Default);
-
     // One shared registry serves every caller, so the surface rides this
     // request as a task-local and the registry itself is never changed.
     let session_profile = if request.method == "initialize" {
@@ -1146,6 +1146,8 @@ async fn serve_mcp_message(
         session_profile,
         state.registry.default_tool_surface_profile(),
     );
+    let force_full_surface = path_profile == Some(ToolSurfaceProfile::Default)
+        && surface_profile != ToolSurfaceProfile::ReviewCredential;
     // A refused credential fails initialize the way a missing one does:
     // HTTP 401 with WWW-Authenticate, which an editor reports as a failed
     // connection, where a JSON-RPC error in a 200 still read "Connected"
@@ -1306,24 +1308,38 @@ async fn serve_mcp_streamable(
     // Atlas Stream Processing wiring — capture the call's start so a
     // post-dispatch tool_call event can carry duration_ms. The actual
     // emit fires fire-and-forget after dispatch returns (see below).
+    let review_cred_only = surface_profile == ToolSurfaceProfile::ReviewCredential
+        || mcp_client::get_task_auth_override().is_some_and(|a| a.is_review_credential_only());
     let tool_call_started = std::time::Instant::now();
-    let workspace_id_for_stream = headers
-        .get("x-contextstream-workspace-id")
-        .or_else(|| headers.get("x-workspace-id"))
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok());
-    let project_id_for_stream = headers
-        .get("x-contextstream-project-id")
-        .or_else(|| headers.get("x-project-id"))
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok());
-    let managed_runtime_identity = managed_harness_runtime_identity(&headers);
+    let workspace_id_for_stream = if review_cred_only {
+        None
+    } else {
+        headers
+            .get("x-contextstream-workspace-id")
+            .or_else(|| headers.get("x-workspace-id"))
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| Uuid::parse_str(s).ok())
+    };
+    let project_id_for_stream = if review_cred_only {
+        None
+    } else {
+        headers
+            .get("x-contextstream-project-id")
+            .or_else(|| headers.get("x-project-id"))
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| Uuid::parse_str(s).ok())
+    };
+    let managed_runtime_identity = if review_cred_only {
+        None
+    } else {
+        managed_harness_runtime_identity(&headers)
+    };
     // The stateless contract has no initialize: server/discover and
     // tools/list are its handshake, and the managed identity rides on every
     // request, so readiness is recorded from them (#328).
     let stateless_handshake =
         stateless_request && matches!(request.method.as_str(), "server/discover" | "tools/list");
-    if stateless_request {
+    if stateless_request && !review_cred_only {
         state
             .telemetry
             .ensure_managed_stateless_hints(&request.params, managed_runtime_identity.clone())
@@ -1350,6 +1366,9 @@ async fn serve_mcp_streamable(
             let answered =
             mcp_client::run_counting_api_calls(async {
                     match request.method.as_str() {
+                        "server/discover" if review_cred_only => {
+                            Ok(crate::server::build_review_credential_stateless_discover_result())
+                        }
                         "server/discover" if surface_profile == ToolSurfaceProfile::Coach => {
                             Ok(crate::server::build_coach_stateless_discover_result())
                         }
@@ -1378,20 +1397,22 @@ async fn serve_mcp_streamable(
                             data: None,
                         }),
                         "initialize" => {
-                            state
-                                .telemetry
-                                .update_managed_initialize_hints_for_session(
-                                    &request.params,
-                                    response_session_id.as_deref(),
-                                    managed_runtime_identity,
-                                )
-                                .await;
+                            if !review_cred_only {
+                                state
+                                    .telemetry
+                                    .update_managed_initialize_hints_for_session(
+                                        &request.params,
+                                        response_session_id.as_deref(),
+                                        managed_runtime_identity,
+                                    )
+                                    .await;
+                            }
                             let result = handle_initialize_method(&state, &request.params).await;
                             if let (Ok(_), Some(session_id)) = (result.as_ref(), response_session_id.as_deref())
                             {
                                 remember_session_client(session_id, &request.params);
                             }
-                            if result.is_ok() {
+                            if result.is_ok() && !review_cred_only {
                                 state
                                     .telemetry
                                     .emit_managed_connected_readiness(
@@ -1412,12 +1433,14 @@ async fn serve_mcp_streamable(
                                     // session's open runs, where the gateway
                                     // is told to keep them alive. Started,
                                     // never waited on.
-                                    let _ = mcp_tools::domains::progress::sign_of_life(
-                                        &state.client,
-                                        &state.session,
-                                        &request.params,
-                                    )
-                                    .await;
+                                    if !review_cred_only {
+                                        let _ = mcp_tools::domains::progress::sign_of_life(
+                                            &state.client,
+                                            &state.session,
+                                            &request.params,
+                                        )
+                                        .await;
+                                    }
                                     handle_call_tool_method(
                                         &state,
                                         request.params,
@@ -1445,7 +1468,7 @@ async fn serve_mcp_streamable(
         })
         .await;
 
-    if stateless_handshake && result.is_ok() {
+    if stateless_handshake && !review_cred_only && result.is_ok() {
         state
             .telemetry
             .emit_managed_connected_readiness(None, workspace_id_for_stream, project_id_for_stream)
@@ -1658,6 +1681,11 @@ fn resolve_request_tool_surface_profile(
     session_profile: Option<ToolSurfaceProfile>,
     default_profile: ToolSurfaceProfile,
 ) -> ToolSurfaceProfile {
+    if default_profile == ToolSurfaceProfile::ReviewCredential
+        || mcp_client::get_task_auth_override().is_some_and(|a| a.is_review_credential_only())
+    {
+        return ToolSurfaceProfile::ReviewCredential;
+    }
     if default_profile == ToolSurfaceProfile::Coach {
         return ToolSurfaceProfile::Coach;
     }
@@ -1676,6 +1704,7 @@ fn surface_profile_code(profile: ToolSurfaceProfile) -> u8 {
         ToolSurfaceProfile::OpenaiAgentic => 1,
         ToolSurfaceProfile::Coach => 2,
         ToolSurfaceProfile::Studio => 3,
+        ToolSurfaceProfile::ReviewCredential => 4,
     }
 }
 
@@ -1708,6 +1737,7 @@ fn surface_profile_from_session_id(session_id: &str) -> Option<ToolSurfaceProfil
         ToolSurfaceProfile::OpenaiAgentic,
         ToolSurfaceProfile::Coach,
         ToolSurfaceProfile::Studio,
+        ToolSurfaceProfile::ReviewCredential,
     ]
     .into_iter()
     .find(|profile| surface_profile_code(*profile) == bytes[15])
@@ -1845,14 +1875,16 @@ async fn handle_list_tools(
 ) -> impl IntoResponse {
     let registry = effective_registry(&state).await;
     let mut tools = contextstream_tools_list(&registry, params.category.as_deref());
-    with_slipstream_listing(
-        &registry,
-        &state.client,
-        &state.session,
-        params.category.as_deref(),
-        &mut tools,
-    )
-    .await;
+    if !registry.is_review_credential_only() {
+        with_slipstream_listing(
+            &registry,
+            &state.client,
+            &state.session,
+            params.category.as_deref(),
+            &mut tools,
+        )
+        .await;
+    }
 
     Json(serde_json::json!({ "tools": tools }))
 }
@@ -1893,8 +1925,9 @@ fn observed_rest_tool_response(
 async fn execute_tool(state: &HttpState, name: &str, input: Value) -> Response {
     let registry = effective_registry(state).await;
     let wire_observation = mcp_tools::wire_tokens::WireTokenObservation::default();
+    let review_cred_only = registry.is_review_credential_only();
 
-    if registry.is_router_mode() && !registry.is_coach_surface() {
+    if registry.is_router_mode() && !registry.is_coach_surface() && !review_cred_only {
         match name {
             "operations" => {
                 return (
@@ -1937,7 +1970,7 @@ async fn execute_tool(state: &HttpState, name: &str, input: Value) -> Response {
         }
     }
 
-    if registry.is_openai_agentic_surface() {
+    if registry.is_openai_agentic_surface() && !review_cred_only {
         match name {
             "tool_search" => {
                 return (
@@ -2112,7 +2145,32 @@ async fn tools_list_cache_key(state: &HttpState, registry: &ToolRegistry) -> Str
     )
 }
 
+fn apply_review_credential_config_isolation(config: &mut Config) {
+    config.tool_surface_profile = ToolSurfaceProfile::ReviewCredential;
+    config.capsule_enabled = true;
+    config.router_mode = false;
+    config.progressive_mode = false;
+    config.consolidated_mode = true;
+    config.transcripts_enabled = false;
+    config.hook_transcripts_enabled = false;
+    config.context_pack_enabled = false;
+}
+
 async fn effective_registry(state: &HttpState) -> Arc<ToolRegistry> {
+    let review_cred_only = mcp_client::get_task_auth_override()
+        .is_some_and(|a| a.is_review_credential_only())
+        || mcp_client::get_task_tool_surface_profile()
+            == Some(ToolSurfaceProfile::ReviewCredential);
+    if review_cred_only {
+        let mut config = effective_config(state).await;
+        apply_review_credential_config_isolation(&mut config);
+        return Arc::new(build_registry(
+            &config,
+            state.client.clone(),
+            state.session.clone(),
+        ));
+    }
+
     let Some(override_config) = get_task_config_override() else {
         return state.registry.clone();
     };
@@ -2137,7 +2195,14 @@ async fn stateless_request_registry(
     force_full_surface: bool,
 ) -> Arc<ToolRegistry> {
     let mut config = effective_config(state).await;
-    if force_full_surface {
+    let review_cred_only = mcp_client::get_task_auth_override()
+        .is_some_and(|a| a.is_review_credential_only())
+        || mcp_client::get_task_tool_surface_profile()
+            == Some(ToolSurfaceProfile::ReviewCredential)
+        || config.is_review_credential_only();
+    if review_cred_only {
+        apply_review_credential_config_isolation(&mut config);
+    } else if force_full_surface {
         config.tool_surface_profile = ToolSurfaceProfile::Default;
     }
     Arc::new(build_registry(
@@ -2876,6 +2941,9 @@ async fn credential_refused(state: &HttpState, headers: &HeaderMap) -> Option<&'
         return None;
     }
     let auth = extract_auth_override(headers)?;
+    if auth.is_review_credential_only() {
+        return None;
+    }
     let (identity, refusal) = match (auth.jwt.as_deref(), auth.api_key.as_deref()) {
         (Some(_), _) if state.jwt_secret.is_some() => return None,
         (Some(token), _) => (
@@ -2973,12 +3041,14 @@ async fn handle_list_tools_method(
     };
 
     // The shared cache holds what every caller sees; Slipstream depends on the caller's
-    // workspace and is added per request.
-    if let Some(tools) = response
-        .get_mut("tools")
-        .and_then(|tools| tools.as_array_mut())
-    {
-        with_slipstream_listing(&registry, &state.client, &state.session, None, tools).await;
+    // workspace and is added per request (except in review-credential mode).
+    if !registry.is_review_credential_only() {
+        if let Some(tools) = response
+            .get_mut("tools")
+            .and_then(|tools| tools.as_array_mut())
+        {
+            with_slipstream_listing(&registry, &state.client, &state.session, None, tools).await;
+        }
     }
 
     Ok(response)
@@ -3022,8 +3092,9 @@ async fn handle_call_tool_method(
         validate_contextstream_meta_tool_arguments(name, &arguments).map_err(JsonRpcError::from)?;
     }
 
-    // The coach surface has no router meta-tools: only its three tools run.
-    if registry.is_router_mode() && !registry.is_coach_surface() {
+    let review_cred_only = registry.is_review_credential_only();
+    // The coach and review-credential surfaces have no router meta-tools.
+    if registry.is_router_mode() && !registry.is_coach_surface() && !review_cred_only {
         match name {
             "operations" => {
                 return Ok(router_operations_response(registry.as_ref(), &arguments));
@@ -3059,7 +3130,7 @@ async fn handle_call_tool_method(
         }
     }
 
-    if registry.is_openai_agentic_surface() {
+    if registry.is_openai_agentic_surface() && !review_cred_only {
         match name {
             "tool_search" => {
                 return Ok(tool_search_response(
@@ -3161,10 +3232,12 @@ async fn handle_call_tool_method(
 
     match outcome {
         Ok(result) => {
-            state
-                .telemetry
-                .emit_managed_tool_readiness(name, &result)
-                .await;
+            if !review_cred_only {
+                state
+                    .telemetry
+                    .emit_managed_tool_readiness(name, &result)
+                    .await;
+            }
             let mut response =
                 tool_result_response_with_title(result, call_title.as_deref(), Some(call_icon));
             if let (Some(Value::Object(fields)), Some(target)) = (
@@ -3258,6 +3331,38 @@ fn tool_call_error_response(
 /// - `X-ContextStream-Project-Id` / `X-Project-Id`
 /// - exact `X-ContextStream-Traffic-Class: synthetic-probe` on an
 ///   authenticated request (all other values are discarded)
+fn has_mixed_review_and_member_credentials(headers: &HeaderMap) -> bool {
+    let has_review = headers
+        .get("x-capsule-credential")
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty());
+    if !has_review {
+        return false;
+    }
+    let has_member_header = [
+        "x-api-key",
+        "x-contextstream-api-key",
+        "x-contextstream-jwt",
+    ]
+    .into_iter()
+    .any(|name| {
+        headers
+            .get(name)
+            .and_then(|h| h.to_str().ok())
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty())
+    });
+    let has_bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|v| {
+            v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer ") && !v[7..].trim().is_empty()
+        });
+    has_member_header || has_bearer
+}
+
 fn extract_auth_override(headers: &HeaderMap) -> Option<AuthOverride> {
     let mut api_key: Option<String> = None;
     let mut jwt: Option<String> = None;
@@ -3272,6 +3377,8 @@ fn extract_auth_override(headers: &HeaderMap) -> Option<AuthOverride> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     };
+
+    let capsule_credential = credential("x-capsule-credential");
 
     // Explicit API-key headers
     if let Some(v) = credential("x-api-key").or_else(|| credential("x-contextstream-api-key")) {
@@ -3303,25 +3410,36 @@ fn extract_auth_override(headers: &HeaderMap) -> Option<AuthOverride> {
         }
     }
 
-    let workspace_id = headers
-        .get("x-contextstream-workspace-id")
-        .or_else(|| headers.get("x-workspace-id"))
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok());
+    let review_cred_only = capsule_credential.is_some() && api_key.is_none() && jwt.is_none();
 
-    let project_id = headers
-        .get("x-contextstream-project-id")
-        .or_else(|| headers.get("x-project-id"))
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok());
+    let workspace_id = if review_cred_only {
+        None
+    } else {
+        headers
+            .get("x-contextstream-workspace-id")
+            .or_else(|| headers.get("x-workspace-id"))
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| Uuid::parse_str(s).ok())
+    };
+
+    let project_id = if review_cred_only {
+        None
+    } else {
+        headers
+            .get("x-contextstream-project-id")
+            .or_else(|| headers.get("x-project-id"))
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| Uuid::parse_str(s).ok())
+    };
 
     // Never carry arbitrary caller-controlled traffic classes into backend
     // telemetry. Authentication is also required here; the API performs the
     // final probe-principal binding before accepting the classification.
-    let has_credential = api_key
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-        || jwt.as_deref().is_some_and(|value| !value.trim().is_empty());
+    let has_credential = !review_cred_only
+        && (api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || jwt.as_deref().is_some_and(|value| !value.trim().is_empty()));
     let traffic_class = if has_credential {
         headers
             .get(TrafficClass::HEADER_NAME)
@@ -3341,6 +3459,7 @@ fn extract_auth_override(headers: &HeaderMap) -> Option<AuthOverride> {
     let auth = AuthOverride {
         api_key,
         jwt,
+        capsule_credential,
         workspace_id,
         project_id,
         traffic_class,
@@ -3687,14 +3806,37 @@ pub async fn auth_middleware(
         return Ok(next.run(request).await);
     }
 
+    if has_mixed_review_and_member_credentials(&headers) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "X-Capsule-Credential cannot be combined with member API keys or Bearer tokens."
+            })),
+        )
+            .into_response());
+    }
+
     let auth = extract_auth_override(&headers);
-    let config_override = extract_config_override(&headers);
-    let edge_geography = extract_edge_geography(&headers);
-    let request_installation_id = headers
-        .get("x-contextstream-installation-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| Uuid::parse_str(value.trim()).ok())
-        .filter(|value| !value.is_nil());
+    let review_cred_only = auth.as_ref().is_some_and(|a| a.is_review_credential_only());
+    let config_override = if review_cred_only {
+        None
+    } else {
+        extract_config_override(&headers)
+    };
+    let edge_geography = if review_cred_only {
+        None
+    } else {
+        extract_edge_geography(&headers)
+    };
+    let request_installation_id = if review_cred_only {
+        None
+    } else {
+        headers
+            .get("x-contextstream-installation-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Uuid::parse_str(value.trim()).ok())
+            .filter(|value| !value.is_nil())
+    };
 
     // Decode the JWT (if one was presented and we have a secret to verify it
     // with) so we can both (a) reject invalid tokens and (b) extract the
@@ -3727,9 +3869,9 @@ pub async fn auth_middleware(
 
     // If auth is required, reject requests without credentials
     if state.require_auth
-        && auth
-            .as_ref()
-            .is_none_or(|a| a.api_key.is_none() && a.jwt.is_none())
+        && auth.as_ref().is_none_or(|a| {
+            a.api_key.is_none() && a.jwt.is_none() && a.capsule_credential.is_none()
+        })
     {
         return Err(oauth_unauthorized_response(
             &headers,
@@ -3769,7 +3911,16 @@ pub async fn auth_middleware(
         })
         .flatten();
     let request_nonce = Uuid::new_v4().simple().to_string();
-    let (session_key, effective_mcp_session_id) = if stateless_transport {
+    let (session_key, effective_mcp_session_id) = if review_cred_only {
+        let cred = auth
+            .as_ref()
+            .and_then(|a| a.capsule_credential.as_deref())
+            .unwrap_or_default();
+        (
+            SessionKey::for_http_review_credential(cred, Some(request_nonce.as_str())),
+            None,
+        )
+    } else if stateless_transport {
         (
             derive_stateless_http_request_key(
                 jwt_subject.as_deref(),
@@ -3786,30 +3937,53 @@ pub async fn auth_middleware(
             &request_nonce,
         )
     };
-    let transient_session_key = stateless_transport.then(|| session_key.clone());
-    let caller_cache_identity = derive_http_caller_cache_identity(
-        jwt_subject.as_deref(),
-        auth.as_ref().and_then(|a| a.api_key.as_deref()),
-    );
+    let transient_session_key =
+        (stateless_transport || review_cred_only).then(|| session_key.clone());
+    let caller_cache_identity = if review_cred_only {
+        None
+    } else {
+        derive_http_caller_cache_identity(
+            jwt_subject.as_deref(),
+            auth.as_ref().and_then(|a| a.api_key.as_deref()),
+        )
+    };
     // A client on the stateless contract can name its connection (see
     // `mcp_client::client_session`). Untrusted input: a value of any other
     // shape is ignored, and no tool uses it without the caller's identity.
-    let client_session = client_session_from_headers(&headers);
+    let client_session = if review_cred_only {
+        None
+    } else {
+        client_session_from_headers(&headers)
+    };
     // A client can name its agent (`mcp_client::agent_handle::HEADER`).
     // Untrusted input too: a label for the caller's own reports, written only
     // where the caller's credential may write.
-    let agent_handle = agent_handle_from_headers(&headers);
+    let agent_handle = if review_cred_only {
+        None
+    } else {
+        agent_handle_from_headers(&headers)
+    };
 
     // Wrap handler execution with per-request auth, config, and session-
     // identity context. SessionManager reads the session key via
     // get_task_session_key() to pick the right in-memory bucket for this
     // caller; ContextStreamClient reads the auth override.
+    let run_inner = || async move {
+        if review_cred_only {
+            run_with_tool_surface_profile(ToolSurfaceProfile::ReviewCredential, || {
+                next.run(request)
+            })
+            .await
+        } else {
+            next.run(request).await
+        }
+    };
     let exec = || async move {
         match (auth, config_override) {
             (Some(a), Some(config)) => {
                 run_with_session_key(session_key, || async {
                     run_with_auth_override(a, || async {
-                        run_with_config_override(config, || next.run(request)).await
+                        run_with_config_override(config, run_inner).await
                     })
                     .await
                 })
@@ -3817,17 +3991,17 @@ pub async fn auth_middleware(
             }
             (Some(a), None) => {
                 run_with_session_key(session_key, || async {
-                    run_with_auth_override(a, || next.run(request)).await
+                    run_with_auth_override(a, run_inner).await
                 })
                 .await
             }
             (None, Some(config)) => {
                 run_with_session_key(session_key, || async {
-                    run_with_config_override(config, || next.run(request)).await
+                    run_with_config_override(config, run_inner).await
                 })
                 .await
             }
-            (None, None) => run_with_session_key(session_key, || next.run(request)).await,
+            (None, None) => run_with_session_key(session_key, run_inner).await,
         }
     };
     let exec_with_installation = || async move {
@@ -8997,6 +9171,449 @@ mod agent_name_header_tests {
                 agent_handle_from_headers(&sent(refused)),
                 None,
                 "{refused:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod review_credential_http_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower::ServiceExt;
+
+    fn sha256_hex(text: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(text.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    struct HttpMockApi {
+        base_url: String,
+        requests: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for HttpMockApi {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl HttpMockApi {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = requests.clone();
+            let md = "# Review capsule 0123456789abcdef  (part 1 of 1)\n\nHTTP body".to_string();
+            let sha = sha256_hex(&md);
+            let digest =
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let recorded = recorded.clone();
+                    let md = md.clone();
+                    let sha = sha.clone();
+                    let digest = digest.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let head = loop {
+                            let mut chunk = [0u8; 4096];
+                            let n = socket.read(&mut chunk).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                                continue;
+                            };
+                            let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                            let len: usize = head
+                                .lines()
+                                .filter_map(|l| l.split_once(':'))
+                                .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                                .and_then(|(_, v)| v.trim().parse().ok())
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break head;
+                            }
+                        };
+                        let line = head.lines().next().unwrap_or_default().to_string();
+                        recorded.lock().unwrap().push((line.clone(), head));
+
+                        let (status, reason, ctype, extra, body) = if line
+                            .starts_with("GET /api/v1/capsules/review/open ")
+                        {
+                            (
+                                200,
+                                "OK",
+                                "application/json",
+                                String::new(),
+                                json!({
+                                    "success": true,
+                                    "data": {
+                                        "review": {
+                                            "label": "rev",
+                                            "digest": digest,
+                                            "repo": "org/repo",
+                                            "base": "a",
+                                            "head": "b",
+                                            "files": 1,
+                                            "files_shown": 1,
+                                            "parts": 1
+                                        },
+                                        "manifest": {
+                                            "contract_version": 1,
+                                            "digest": digest,
+                                            "label": "rev",
+                                            "source": "client",
+                                            "repo": "org/repo",
+                                            "base": "a",
+                                            "head": "b",
+                                            "title": "T",
+                                            "task": "Task",
+                                            "part_chars": 4000,
+                                            "parts": [{ "n": 1, "chars": md.len(), "sha256": sha }]
+                                        }
+                                    }
+                                })
+                                .to_string(),
+                            )
+                        } else if line.starts_with("GET /api/v1/capsules/review/open/prompt.md") {
+                            (
+                                    200,
+                                    "OK",
+                                    "text/markdown; charset=utf-8",
+                                    format!(
+                                        "X-Capsule-Digest: {digest}\r\nX-Capsule-Part-SHA256: {sha}\r\n"
+                                    ),
+                                    md,
+                                )
+                        } else if line.starts_with("POST /api/v1/capsules/review/open/answers ") {
+                            (
+                                201,
+                                "Created",
+                                "application/json",
+                                String::new(),
+                                json!({
+                                    "success": true,
+                                    "data": {
+                                        "valid": true,
+                                        "verdict": "SAFE TO LAND",
+                                        "must": 0,
+                                        "should": 0,
+                                        "status": "approved"
+                                    }
+                                })
+                                .to_string(),
+                            )
+                        } else {
+                            (
+                                500,
+                                "Unexpected",
+                                "application/json",
+                                String::new(),
+                                json!({"error": format!("unexpected route: {line}")}).to_string(),
+                            )
+                        };
+
+                        let resp = format!(
+                            "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    });
+                }
+            });
+
+            Self {
+                base_url,
+                requests,
+                task,
+            }
+        }
+
+        fn captured(&self) -> Vec<(String, String)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn test_gateway_router(api_url: String) -> axum::Router {
+        // Simulate an ambient gateway key in Config to verify review-credential
+        // requests NEVER fall back to it!
+        let cfg = Config {
+            api_url,
+            api_key: Some("cbiq_gateway_ambient_do_not_leak".to_string()),
+            allow_header_auth: true,
+            is_http_transport: true,
+            capsule_enabled: true,
+            ..Default::default()
+        };
+        let client = ContextStreamClient::new(cfg.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), cfg.clone()));
+        let registry = Arc::new(build_registry(&cfg, client.clone(), session.clone()));
+        let state = HttpState {
+            registry,
+            client: client.clone(),
+            session: session.clone(),
+            jwt_secret: None,
+            require_auth: true,
+            telemetry: AgenticTelemetry::new(client, session),
+            tools_list_cache: Arc::new(RwLock::new(HashMap::new())),
+            concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            metrics_handle: None,
+        };
+        create_router(state)
+    }
+
+    #[tokio::test]
+    async fn review_credential_mixed_with_member_headers_is_rejected_400() {
+        let app = test_gateway_router("http://127.0.0.1:9".to_string());
+        for (member_header, member_value) in [
+            ("x-api-key", "cbiq_member"),
+            ("x-contextstream-api-key", "cbiq_member"),
+            ("x-contextstream-jwt", "a.b.c"),
+            ("authorization", "Bearer cbiq_member"),
+        ] {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-capsule-credential", "capsule_rev_secret")
+                .header(member_header, member_value)
+                .body(Body::from(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+                ))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 when mixing X-Capsule-Credential with {member_header}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn review_credential_require_auth_gateway_isolates_mcp_and_rest_routes() {
+        let mock = HttpMockApi::start().await;
+        let app = test_gateway_router(mock.base_url.clone());
+
+        // 1. initialize on /mcp succeeds with toolCount: 1 and does NOT call me().
+        let init_req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-capsule-credential", "capsule_http_tok")
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": { "protocolVersion": "2025-03-26", "clientInfo": { "name": "chatgpt" } }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let init_resp = app.clone().oneshot(init_req).await.unwrap();
+        assert_eq!(init_resp.status(), StatusCode::OK);
+        let init_json: Value =
+            serde_json::from_slice(&to_bytes(init_resp.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(init_json["result"]["toolCount"], 1);
+        assert!(mock.captured().is_empty(), "initialize must not call /me");
+
+        // 2. tools/list even on /chatgpt (which normally forces OpenaiAgentic/Default)
+        // lists ONLY `capsule`.
+        let list_req = Request::builder()
+            .method(Method::POST)
+            .uri("/chatgpt")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-capsule-credential", "capsule_http_tok")
+            .body(Body::from(
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).to_string(),
+            ))
+            .unwrap();
+        let list_resp = app.clone().oneshot(list_req).await.unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_json: Value =
+            serde_json::from_slice(&to_bytes(list_resp.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        let names: Vec<&str> = list_json["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["capsule"]);
+
+        // 3. Legacy /api/v1/tools/list also returns ONLY `capsule`, and /api/v1/tools/call blocks `search`.
+        let rest_list_req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/tools/list")
+            .header("x-capsule-credential", "capsule_http_tok")
+            .body(Body::empty())
+            .unwrap();
+        let rest_list_resp = app.clone().oneshot(rest_list_req).await.unwrap();
+        assert_eq!(rest_list_resp.status(), StatusCode::OK);
+        let rest_list_json: Value = serde_json::from_slice(
+            &to_bytes(rest_list_resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let rest_names: Vec<&str> = rest_list_json["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(rest_names, vec!["capsule"]);
+
+        let rest_blocked_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/tools/call")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-capsule-credential", "capsule_http_tok")
+            .body(Body::from(
+                json!({"tool": "search", "input": {"query": "x"}}).to_string(),
+            ))
+            .unwrap();
+        let rest_blocked_resp = app.clone().oneshot(rest_blocked_req).await.unwrap();
+        assert_eq!(rest_blocked_resp.status(), StatusCode::BAD_REQUEST);
+
+        // 4. Member tools/list on the same app still sees the full catalog
+        // (proving tools_list_cache does not cross-contaminate).
+        let member_list_req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-api-key", "cbiq_member_real")
+            .body(Body::from(
+                json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}).to_string(),
+            ))
+            .unwrap();
+        let member_list_resp = app.clone().oneshot(member_list_req).await.unwrap();
+        let member_list_json: Value = serde_json::from_slice(
+            &to_bytes(member_list_resp.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            member_list_json["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .len()
+                > 5
+        );
+
+        // Member tools/list succeeded without crossing review-cred cache; record
+        // baseline mock count (in case member listing probed slipstream).
+        let baseline_count = mock.captured().len();
+
+        // 5. Blocked tools and blocked capsule actions fail with ZERO HTTP requests.
+        for blocked_payload in [
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "search", "arguments": {"query": "x"}}}),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "tool_search", "arguments": {"query": "x"}}}),
+            json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "capsule", "arguments": {"action": "review_answers", "capsule_id": "c1"}}}),
+        ] {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-capsule-credential", "capsule_http_tok")
+                .body(Body::from(blocked_payload.to_string()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let body: Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            assert!(
+                body.get("error").is_some() || body["result"]["isError"] == true,
+                "blocked call succeeded: {body}"
+            );
+        }
+        assert_eq!(
+            mock.captured().len(),
+            baseline_count,
+            "blocked calls hit API mock: {:?}",
+            mock.captured()
+        );
+
+        // 6. open + review_answer work and send ONLY X-Capsule-Credential (never
+        // ambient gateway api_key or forged workspace header).
+        let open_req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-capsule-credential", "capsule_http_tok")
+            .header("x-workspace-id", Uuid::new_v4().to_string())
+            .body(Body::from(
+                json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "capsule", "arguments": {"action": "open"}}})
+                    .to_string(),
+            ))
+            .unwrap();
+        let open_resp = app.clone().oneshot(open_req).await.unwrap();
+        assert_eq!(open_resp.status(), StatusCode::OK);
+        let open_json: Value =
+            serde_json::from_slice(&to_bytes(open_resp.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_ne!(open_json["result"]["isError"], true, "{open_json}");
+
+        let ans_req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-capsule-credential", "capsule_http_tok")
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "capsule",
+                        "arguments": { "action": "review_answer", "answer": "CAPSULE: 0123456789abcdef\nVERDICT: SAFE TO LAND" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let ans_resp = app.clone().oneshot(ans_req).await.unwrap();
+        assert_eq!(ans_resp.status(), StatusCode::OK);
+        let ans_json: Value =
+            serde_json::from_slice(&to_bytes(ans_resp.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_ne!(ans_json["result"]["isError"], true, "{ans_json}");
+
+        let all_reqs = mock.captured();
+        let reqs = &all_reqs[baseline_count..];
+        assert_eq!(reqs.len(), 3, "expected 3 review requests, got: {reqs:?}");
+        for (line, headers) in reqs {
+            let lower = headers.to_ascii_lowercase();
+            assert!(
+                lower.contains("x-capsule-credential: capsule_http_tok"),
+                "{line}: {headers}"
+            );
+            assert!(
+                !lower.contains("x-api-key:")
+                    && !lower.contains("authorization:")
+                    && !lower.contains("x-workspace-id:"),
+                "leaked header on {line}: {headers}"
             );
         }
     }

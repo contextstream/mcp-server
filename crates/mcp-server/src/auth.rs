@@ -63,6 +63,7 @@ pub fn extract_auth_from_headers(headers: &serde_json::Value) -> Option<AuthOver
         Some(AuthOverride {
             api_key,
             jwt,
+            capsule_credential: None,
             workspace_id,
             project_id,
             traffic_class,

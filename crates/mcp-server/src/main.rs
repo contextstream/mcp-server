@@ -4468,7 +4468,9 @@ async fn run_stdio_server() -> Result<()> {
         client.clone(),
         config.clone(),
     ));
-    session.register_session_refresh_hook().await;
+    if !config.is_review_credential_only() {
+        session.register_session_refresh_hook().await;
+    }
 
     // Run the server
     server::run_server(config, client, session).await?;
@@ -4598,7 +4600,9 @@ async fn run_http_server(host: &str, port: u16) -> Result<()> {
         client.clone(),
         config.clone(),
     ));
-    session.register_session_refresh_hook().await;
+    if !config.is_review_credential_only() {
+        session.register_session_refresh_hook().await;
+    }
 
     // The same registry the stdio server and the per-request HTTP registries use
     // (server::build_registry). A list of its own here drifted: answer, feed, vcs,

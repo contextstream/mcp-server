@@ -1874,3 +1874,813 @@ fn capsule_and_share_responses_carry_the_live_links() {
         Some("https://ctx.example/c/t/mcp")
     );
 }
+
+#[derive(Clone, Debug)]
+struct RecordedHttpRequest {
+    request_line: String,
+    headers: String,
+    body: String,
+}
+
+struct ScriptedReviewMock {
+    base_url: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<RecordedHttpRequest>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ScriptedReviewMock {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl ScriptedReviewMock {
+    async fn start<F>(responder: F) -> Self
+    where
+        F: Fn(&str, &str, &str) -> (u16, &'static str, Vec<(&'static str, String)>, String)
+            + Send
+            + Sync
+            + 'static,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let responder = std::sync::Arc::new(responder);
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = recorded.clone();
+                let responder = responder.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let (head, body) = loop {
+                        let mut chunk = [0u8; 4096];
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        let len: usize = head
+                            .lines()
+                            .filter_map(|l| l.split_once(':'))
+                            .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, v)| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            let body =
+                                String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).to_string();
+                            break (head, body);
+                        }
+                    };
+                    let request_line = head.lines().next().unwrap_or_default().to_string();
+                    recorded.lock().unwrap().push(RecordedHttpRequest {
+                        request_line: request_line.clone(),
+                        headers: head.clone(),
+                        body: body.clone(),
+                    });
+                    let (status, reason, extra_headers, resp_body) =
+                        responder(&request_line, &head, &body);
+                    let mut resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                        resp_body.len()
+                    );
+                    for (k, v) in extra_headers {
+                        resp.push_str(&format!("{k}: {v}\r\n"));
+                    }
+                    resp.push_str("\r\n");
+                    resp.push_str(&resp_body);
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        Self {
+            base_url,
+            requests,
+            task,
+        }
+    }
+
+    fn captured(&self) -> Vec<RecordedHttpRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+fn run_git_sync(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Tester")
+        .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+        .env("GIT_COMMITTER_NAME", "Tester")
+        .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+        .output()
+        .expect("git command");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[tokio::test]
+async fn review_capsule_create_from_throwaway_repo_scrubs_and_omits_auto_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    run_git_sync(root, &["init"]);
+    std::fs::write(root.join("lib.rs"), "pub fn ok() -> i32 { 1 }\n").unwrap();
+    run_git_sync(root, &["add", "."]);
+    run_git_sync(root, &["commit", "-m", "base"]);
+    let base_sha = run_git_sync(root, &["rev-parse", "HEAD"]);
+
+    // Commit both a real code change with an embedded secret and a .env.example sensitive file.
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn ok() -> i32 { 2 }\npub const KEY: &str = \"sk_live_51TestSecretValue123456\";\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".env.example"),
+        "API_TOKEN=secret_example_value\n",
+    )
+    .unwrap();
+    run_git_sync(root, &["add", "."]);
+    run_git_sync(root, &["commit", "-m", "head"]);
+    let head_sha = run_git_sync(root, &["rev-parse", "HEAD"]);
+
+    let mock = ScriptedReviewMock::start(|line, _headers, _body| {
+        if line.starts_with("POST /api/v1/capsules/review ") {
+            let body = serde_json::json!({
+                "success": true,
+                "data": {
+                    "capsule_id": "cap_rev_1",
+                    "name": "auth-check",
+                    "review": {
+                        "label": "auth-check",
+                        "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "contract_version": 1,
+                        "repo": "local/repo",
+                        "base": "base",
+                        "head": "head",
+                        "title": "Check auth",
+                        "files": 2,
+                        "files_shown": 1,
+                        "add": 2,
+                        "del": 0,
+                        "parts": 1,
+                        "chars": 120,
+                        "claims": 1,
+                        "evidence": 0,
+                        "redactions": 1,
+                        "source": "client"
+                    },
+                    "redactions": [
+                        { "at": "lib.rs:2", "rule": "known_prefix", "count": 1 }
+                    ],
+                    "links": {
+                        "review": "/api/v1/capsules/cap_rev_1/review",
+                        "prompt": "/api/v1/capsules/cap_rev_1/review/prompt.md"
+                    }
+                }
+            });
+            return (
+                201,
+                "Created",
+                vec![("Content-Type", "application/json".to_string())],
+                body.to_string(),
+            );
+        }
+        panic!("unexpected request line: {line}");
+    })
+    .await;
+
+    let mut cfg = TestFixtures::test_config();
+    cfg.api_url = mock.base_url.clone();
+    let client = ContextStreamClient::new(cfg);
+    let tool = CapsuleTool::new(client);
+    let project_id = Uuid::new_v4().to_string();
+
+    let res = tool
+        .execute(json!({
+            "action": "create",
+            "project_id": project_id,
+            "folder_path": root.to_string_lossy(),
+            "name": "auth-check",
+            "review": {
+                "base": base_sha,
+                "head": head_sha,
+                "title": "Check auth",
+                "task": "Verify code safety",
+                "claims": ["No secrets leave client"]
+            }
+        }))
+        .await
+        .unwrap();
+    assert!(!res.is_error);
+
+    let captured = mock.captured();
+    assert_eq!(
+        captured.len(),
+        1,
+        "only POST /api/v1/capsules/review expected"
+    );
+    assert!(captured[0]
+        .request_line
+        .starts_with("POST /api/v1/capsules/review "));
+    assert!(
+        !captured[0].body.contains("sk_live_51TestSecretValue123456"),
+        "secret must be scrubbed client-side before upload: {}",
+        captured[0].body
+    );
+    assert!(
+        captured[0].body.contains("[REDACTED]"),
+        "expected [REDACTED] placeholder: {}",
+        captured[0].body
+    );
+    assert!(
+        !captured[0].body.contains("secret_example_value"),
+        "sensitive .env.example content must never upload: {}",
+        captured[0].body
+    );
+    let parsed_body: serde_json::Value = serde_json::from_str(&captured[0].body).unwrap();
+    let files = parsed_body["review"]["files"].as_array().unwrap();
+    let env_entry = files.iter().find(|f| f["path"] == ".env.example").unwrap();
+    assert_eq!(env_entry["skipped"], "excluded");
+}
+
+#[tokio::test]
+async fn review_capsule_create_purpose_review_without_review_object_uses_legacy_endpoint() {
+    let probe = RequestProbe::answering(
+        r#"{"success":true,"data":{"capsule_id":"cap_legacy","status":"ready","warnings":[]}}"#,
+    )
+    .await;
+    let mut cfg = TestFixtures::test_config();
+    cfg.api_url = probe.base_url.clone();
+    let client = ContextStreamClient::new(cfg);
+    let tool = CapsuleTool::new(client);
+
+    let res = tool
+        .execute(json!({
+            "action": "create",
+            "scope": "workspace",
+            "workspace_id": Uuid::new_v4().to_string(),
+            "purpose": "review"
+        }))
+        .await
+        .unwrap();
+    assert!(!res.is_error);
+    let lines = probe.request_lines();
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].starts_with("POST /api/v1/capsules "),
+        "expected legacy POST /api/v1/capsules, got {:?}",
+        lines
+    );
+}
+
+#[tokio::test]
+async fn review_capsule_open_fetches_ordered_parts_verifies_sha256_and_skips_warm_cache() {
+    let part1_md = "# Review capsule 0123456789abcdef  (part 1 of 2)\n\nPart 1 body";
+    let part2_md = "# Review capsule 0123456789abcdef  (part 2 of 2)\n\nPart 2 body\n\nCAPSULE: 0123456789abcdef";
+    let part1_sha = crate::domains::review_capsule::sha256_hex(part1_md);
+    let part2_sha = crate::domains::review_capsule::sha256_hex(part2_md);
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let p1_md = part1_md.to_string();
+    let p2_md = part2_md.to_string();
+    let p1_sha = part1_sha.clone();
+    let p2_sha = part2_sha.clone();
+
+    let mock = ScriptedReviewMock::start(move |line, _headers, _body| {
+        if line.starts_with("GET /api/v1/capsules/cap_rev_open ") {
+            let body = json!({
+                "success": true,
+                "data": {
+                    "capsule_id": "cap_rev_open",
+                    "scope": "project",
+                    "mode": "snapshot",
+                    "status": "ready",
+                    "review": { "label": "rev", "digest": digest }
+                }
+            });
+            return (
+                200,
+                "OK",
+                vec![("Content-Type", "application/json".to_string())],
+                body.to_string(),
+            );
+        }
+        if line.starts_with("GET /api/v1/capsules/cap_rev_open/review ") {
+            let body = json!({
+                "success": true,
+                "data": {
+                    "capsule_id": "cap_rev_open",
+                    "name": "rev",
+                    "review": {
+                        "label": "rev",
+                        "digest": digest,
+                        "contract_version": 1,
+                        "repo": "org/repo",
+                        "base": "aaa",
+                        "head": "bbb",
+                        "files": 1,
+                        "files_shown": 1,
+                        "parts": 2
+                    },
+                    "manifest": {
+                        "contract_version": 1,
+                        "digest": digest,
+                        "label": "rev",
+                        "source": "client",
+                        "repo": "org/repo",
+                        "base": "aaa",
+                        "head": "bbb",
+                        "title": "Title",
+                        "task": "Task",
+                        "part_chars": 4000,
+                        "parts": [
+                            { "n": 2, "chars": p2_md.len(), "sha256": p2_sha },
+                            { "n": 1, "chars": p1_md.len(), "sha256": p1_sha }
+                        ]
+                    }
+                }
+            });
+            return (
+                200,
+                "OK",
+                vec![("Content-Type", "application/json".to_string())],
+                body.to_string(),
+            );
+        }
+        if line.starts_with("GET /api/v1/capsules/cap_rev_open/review/prompt.md?part=1 ") {
+            return (
+                200,
+                "OK",
+                vec![
+                    ("Content-Type", "text/markdown; charset=utf-8".to_string()),
+                    ("X-Capsule-Digest", digest.to_string()),
+                    ("X-Capsule-Part", "1 of 2".to_string()),
+                    ("X-Capsule-Part-SHA256", p1_sha.clone()),
+                ],
+                p1_md.clone(),
+            );
+        }
+        if line.starts_with("GET /api/v1/capsules/cap_rev_open/review/prompt.md?part=2 ") {
+            return (
+                200,
+                "OK",
+                vec![
+                    ("Content-Type", "text/markdown; charset=utf-8".to_string()),
+                    ("X-Capsule-Digest", digest.to_string()),
+                    ("X-Capsule-Part", "2 of 2".to_string()),
+                    ("X-Capsule-Part-SHA256", p2_sha.clone()),
+                ],
+                p2_md.clone(),
+            );
+        }
+        panic!("unexpected request: {line}");
+    })
+    .await;
+
+    let mut cfg = TestFixtures::test_config();
+    cfg.api_url = mock.base_url.clone();
+    let client = ContextStreamClient::new(cfg);
+    let tool = CapsuleTool::new(client);
+
+    let res = tool
+        .execute(json!({
+            "action": "open",
+            "capsule_id": "cap_rev_open",
+            "part": "all"
+        }))
+        .await
+        .unwrap();
+    let text = match &res.content[0] {
+        mcp_types::tool::ContentItem::Text { text } => text.clone(),
+        _ => panic!("expected text"),
+    };
+    assert!(text.contains("CAPSULE: 0123456789abcdef"));
+    let p1_pos = text.find("Part 1 body").unwrap();
+    let p2_pos = text.find("Part 2 body").unwrap();
+    assert!(p1_pos < p2_pos, "parts must be assembled 1 then 2: {text}");
+
+    let lines: Vec<String> = mock
+        .captured()
+        .into_iter()
+        .map(|r| r.request_line)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "GET /api/v1/capsules/cap_rev_open/review HTTP/1.1",
+            "GET /api/v1/capsules/cap_rev_open/review/prompt.md?part=1 HTTP/1.1",
+            "GET /api/v1/capsules/cap_rev_open/review/prompt.md?part=2 HTTP/1.1",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn review_capsule_open_rejects_sha256_mismatch() {
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let mock = ScriptedReviewMock::start(move |line, _headers, _body| {
+        if line.starts_with("GET /api/v1/capsules/cap_bad_sha/review ") {
+            let body = json!({
+                "success": true,
+                "data": {
+                    "capsule_id": "cap_bad_sha",
+                    "review": { "label": "rev", "digest": digest },
+                    "manifest": {
+                        "contract_version": 1,
+                        "digest": digest,
+                        "label": "rev",
+                        "source": "client",
+                        "repo": "org/repo",
+                        "base": "aaa",
+                        "head": "bbb",
+                        "title": "Title",
+                        "task": "Task",
+                        "part_chars": 4000,
+                        "parts": [
+                            { "n": 1, "chars": 10, "sha256": "0000000000000000000000000000000000000000000000000000000000000000" }
+                        ]
+                    }
+                }
+            });
+            return (200, "OK", vec![("Content-Type", "application/json".to_string())], body.to_string());
+        }
+        if line.starts_with("GET /api/v1/capsules/cap_bad_sha/review/prompt.md?part=1 ") {
+            return (
+                200,
+                "OK",
+                vec![("Content-Type", "text/markdown; charset=utf-8".to_string())],
+                "Tampered markdown body".to_string(),
+            );
+        }
+        panic!("unexpected request: {line}");
+    })
+    .await;
+
+    let mut cfg = TestFixtures::test_config();
+    cfg.api_url = mock.base_url.clone();
+    let tool = CapsuleTool::new(ContextStreamClient::new(cfg));
+    let err = tool
+        .execute(json!({ "action": "open", "capsule_id": "cap_bad_sha", "part": 1 }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("SHA-256 mismatch"), "got: {err}");
+}
+
+#[tokio::test]
+async fn review_capsule_review_answer_201_and_422_preserve_problems() {
+    let mock = ScriptedReviewMock::start(|line, _headers, body| {
+        if line.starts_with("POST /api/v1/capsules/cap_ans/review/answers ") {
+            let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+            if parsed["answer"].as_str().unwrap_or("").contains("BAD") {
+                return (
+                    422,
+                    "Unprocessable Entity",
+                    vec![("Content-Type", "application/json".to_string())],
+                    json!({
+                        "success": false,
+                        "error": {
+                            "code": "REVIEW_ANSWER_INVALID",
+                            "message": "The review answer did not pass validation."
+                        },
+                        "data": {
+                            "valid": false,
+                            "problems": ["Missing VERDICT line", "Claim C1 is unjudged"]
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+            return (
+                201,
+                "Created",
+                vec![("Content-Type", "application/json".to_string())],
+                json!({
+                    "success": true,
+                    "data": {
+                        "valid": true,
+                        "verdict": "SAFE TO LAND",
+                        "must": 0,
+                        "should": 0,
+                        "status": "approved",
+                        "review_id": Uuid::new_v4()
+                    }
+                })
+                .to_string(),
+            );
+        }
+        panic!("unexpected request: {line}");
+    })
+    .await;
+
+    let mut cfg = TestFixtures::test_config();
+    cfg.api_url = mock.base_url.clone();
+    let tool = CapsuleTool::new(ContextStreamClient::new(cfg));
+
+    let invalid = tool
+        .execute(json!({
+            "action": "review_answer",
+            "capsule_id": "cap_ans",
+            "answer": "BAD"
+        }))
+        .await
+        .unwrap();
+    assert!(invalid.is_error, "422 must surface as is_error=true");
+    let structured = invalid.structured_content.unwrap();
+    assert_eq!(structured["valid"], false);
+    assert_eq!(
+        structured["problems"],
+        json!(["Missing VERDICT line", "Claim C1 is unjudged"])
+    );
+
+    let ok = tool
+        .execute(json!({
+            "action": "review_answer",
+            "capsule_id": "cap_ans",
+            "answer": "CAPSULE: 0123456789abcdef\nVERDICT: SAFE TO LAND"
+        }))
+        .await
+        .unwrap();
+    assert!(!ok.is_error);
+}
+
+#[tokio::test]
+async fn review_capsule_review_answers_and_review_credential_member_actions() {
+    let cred_id = Uuid::new_v4();
+    let ans_id = Uuid::new_v4();
+    let mock = ScriptedReviewMock::start(move |line, _headers, _body| {
+        if line.starts_with("GET /api/v1/capsules/cap_mem/review/answers ") {
+            return (
+                200,
+                "OK",
+                vec![("Content-Type", "application/json".to_string())],
+                json!({
+                    "success": true,
+                    "data": {
+                        "capsule_id": "cap_mem",
+                        "digest": "0123456789abcdef",
+                        "answers": [{
+                            "review_id": ans_id,
+                            "title": "Review",
+                            "status": "approved",
+                            "verdict": "SAFE TO LAND",
+                            "by": "credential",
+                            "for_this_digest": true,
+                            "headline": "All claims verified"
+                        }]
+                    }
+                })
+                .to_string(),
+            );
+        }
+        if line.starts_with("POST /api/v1/capsules/cap_mem/review/credentials ") {
+            return (
+                201,
+                "Created",
+                vec![("Content-Type", "application/json".to_string())],
+                json!({
+                    "success": true,
+                    "data": {
+                        "credential": "capsule_testcred1234567890",
+                        "credential_id": cred_id,
+                        "capsule_id": "cap_mem",
+                        "digest": "0123456789abcdef",
+                        "answer": true,
+                        "max_answers": 2,
+                        "expires_at": "2026-12-01T00:00:00Z",
+                        "shown_once": true,
+                        "use": { "header": "X-Capsule-Credential" }
+                    }
+                })
+                .to_string(),
+            );
+        }
+        panic!("unexpected request: {line}");
+    })
+    .await;
+
+    let mut cfg = TestFixtures::test_config();
+    cfg.api_url = mock.base_url.clone();
+    let tool = CapsuleTool::new(ContextStreamClient::new(cfg));
+
+    let list_res = tool
+        .execute(json!({ "action": "review_answers", "capsule_id": "cap_mem" }))
+        .await
+        .unwrap();
+    assert!(!list_res.is_error);
+    let list_text = match &list_res.content[0] {
+        mcp_types::tool::ContentItem::Text { text } => text.clone(),
+        _ => panic!(),
+    };
+    assert!(list_text.contains("SAFE TO LAND"));
+
+    let cred_res = tool
+        .execute(json!({
+            "action": "review_credential",
+            "capsule_id": "cap_mem",
+            "allow_answer": true,
+            "expires_in_hours": 12,
+            "max_answers": 2
+        }))
+        .await
+        .unwrap();
+    assert!(!cred_res.is_error);
+    let cred_text = match &cred_res.content[0] {
+        mcp_types::tool::ContentItem::Text { text } => text.clone(),
+        _ => panic!(),
+    };
+    assert!(cred_text.contains("capsule_testcred1234567890"));
+}
+
+#[tokio::test]
+async fn review_capsule_credential_only_mode_isolates_actions_and_headers() {
+    let md = "# Review capsule 0123456789abcdef  (part 1 of 1)\n\nReviewer view";
+    let sha = crate::domains::review_capsule::sha256_hex(md);
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let md_clone = md.to_string();
+    let sha_clone = sha.clone();
+
+    let mock = ScriptedReviewMock::start(move |line, _headers, _body| {
+        if line.starts_with("GET /api/v1/capsules/review/open ") {
+            return (
+                200,
+                "OK",
+                vec![("Content-Type", "application/json".to_string())],
+                json!({
+                    "success": true,
+                    "data": {
+                        "review": { "label": "rev", "digest": digest, "repo": "org/repo", "base": "a", "head": "b", "files": 1, "files_shown": 1, "parts": 1 },
+                        "manifest": {
+                            "contract_version": 1,
+                            "digest": digest,
+                            "label": "rev",
+                            "source": "client",
+                            "repo": "org/repo",
+                            "base": "a",
+                            "head": "b",
+                            "title": "T",
+                            "task": "Task",
+                            "part_chars": 4000,
+                            "parts": [{ "n": 1, "chars": md_clone.len(), "sha256": sha_clone }]
+                        }
+                    }
+                })
+                .to_string(),
+            );
+        }
+        if line.starts_with("GET /api/v1/capsules/review/open/prompt.md?part=1 ") {
+            return (
+                200,
+                "OK",
+                vec![
+                    ("Content-Type", "text/markdown; charset=utf-8".to_string()),
+                    ("X-Capsule-Digest", digest.to_string()),
+                    ("X-Capsule-Part-SHA256", sha_clone.clone()),
+                ],
+                md_clone.clone(),
+            );
+        }
+        if line.starts_with("POST /api/v1/capsules/review/open/answers ") {
+            return (
+                201,
+                "Created",
+                vec![("Content-Type", "application/json".to_string())],
+                json!({
+                    "success": true,
+                    "data": {
+                        "valid": true,
+                        "verdict": "SAFE TO LAND",
+                        "must": 0,
+                        "should": 0,
+                        "status": "approved"
+                    }
+                })
+                .to_string(),
+            );
+        }
+        panic!("unexpected credential-only request: {line}");
+    })
+    .await;
+
+    let mut cfg = TestFixtures::test_config();
+    cfg.api_url = mock.base_url.clone();
+    cfg.api_key = None;
+    cfg.jwt = None;
+    cfg.capsule_credential = Some("capsule_only_secret_tok".to_string());
+    cfg.tool_surface_profile = mcp_types::config::ToolSurfaceProfile::ReviewCredential;
+    let tool = CapsuleTool::new(ContextStreamClient::new(cfg));
+
+    // All non-(open, review_answer) actions fail locally with ZERO HTTP requests.
+    for blocked in [
+        "create",
+        "live",
+        "list",
+        "share",
+        "review_answers",
+        "review_credential",
+    ] {
+        let err = tool
+            .execute(json!({ "action": blocked }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("review credential"),
+            "{blocked}: {err}"
+        );
+    }
+    assert!(
+        mock.captured().is_empty(),
+        "blocked actions sent network requests"
+    );
+
+    // Passing capsule_id in credential-only mode is rejected locally.
+    let err = tool
+        .execute(json!({ "action": "open", "capsule_id": "cap_other" }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Do not pass capsule_id"));
+    assert!(mock.captured().is_empty());
+
+    // open + review_answer work with ONLY X-Capsule-Credential.
+    let opened = tool.execute(json!({ "action": "open" })).await.unwrap();
+    assert!(!opened.is_error);
+    let answered = tool
+        .execute(json!({
+            "action": "review_answer",
+            "answer": "CAPSULE: 0123456789abcdef\nVERDICT: SAFE TO LAND"
+        }))
+        .await
+        .unwrap();
+    assert!(!answered.is_error);
+
+    let reqs = mock.captured();
+    assert_eq!(reqs.len(), 3);
+    for r in &reqs {
+        let lower = r.headers.to_ascii_lowercase();
+        assert!(
+            lower.contains("x-capsule-credential: capsule_only_secret_tok"),
+            "missing X-Capsule-Credential header: {}",
+            r.headers
+        );
+        assert!(
+            !lower.contains("x-api-key:") && !lower.contains("authorization:"),
+            "member auth headers leaked on review-credential request: {}",
+            r.headers
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_capsule_registry_isolation_exposes_only_capsule_and_no_operations() {
+    use crate::registry::ToolRegistry;
+    use mcp_types::config::{ToolSurfaceProfile, Toolset};
+
+    let mut cfg = TestFixtures::test_config();
+    cfg.api_key = None;
+    cfg.capsule_credential = Some("capsule_reg_tok".to_string());
+    cfg.tool_surface_profile = ToolSurfaceProfile::ReviewCredential;
+    cfg.toolset = Toolset::Light;
+    cfg.router_mode = true;
+    cfg.progressive_mode = true;
+    cfg.capsule_enabled = true;
+    let client = ContextStreamClient::new(cfg.clone());
+    let session = Arc::new(mcp_session::SessionManager::new(
+        client.clone(),
+        cfg.clone(),
+    ));
+
+    let mut registry = ToolRegistry::new(&cfg);
+    crate::domains::capsule::register_capsule_tools(&mut registry, client.clone(), session.clone());
+    crate::domains::memory::register_memory_tools(&mut registry, client, session);
+
+    assert_eq!(registry.names(), vec!["capsule"]);
+    assert_eq!(registry.operation_count(), 0);
+    assert!(registry.list_operations().is_empty());
+    assert!(registry.search_catalog("memory", None, 10).is_empty());
+    assert!(!registry.should_expose_discovery_tools());
+    registry.apply_initialize_surface_profile(Some(ToolSurfaceProfile::Default));
+    assert_eq!(
+        registry.tool_surface_profile(),
+        ToolSurfaceProfile::ReviewCredential
+    );
+    let err = registry
+        .execute("memory", json!({ "action": "list_docs" }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("review credential"));
+}

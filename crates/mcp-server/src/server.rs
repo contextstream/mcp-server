@@ -831,8 +831,11 @@ pub(crate) fn contextstream_tools_list(
         .map(contextstream_tool_list_entry)
         .collect();
 
-    // The coach surface is exactly its three tools: no discovery meta-tools.
-    if requested_category_matches(category, "router") && !registry.is_coach_surface() {
+    // The coach and review-credential surfaces have no discovery meta-tools.
+    if requested_category_matches(category, "router")
+        && !registry.is_coach_surface()
+        && !registry.is_review_credential_only()
+    {
         if registry.is_router_mode() {
             tools.push(operations_meta_tool());
             tools.push(execute_operation_meta_tool());
@@ -964,7 +967,10 @@ pub(crate) async fn slipstream_list_changed_notice(
 /// (`domains::hosted_tools`): the full surfaces, not the router, coach or
 /// studio-only ones.
 pub(crate) fn lists_hosted_tools(registry: &ToolRegistry) -> bool {
-    !registry.is_router_mode() && !registry.is_coach_surface() && !registry.is_studio_surface()
+    !registry.is_router_mode()
+        && !registry.is_coach_surface()
+        && !registry.is_studio_surface()
+        && !registry.is_review_credential_only()
 }
 
 /// The `tools/list` entries for the tools the API defines for this caller,
@@ -1284,8 +1290,9 @@ async fn run_stdio_transport(
             tokenizer_warmup.start();
         }
         if legacy_initialize {
-            announces_tool_changes = registry.get(domains::slipstream::TOOL_NAME).is_some()
-                || lists_hosted_tools(&registry);
+            announces_tool_changes = !registry.is_review_credential_only()
+                && (registry.get(domains::slipstream::TOOL_NAME).is_some()
+                    || lists_hosted_tools(&registry));
         }
     }
     debug!("Client disconnected");
@@ -1527,7 +1534,7 @@ async fn record_successful_runtime_evidence(
 
 fn initialize_tool_count(registry: &ToolRegistry) -> usize {
     let mut tool_count = registry.len();
-    if registry.is_coach_surface() {
+    if registry.is_coach_surface() || registry.is_review_credential_only() {
         return tool_count;
     }
     if registry.is_router_mode() {
@@ -1585,6 +1592,9 @@ fn build_legacy_initialize_result_with_teaching(
     params: &serde_json::Value,
     protocol_teaching_enabled: bool,
 ) -> serde_json::Value {
+    if registry.is_review_credential_only() {
+        return build_review_credential_initialize_result(registry, protocol_version);
+    }
     if registry.is_coach_surface() {
         return build_coach_initialize_result(registry, protocol_version);
     }
@@ -1730,6 +1740,31 @@ pub(crate) const MCP_2026_STATELESS_CONFORMANCE: StatelessMcpConformance =
         cacheable_results: true,
         http_header_routing: true,
     };
+
+pub(crate) fn build_review_credential_initialize_result(
+    registry: &ToolRegistry,
+    protocol_version: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": protocol_version,
+        "capabilities": {
+            "tools": { "listChanged": false }
+        },
+        "serverInfo": {
+            "name": "contextstream-mcp",
+            "version": mcp_types::config::VERSION
+        },
+        "instructions": "Review credential session: only the `capsule` tool is available (actions `open` and `review_answer`). Call `capsule(action=\"open\")` to open and verify the review packet, then `capsule(action=\"review_answer\", answer=...)` to submit your review.",
+        "toolCount": registry.len()
+    })
+}
+
+pub(crate) fn build_review_credential_stateless_discover_result() -> serde_json::Value {
+    mcp_types::build_stateless_discover_result(Some(
+        "Review credential session: only the `capsule` tool is available (actions `open` and `review_answer`)."
+            .to_string(),
+    ))
+}
 
 pub(crate) fn build_contextstream_stateless_discover_result() -> serde_json::Value {
     let teaching = stateless_discovery_teaching(
@@ -2104,6 +2139,9 @@ async fn handle_request_dispatch(
     debug!("Handling request: method={}", method);
 
     match method {
+        "server/discover" if registry.is_review_credential_only() => {
+            json_rpc_result(id, build_review_credential_stateless_discover_result())
+        }
         "server/discover" if registry.is_coach_surface() => {
             json_rpc_result(id, build_coach_stateless_discover_result())
         }
@@ -2136,7 +2174,10 @@ async fn handle_request_dispatch(
             // auto-detected narrowing can't persist (global-state bleed).
             registry
                 .apply_initialize_surface_profile(surface_profile_from_initialize_params(&params));
-            telemetry.update_initialize_hints(&params).await;
+            let review_cred_only = registry.is_review_credential_only();
+            if !review_cred_only {
+                telemetry.update_initialize_hints(&params).await;
+            }
             let protocol_version = mcp_types::negotiate_legacy_protocol_version(
                 params
                     .get("protocolVersion")
@@ -2146,7 +2187,7 @@ async fn handle_request_dispatch(
             // Stdio can tell the client when the Slipstream listing changes (see
             // `slipstream_list_changed_notice`); read the catalog now so the tools/list that
             // follows finds it ready.
-            if registry.get(domains::slipstream::TOOL_NAME).is_some() {
+            if !review_cred_only && registry.get(domains::slipstream::TOOL_NAME).is_some() {
                 result["capabilities"]["tools"]["listChanged"] = serde_json::Value::Bool(true);
                 domains::slipstream::prefetch(
                     domains::slipstream::SlipstreamGate::global(),
@@ -2154,13 +2195,13 @@ async fn handle_request_dispatch(
                     session.clone(),
                 );
             }
-            if registry.get(domains::studio::TOOL_NAME).is_some() {
+            if !review_cred_only && registry.get(domains::studio::TOOL_NAME).is_some() {
                 domains::studio::prefetch(
                     domains::studio::StudioGate::global(),
                     (**client).clone(),
                 );
             }
-            if lists_hosted_tools(registry) {
+            if !review_cred_only && lists_hosted_tools(registry) {
                 result["capabilities"]["tools"]["listChanged"] = serde_json::Value::Bool(true);
                 domains::hosted_tools::prefetch(
                     domains::hosted_tools::HostedToolsGate::global(),
@@ -2168,7 +2209,7 @@ async fn handle_request_dispatch(
                     session.clone(),
                 );
             }
-            if crate::readiness_evidence_writes_enabled() {
+            if !review_cred_only && crate::readiness_evidence_writes_enabled() {
                 let managed_harness = std::env::var("CONTEXTSTREAM_CLIENT")
                     .ok()
                     .and_then(|value| HarnessId::from_alias(&value));
@@ -2201,13 +2242,15 @@ async fn handle_request_dispatch(
 
         "tools/list" => {
             let mut tools = contextstream_tools_list(registry, None);
-            // The listings read at once: one waits for the slower, not the sum.
-            let ((), hosted) = tokio::join!(
-                with_slipstream_listing(registry, client, session, None, &mut tools),
-                hosted_tools_entries(registry, client, session),
-            );
-            for entry in hosted {
-                insert_sorted(&mut tools, entry);
+            if !registry.is_review_credential_only() {
+                // The listings read at once: one waits for the slower, not the sum.
+                let ((), hosted) = tokio::join!(
+                    with_slipstream_listing(registry, client, session, None, &mut tools),
+                    hosted_tools_entries(registry, client, session),
+                );
+                for entry in hosted {
+                    insert_sorted(&mut tools, entry);
+                }
             }
             json_rpc_result(id, serde_json::json!({ "tools": tools }))
         }
@@ -2221,6 +2264,10 @@ async fn handle_request_dispatch(
                     "Invalid params: tools/call requires \"name\", the tool to run",
                 );
             };
+            let review_cred_only = registry.is_review_credential_only();
+            if review_cred_only && tool_name != "capsule" {
+                return json_rpc_error(id, -32602, &unknown_tool_message(registry, tool_name));
+            }
             if let Some(message) = mcp_tools::input_shape::tools_call_arguments_error(
                 tool_name,
                 params.get("arguments"),
@@ -2236,7 +2283,8 @@ async fn handle_request_dispatch(
             // Auto-init: if session isn't initialized and this isn't the init tool,
             // automatically trigger session init. This is the biggest difference-maker
             // for editors actually using ContextStream effectively.
-            if tool_name != "init"
+            if !review_cred_only
+                && tool_name != "init"
                 && tool_name != "context"
                 && !domains::coach::is_coach_tool(tool_name)
                 && !registry.is_studio_surface()
@@ -2294,8 +2342,8 @@ async fn handle_request_dispatch(
                 }
             }
 
-            // Handle router mode meta-operations (never on the coach surface)
-            if registry.is_router_mode() && !registry.is_coach_surface() {
+            // Handle router mode meta-operations (never on coach or review-credential surfaces)
+            if registry.is_router_mode() && !registry.is_coach_surface() && !review_cred_only {
                 match tool_name {
                     "operations" => {
                         return handle_router_operations(id, registry, arguments);
@@ -2423,8 +2471,11 @@ async fn handle_request_dispatch(
             };
 
             // A hosted tool's result carries its own structured part (how the run went), which
-            // the caller is meant to read; the structured parts of the other tools stay off this wire.
-            let include_structured = include_workflow_contract || hosted_tool.is_some();
+            // the caller is meant to read; review-credential `capsule` responses also carry
+            // structured verdict/validation problems when returned.
+            let include_structured = include_workflow_contract
+                || hosted_tool.is_some()
+                || (review_cred_only && tool_name == "capsule");
 
             // MCP lists an unknown tool as a protocol error (#368).
             if registry.get(tool_name).is_none() && hosted_tool.is_none() {
@@ -2463,24 +2514,28 @@ async fn handle_request_dispatch(
                 })
                 .await;
             let tool_call_latency_ms = tool_call_started.elapsed().as_millis() as u64;
-            telemetry
-                .emit_tool_call(
-                    tool_name,
-                    tool_call_latency_ms,
-                    tool_call_outcome
-                        .as_ref()
-                        .map(|result| result.is_error)
-                        .unwrap_or(true),
-                    &tool_call_input,
-                )
-                .await;
+            if !review_cred_only {
+                telemetry
+                    .emit_tool_call(
+                        tool_name,
+                        tool_call_latency_ms,
+                        tool_call_outcome
+                            .as_ref()
+                            .map(|result| result.is_error)
+                            .unwrap_or(true),
+                        &tool_call_input,
+                    )
+                    .await;
+            }
 
             match tool_call_outcome {
                 Ok(result) => {
-                    record_successful_runtime_evidence(
-                        client, session, telemetry, tool_name, &result,
-                    )
-                    .await;
+                    if !review_cred_only {
+                        record_successful_runtime_evidence(
+                            client, session, telemetry, tool_name, &result,
+                        )
+                        .await;
+                    }
                     let context = mcp_tools::wire_tokens::WireResponseContext::stdio_jsonrpc(
                         id.clone(),
                         call_title.clone(),
@@ -2490,13 +2545,15 @@ async fn handle_request_dispatch(
                     let mut payload =
                         mcp_tools::wire_tokens::tool_result_payload(&result, &context);
                     with_input_required(&mut payload);
-                    crate::hook_handlers::mid_run_notices::attach_to_tool_result(
-                        &mut payload,
-                        tool_name,
-                        client,
-                        session,
-                    )
-                    .await;
+                    if !review_cred_only {
+                        crate::hook_handlers::mid_run_notices::attach_to_tool_result(
+                            &mut payload,
+                            tool_name,
+                            client,
+                            session,
+                        )
+                        .await;
+                    }
                     json_rpc_result(id, payload)
                 }
                 Err(e) => {
@@ -3395,8 +3452,11 @@ mod tests {
             // and parameters only those actions took left with them).
             // Live Capsule: actions live and live_read, with live_read's page,
             // path, start_line, end_line, query, kind, item_id and unlock_key.
+            // Review Capsule: actions review_answer, review_answers,
+            // review_credential, plus review, part, answer, reviewer,
+            // allow_answer, expires_in_hours and max_answers.
             "capsule",
-            "b07b4cd4ca44edfcb04befcab71f4f0a164b458be64e00e6c31fda693a2146d8",
+            "73277283c0f4ee726b51de47d580a0af538186df73f905c8b93e1be3b69ca9c5",
         ),
         (
             "capture_plan",

@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use mcp_client::ContextStreamClient;
 use mcp_session::SessionManager;
-use mcp_tools::domains::{media::MediaTool, project::ProjectTool, skill::SkillTool};
+use mcp_tools::domains::{
+    capsule::CapsuleTool, media::MediaTool, project::ProjectTool, skill::SkillTool,
+};
 use mcp_tools::registry::ToolHandler;
 use mcp_types::tool::ToolResult;
 use mcp_types::Config;
@@ -182,5 +184,51 @@ async fn stdio_mode_allows_local_file_paths() {
     assert!(
         !text.contains(DISABLED_MARKER),
         "stdio must not refuse: {text}"
+    );
+}
+
+#[tokio::test]
+async fn http_gateway_refuses_capsule_create_with_review() {
+    let cfg = gateway_config(true, false);
+    let client = ContextStreamClient::new(cfg.clone());
+    let session = Arc::new(SessionManager::new(client.clone(), cfg));
+    let capsule = CapsuleTool::new(client).with_session(session);
+    // Fires before git or network calls even when folder_path points at a local path.
+    let text = result_text(
+        capsule
+            .execute(json!({
+                "action": "create",
+                "project_id": TEST_PROJECT,
+                "folder_path": "/etc",
+                "review": {
+                    "base": "HEAD~1",
+                    "head": "HEAD",
+                    "task": "Review commit diff"
+                }
+            }))
+            .await,
+    );
+    assert!(text.contains(DISABLED_MARKER), "got: {text}");
+}
+
+#[tokio::test]
+async fn http_gateway_allows_capsule_create_purpose_review_without_review_object() {
+    let cfg = gateway_config(true, false);
+    let client = ContextStreamClient::new(cfg.clone());
+    let session = Arc::new(SessionManager::new(client.clone(), cfg));
+    let capsule = CapsuleTool::new(client).with_session(session);
+    let text = result_text(
+        capsule
+            .execute(json!({
+                "action": "create",
+                "scope": "workspace",
+                "workspace_id": TEST_WS,
+                "purpose": "review"
+            }))
+            .await,
+    );
+    assert!(
+        !text.contains(DISABLED_MARKER),
+        "legacy purpose='review' without review object must not hit hosted local-files refusal: {text}"
     );
 }

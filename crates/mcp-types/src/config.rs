@@ -12,7 +12,7 @@ pub const DEFAULT_API_URL: &str = "https://api.contextstream.io";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Server configuration loaded from environment variables or config file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Base API URL (e.g., https://api.contextstream.io)
     pub api_url: String,
@@ -24,6 +24,11 @@ pub struct Config {
     /// JWT token for authentication (mutually exclusive with api_key)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jwt: Option<String>,
+
+    /// One-time or capped review capsule credential (`X-Capsule-Credential`).
+    /// Never serialized to disk and always redacted in `Debug`.
+    #[serde(default, skip_serializing)]
+    pub capsule_credential: Option<String>,
 
     /// Default workspace ID (UUID)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,6 +152,47 @@ fn default_search_max_chars() -> usize {
     800
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("api_url", &self.api_url)
+            .field("api_key", &self.api_key)
+            .field("jwt", &self.jwt)
+            .field(
+                "capsule_credential",
+                &self.capsule_credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("default_workspace_id", &self.default_workspace_id)
+            .field("default_project_id", &self.default_project_id)
+            .field("user_agent", &self.user_agent)
+            .field("allow_header_auth", &self.allow_header_auth)
+            .field("context_pack_enabled", &self.context_pack_enabled)
+            .field("show_timing", &self.show_timing)
+            .field("toolset", &self.toolset)
+            .field("log_level", &self.log_level)
+            .field("output_format", &self.output_format)
+            .field("progressive_mode", &self.progressive_mode)
+            .field("router_mode", &self.router_mode)
+            .field("consolidated_mode", &self.consolidated_mode)
+            .field("auto_hide_integrations", &self.auto_hide_integrations)
+            .field("capsule_enabled", &self.capsule_enabled)
+            .field("search_limit", &self.search_limit)
+            .field("search_max_chars", &self.search_max_chars)
+            .field("transcripts_enabled", &self.transcripts_enabled)
+            .field("hook_transcripts_enabled", &self.hook_transcripts_enabled)
+            .field("tool_surface_profile", &self.tool_surface_profile)
+            .field("is_http_transport", &self.is_http_transport)
+            .field("http_local_files", &self.http_local_files)
+            .field("account_mode_preference", &self.account_mode_preference)
+            .field(
+                "slipstream_auto_accept_max_credits",
+                &self.slipstream_auto_accept_max_credits,
+            )
+            .field("max_spend_credits", &self.max_spend_credits)
+            .finish()
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -156,6 +202,7 @@ impl Default for Config {
                 .unwrap_or_else(|| DEFAULT_API_URL.to_string()),
             api_key: None,
             jwt: None,
+            capsule_credential: None,
             default_workspace_id: None,
             default_project_id: None,
             user_agent: format!("contextstream-mcp-rust/{}", VERSION),
@@ -201,9 +248,22 @@ impl Config {
         !self.is_http_transport || self.http_local_files
     }
 
+    /// True when this config carries only a review capsule credential and no
+    /// member credentials (`api_key` / `jwt`).
+    pub fn is_review_credential_only(&self) -> bool {
+        self.capsule_credential
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+            && self.api_key.is_none()
+            && self.jwt.is_none()
+    }
+
     /// Check if the config has valid authentication.
     pub fn has_auth(&self) -> bool {
-        self.api_key.is_some() || self.jwt.is_some() || self.allow_header_auth
+        self.api_key.is_some()
+            || self.jwt.is_some()
+            || self.capsule_credential.is_some()
+            || self.allow_header_auth
     }
 
     /// Get the authentication header value.
@@ -380,6 +440,9 @@ pub enum ToolSurfaceProfile {
     /// ContextStudio: only the `studio` tool, always listed. Served at
     /// `/studio`, the ContextStudio connector.
     Studio,
+    /// Review-credential-only mode: exposes ONLY `capsule` (`open` and
+    /// `review_answer` only) for `X-Capsule-Credential`-authenticated sessions.
+    ReviewCredential,
 }
 
 impl FromStr for ToolSurfaceProfile {
@@ -391,6 +454,7 @@ impl FromStr for ToolSurfaceProfile {
             "openai" | "openai_agentic" | "agentic" | "agentic_openai" => Ok(Self::OpenaiAgentic),
             "coach" | "agent_coach_kit" => Ok(Self::Coach),
             "studio" | "contextstudio" => Ok(Self::Studio),
+            "review_credential" | "review-credential" => Ok(Self::ReviewCredential),
             _ => Err(()),
         }
     }
@@ -403,6 +467,7 @@ impl ToolSurfaceProfile {
             Self::OpenaiAgentic => "openai_agentic",
             Self::Coach => "coach",
             Self::Studio => "studio",
+            Self::ReviewCredential => "review_credential",
         }
     }
 }
@@ -493,10 +558,11 @@ impl FromStr for OutputFormat {
 }
 
 /// Authentication override for per-request auth.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AuthOverride {
     pub api_key: Option<String>,
     pub jwt: Option<String>,
+    pub capsule_credential: Option<String>,
     pub workspace_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
     /// Trusted, low-cardinality request classification. This can only be
@@ -509,6 +575,23 @@ pub struct AuthOverride {
     /// (Claude Code's tool names, for instance). It is not a credential and
     /// does not make an override non-empty.
     pub client: Option<crate::HarnessId>,
+}
+
+impl std::fmt::Debug for AuthOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthOverride")
+            .field("api_key", &self.api_key)
+            .field("jwt", &self.jwt)
+            .field(
+                "capsule_credential",
+                &self.capsule_credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("workspace_id", &self.workspace_id)
+            .field("project_id", &self.project_id)
+            .field("traffic_class", &self.traffic_class)
+            .field("client", &self.client)
+            .finish()
+    }
 }
 
 /// Allowlisted traffic classifications that may cross the MCP/API boundary.
@@ -623,6 +706,9 @@ pub enum SessionKey {
     /// SHA-256 hash of the API key — stable per-key bucketing for
     /// api-key-authenticated requests (we don't store the raw key).
     ApiKey(String),
+    /// SHA-256 partition for a review-credential-only HTTP connection.
+    /// Deliberately non-cacheable in Atlas/warm caches (`atlas_user_scope_token() == None`).
+    ReviewCredential(String),
     /// Unauthenticated HTTP request/session. The HTTP transport partitions
     /// this by the validated MCP session id, or by a fresh request nonce when
     /// the header is absent. It is deliberately never cacheable.
@@ -637,9 +723,18 @@ impl AuthOverride {
     pub fn is_empty(&self) -> bool {
         self.api_key.is_none()
             && self.jwt.is_none()
+            && self.capsule_credential.is_none()
             && self.workspace_id.is_none()
             && self.project_id.is_none()
             && self.traffic_class.is_none()
+    }
+
+    pub fn is_review_credential_only(&self) -> bool {
+        self.capsule_credential
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+            && self.api_key.is_none()
+            && self.jwt.is_none()
     }
 }
 
@@ -661,6 +756,16 @@ impl SessionKey {
         Self::ApiKey(http_session_partition_digest(
             "api_key",
             api_key,
+            mcp_session_id,
+        ))
+    }
+
+    /// Build the HTTP session partition for a review capsule credential without
+    /// retaining the raw credential. Domain-separated from API keys and JWTs.
+    pub fn for_http_review_credential(credential: &str, mcp_session_id: Option<&str>) -> Self {
+        Self::ReviewCredential(http_session_partition_digest(
+            "review_credential",
+            credential,
             mcp_session_id,
         ))
     }
@@ -697,7 +802,7 @@ impl SessionKey {
                 "csuc:v2:k:{}",
                 framed_sha256("contextstream-atlas-user-scope-v2", &["api_key", identity])
             )),
-            Self::AnonymousHttp(_) | Self::Local => None,
+            Self::ReviewCredential(_) | Self::AnonymousHttp(_) | Self::Local => None,
         }
     }
 }
@@ -914,5 +1019,53 @@ mod tests {
             OutputFormat::Pretty
         );
         assert!("invalid".parse::<OutputFormat>().is_err());
+    }
+
+    #[test]
+    fn review_credential_config_and_auth_override_behave_safely() {
+        let secret = "capsule_0123456789abcdef0123456789abcdef";
+        let cfg = Config {
+            capsule_credential: Some(secret.to_string()),
+            ..Default::default()
+        };
+        assert!(cfg.has_auth());
+        assert!(cfg.is_review_credential_only());
+        assert!(cfg.auth_header().is_none());
+        let cfg_debug = format!("{cfg:?}");
+        assert!(!cfg_debug.contains(secret));
+        assert!(cfg_debug.contains("[REDACTED]"));
+
+        let serialized = serde_json::to_value(&cfg).unwrap();
+        assert!(serialized.get("capsule_credential").is_none());
+
+        let mixed = Config {
+            api_key: Some("cbiq_123".to_string()),
+            capsule_credential: Some(secret.to_string()),
+            ..Default::default()
+        };
+        assert!(!mixed.is_review_credential_only());
+
+        let auth = AuthOverride {
+            capsule_credential: Some(secret.to_string()),
+            ..Default::default()
+        };
+        assert!(!auth.is_empty());
+        assert!(auth.is_review_credential_only());
+        let auth_debug = format!("{auth:?}");
+        assert!(!auth_debug.contains(secret));
+        assert!(auth_debug.contains("[REDACTED]"));
+
+        let session_key = SessionKey::for_http_review_credential(secret, Some("sess_1"));
+        assert_eq!(session_key.atlas_user_scope_token(), None);
+        let SessionKey::ReviewCredential(partition) = session_key else {
+            panic!("expected ReviewCredential partition");
+        };
+        assert!(partition.starts_with("cshttp:v2:review_credential:"));
+        assert!(!partition.contains(secret));
+        assert!(!partition.contains("sess_1"));
+        assert_ne!(
+            SessionKey::for_http_review_credential("same", None),
+            SessionKey::for_http_api_key("same", None)
+        );
     }
 }

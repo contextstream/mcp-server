@@ -943,6 +943,20 @@ impl ToolRegistry {
         // So are the read-only twins (`domains::read_only`) and the tool of
         // irreversible actions (`domains::destructive`): direct tools only,
         // never in an operations catalog.
+        if self.default_tool_surface_profile == ToolSurfaceProfile::ReviewCredential {
+            if name == "capsule" {
+                self.tools.insert(
+                    name.to_string(),
+                    RegisteredTool {
+                        metadata,
+                        handler,
+                        input_schema,
+                    },
+                );
+            }
+            return;
+        }
+
         if crate::domains::coach::is_coach_tool(name)
             || name == crate::domains::studio::TOOL_NAME
             || crate::domains::read_only::is_read_only_twin(name)
@@ -1121,6 +1135,13 @@ impl ToolRegistry {
 
     /// Execute a tool by name.
     pub async fn execute(&self, name: &str, mut input: Value) -> Result<ToolResult> {
+        let review_cred_only = self.is_review_credential_only();
+        if review_cred_only && name != "capsule" {
+            return Err(Error::Tool(
+                "This connection holds only a review credential and is limited to `capsule` actions `open` and `review_answer`."
+                    .to_string(),
+            ));
+        }
         if !self.is_tool_visible(name) {
             return Err(Error::Tool(format!("Unknown tool: {}", name)));
         }
@@ -1141,8 +1162,10 @@ impl ToolRegistry {
             return Err(Error::Validation(refusal));
         }
 
-        if let Some(result) = self.plan_restriction_for_tool(&tool.metadata).await {
-            return Ok(result);
+        if !review_cred_only {
+            if let Some(result) = self.plan_restriction_for_tool(&tool.metadata).await {
+                return Ok(result);
+            }
         }
         let mismatches = normalize_input_shape(name, &tool.input_schema, &mut input);
         refuse_negative_counts(name, &input)?;
@@ -1154,14 +1177,21 @@ impl ToolRegistry {
         // model: resolve it from the file-backed session model cache (warmed by
         // the hook layer) using the session id the tool carries, then scope it
         // so `ContextStreamClient` forwards `X-ContextStream-Model`.
-        let model_id = input
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(mcp_session::session_model_cache::lookup);
-        let observation =
-            acceleration_observation_request(name, &input).map(|request| (request, Instant::now()));
+        let model_id = if review_cred_only {
+            None
+        } else {
+            input
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(mcp_session::session_model_cache::lookup)
+        };
+        let observation = if review_cred_only {
+            None
+        } else {
+            acceleration_observation_request(name, &input).map(|request| (request, Instant::now()))
+        };
         let write_timing = write_timing_start(name, &input, observation.is_some());
 
         // `help` describes the tools this registry lists, not a fixed catalog (#352).
@@ -1185,8 +1215,10 @@ impl ToolRegistry {
             self.report_acceleration_observation(request, started.elapsed(), outcome.as_ref());
         }
         record_write_timing(write_timing, outcome.as_ref());
-        self.report_activation_outcome(name, tool.metadata.category.as_str(), outcome.as_ref())
-            .await;
+        if !review_cred_only {
+            self.report_activation_outcome(name, tool.metadata.category.as_str(), outcome.as_ref())
+                .await;
+        }
         outcome.map(drop_control_characters)
     }
 
@@ -1441,12 +1473,24 @@ impl ToolRegistry {
     /// per process; the hosted HTTP transport never changes the shared
     /// registry and scopes each request's profile as a task-local instead.
     pub fn apply_initialize_surface_profile(&self, detected: Option<ToolSurfaceProfile>) {
-        // A server configured as coach-only stays coach-only.
+        // A server configured as review-credential-only or coach-only stays locked.
+        if self.default_tool_surface_profile == ToolSurfaceProfile::ReviewCredential {
+            self.set_tool_surface_profile(ToolSurfaceProfile::ReviewCredential);
+            return;
+        }
         if self.default_tool_surface_profile == ToolSurfaceProfile::Coach {
             self.set_tool_surface_profile(ToolSurfaceProfile::Coach);
             return;
         }
         self.set_tool_surface_profile(detected.unwrap_or(self.default_tool_surface_profile));
+    }
+
+    /// Whether this connection/request is isolated to `X-Capsule-Credential`-only
+    /// review capsule operations (`capsule` actions `open` and `review_answer`).
+    pub fn is_review_credential_only(&self) -> bool {
+        self.tool_surface_profile() == ToolSurfaceProfile::ReviewCredential
+            || mcp_client::get_task_auth_override()
+                .is_some_and(|auth| auth.is_review_credential_only())
     }
 
     /// Whether the current surface profile is the Agent Coach Kit surface.
@@ -1466,7 +1510,7 @@ impl ToolRegistry {
 
     /// Whether discovery meta-tools should be exposed.
     pub fn should_expose_discovery_tools(&self) -> bool {
-        self.router_mode || self.is_openai_agentic_surface()
+        !self.is_review_credential_only() && (self.router_mode || self.is_openai_agentic_surface())
     }
 
     // =========================================================================
@@ -1477,6 +1521,9 @@ impl ToolRegistry {
     /// operation's `metadata.name`) are left out, so each operation is listed once; they stay
     /// callable through [`Self::get_operation`].
     pub fn list_operations(&self) -> Vec<&RegisteredTool> {
+        if self.is_review_credential_only() {
+            return Vec::new();
+        }
         self.operations
             .iter()
             .filter(|(name, tool)| !self.is_operation_alias(name, tool))
@@ -1486,6 +1533,9 @@ impl ToolRegistry {
 
     /// Get operation names (router mode), back-compat aliases left out.
     pub fn operation_names(&self) -> Vec<&str> {
+        if self.is_review_credential_only() {
+            return Vec::new();
+        }
         self.operations
             .iter()
             .filter(|(name, tool)| !self.is_operation_alias(name, tool))
@@ -1500,11 +1550,20 @@ impl ToolRegistry {
 
     /// Get an operation by name (router mode).
     pub fn get_operation(&self, name: &str) -> Option<&RegisteredTool> {
+        if self.is_review_credential_only() {
+            return None;
+        }
         self.operations.get(name)
     }
 
     /// Execute an operation by name (router mode).
     pub async fn execute_operation(&self, name: &str, mut input: Value) -> Result<ToolResult> {
+        if self.is_review_credential_only() {
+            return Err(Error::Tool(
+                "This connection holds only a review credential and cannot execute catalog operations."
+                    .to_string(),
+            ));
+        }
         let operation = self
             .operations
             .get(name)
@@ -1547,11 +1606,17 @@ impl ToolRegistry {
 
     /// Get operation count (router mode).
     pub fn operation_count(&self) -> usize {
+        if self.is_review_credential_only() {
+            return 0;
+        }
         self.operations.len()
     }
 
     /// Search visible tools and hidden operations for discovery.
     pub fn search_catalog(&self, query: &str, category: Option<&str>, limit: usize) -> Vec<Value> {
+        if self.is_review_credential_only() {
+            return Vec::new();
+        }
         let query = query.trim().to_ascii_lowercase();
         if query.is_empty() {
             return Vec::new();
@@ -1757,6 +1822,9 @@ impl ToolRegistry {
         if !self.tools.contains_key(name) {
             return false;
         }
+        if self.is_review_credential_only() {
+            return name == "capsule";
+        }
         let coach = crate::domains::coach::is_coach_tool(name);
         let studio = name == crate::domains::studio::TOOL_NAME;
         match self.tool_surface_profile() {
@@ -1764,6 +1832,7 @@ impl ToolRegistry {
             ToolSurfaceProfile::OpenaiAgentic => !coach && is_openai_agentic_core_tool(name),
             ToolSurfaceProfile::Coach => coach,
             ToolSurfaceProfile::Studio => studio,
+            ToolSurfaceProfile::ReviewCredential => name == "capsule",
         }
     }
 }

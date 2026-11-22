@@ -85,6 +85,8 @@ pub const SURFACE_ADAPTIVE_OPENAI: &str = "adaptive_openai_surface";
 pub const SURFACE_COACH: &str = "coach_surface";
 /// Analytics label for the ContextStudio surface (`/studio`).
 pub const SURFACE_STUDIO: &str = "studio_surface";
+/// Analytics label for a connection restricted to one review capsule via `X-Capsule-Credential`.
+pub const SURFACE_REVIEW_CREDENTIAL: &str = "review_credential_surface";
 
 /// Normalize the configured tool surface to the analytics label.
 pub fn analytics_surface_profile(profile: ToolSurfaceProfile) -> &'static str {
@@ -93,6 +95,7 @@ pub fn analytics_surface_profile(profile: ToolSurfaceProfile) -> &'static str {
         ToolSurfaceProfile::OpenaiAgentic => SURFACE_ADAPTIVE_OPENAI,
         ToolSurfaceProfile::Coach => SURFACE_COACH,
         ToolSurfaceProfile::Studio => SURFACE_STUDIO,
+        ToolSurfaceProfile::ReviewCredential => SURFACE_REVIEW_CREDENTIAL,
     }
 }
 

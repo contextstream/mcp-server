@@ -870,9 +870,12 @@ where
 /// `path` with the task's capsule scope in its query when it names a capsule
 /// by id (`/capsules/{id}…`); share-token paths and other calls are unchanged.
 fn capsule_routed(path: String) -> String {
-    let by_id = path
-        .strip_prefix("/capsules/")
-        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with("shares/"));
+    let by_id = path.strip_prefix("/capsules/").is_some_and(|rest| {
+        !rest.is_empty()
+            && !rest.starts_with("shares/")
+            && rest != "review"
+            && !rest.starts_with("review/")
+    });
     let Some((workspace_id, project_id)) = TASK_CAPSULE_SCOPE.try_with(|scope| *scope).ok() else {
         return path;
     };
@@ -4751,9 +4754,12 @@ impl ContextStreamClient {
         let task_auth = get_task_auth_override();
         let effective_auth: Option<&AuthOverride> =
             options.auth_override.as_ref().or(task_auth.as_ref());
+        let review_cred_only = is_review_credential_only_request(effective_auth, &config);
 
-        // Build URL
-        let api_path = if path.starts_with("/api/") {
+        // Build URL (enforcing strict path + method + parsed URL allowlist before send in review-credential mode)
+        let api_path = if review_cred_only {
+            validate_review_credential_request(method, path, &config.api_url)?
+        } else if path.starts_with("/api/") {
             path.to_string()
         } else {
             format!("/api/v1{}", path)
@@ -4779,69 +4785,83 @@ impl ContextStreamClient {
         req = req.header("Content-Type", "application/json");
         req = req.header("User-Agent", &config.user_agent);
 
-        // Add auth
         let auth = effective_auth;
-        if let Some(key) = auth
-            .and_then(|a| a.api_key.as_ref())
-            .or(config.api_key.as_ref())
-        {
-            req = req.header("X-API-Key", key);
-        } else if let Some(jwt) = auth.and_then(|a| a.jwt.as_ref()).or(config.jwt.as_ref()) {
-            req = req.header("Authorization", format!("Bearer {}", jwt));
-        }
-
-        // Add workspace ID header (matches TypeScript: authOverride, options, body, path, default)
-        let workspace_id: Option<Uuid> = auth
-            .and_then(|a| a.workspace_id)
-            .or(options.workspace_id)
-            .or(infer_workspace_id_from_body(&body))
-            .or(infer_workspace_id_from_path(&api_path))
-            .or(config.default_workspace_id);
-        if let Some(id) = workspace_id {
-            req = req.header("X-Workspace-Id", id.to_string());
-        }
-
-        if let Some(traffic_class) = auth.and_then(|value| value.traffic_class) {
-            req = req.header(TrafficClass::HEADER_NAME, traffic_class.as_header_value());
-        }
-        if let Some(client) = auth.and_then(|value| value.client) {
-            if !request_options_has_header(&options, CLIENT_HEADER) {
-                req = req.header(CLIENT_HEADER, client.as_str());
+        if review_cred_only {
+            let cred = effective_review_credential(auth, &config).ok_or_else(|| {
+                Error::Tool(
+                    "Missing review capsule credential for X-Capsule-Credential request."
+                        .to_string(),
+                )
+            })?;
+            req = req.header(
+                "X-Capsule-Credential",
+                sensitive_review_credential_header(cred)?,
+            );
+            req = with_api_forwarder_header(req);
+        } else {
+            // Add auth
+            if let Some(key) = auth
+                .and_then(|a| a.api_key.as_ref())
+                .or(config.api_key.as_ref())
+            {
+                req = req.header("X-API-Key", key);
+            } else if let Some(jwt) = auth.and_then(|a| a.jwt.as_ref()).or(config.jwt.as_ref()) {
+                req = req.header("Authorization", format!("Bearer {}", jwt));
             }
-        }
-        req = with_edge_geography_headers(req);
-        req = with_api_forwarder_header(req);
 
-        // Forward the agent's model so server-side compliance events attribute
-        // to the real model instead of the `unknown` bucket. Set by the tool
-        // registry from the session model cache; absent for unscoped calls.
-        if let Some(model_id) = get_task_model_id() {
-            req = req.header("X-ContextStream-Model", model_id);
-        }
+            // Add workspace ID header (matches TypeScript: authOverride, options, body, path, default)
+            let workspace_id: Option<Uuid> = auth
+                .and_then(|a| a.workspace_id)
+                .or(options.workspace_id)
+                .or(infer_workspace_id_from_body(&body))
+                .or(infer_workspace_id_from_path(&api_path))
+                .or(config.default_workspace_id);
+            if let Some(id) = workspace_id {
+                req = req.header("X-Workspace-Id", id.to_string());
+            }
 
-        // Explicit ContextStream MCP runtime marker plus PII-safe installation
-        // and platform metadata. Older APIs ignore these additive headers.
-        if !config.is_http_transport {
-            for (key, value) in crate::activation::runtime_headers() {
-                if !request_options_has_header(&options, key) {
-                    req = req.header(key, value);
+            if let Some(traffic_class) = auth.and_then(|value| value.traffic_class) {
+                req = req.header(TrafficClass::HEADER_NAME, traffic_class.as_header_value());
+            }
+            if let Some(client) = auth.and_then(|value| value.client) {
+                if !request_options_has_header(&options, CLIENT_HEADER) {
+                    req = req.header(CLIENT_HEADER, client.as_str());
                 }
             }
-        }
+            req = with_edge_geography_headers(req);
+            req = with_api_forwarder_header(req);
 
-        // Add extra headers
-        if let Some(ref headers) = options.extra_headers {
-            for (key, value) in headers {
-                if TrafficClass::is_header_name(key) {
-                    continue;
+            // Forward the agent's model so server-side compliance events attribute
+            // to the real model instead of the `unknown` bucket. Set by the tool
+            // registry from the session model cache; absent for unscoped calls.
+            if let Some(model_id) = get_task_model_id() {
+                req = req.header("X-ContextStream-Model", model_id);
+            }
+
+            // Explicit ContextStream MCP runtime marker plus PII-safe installation
+            // and platform metadata. Older APIs ignore these additive headers.
+            if !config.is_http_transport {
+                for (key, value) in crate::activation::runtime_headers() {
+                    if !request_options_has_header(&options, key) {
+                        req = req.header(key, value);
+                    }
                 }
-                req = req.header(key.as_str(), value.as_str());
+            }
+
+            // Add extra headers
+            if let Some(ref headers) = options.extra_headers {
+                for (key, value) in headers {
+                    if TrafficClass::is_header_name(key) {
+                        continue;
+                    }
+                    req = req.header(key.as_str(), value.as_str());
+                }
             }
         }
 
         // One idempotency key per logical write, reused by every retry of
         // it below (the retries resend this same built request).
-        let is_write = is_agent_write_request(method, &api_path);
+        let is_write = !review_cred_only && is_agent_write_request(method, &api_path);
         // A write that must not be resent blindly once it may have run: the
         // keyed agent writes, and the creates the API does not key (#477).
         let resend_unsafe = is_write || is_unkeyed_create_request(method, &api_path);
@@ -4851,7 +4871,9 @@ impl ContextStreamClient {
 
         // Add body
         if let Some(ref b) = body {
-            if let Ok(body_json) = serde_json::to_value(b) {
+            if review_cred_only {
+                debug!("{} {} (review-credential mode)", method, api_path);
+            } else if let Ok(body_json) = serde_json::to_value(b) {
                 debug!("{} {} body: {}", method, url, body_json);
             }
             req = req.json(b);
@@ -4967,7 +4989,9 @@ impl ContextStreamClient {
 
             let status = response.status();
             debug!("Response: {} (attempt {})", status, attempt + 1);
-            crate::run_progress::api_answered(effective_auth, &config, status.as_u16());
+            if !review_cred_only {
+                crate::run_progress::api_answered(effective_auth, &config, status.as_u16());
+            }
 
             if status.is_success() {
                 let parsed = self.parse_response(response).await;
@@ -4999,7 +5023,7 @@ impl ContextStreamClient {
             let response_is_replay = response_is_idempotent_replay(response.headers());
 
             // Handle error response
-            let error = self.parse_error(response).await;
+            let error = self.parse_error_for_mode(response, review_cred_only).await;
             debug!("Error response: {:?}", error);
 
             // A resend whose first attempt is still running is answered 409
@@ -5042,7 +5066,11 @@ impl ContextStreamClient {
             // A session refresh is an authentication repair, not a generic
             // endpoint retry. Preserve exactly one immediate replay even when
             // callers set `retries: 0` to suppress terminal 5xx/backoff.
-            if allow_auth_refresh_replay && status.as_u16() == 403 && !auth_refresh_replayed {
+            if !review_cred_only
+                && allow_auth_refresh_replay
+                && status.as_u16() == 403
+                && !auth_refresh_replayed
+            {
                 auth_refresh_replayed = true;
                 let hook = self.session_refresh_hook.read().await.clone();
                 if let Some(hook) = hook {
@@ -5079,8 +5107,11 @@ impl ContextStreamClient {
         let task_auth = get_task_auth_override();
         let effective_auth: Option<&AuthOverride> =
             options.auth_override.as_ref().or(task_auth.as_ref());
+        let review_cred_only = is_review_credential_only_request(effective_auth, &config);
 
-        let api_path = if path.starts_with("/api/") {
+        let api_path = if review_cred_only {
+            validate_review_credential_request(method, path, &config.api_url)?
+        } else if path.starts_with("/api/") {
             path.to_string()
         } else {
             format!("/api/v1{}", path)
@@ -5107,60 +5138,74 @@ impl ContextStreamClient {
             req = req.header("Accept", accept);
         }
 
-        if let Some(key) = effective_auth
-            .and_then(|a| a.api_key.as_ref())
-            .or(config.api_key.as_ref())
-        {
-            req = req.header("X-API-Key", key);
-        } else if let Some(jwt) = effective_auth
-            .and_then(|a| a.jwt.as_ref())
-            .or(config.jwt.as_ref())
-        {
-            req = req.header("Authorization", format!("Bearer {}", jwt));
-        }
-
-        let workspace_id: Option<Uuid> = effective_auth
-            .and_then(|a| a.workspace_id)
-            .or(options.workspace_id)
-            .or(infer_workspace_id_from_body(&body))
-            .or(infer_workspace_id_from_path(&api_path))
-            .or(config.default_workspace_id);
-        if let Some(id) = workspace_id {
-            req = req.header("X-Workspace-Id", id.to_string());
-        }
-
-        if let Some(traffic_class) = effective_auth.and_then(|value| value.traffic_class) {
-            req = req.header(TrafficClass::HEADER_NAME, traffic_class.as_header_value());
-        }
-        if let Some(client) = effective_auth.and_then(|value| value.client) {
-            if !request_options_has_header(&options, CLIENT_HEADER) {
-                req = req.header(CLIENT_HEADER, client.as_str());
+        if review_cred_only {
+            let cred = effective_review_credential(effective_auth, &config).ok_or_else(|| {
+                Error::Tool(
+                    "Missing review capsule credential for X-Capsule-Credential request."
+                        .to_string(),
+                )
+            })?;
+            req = req.header(
+                "X-Capsule-Credential",
+                sensitive_review_credential_header(cred)?,
+            );
+            req = with_api_forwarder_header(req);
+        } else {
+            if let Some(key) = effective_auth
+                .and_then(|a| a.api_key.as_ref())
+                .or(config.api_key.as_ref())
+            {
+                req = req.header("X-API-Key", key);
+            } else if let Some(jwt) = effective_auth
+                .and_then(|a| a.jwt.as_ref())
+                .or(config.jwt.as_ref())
+            {
+                req = req.header("Authorization", format!("Bearer {}", jwt));
             }
-        }
-        req = with_edge_geography_headers(req);
-        req = with_api_forwarder_header(req);
 
-        // Forward the agent's model so server-side compliance events attribute
-        // to the real model instead of the `unknown` bucket. Set by the tool
-        // registry from the session model cache; absent for unscoped calls.
-        if let Some(model_id) = get_task_model_id() {
-            req = req.header("X-ContextStream-Model", model_id);
-        }
+            let workspace_id: Option<Uuid> = effective_auth
+                .and_then(|a| a.workspace_id)
+                .or(options.workspace_id)
+                .or(infer_workspace_id_from_body(&body))
+                .or(infer_workspace_id_from_path(&api_path))
+                .or(config.default_workspace_id);
+            if let Some(id) = workspace_id {
+                req = req.header("X-Workspace-Id", id.to_string());
+            }
 
-        if !config.is_http_transport {
-            for (key, value) in crate::activation::runtime_headers() {
-                if !request_options_has_header(&options, key) {
-                    req = req.header(key, value);
+            if let Some(traffic_class) = effective_auth.and_then(|value| value.traffic_class) {
+                req = req.header(TrafficClass::HEADER_NAME, traffic_class.as_header_value());
+            }
+            if let Some(client) = effective_auth.and_then(|value| value.client) {
+                if !request_options_has_header(&options, CLIENT_HEADER) {
+                    req = req.header(CLIENT_HEADER, client.as_str());
                 }
             }
-        }
+            req = with_edge_geography_headers(req);
+            req = with_api_forwarder_header(req);
 
-        if let Some(ref headers) = options.extra_headers {
-            for (key, value) in headers {
-                if TrafficClass::is_header_name(key) {
-                    continue;
+            // Forward the agent's model so server-side compliance events attribute
+            // to the real model instead of the `unknown` bucket. Set by the tool
+            // registry from the session model cache; absent for unscoped calls.
+            if let Some(model_id) = get_task_model_id() {
+                req = req.header("X-ContextStream-Model", model_id);
+            }
+
+            if !config.is_http_transport {
+                for (key, value) in crate::activation::runtime_headers() {
+                    if !request_options_has_header(&options, key) {
+                        req = req.header(key, value);
+                    }
                 }
-                req = req.header(key.as_str(), value.as_str());
+            }
+
+            if let Some(ref headers) = options.extra_headers {
+                for (key, value) in headers {
+                    if TrafficClass::is_header_name(key) {
+                        continue;
+                    }
+                    req = req.header(key.as_str(), value.as_str());
+                }
             }
         }
 
@@ -5179,10 +5224,12 @@ impl ContextStreamClient {
             }
         })?;
         observe_tenant_home_header(response.headers());
-        crate::run_progress::api_answered(effective_auth, &config, response.status().as_u16());
+        if !review_cred_only {
+            crate::run_progress::api_answered(effective_auth, &config, response.status().as_u16());
+        }
 
         if !response.status().is_success() {
-            return Err(self.parse_error(response).await);
+            return Err(self.parse_error_for_mode(response, review_cred_only).await);
         }
 
         response
@@ -5247,11 +5294,27 @@ impl ContextStreamClient {
         extra_headers: &[(&str, String)],
         timeout: Duration,
     ) -> Result<Response> {
+        self.send_raw_request_with_auth(method, path, body, extra_headers, timeout, None)
+            .await
+    }
+
+    pub(crate) async fn send_raw_request_with_auth(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<RawBody<'_>>,
+        extra_headers: &[(&str, String)],
+        timeout: Duration,
+        auth_override: Option<&AuthOverride>,
+    ) -> Result<Response> {
         let config = self.config().await;
         let task_auth = get_task_auth_override();
-        let auth: Option<&AuthOverride> = task_auth.as_ref();
+        let auth: Option<&AuthOverride> = auth_override.or(task_auth.as_ref());
+        let review_cred_only = is_review_credential_only_request(auth, &config);
 
-        let api_path = if path.starts_with("/api/") {
+        let api_path = if review_cred_only {
+            validate_review_credential_request(method, path, &config.api_url)?
+        } else if path.starts_with("/api/") {
             path.to_string()
         } else {
             format!("/api/v1{}", path)
@@ -5271,37 +5334,62 @@ impl ContextStreamClient {
                 )))
             }
         };
-        req = req.header("Accept", "application/json");
+        let has_accept_override = extra_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("accept"));
+        if !has_accept_override {
+            req = req.header("Accept", "application/json");
+        }
         req = req.header("User-Agent", &config.user_agent);
-        if let Some(key) = auth
-            .and_then(|a| a.api_key.as_ref())
-            .or(config.api_key.as_ref())
-        {
-            req = req.header("X-API-Key", key);
-        } else if let Some(jwt) = auth.and_then(|a| a.jwt.as_ref()).or(config.jwt.as_ref()) {
-            req = req.header("Authorization", format!("Bearer {}", jwt));
-        }
-        if let Some(traffic_class) = auth.and_then(|value| value.traffic_class) {
-            req = req.header(TrafficClass::HEADER_NAME, traffic_class.as_header_value());
-        }
-        if let Some(client) = auth.and_then(|value| value.client) {
-            req = req.header(CLIENT_HEADER, client.as_str());
-        }
-        req = with_edge_geography_headers(req);
-        req = with_api_forwarder_header(req);
-        if let Some(model_id) = get_task_model_id() {
-            req = req.header("X-ContextStream-Model", model_id);
-        }
-        if !config.is_http_transport {
-            for (key, value) in crate::activation::runtime_headers() {
-                req = req.header(key, value);
+
+        if review_cred_only {
+            let cred = effective_review_credential(auth, &config).ok_or_else(|| {
+                Error::Tool(
+                    "Missing review capsule credential for X-Capsule-Credential request."
+                        .to_string(),
+                )
+            })?;
+            req = req.header(
+                "X-Capsule-Credential",
+                sensitive_review_credential_header(cred)?,
+            );
+            req = with_api_forwarder_header(req);
+            for (name, value) in extra_headers {
+                if name.eq_ignore_ascii_case("accept") {
+                    req = req.header(*name, value.as_str());
+                }
             }
-        }
-        for (name, value) in extra_headers {
-            if TrafficClass::is_header_name(name) {
-                continue;
+        } else {
+            if let Some(key) = auth
+                .and_then(|a| a.api_key.as_ref())
+                .or(config.api_key.as_ref())
+            {
+                req = req.header("X-API-Key", key);
+            } else if let Some(jwt) = auth.and_then(|a| a.jwt.as_ref()).or(config.jwt.as_ref()) {
+                req = req.header("Authorization", format!("Bearer {}", jwt));
             }
-            req = req.header(*name, value.as_str());
+            if let Some(traffic_class) = auth.and_then(|value| value.traffic_class) {
+                req = req.header(TrafficClass::HEADER_NAME, traffic_class.as_header_value());
+            }
+            if let Some(client) = auth.and_then(|value| value.client) {
+                req = req.header(CLIENT_HEADER, client.as_str());
+            }
+            req = with_edge_geography_headers(req);
+            req = with_api_forwarder_header(req);
+            if let Some(model_id) = get_task_model_id() {
+                req = req.header("X-ContextStream-Model", model_id);
+            }
+            if !config.is_http_transport {
+                for (key, value) in crate::activation::runtime_headers() {
+                    req = req.header(key, value);
+                }
+            }
+            for (name, value) in extra_headers {
+                if TrafficClass::is_header_name(name) {
+                    continue;
+                }
+                req = req.header(*name, value.as_str());
+            }
         }
         match body {
             Some(RawBody::Json(body)) => req = req.json(body),
@@ -5327,7 +5415,9 @@ impl ContextStreamClient {
         })?;
         observe_tenant_home_header(response.headers());
         let status = response.status().as_u16();
-        crate::run_progress::api_answered(auth, &config, status);
+        if !review_cred_only {
+            crate::run_progress::api_answered(auth, &config, status);
+        }
         Ok(response)
     }
 
@@ -5389,8 +5479,7 @@ impl ContextStreamClient {
         }
     }
 
-    /// Parse an error response.
-    async fn parse_error(&self, response: Response) -> Error {
+    async fn parse_error_for_mode(&self, response: Response, review_cred_only: bool) -> Error {
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let content_type = headers
@@ -5418,6 +5507,14 @@ impl ContextStreamClient {
                 error = %message,
                 "API returned non-blocking ParserError; preserving for logs while sanitizing client-facing error"
             );
+        }
+
+        if review_cred_only && status == 401 {
+            // Do not surface API-key setup instructions (`Error::is_key_refusal()`)
+            // on an X-Capsule-Credential-only connection.
+            return Error::Tool(format!(
+                "Review capsule credential unauthorized (HTTP 401): {message}"
+            ));
         }
 
         if status == 429 {
@@ -13382,6 +13479,233 @@ impl ContextStreamClient {
             });
         self.request_text("GET", &path, None::<()>, options, Some("text/markdown"))
             .await
+    }
+
+    // =========================================================================
+    // Review Capsules (`0a290693`)
+    // =========================================================================
+
+    /// `POST /api/v1/capsules/review`
+    pub async fn create_review_capsule(
+        &self,
+        body: CreateReviewCapsuleRequest,
+    ) -> Result<ReviewCapsuleCreateResponse> {
+        self.post("/capsules/review", body).await
+    }
+
+    /// `GET /api/v1/capsules/{capsule_id}/review`
+    pub async fn get_review_capsule(
+        &self,
+        capsule_id: &str,
+    ) -> Result<ReviewCapsuleManifestResponse> {
+        let id = capsule_id.trim();
+        if id.is_empty() {
+            return Err(Error::Validation("capsule_id is required".to_string()));
+        }
+        self.get(&format!("/capsules/{id}/review")).await
+    }
+
+    /// `GET /api/v1/capsules/{capsule_id}/review/prompt.md[?part=N]`
+    pub async fn get_review_capsule_prompt(
+        &self,
+        capsule_id: &str,
+        part: Option<&str>,
+    ) -> Result<ReviewPromptPart> {
+        let id = capsule_id.trim();
+        if id.is_empty() {
+            return Err(Error::Validation("capsule_id is required".to_string()));
+        }
+        let path = match part.map(str::trim).filter(|p| !p.is_empty()) {
+            Some(part) => format!("/capsules/{id}/review/prompt.md?part={part}"),
+            None => format!("/capsules/{id}/review/prompt.md"),
+        };
+        self.fetch_review_prompt_part(&path, None).await
+    }
+
+    /// `POST /api/v1/capsules/{capsule_id}/review/answers`
+    pub async fn post_review_answer(
+        &self,
+        capsule_id: &str,
+        body: ReviewAnswerRequest,
+    ) -> Result<ReviewAnswerOutcome> {
+        let id = capsule_id.trim();
+        if id.is_empty() {
+            return Err(Error::Validation("capsule_id is required".to_string()));
+        }
+        self.send_review_answer(&format!("/capsules/{id}/review/answers"), body, None)
+            .await
+    }
+
+    /// `GET /api/v1/capsules/{capsule_id}/review/answers`
+    pub async fn list_review_answers(&self, capsule_id: &str) -> Result<ReviewAnswersListResponse> {
+        let id = capsule_id.trim();
+        if id.is_empty() {
+            return Err(Error::Validation("capsule_id is required".to_string()));
+        }
+        self.get(&format!("/capsules/{id}/review/answers")).await
+    }
+
+    /// `POST /api/v1/capsules/{capsule_id}/review/credentials`
+    pub async fn create_review_credential(
+        &self,
+        capsule_id: &str,
+        body: CreateReviewCredentialRequest,
+    ) -> Result<ReviewCredentialResponse> {
+        let id = capsule_id.trim();
+        if id.is_empty() {
+            return Err(Error::Validation("capsule_id is required".to_string()));
+        }
+        self.post(&format!("/capsules/{id}/review/credentials"), body)
+            .await
+    }
+
+    /// `GET /api/v1/capsules/review/open` with `X-Capsule-Credential`.
+    pub async fn open_review_capsule_by_credential(
+        &self,
+        cred: Option<&str>,
+    ) -> Result<ReviewCapsuleManifestResponse> {
+        let options = review_credential_request_options(cred);
+        self.request("GET", "/capsules/review/open", None::<()>, options)
+            .await
+    }
+
+    /// `GET /api/v1/capsules/review/open/prompt.md[?part=N]` with `X-Capsule-Credential`.
+    pub async fn open_review_capsule_prompt_by_credential(
+        &self,
+        cred: Option<&str>,
+        part: Option<&str>,
+    ) -> Result<ReviewPromptPart> {
+        let path = match part.map(str::trim).filter(|p| !p.is_empty()) {
+            Some(part) => format!("/capsules/review/open/prompt.md?part={part}"),
+            None => "/capsules/review/open/prompt.md".to_string(),
+        };
+        let auth_override = review_credential_auth_override(cred);
+        self.fetch_review_prompt_part(&path, auth_override.as_ref())
+            .await
+    }
+
+    /// `POST /api/v1/capsules/review/open/answers` with `X-Capsule-Credential`.
+    pub async fn post_review_answer_by_credential(
+        &self,
+        cred: Option<&str>,
+        body: ReviewAnswerRequest,
+    ) -> Result<ReviewAnswerOutcome> {
+        let auth_override = review_credential_auth_override(cred);
+        self.send_review_answer(
+            "/capsules/review/open/answers",
+            body,
+            auth_override.as_ref(),
+        )
+        .await
+    }
+
+    async fn fetch_review_prompt_part(
+        &self,
+        path: &str,
+        auth_override: Option<&AuthOverride>,
+    ) -> Result<ReviewPromptPart> {
+        let config = self.config().await;
+        let task_auth = get_task_auth_override();
+        let effective_auth = auth_override.or(task_auth.as_ref());
+        let review_cred_only = is_review_credential_only_request(effective_auth, &config);
+        let response = self
+            .send_raw_request_with_auth(
+                "GET",
+                path,
+                None,
+                &[("Accept", "text/markdown".to_string())],
+                Duration::from_secs(30),
+                auth_override,
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.parse_error_for_mode(response, review_cred_only).await);
+        }
+        let header_str = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let digest = header_str("x-capsule-digest");
+        let part = header_str("x-capsule-part");
+        let sha256 = header_str("x-capsule-part-sha256");
+        let markdown = response
+            .text()
+            .await
+            .map_err(|e| Error::Network(e.to_string()))?;
+        Ok(ReviewPromptPart {
+            markdown,
+            digest,
+            part,
+            sha256,
+        })
+    }
+
+    async fn send_review_answer(
+        &self,
+        path: &str,
+        body: ReviewAnswerRequest,
+        auth_override: Option<&AuthOverride>,
+    ) -> Result<ReviewAnswerOutcome> {
+        let config = self.config().await;
+        let task_auth = get_task_auth_override();
+        let effective_auth = auth_override.or(task_auth.as_ref());
+        let review_cred_only = is_review_credential_only_request(effective_auth, &config);
+        let payload = serde_json::to_value(&body)?;
+        let response = self
+            .send_raw_request_with_auth(
+                "POST",
+                path,
+                Some(RawBody::Json(&payload)),
+                &[],
+                Duration::from_secs(30),
+                auth_override,
+            )
+            .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| Error::Network(e.to_string()))?;
+            let json_body: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            let problems = json_body
+                .pointer("/data/problems")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !problems.is_empty()
+                || extract_error_code(&json_body).as_deref() == Some("REVIEW_ANSWER_INVALID")
+            {
+                let message = extract_error_message(&json_body, 422);
+                return Ok(ReviewAnswerOutcome::Invalid { message, problems });
+            }
+            let message = if !json_body.is_null() {
+                extract_error_message(&json_body, 422)
+            } else {
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
+            return Err(Error::http_with_code(
+                422,
+                message,
+                ErrorCode::ValidationError,
+            ));
+        }
+        if !status.is_success() {
+            return Err(self.parse_error_for_mode(response, review_cred_only).await);
+        }
+        let parsed: ReviewAnswerSuccess = self.parse_response(response).await?;
+        Ok(ReviewAnswerOutcome::Accepted(parsed))
     }
 
     fn capsule_locator_path<T: CapsuleLocatorInput>(
@@ -29173,6 +29497,7 @@ mod tests {
             AuthOverride {
                 api_key: Some("test-key".into()),
                 jwt: None,
+                capsule_credential: None,
                 workspace_id: Some(user_a_ws),
                 project_id: None,
                 traffic_class: None,
@@ -29230,6 +29555,7 @@ mod tests {
             AuthOverride {
                 api_key: Some("test-key".into()),
                 jwt: None,
+                capsule_credential: None,
                 workspace_id: Some(Uuid::new_v4()),
                 project_id: Some(Uuid::new_v4()),
                 traffic_class: None,
@@ -36301,5 +36627,428 @@ mod pushed_commits_body_tests {
             let body = push_body(commits);
             assert!(body.get("pushed_commits").is_none(), "{body}");
         }
+    }
+}
+
+fn is_review_credential_only_request(auth: Option<&AuthOverride>, config: &Config) -> bool {
+    auth.is_some_and(AuthOverride::is_review_credential_only)
+        || (auth.is_none_or(|a| a.api_key.is_none() && a.jwt.is_none())
+            && config.is_review_credential_only())
+}
+
+fn effective_review_credential<'a>(
+    auth: Option<&'a AuthOverride>,
+    config: &'a Config,
+) -> Option<&'a str> {
+    auth.and_then(|a| a.capsule_credential.as_deref())
+        .or(config.capsule_credential.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn sensitive_review_credential_header(cred: &str) -> Result<reqwest::header::HeaderValue> {
+    let mut header_val = reqwest::header::HeaderValue::from_str(cred)
+        .map_err(|_| Error::Tool("Invalid X-Capsule-Credential header value.".to_string()))?;
+    header_val.set_sensitive(true);
+    Ok(header_val)
+}
+
+fn review_credential_auth_override(cred: Option<&str>) -> Option<AuthOverride> {
+    cred.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| AuthOverride {
+            capsule_credential: Some(s.to_string()),
+            ..Default::default()
+        })
+}
+
+fn review_credential_request_options(cred: Option<&str>) -> Option<RequestOptions> {
+    review_credential_auth_override(cred).map(|auth_override| RequestOptions {
+        auth_override: Some(auth_override),
+        ..Default::default()
+    })
+}
+
+/// Strictly validate `(method, path, base_url)` when operating under a
+/// review-credential-only connection (`X-Capsule-Credential`). Only the three
+/// `/api/v1/capsules/review/open*` routes are allowed, with zero traversal,
+/// percent-encoding, fragment, userinfo, extra query parameter, or method bypass.
+pub(crate) fn validate_review_credential_request(
+    method: &str,
+    path: &str,
+    base_url: &str,
+) -> Result<String> {
+    let denied = || {
+        Error::Tool(
+            "This connection holds only a review credential and cannot access that ContextStream endpoint."
+                .to_string(),
+        )
+    };
+    if path.is_empty()
+        || !path.starts_with('/')
+        || path.chars().any(|c| {
+            c.is_ascii_whitespace() || c.is_ascii_control() || matches!(c, '\\' | '#' | '@' | '%')
+        })
+    {
+        return Err(denied());
+    }
+    let api_path = if path.starts_with("/api/") {
+        path.to_string()
+    } else {
+        format!("/api/v1{}", path)
+    };
+    if api_path.contains("//")
+        || api_path.contains("..")
+        || api_path.contains("/.")
+        || api_path.contains("./")
+    {
+        return Err(denied());
+    }
+    let (route, query) = match api_path.split_once('?') {
+        Some((route, q)) => {
+            if q.contains('?') || q.contains('&') || q.is_empty() {
+                return Err(denied());
+            }
+            (route, Some(q))
+        }
+        None => (api_path.as_str(), None),
+    };
+    let allowed = match (method, route, query) {
+        ("GET", "/api/v1/capsules/review/open", None) => true,
+        ("GET", "/api/v1/capsules/review/open/prompt.md", None) => true,
+        ("GET", "/api/v1/capsules/review/open/prompt.md", Some(q)) => {
+            q == "part=all"
+                || q.strip_prefix("part=").is_some_and(|n| {
+                    !n.is_empty()
+                        && n.bytes().all(|b| b.is_ascii_digit())
+                        && n.parse::<usize>().is_ok_and(|num| num >= 1)
+                })
+        }
+        ("POST", "/api/v1/capsules/review/open/answers", None) => true,
+        _ => false,
+    };
+    if !allowed {
+        return Err(denied());
+    }
+    let full_url = format!("{}{}", base_url.trim_end_matches('/'), api_path);
+    let parsed = reqwest::Url::parse(&full_url).map_err(|_| denied())?;
+    let base_parsed = reqwest::Url::parse(base_url).map_err(|_| denied())?;
+    if parsed.path() != route
+        || parsed.query() != query
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.host_str() != base_parsed.host_str()
+        || parsed.port_or_known_default() != base_parsed.port_or_known_default()
+    {
+        return Err(denied());
+    }
+    Ok(api_path)
+}
+
+#[cfg(test)]
+mod review_capsule_client_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn mock_api(
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        body: &'static str,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<(String, String)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let rec = recorded.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let rec = rec.clone();
+                let headers = headers.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let (head, req_body) = loop {
+                        let mut chunk = [0u8; 4096];
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                        let len: usize = head
+                            .lines()
+                            .filter_map(|l| l.split_once(':'))
+                            .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, v)| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= pos + 4 + len {
+                            let req_body =
+                                String::from_utf8_lossy(&buf[pos + 4..pos + 4 + len]).to_string();
+                            break (head, req_body);
+                        }
+                    };
+                    rec.lock().unwrap().push((head, req_body));
+                    let mut resp = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+                        body.len()
+                    );
+                    for (k, v) in headers {
+                        resp.push_str(&format!("{k}: {v}\r\n"));
+                    }
+                    resp.push_str("\r\n");
+                    resp.push_str(body);
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (base_url, recorded, task)
+    }
+
+    #[test]
+    fn capsule_routed_leaves_review_routes_untouched() {
+        let ws = Uuid::new_v4();
+        let fut = run_with_capsule_scope(Some(ws), None, || async {
+            assert_eq!(
+                capsule_routed("/capsules/review".to_string()),
+                "/capsules/review"
+            );
+            assert_eq!(
+                capsule_routed("/capsules/review/open".to_string()),
+                "/capsules/review/open"
+            );
+            assert_eq!(
+                capsule_routed("/capsules/review/open/prompt.md?part=1".to_string()),
+                "/capsules/review/open/prompt.md?part=1"
+            );
+            assert_eq!(
+                capsule_routed("/capsules/cap_123/review".to_string()),
+                format!("/capsules/cap_123/review?workspace_id={ws}")
+            );
+        });
+        tokio::runtime::Runtime::new().unwrap().block_on(fut);
+    }
+
+    #[test]
+    fn validate_review_credential_request_allowlist_matrix() {
+        let base = "https://api.contextstream.io";
+        for (method, path, expected) in [
+            (
+                "GET",
+                "/capsules/review/open",
+                "/api/v1/capsules/review/open",
+            ),
+            (
+                "GET",
+                "/api/v1/capsules/review/open",
+                "/api/v1/capsules/review/open",
+            ),
+            (
+                "GET",
+                "/capsules/review/open/prompt.md",
+                "/api/v1/capsules/review/open/prompt.md",
+            ),
+            (
+                "GET",
+                "/capsules/review/open/prompt.md?part=1",
+                "/api/v1/capsules/review/open/prompt.md?part=1",
+            ),
+            (
+                "GET",
+                "/capsules/review/open/prompt.md?part=all",
+                "/api/v1/capsules/review/open/prompt.md?part=all",
+            ),
+            (
+                "POST",
+                "/capsules/review/open/answers",
+                "/api/v1/capsules/review/open/answers",
+            ),
+        ] {
+            assert_eq!(
+                validate_review_credential_request(method, path, base).unwrap(),
+                expected
+            );
+        }
+
+        for (method, path) in [
+            ("GET", "/capsules/review/open/../../projects"),
+            ("GET", "/capsules/review/open/%2e%2e/projects"),
+            ("GET", "/capsules/review/open/%2f.."),
+            ("GET", "/capsules/review//open"),
+            ("GET", "/capsules/review/open\\.."),
+            ("POST", "/capsules/review/open"),
+            ("GET", "/capsules/review/open/answers"),
+            ("DELETE", "/capsules/review/open"),
+            ("GET", "/capsules/review/open?workspace_id=123"),
+            ("GET", "/capsules/review/open/prompt.md?part=0"),
+            ("GET", "/capsules/review/open/prompt.md?part=1&foo=bar"),
+            ("GET", "/capsules/review/open#frag"),
+            ("GET", "/capsules/review/open@evil.com"),
+            ("GET", "/auth/me"),
+            ("GET", "/capsules"),
+            ("GET", "/capsules/cap_1/review"),
+            ("GET", "/capsules/cap_1/review/answers"),
+            ("POST", "/capsules/cap_1/review/credentials"),
+            ("POST", "/session/init"),
+        ] {
+            assert!(
+                validate_review_credential_request(method, path, base).is_err(),
+                "expected rejection for {method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn review_cred_mode_blocks_non_open_routes_and_never_falls_back_to_gateway_api_key() {
+        let (base_url, recorded, task) = mock_api(
+            200,
+            vec![("Content-Type", "application/json")],
+            r#"{"success":true,"data":{"valid":true,"verdict":"SAFE TO LAND","must":0,"should":0,"status":"approved"}}"#,
+        )
+        .await;
+        // Gateway config has a member api_key, while the task AuthOverride holds ONLY a review credential.
+        let client = ContextStreamClient::new(Config {
+            api_url: base_url,
+            api_key: Some("gateway_secret_api_key".to_string()),
+            default_workspace_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        });
+        let auth = AuthOverride {
+            capsule_credential: Some("capsule_cred_only_123".to_string()),
+            workspace_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        run_with_auth_override(auth.clone(), || async {
+            // Non-open routes across all three transport methods must fail with 0 HTTP requests.
+            assert!(client.me().await.is_err());
+            assert!(client
+                .request_text(
+                    "GET",
+                    "/capsules/cap_1/review/prompt.md",
+                    None::<()>,
+                    None,
+                    None
+                )
+                .await
+                .is_err());
+            assert!(client
+                .send_raw_request(
+                    "POST",
+                    "/capsules/cap_1/review/credentials",
+                    None,
+                    &[],
+                    Duration::from_secs(5)
+                )
+                .await
+                .is_err());
+            assert!(
+                recorded.lock().unwrap().is_empty(),
+                "blocked routes must send 0 requests"
+            );
+
+            // Allowed route via send_raw_request_with_auth (post_review_answer_by_credential)
+            let outcome = client
+                .post_review_answer_by_credential(
+                    None,
+                    ReviewAnswerRequest {
+                        answer: "VERDICT: SAFE TO LAND".to_string(),
+                        reviewer: None,
+                    },
+                )
+                .await
+                .expect("answer succeeds");
+            assert!(matches!(outcome, ReviewAnswerOutcome::Accepted(_)));
+        })
+        .await;
+
+        let reqs = recorded.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        let head_lower = reqs[0].0.to_ascii_lowercase();
+        assert!(head_lower.starts_with("post /api/v1/capsules/review/open/answers "));
+        assert!(head_lower.contains("x-capsule-credential: capsule_cred_only_123"));
+        assert!(!head_lower.contains("x-api-key"));
+        assert!(!head_lower.contains("gateway_secret_api_key"));
+        assert!(!head_lower.contains("authorization:"));
+        assert!(!head_lower.contains("x-workspace-id"));
+        assert!(!head_lower.contains("idempotency-key"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn post_review_answer_preserves_422_problems_and_prompt_captures_headers() {
+        let err_body = r#"{"success":false,"error":{"code":"REVIEW_ANSWER_INVALID","message":"The answer does not fit this capsule. Nothing was stored."},"data":{"valid":false,"problems":["missing CAPSULE line","unknown finding path"]}}"#;
+        let (base_url, _recorded, task) =
+            mock_api(422, vec![("Content-Type", "application/json")], err_body).await;
+        let client = ContextStreamClient::new(Config {
+            api_url: base_url,
+            api_key: Some("cbiq_member".to_string()),
+            ..Default::default()
+        });
+        let outcome = client
+            .post_review_answer(
+                "cap_1",
+                ReviewAnswerRequest {
+                    answer: "bad".to_string(),
+                    reviewer: None,
+                },
+            )
+            .await
+            .unwrap();
+        match outcome {
+            ReviewAnswerOutcome::Invalid { message, problems } => {
+                assert!(message.contains("does not fit"));
+                assert_eq!(
+                    problems,
+                    vec![
+                        "missing CAPSULE line".to_string(),
+                        "unknown finding path".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        task.abort();
+
+        let (prompt_url, _rec2, task2) = mock_api(
+            200,
+            vec![
+                ("Content-Type", "text/markdown; charset=utf-8"),
+                (
+                    "x-capsule-digest",
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                ),
+                ("x-capsule-part", "1 of 2"),
+                ("x-capsule-part-sha256", "deadbeef"),
+            ],
+            "# Review capsule 0123456789abcdef  (part 1 of 2: the brief)\n",
+        )
+        .await;
+        let client2 = ContextStreamClient::new(Config {
+            api_url: prompt_url,
+            capsule_credential: Some("capsule_cred_1".to_string()),
+            ..Default::default()
+        });
+        let part = client2
+            .open_review_capsule_prompt_by_credential(None, Some("1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            part.digest.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(part.part.as_deref(), Some("1 of 2"));
+        assert_eq!(part.sha256.as_deref(), Some("deadbeef"));
+        assert!(part.markdown.contains("Review capsule 0123456789abcdef"));
+        task2.abort();
     }
 }

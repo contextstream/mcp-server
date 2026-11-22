@@ -3530,6 +3530,23 @@ pub async fn handle() -> Result<()> {
             }
         }
 
+        _ if super::edit_safety_card::is_code_edit_tool(&tool_lower) => {
+            let graph_read = contextstream_tool_name(&editor, "graph_read");
+            match super::edit_safety_card::maybe_safety_card_for_edit(
+                &input,
+                &cwd,
+                &tool_lower,
+                &tool_input,
+                &compliance_config,
+                &graph_read,
+            )
+            .await
+            {
+                Some(card) => HookDecision::AllowWithContext(card),
+                None => HookDecision::Allow,
+            }
+        }
+
         _ => HookDecision::Allow,
     };
 

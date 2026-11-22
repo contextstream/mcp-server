@@ -15,6 +15,7 @@ pub(crate) mod credit_notice;
 pub mod dirty_drain;
 pub(crate) mod durable_capture;
 pub(crate) mod durable_paths;
+pub(crate) mod edit_safety_card;
 pub mod git_bash_observed;
 pub mod git_common;
 pub mod git_post_checkout;

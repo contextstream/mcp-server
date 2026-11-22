@@ -1729,6 +1729,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-test",
+ "tokio-tungstenite",
  "toml_edit",
  "tower",
  "tower-http 0.7.1",

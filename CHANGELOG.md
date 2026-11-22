@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Declined remote checks show the worker's reason. `contextstream-mcp run -v` also shows the remote call ID.
+- `contextstream-mcp run` fetches missing or stale command hints, including in sessions using the hosted MCP. If the catalog is unavailable, commands run locally and skip catalog requests for 30 seconds.
+
 ## 1.0.92
 
 - Remote checks can be turned on from the MCP: `session(action="remote_checks")` shows whether they are on, what they cost, your credit balance and which of the project's languages run remotely; pass `enabled=true` or `false`, and `more_engines` for the extra languages (Java, .NET, Ruby, PHP, C/C++, Bun, Deno, Dart, Elixir, Zig, Swift). The same from a shell: `contextstream-mcp remote-checks [status|on|off] [--more-engines|--no-more-engines] [--json]`. The `check` tool appears or goes away at once, without a restart.

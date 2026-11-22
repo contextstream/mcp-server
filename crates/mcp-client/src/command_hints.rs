@@ -9,10 +9,10 @@
 //! hint: the service may still decline, and the command then runs where it
 //! would have run.
 //!
-//! The server writes the hints it read to a small file under `~/.contextstream`
-//! for the editor hook, which must answer without a network call. The file is
-//! tied to the account (a digest of its credential, never the credential) and
-//! the API address, and is not used when it is old.
+//! The server and the run command write hints to a file under
+//! `~/.contextstream` for the editor hook, which must answer without a network
+//! call. The file is tied to the account (a digest of its credential, never
+//! the credential) and the API address.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,12 +21,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::hosted_tools::KNOWN_TTL;
+
 /// The start of the name of the file the hints are kept in, under `~/.contextstream`;
 /// each account has its own (`hosted-command-hints-<its digest>.json`), so that
 /// two accounts on one machine do not overwrite each other's.
 pub const CACHE_FILE: &str = "hosted-command-hints";
 
-/// How long a written file is used for.
+/// How long the editor hook can use a written file. The run command checks
+/// against the catalog TTL before using it to send a command.
 pub const CACHE_MAX_AGE: Duration = Duration::from_secs(12 * 3600);
 
 /// Set to `off` to leave every command as it is.
@@ -200,6 +203,11 @@ impl Cache {
         }
     }
 
+    /// Whether the last catalog read is younger than `ttl`.
+    pub fn is_fresh(&self, ttl: Duration) -> bool {
+        Duration::from_secs(now_secs().saturating_sub(self.written_at)) < ttl
+    }
+
     /// The first tool that takes `command`.
     pub fn tool_for(&self, command: &str) -> Option<&CachedTool> {
         self.tools.iter().find(|tool| tool.hints.matches(command))
@@ -240,6 +248,7 @@ pub fn cache_path(identity: &str) -> Option<PathBuf> {
 pub enum CheckMarker {
     SettingsChanged,
     OutOfCredits,
+    CatalogUnreachable,
 }
 
 impl CheckMarker {
@@ -250,6 +259,7 @@ impl CheckMarker {
         let suffix = match self {
             Self::SettingsChanged => "settings",
             Self::OutOfCredits => "credits",
+            Self::CatalogUnreachable => "catalog-unreachable",
         };
         Some(cache_path(identity)?.with_file_name(format!("remote-checks-{suffix}-{digest}")))
     }
@@ -277,27 +287,20 @@ impl CheckMarker {
 /// when it was written). Returns whether it wrote. A symlink at `path` is
 /// never written through.
 pub fn write_to(path: &Path, cache: &Cache) -> std::io::Result<bool> {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if let Ok(old) = serde_json::from_str::<Cache>(&existing) {
-            let same = old.identity == cache.identity
-                && old.api_url == cache.api_url
-                && old.settings_changed == cache.settings_changed
-                && old.tools == cache.tools
-                && old.version == cache.version;
-            // A file nearly as old as it may be is written again, so a live session keeps it fresh.
-            let fresh = now_secs().saturating_sub(old.written_at) < CACHE_MAX_AGE.as_secs() / 4;
-            if same && fresh {
-                return Ok(false);
-            }
-        }
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the hints path is not a regular file",
+        ));
     }
-    if let Ok(metadata) = std::fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "the hints file is a symlink",
-            ));
-        }
+    // A confirmed catalog read keeps CLI hints fresh even when the tools stay the same.
+    if read_from(path, &cache.identity, &cache.api_url).is_some_and(|old| {
+        old.settings_changed == cache.settings_changed
+            && old.tools == cache.tools
+            && old.version == cache.version
+            && old.is_fresh(KNOWN_TTL / 4)
+    }) {
+        return Ok(false);
     }
     let parent = path
         .parent()
@@ -323,11 +326,10 @@ pub fn read_from(path: &Path, identity: &str, api_url: &str) -> Option<Cache> {
         return None;
     }
     let cache: Cache = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    let age = now_secs().saturating_sub(cache.written_at);
     (cache.version == CACHE_VERSION
         && cache.identity == identity
         && cache.api_url == normalized_url(api_url)
-        && age < CACHE_MAX_AGE.as_secs())
+        && cache.is_fresh(CACHE_MAX_AGE))
     .then_some(cache)
 }
 

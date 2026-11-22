@@ -793,9 +793,9 @@ async fn a_stream_call_runs_over_frames_and_returns_what_the_service_made() {
 
 #[tokio::test]
 async fn a_run_the_service_declines_is_handed_back_to_the_caller() {
-    let (ws_url, _) = frames_service(vec![Step::Json(
-        json!({"type": "result", "ran": false, "exit": 2, "refused": "something internal", "host": "gateway"}),
-    )])
+    let (ws_url, _) = frames_service(vec![Step::Json(json!({
+        "type": "result", "ran": false, "exit": 75, "host": "gateway"
+    }))])
     .await;
     let (url, _) = stream_api(stream_answer(&ws_url, "frames/1")).await;
     let client = client_in_workspace(&url);
@@ -809,17 +809,44 @@ async fn a_run_the_service_declines_is_handed_back_to_the_caller() {
     )
     .await;
     assert!(result.is_error);
-    let message = text_of(&result).join(" ");
-    assert!(
-        message.contains("Run it yourself: run the thing (from the folder pkg)"),
-        "{message}"
-    );
-    // What the service said of why is not passed on.
-    assert!(
-        !message.contains("something internal") && !message.contains("gateway"),
-        "{message}"
+    assert_eq!(
+        text_of(&result),
+        ["check was not run remotely: the service declined to run it. Run it yourself: run the thing (from the folder pkg)"]
     );
     assert_eq!(result.structured_content, Some(json!({"ran": false})));
+}
+
+#[tokio::test]
+async fn a_declined_run_includes_the_workers_reason_in_text_and_structured_content() {
+    let reason = "the session runs Node 26 and this host runs Node 22 or 24 or 20, so it runs in the session";
+    let (ws_url, _) = frames_service(vec![Step::Json(json!({
+        "type": "result", "ran": false, "exit": 75, "refused": format!("\0{reason}\n"),
+        "refused_code": "node_version_mismatch", "host": "gateway"
+    }))])
+    .await;
+    let mut answer = stream_answer(&ws_url, "frames/1");
+    answer["stream"]["request"]["command"] = json!("npx tsc --noEmit");
+    answer["stream"]["request"]["cwd"] = json!("");
+    let (url, _) = stream_api(answer).await;
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let result = run(
+        &client,
+        &session,
+        &tool,
+        json!({"command": "npx tsc --noEmit"}),
+    )
+    .await;
+    assert!(result.is_error);
+    assert_eq!(
+        text_of(&result),
+        ["check was not run remotely: the remote machine can't match this one (the session runs Node 26 and this host runs Node 22 or 24 or 20). Run it yourself: npx tsc --noEmit"]
+    );
+    assert_eq!(
+        result.structured_content,
+        Some(json!({"ran": false, "declined_reason": reason}))
+    );
 }
 
 #[tokio::test]

@@ -2,28 +2,32 @@
 //! account has for it, and where there is none (or it declines, or cannot be
 //! reached) run it right here, as the shell would.
 //!
-//! The tool is found in the hints the server keeps for the editor hook
-//! (`mcp_client::command_hints`): the command must be one a tool says it takes
-//! (or the tool is named with `--tool`). The call is the same a tool call
-//! makes (the checkout is described to the API and sent on its stream), except
-//! that the output is written as it arrives (marked once on stderr as the
-//! run's output so far) and the process ends with the command's own exit
-//! status; a failure the host calls its own, or a run it refuses after its
-//! output, ends with a line that says so, and the command then runs here. Nothing here reaches the network when no tool
-//! takes the command.
+//! The tool is found in the hints shared with the editor hook
+//! (`mcp_client::command_hints`), refreshed from the API when stale. The command
+//! must be one a tool says it takes, or the tool can be named with `--tool`.
+//! The call describes the checkout to the API and sends it on its stream,
+//! just as a tool call does. Output is written as it arrives, with a first
+//! line on stderr, and the process ends with the command's own exit status.
+//! When the host declines or says a failure was its own, the command runs
+//! here after a line that says why.
 
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 
 use mcp_client::command_hints::{self, CachedTool};
-use mcp_client::frames::{Delivery, Event};
+use mcp_client::frames::{self, Delivery, Event};
 use mcp_client::ContextStreamClient;
 use mcp_session::SessionManager;
 use mcp_tools::domains::hosted_tools::{
-    begin_snapshot, call_api, drive_stream, stream_call, Attachment, CallRefusal, HostedTool,
-    Transport, ADD_CREDITS, CREDIT_MESSAGE,
+    begin_snapshot, call_api, command_hints_for_run, drive_stream, stream_call, Attachment,
+    CallRefusal, HostedTool, Transport, ADD_CREDITS, CREDIT_MESSAGE,
 };
+use mcp_types::tool::ContentItem;
 use serde_json::Value;
+
+/// How long a command will wait to discover the caller's hosted tools.
+const HINTS_BUDGET: Duration = Duration::from_millis(1500);
 
 /// How a try at running the command on the service came out.
 #[derive(Debug, PartialEq)]
@@ -39,8 +43,13 @@ enum Remote {
 
 /// Run `command` and return the process's exit status.
 pub async fn run(tool: Option<String>, command: String) -> i32 {
+    run_with_verbosity(tool, command, false).await
+}
+
+/// Run the command, reporting the API's call ID when verbose.
+pub async fn run_with_verbosity(tool: Option<String>, command: String, verbose: bool) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    match try_remote(tool.as_deref(), &command, &cwd).await {
+    match try_remote(tool.as_deref(), &command, &cwd, verbose).await {
         Remote::Ran(status, said) => {
             eprintln!("{said}");
             status
@@ -66,7 +75,7 @@ fn out_of_credits_line() -> String {
     format!("contextstream: {CREDIT_MESSAGE} Running the command locally. {ADD_CREDITS}")
 }
 
-async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
+async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path, verbose: bool) -> Remote {
     if command_hints::switched_off(std::env::var(command_hints::ENV_SWITCH).ok().as_deref()) {
         return Remote::Here(None);
     }
@@ -75,23 +84,9 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
         return Remote::Here(None);
     }
     let identity = command_hints::local_identity(&config.api_key);
-    let Some(cache) = command_hints::read(&identity, &config.api_url) else {
-        return Remote::Here(None);
-    };
-    let cached = match tool {
-        Some(name) => cache.tool_named(name),
-        None => cache.tool_for(command),
-    };
-    let Some(cached) = cached else {
-        return Remote::Here(None);
-    };
-    let Some(tool) = hosted_tool(cached) else {
-        return Remote::Here(None);
-    };
-
     let client_config = mcp_types::Config {
-        api_url: config.api_url.clone(),
-        api_key: Some(config.api_key.clone()),
+        api_url: config.api_url,
+        api_key: Some(config.api_key),
         default_workspace_id: config
             .workspace_id
             .as_ref()
@@ -104,6 +99,20 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
     };
     let client = ContextStreamClient::new(client_config.clone());
     let session = SessionManager::new(client.clone(), client_config);
+    let Some(cache) = command_hints_for_run(&client, &session, &identity, HINTS_BUDGET).await
+    else {
+        return Remote::Here(None);
+    };
+    let cached = match tool {
+        Some(name) => cache.tool_named(name),
+        None => cache.tool_for(command),
+    };
+    let Some(cached) = cached else {
+        return Remote::Here(None);
+    };
+    let Some(tool) = hosted_tool(cached) else {
+        return Remote::Here(None);
+    };
 
     // The call is made while the rest of the snapshot is taken: it needs only who the repository is.
     let pending = match begin_snapshot(&session, &tool).await {
@@ -135,10 +144,28 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path) -> Remote {
     {
         Ok(data) => data,
         Err(CallRefusal::OutOfCredits) => return Remote::OutOfCredits,
-        Err(CallRefusal::Other(_)) => {
-            return Remote::Here(Some("the call was not taken".to_string()))
+        Err(CallRefusal::Other(result)) => {
+            let reason = result.content.iter().find_map(|item| match item {
+                ContentItem::Text { text } => frames::display_text(text),
+                _ => None,
+            });
+            return Remote::Here(Some(
+                reason.unwrap_or_else(|| "the call was not taken".into()),
+            ));
         }
     };
+    if verbose {
+        if let Some(id) = ["/call/id", "/stream/request/id"]
+            .into_iter()
+            .find_map(|path| {
+                data.pointer(path)
+                    .and_then(Value::as_str)
+                    .and_then(frames::display_text)
+            })
+        {
+            eprintln!("contextstream: remote call {id}");
+        }
+    }
     let call = match stream_call(&data) {
         Ok(call) => call,
         Err(message) => return Remote::Here(Some(message)),
@@ -185,30 +212,30 @@ fn output_mark(delivery: Delivery) -> Option<&'static str> {
     )
 }
 
-/// Why the service did not stand by a run: its `refused` words, else its `refused_code`.
+/// Why the service did not stand by the output it already sent.
 fn refusal_reason(frame: &Value) -> String {
-    let text = |key: &str| {
-        frame
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|v| !v.trim().is_empty())
-    };
-    text("refused")
-        .or_else(|| text("refused_code"))
-        .unwrap_or("the service did not finish it")
-        .to_string()
+    frames::declined_reason(frame)
+        .or_else(|| {
+            ["refused", "refused_code"].into_iter().find_map(|key| {
+                frame
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(frames::display_text)
+            })
+        })
+        .unwrap_or_else(|| "the service did not finish it".to_string())
 }
 
 /// What the host says when a run's failure was its own (mcd's `environment` on the result): its detail, else its code.
 fn host_fault(frame: &Value) -> Option<String> {
     let cause = frame.get("environment").filter(|cause| cause.is_object())?;
-    let text = |key: &str| {
+    let reason = ["detail", "refused_code"].into_iter().find_map(|key| {
         cause
             .get(key)
             .and_then(Value::as_str)
-            .filter(|v| !v.trim().is_empty())
-    };
-    Some(match text("detail").or_else(|| text("refused_code")) {
+            .and_then(frames::display_text)
+    });
+    Some(match reason {
         Some(why) => format!("the host's fault, not your change: {why}"),
         None => "the host's fault, not your change".to_string(),
     })
@@ -229,7 +256,11 @@ fn outcome(result: Result<Value, String>, wrote: bool) -> Remote {
             "the host did not stand by the output above: {}",
             refusal_reason(&frame)
         ))),
-        Ok(_) => Remote::Here(Some("the service declined to run it".to_string())),
+        Ok(frame) => Remote::Here(Some(
+            frames::declined_reason(&frame)
+                .map(|reason| frames::decline_explanation(&reason).to_string())
+                .unwrap_or_else(|| "the service declined to run it".to_string()),
+        )),
         Err(_) if wrote => Remote::Broken,
         Err(reason) => Remote::Here(Some(reason)),
     }
@@ -454,13 +485,13 @@ mod tests {
                 "the host did not stand by the output above: run_wrote_tree".to_string()
             ))
         );
-        // nothing shown yet: as before
+        // With nothing shown yet, give the reason on its own.
         assert_eq!(
             outcome(
                 Ok(json!({"ran": false, "exit": 75, "refused": "busy"})),
                 false
             ),
-            Remote::Here(Some("the service declined to run it".to_string()))
+            Remote::Here(Some("busy".to_string()))
         );
     }
 

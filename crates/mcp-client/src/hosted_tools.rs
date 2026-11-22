@@ -15,6 +15,11 @@ use mcp_types::Result;
 /// Where the API lists the tools it defines for the caller.
 pub const HOSTED_TOOLS_PATH: &str = "/mcp/hosted-tools";
 
+/// How long a known catalog is fresh.
+pub const KNOWN_TTL: Duration = Duration::from_secs(300);
+/// How long to wait before retrying an unreachable catalog.
+pub const UNREACHABLE_RETRY: Duration = Duration::from_secs(30);
+
 /// An answer from the hosted-tools routes.
 #[derive(Debug, Clone)]
 pub struct HostedToolsAnswer {

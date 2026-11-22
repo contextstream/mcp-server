@@ -519,7 +519,50 @@ async fn frame_types_it_does_not_know_are_skipped() {
         .unwrap();
     assert_eq!(result["ran"], false);
     assert_eq!(result["exit"], 75);
+    assert_eq!(declined_reason(&result), None);
     service.await.unwrap();
+}
+
+#[test]
+fn declined_reasons_use_the_workers_explanation_for_exit_75() {
+    let frame = json!({
+        "type": "result", "ran": false, "exit": 75,
+        "refused": "the session runs Node 26 and this host runs Node 22, so it runs in the session",
+        "refused_code": "node_version_mismatch", "refused_class": "session",
+        "detail": "the session runs node 26; the host runs node 22"
+    });
+    let reason = declined_reason(&frame).unwrap();
+    assert_eq!(reason, frame["refused"].as_str().unwrap());
+    assert_eq!(
+        decline_explanation(&reason),
+        "the session runs Node 26 and this host runs Node 22"
+    );
+    assert_eq!(
+        declined_reason(&json!({"ran": false, "exit": 75, "reason": "busy"})).as_deref(),
+        Some("busy")
+    );
+    for frame in [
+        json!({"ran": true, "exit": 75, "reason": "a command's own exit code"}),
+        json!({"ran": false, "exit": 2, "refused": "protocol error"}),
+        json!({"ran": false, "exit": 75, "refused_code": "busy", "detail": "cause only"}),
+        json!({"ran": false, "exit": 75, "refused": ["busy"]}),
+        json!({"ran": false, "exit": 75, "refused": " \u{1b}\n \u{7f} "}),
+    ] {
+        assert_eq!(declined_reason(&frame), None, "{frame}");
+    }
+}
+
+#[test]
+fn a_worker_reason_is_plain_and_bounded_in_unicode_characters() {
+    let frame = json!({"ran": false, "exit": 75, "refused": format!(
+        " \0 Node\t26\r\nneeds\u{2028} \u{202e}résumé\u{009b} {}", "é".repeat(400)
+    )});
+    let reason = declined_reason(&frame).unwrap();
+    assert!(reason.starts_with("Node 26 needs résumé "));
+    assert_eq!(reason.chars().count(), 300);
+    assert!(reason.ends_with('é'));
+    assert!(!reason.chars().any(char::is_control));
+    assert!(!reason.contains(['\u{2028}', '\u{202e}']));
 }
 
 /// A one-connection HTTP server on this machine: calls `serve` with the raw

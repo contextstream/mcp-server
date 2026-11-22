@@ -88,6 +88,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 criterion = { workspace = true }
 tokio-test = { workspace = true }
+tokio-tungstenite = { workspace = true }
 http-body-util = "0.1"
 
 [[bench]]

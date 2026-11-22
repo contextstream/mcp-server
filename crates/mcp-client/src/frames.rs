@@ -72,6 +72,57 @@ pub enum Event {
     Heartbeat,
 }
 
+/// The worker's explanation when it declined a run. A command that ran and
+/// exited with 75 still has its own result.
+pub fn declined_reason(frame: &Value) -> Option<String> {
+    if frame.get("ran").and_then(Value::as_bool) == Some(true)
+        || frame.get("exit").and_then(Value::as_i64) != Some(75)
+    {
+        return None;
+    }
+    ["refused", "reason"].into_iter().find_map(|key| {
+        frame
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(display_text)
+    })
+}
+
+/// Bounded, single-line text from the service for a tool result or terminal.
+pub fn display_text(value: &str) -> Option<String> {
+    let mut at_space = true;
+    let mut text: String = value
+        .chars()
+        .filter(|ch| {
+            (!ch.is_control() || ch.is_whitespace())
+                && !matches!(
+                    ch,
+                    '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                )
+        })
+        .filter_map(|ch| {
+            let was_space = at_space;
+            at_space = ch.is_whitespace();
+            match (at_space, was_space) {
+                (false, _) => Some(ch),
+                (true, false) => Some(' '),
+                (true, true) => None,
+            }
+        })
+        .take(300)
+        .collect();
+    text.truncate(text.trim_end().len());
+    (!text.is_empty()).then_some(text)
+}
+
+/// Explain the decline where the caller already says the command runs locally.
+pub fn decline_explanation(reason: &str) -> &str {
+    reason
+        .strip_suffix(", so it runs in the session")
+        .filter(|text| !text.is_empty())
+        .unwrap_or(reason)
+}
+
 /// Whether `url` may receive a call: `wss`, or `ws` to this machine.
 pub fn stream_url_allowed(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {

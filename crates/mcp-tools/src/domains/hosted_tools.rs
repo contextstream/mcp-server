@@ -30,7 +30,7 @@ use mcp_client::checkout_snapshot::{CheckoutSnapshot, SnapshotError};
 use mcp_client::command_hints::{self, CachedTool, CheckMarker, Hints};
 use mcp_client::environment;
 use mcp_client::frames::{self, Delivery, Event, ExchangeError};
-use mcp_client::hosted_tools::HostedToolsAnswer;
+use mcp_client::hosted_tools::{HostedToolsAnswer, KNOWN_TTL, UNREACHABLE_RETRY};
 use mcp_client::ContextStreamClient;
 use mcp_session::SessionManager;
 use mcp_types::tool::{ContentItem, ToolResult};
@@ -44,8 +44,6 @@ use std::time::{Duration, Instant, SystemTime};
 pub const LISTING_BUDGET: Duration = Duration::from_millis(2500);
 /// How long the check after a tool call waits for them.
 pub const CHANGE_CHECK_BUDGET: Duration = Duration::from_millis(500);
-pub(crate) const KNOWN_TTL: Duration = Duration::from_secs(300);
-pub(crate) const UNREACHABLE_RETRY: Duration = Duration::from_secs(30);
 /// Callers remembered at once; beyond it the oldest reads go first.
 const MAX_ENTRIES: usize = 4096;
 /// Hosted tools listed for one caller at most.
@@ -206,6 +204,17 @@ enum Read {
 }
 
 impl Read {
+    async fn fetch(
+        client: &ContextStreamClient,
+        workspace: Option<&str>,
+        budget: Duration,
+    ) -> Self {
+        match client.hosted_tools_catalog(workspace, budget).await {
+            Ok(answer) => Self::from_answer(&answer),
+            Err(_) => Self::Unreachable,
+        }
+    }
+
     fn from_answer(answer: &HostedToolsAnswer) -> Self {
         match answer.status {
             200..=299 => Self::Known(Arc::new(parse_catalog(&answer.data))),
@@ -402,17 +411,11 @@ impl HostedToolsGate {
         } else {
             deadline.saturating_duration_since(tokio::time::Instant::now())
         };
-        let read = match tokio::time::timeout(
-            remaining,
-            client.hosted_tools_catalog(workspace, remaining),
-        )
-        .await
-        {
-            Ok(Ok(answer)) => Read::from_answer(&answer),
-            _ => Read::Unreachable,
-        };
-        if let Read::Known(tools) = &read {
-            remember_hints(client, identity, tools, changed).await;
+        let read = tokio::time::timeout(remaining, Read::fetch(client, workspace, remaining))
+            .await
+            .unwrap_or(Read::Unreachable);
+        if let (true, Read::Known(tools)) = (local, &read) {
+            remember_hints(identity, &config.api_url, tools, changed).await;
         }
         self.record(identity, read, changed)
     }
@@ -437,20 +440,60 @@ impl HostedToolsGate {
     }
 }
 
-/// Keep the command hints of the caller's tools where the editor hook can read
-/// them (`mcp_client::command_hints`): written when they changed, and also when
-/// there are none any more, so that a tool taken away stops being used. A local
-/// caller only; the hosted gateway has no home folder to keep them in.
-async fn remember_hints(
+/// Read the local caller's command hints, refreshing them if they are missing
+/// or stale. A failed refresh skips remote execution and is shared with the
+/// next invocation so it doesn't wait on the same unreachable API.
+pub async fn command_hints_for_run(
     client: &ContextStreamClient,
+    session: &SessionManager,
     identity: &str,
+    budget: Duration,
+) -> Option<command_hints::Cache> {
+    let config = client.config().await;
+    let api_url = &config.api_url;
+    let settings_changed = || CheckMarker::SettingsChanged.modified(identity, api_url);
+    let changed = settings_changed();
+    if let Some(cache) = command_hints::read(identity, api_url)
+        .filter(|cache| cache.settings_changed == changed && cache.is_fresh(KNOWN_TTL))
+    {
+        return Some(cache);
+    }
+    if CheckMarker::CatalogUnreachable
+        .modified(identity, api_url)
+        .filter(|failed| changed.is_none_or(|changed| *failed >= changed))
+        .and_then(|failed| failed.elapsed().ok())
+        .is_some_and(|age| age < UNREACHABLE_RETRY)
+    {
+        return None;
+    }
+
+    let read = tokio::time::timeout(budget, async {
+        let workspace = workspace_of(client, session).await;
+        Read::fetch(client, workspace.as_deref(), budget).await
+    })
+    .await
+    .unwrap_or(Read::Unreachable);
+    match read {
+        Read::Known(tools) => remember_hints(identity, api_url, &tools, changed)
+            .await
+            .filter(|cache| cache.settings_changed == settings_changed()),
+        Read::Unreachable => {
+            if changed == settings_changed() {
+                CheckMarker::CatalogUnreachable.mark(identity, api_url);
+            }
+            None
+        }
+    }
+}
+
+/// Keep a local caller's command hints where the editor hook can read them,
+/// including an empty catalog when a tool was taken away.
+async fn remember_hints(
+    identity: &str,
+    api_url: &str,
     tools: &[HostedTool],
     changed: Option<SystemTime>,
-) {
-    let config = client.config().await;
-    if config.is_http_transport || !identity.starts_with("local:") {
-        return;
-    }
+) -> Option<command_hints::Cache> {
     let cached: Vec<CachedTool> = tools
         .iter()
         .filter_map(|tool| {
@@ -472,10 +515,15 @@ async fn remember_hints(
             })
         })
         .collect();
-    let mut cache = command_hints::Cache::new(identity, &config.api_url, cached);
+    let mut cache = command_hints::Cache::new(identity, api_url, cached);
     cache.settings_changed = changed;
-    // Best effort, and off the executor: a file that cannot be written only means no rewrite.
-    let _ = tokio::task::spawn_blocking(move || command_hints::write(&cache)).await;
+    // Best effort, and off the executor. The current run can still use the hints.
+    tokio::task::spawn_blocking(move || {
+        let _ = command_hints::write(&cache);
+        cache
+    })
+    .await
+    .ok()
 }
 
 /// The `tools/list` entries for `tools`, leaving out names `taken` says another
@@ -1019,12 +1067,25 @@ async fn run_stream(name: &str, data: &Value, snapshot: Option<&CheckoutSnapshot
 /// did not run the command.
 fn interpret(name: &str, command: &str, cwd: &str, frame: &Value) -> Streamed {
     if frame.get("ran").and_then(Value::as_bool) != Some(true) {
-        return Streamed::NotRun(not_run(
+        let Some(reason) = frames::declined_reason(frame) else {
+            return Streamed::NotRun(not_run(
+                name,
+                command,
+                cwd,
+                "the service declined to run it",
+            ));
+        };
+        let explanation = frames::decline_explanation(&reason);
+        let mut result = not_run(
             name,
             command,
             cwd,
-            "the service declined to run it",
-        ));
+            &format!("the remote machine can't match this one ({explanation})"),
+        );
+        if let Some(Value::Object(fields)) = &mut result.structured_content {
+            fields.insert("declined_reason".into(), Value::String(reason));
+        }
+        return Streamed::NotRun(result);
     }
     if let Some(made) = frame.get("tool_result").filter(|made| made.is_object()) {
         return Streamed::Ran(result_from(name, made, String::new()));

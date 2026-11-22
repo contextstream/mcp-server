@@ -995,7 +995,11 @@ fn main() -> Result<()> {
             let status = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
-                .block_on(mcp_server::hosted_run::run(tool, command.join(" ")));
+                .block_on(mcp_server::hosted_run::run_with_verbosity(
+                    tool,
+                    command.join(" "),
+                    cli.verbose,
+                ));
             std::process::exit(status);
         }
         Some(Commands::AwaitAnswer {

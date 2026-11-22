@@ -42,6 +42,7 @@ pub(crate) mod run_step_labels;
 mod save_intent;
 pub mod session_end;
 pub mod session_start;
+pub(crate) mod speculative;
 pub mod stop;
 pub mod stop_failure;
 pub mod subagent_start;
@@ -616,6 +617,8 @@ pub async fn dispatch_hook(name: &str) -> Result<()> {
             // Silent/detached editor hooks emit nothing on stdout.
             "codex-notify"
             | mid_run_notices::BACKGROUND_POLL_HOOK
+            | prewarm::PREPARE_HOOK
+            | speculative::SPECULATIVE_HOOK
             | run_progress::BEAT_HOOK
             | run_progress::EVENT_HOOK => return Ok(()),
             // Known JSON-stdout editor lifecycle hooks immediately no-op (`{}`).
@@ -702,6 +705,8 @@ pub async fn dispatch_hook(name: &str) -> Result<()> {
         run_progress::BEAT_HOOK => run_progress::run_beater().await,
         // Detached predictive workspace pre-warming (`:prepare`).
         prewarm::PREPARE_HOOK => prewarm::run_background_prepare().await,
+        // Detached debounced speculative background checks.
+        speculative::SPECULATIVE_HOOK => speculative::run_background_speculative().await,
         // Codex `PostToolUse` and `Stop`: live progress only.
         run_progress::EVENT_HOOK => run_progress::handle_event_hook().await,
         "permission-request" => permission_request::handle().await,

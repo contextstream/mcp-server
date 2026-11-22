@@ -198,11 +198,29 @@ pub fn parse_catalog(data: &Value) -> Vec<HostedTool> {
     tools
 }
 
+/// Extract the account's `speculative_checks` opt-in boolean from a catalog response,
+/// checking top-level `speculative_checks` or the `check` tool's `command_hints.speculative_checks`.
+pub fn parse_speculative_checks(data: &Value) -> Option<bool> {
+    if let Some(flag) = data.get("speculative_checks").and_then(Value::as_bool) {
+        return Some(flag);
+    }
+    data.get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|item| item.get("name").and_then(Value::as_str) == Some("check"))
+        .and_then(|item| item.pointer("/command_hints/speculative_checks"))
+        .and_then(Value::as_bool)
+}
+
 /// What one read of the catalog said.
 #[derive(Debug, Clone)]
 enum Read {
     /// The API answered: these tools (none for a caller it defines none for).
-    Known(Arc<Vec<HostedTool>>),
+    Known {
+        tools: Arc<Vec<HostedTool>>,
+        speculative_checks: Option<bool>,
+    },
     /// The API could not be reached.
     Unreachable,
 }
@@ -221,15 +239,21 @@ impl Read {
 
     fn from_answer(answer: &HostedToolsAnswer) -> Self {
         match answer.status {
-            200..=299 => Self::Known(Arc::new(parse_catalog(&answer.data))),
-            401 | 403 | 404 => Self::Known(Arc::new(Vec::new())),
+            200..=299 => Self::Known {
+                tools: Arc::new(parse_catalog(&answer.data)),
+                speculative_checks: parse_speculative_checks(&answer.data),
+            },
+            401 | 403 | 404 => Self::Known {
+                tools: Arc::new(Vec::new()),
+                speculative_checks: None,
+            },
             _ => Self::Unreachable,
         }
     }
 
     fn tools(&self) -> Arc<Vec<HostedTool>> {
         match self {
-            Self::Known(tools) => tools.clone(),
+            Self::Known { tools, .. } => tools.clone(),
             Self::Unreachable => Arc::new(Vec::new()),
         }
     }
@@ -286,7 +310,7 @@ impl HostedToolsGate {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let shown = entries.get(identity).and_then(|entry| entry.shown.clone());
         let kept = match (&read, entries.get(identity)) {
-            (Read::Unreachable, Some(previous)) if matches!(previous.read, Read::Known(_)) => {
+            (Read::Unreachable, Some(previous)) if matches!(previous.read, Read::Known { .. }) => {
                 Entry {
                     read: previous.read.clone(),
                     read_at: previous.read_at,
@@ -401,14 +425,21 @@ impl HostedToolsGate {
             .get_mut(identity)
         {
             if force || changed != entry.settings_changed {
-                if let Read::Known(tools) = &mut entry.read {
+                if let Read::Known { tools, .. } = &mut entry.read {
                     Arc::make_mut(tools).retain(|tool| tool.name != "check");
                 }
                 entry.refresh_at = Instant::now();
             }
         }
         if off_by(std::env::var(ENV_SWITCH).ok().as_deref()) {
-            return self.record(identity, Read::Known(Arc::new(Vec::new())), changed);
+            return self.record(
+                identity,
+                Read::Known {
+                    tools: Arc::new(Vec::new()),
+                    speculative_checks: None,
+                },
+                changed,
+            );
         }
         let remaining = if force {
             budget
@@ -418,8 +449,22 @@ impl HostedToolsGate {
         let read = tokio::time::timeout(remaining, Read::fetch(client, workspace, remaining))
             .await
             .unwrap_or(Read::Unreachable);
-        if let (true, Read::Known(tools)) = (local, &read) {
-            remember_hints(identity, &config.api_url, tools, changed).await;
+        if let (
+            true,
+            Read::Known {
+                tools,
+                speculative_checks,
+            },
+        ) = (local, &read)
+        {
+            remember_hints(
+                identity,
+                &config.api_url,
+                tools,
+                *speculative_checks,
+                changed,
+            )
+            .await;
         }
         self.record(identity, read, changed)
     }
@@ -478,7 +523,10 @@ pub async fn command_hints_for_run(
     .await
     .unwrap_or(Read::Unreachable);
     match read {
-        Read::Known(tools) => remember_hints(identity, api_url, &tools, changed)
+        Read::Known {
+            tools,
+            speculative_checks,
+        } => remember_hints(identity, api_url, &tools, speculative_checks, changed)
             .await
             .filter(|cache| cache.settings_changed == settings_changed()),
         Read::Unreachable => {
@@ -496,6 +544,7 @@ async fn remember_hints(
     identity: &str,
     api_url: &str,
     tools: &[HostedTool],
+    speculative_checks: Option<bool>,
     changed: Option<SystemTime>,
 ) -> Option<command_hints::Cache> {
     let cached: Vec<CachedTool> = tools
@@ -519,7 +568,8 @@ async fn remember_hints(
             })
         })
         .collect();
-    let mut cache = command_hints::Cache::new(identity, api_url, cached);
+    let mut cache = command_hints::Cache::new(identity, api_url, cached)
+        .with_speculative_checks(speculative_checks);
     cache.settings_changed = changed;
     // Best effort, and off the executor. The current run can still use the hints.
     tokio::task::spawn_blocking(move || {
@@ -1092,6 +1142,39 @@ pub(crate) async fn run_with_trace(
             Ok(taken) => Some(taken),
             Err(refusal) => return refusal,
         };
+    }
+    if let (Some(snapshot), Some(command)) = (&snapshot, arguments["command"].as_str()) {
+        let config = client.config().await;
+        if tool.name == "check"
+            && !config.is_http_transport
+            && arguments["speculative"] != true
+            && arguments["prepare"] != true
+        {
+            if let Some(key) = config.api_key.as_deref() {
+                let identity = command_hints::local_identity(key);
+                let enabled = speculative_opt_in(&identity, &config.api_url);
+                if enabled {
+                    let repo = prepare_repo_key(&snapshot.repo_name, &snapshot.origin_sha256);
+                    if let Some(path) = command_hints::speculative_path(
+                        "recent",
+                        &[&identity, &config.api_url, &repo],
+                    ) {
+                        let digest = command_hints::command_digest(
+                            arguments["cwd"].as_str().unwrap_or(""),
+                            command,
+                        );
+                        let _ = command_hints::update_speculative_state(
+                            &path,
+                            |recent: &mut Vec<String>| {
+                                recent.retain(|entry| entry != &digest);
+                                recent.insert(0, digest);
+                                recent.truncate(5);
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
     let workspace_id = workspace_of(client, session).await;
     let project_id = project_of(client, session).await;
@@ -2647,6 +2730,141 @@ pub async fn fire_and_forget_prepare_with(
     };
     if let Some(path) = stamp_path.as_deref() {
         write_prewarm_stamp(path, if succeeded { ttl } else { failure_backoff });
+    }
+}
+
+const SPECULATIVE_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+const SPECULATIVE_STREAM_TIMEOUT: Duration = Duration::from_secs(120);
+pub fn speculative_opt_in(identity: &str, api_url: &str) -> bool {
+    if command_hints::switched_off(std::env::var(ENV_SWITCH).ok().as_deref()) {
+        return false;
+    }
+    let Some(cache) = command_hints::read(identity, api_url) else {
+        return false;
+    };
+    if !cache.is_fresh(KNOWN_TTL) || cache.tool_named("check").is_none() {
+        return false;
+    }
+    local_speculative_override().unwrap_or(cache.speculative_checks == Some(true))
+}
+
+pub fn local_speculative_override() -> Option<bool> {
+    match std::env::var(command_hints::SPECULATIVE_ENV_SWITCH)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "0" | "off" | "no" | "false" => Some(false),
+        "1" | "on" | "yes" | "true" => Some(true),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpeculativeCallStatus {
+    Completed {
+        ran: bool,
+        exit: Option<i64>,
+        credits: u32,
+    },
+    RateLimited {
+        status: u16,
+    },
+    NotStarted,
+    Failed,
+}
+
+/// Run one debounced speculative `check` using a pre-captured `CheckoutSnapshot`
+/// without reading or updating `CheckMarker::OutOfCredits` (`credit_cooldown`).
+pub async fn run_speculative_check_with_snapshot(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    snapshot: &CheckoutSnapshot,
+    cwd_rel: &str,
+    command: &str,
+    credit_limit: u32,
+) -> SpeculativeCallStatus {
+    let mut arguments = serde_json::json!({
+        "command": command.trim(),
+        "speculative": true,
+        "speculative_credit_limit": credit_limit,
+        "wait_seconds": 1,
+    });
+    if local_speculative_override() == Some(true) {
+        arguments["speculative_local_opt_in"] = Value::Bool(true);
+    }
+    let norm_cwd = cwd_rel.trim().trim_matches('/');
+    if !norm_cwd.is_empty() {
+        arguments["cwd"] = Value::String(norm_cwd.to_string());
+    }
+    let mut body = serde_json::json!({
+        "arguments": arguments,
+        "checkout": snapshot.identity(),
+    });
+    if let Some(workspace) = workspace_of(client, session).await {
+        body["workspace_id"] = Value::String(workspace);
+    }
+    let answer = match client
+        .hosted_tool_call("check", &body, SPECULATIVE_CALL_TIMEOUT)
+        .await
+    {
+        Ok(answer) => answer,
+        Err(_) => return SpeculativeCallStatus::NotStarted,
+    };
+    if matches!(answer.status, 402 | 429) {
+        return SpeculativeCallStatus::RateLimited {
+            status: answer.status,
+        };
+    }
+    // Older servers do not promise a maximum price. Never open their stream on a local budget.
+    let Some(limit) = answer
+        .data
+        .pointer("/call/speculative_credit_limit")
+        .and_then(Value::as_u64)
+        .filter(|n| *n <= u64::from(credit_limit))
+    else {
+        return SpeculativeCallStatus::NotStarted;
+    };
+    let Some(price) = answer
+        .data
+        .pointer("/call/credits_per_10s")
+        .and_then(Value::as_u64)
+    else {
+        return SpeculativeCallStatus::NotStarted;
+    };
+    let Ok(call) = stream_call(&answer.data) else {
+        return SpeculativeCallStatus::NotStarted;
+    };
+    if !answer.is_success() || call.request["speculative"] != true {
+        return SpeculativeCallStatus::NotStarted;
+    }
+    let (events, _inbox) = tokio::sync::mpsc::unbounded_channel();
+    match tokio::time::timeout(
+        SPECULATIVE_STREAM_TIMEOUT,
+        drive_stream(&call, snapshot, Delivery::ToolResult, events),
+    )
+    .await
+    {
+        Ok(Ok(frame)) => {
+            let ran = frame["ran"].as_bool() == Some(true);
+            let exit = frame["exit"].as_i64();
+            let credits = if frame["ran"] == false || frame["cache"] == "hit" || exit == Some(75) {
+                0
+            } else if let Some(seconds) = frame["ran_seconds"].as_f64().filter(|s| *s >= 0.0) {
+                // Same millisecond rounding and whole-credit ceiling as gateway usage and billing.
+                let ms = (seconds * 1000.0).round() as u64;
+                ms.saturating_mul(price).div_ceil(10_000).min(limit)
+            } else {
+                limit
+            };
+            SpeculativeCallStatus::Completed {
+                ran,
+                exit,
+                credits: credits as u32,
+            }
+        }
+        _ => SpeculativeCallStatus::Failed,
     }
 }
 

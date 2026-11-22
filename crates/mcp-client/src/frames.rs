@@ -358,6 +358,12 @@ pub fn hello(
     if let Some(prepare) = request.get("prepare").filter(|value| value.is_boolean()) {
         hello.insert("prepare".into(), prepare.clone());
     }
+    if let Some(speculative) = request
+        .get("speculative")
+        .filter(|value| value.is_boolean())
+    {
+        hello.insert("speculative".into(), speculative.clone());
+    }
     if let Some(languages) = request.get("languages").and_then(Value::as_array) {
         let strings: Vec<Value> = languages
             .iter()

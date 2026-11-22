@@ -1076,6 +1076,11 @@ pub async fn handle() -> Result<()> {
         return capture_exit_plan_mode(&input, &cwd, &tool_input, &tool_response).await;
     }
 
+    let absolute_paths = edited_paths(&cwd, &tool_name, &input, &tool_input);
+    if !absolute_paths.is_empty() && tool_call_succeeded(&tool_response) {
+        super::speculative::maybe_spawn(&cwd, &absolute_paths);
+    }
+
     // Disabling file indexing must not disable initialization receipts while
     // the corresponding PreToolUse gate remains enabled.
     if std::env::var("CONTEXTSTREAM_POSTWRITE_ENABLED")
@@ -1169,42 +1174,10 @@ pub async fn handle() -> Result<()> {
         }
     }
 
-    // Only process write/edit-like tools (Codex edits arrive as `apply_patch`).
-    let is_codex_patch = tool_name.eq_ignore_ascii_case("apply_patch");
-    if !is_codex_patch
-        && !matches!(
-            tool_name.as_str(),
-            "Edit" | "MultiEdit" | "Write" | "NotebookEdit"
-        )
-    {
+    if absolute_paths.is_empty() {
         write_stdout_json(&HookOutput::empty())?;
         return Ok(());
     }
-
-    // Extract file paths (multi-editor support; a patch can touch several).
-    let file_paths = if is_codex_patch {
-        super::durable_paths::write_target_paths("apply_patch", &tool_input)
-    } else {
-        extract_file_path(&input).into_iter().collect()
-    };
-    if file_paths.is_empty() {
-        write_stdout_json(&HookOutput::empty())?;
-        return Ok(());
-    }
-    let absolute_paths: Vec<String> = file_paths
-        .iter()
-        .map(|file_path| {
-            if Path::new(file_path).is_absolute() {
-                file_path.clone()
-            } else {
-                Path::new(&cwd)
-                    .join(file_path)
-                    .to_string_lossy()
-                    .to_string()
-            }
-        })
-        .collect();
-
     let index_files = async {
         let mut reached_drain = false;
         for absolute_path in &absolute_paths {
@@ -1239,6 +1212,30 @@ pub async fn handle() -> Result<()> {
         super::write_context_for_input(&input, mirror_notes.join("\n"))?;
     }
     Ok(())
+}
+
+fn edited_paths(cwd: &str, tool_name: &str, input: &Value, tool_input: &Value) -> Vec<String> {
+    let is_codex_patch = tool_name.eq_ignore_ascii_case("apply_patch");
+    if !is_codex_patch && !matches!(tool_name, "Edit" | "MultiEdit" | "Write" | "NotebookEdit") {
+        return Vec::new();
+    }
+
+    // Extract file paths (multi-editor support; a patch can touch several).
+    let file_paths = if is_codex_patch {
+        super::durable_paths::write_target_paths("apply_patch", tool_input)
+    } else {
+        extract_file_path(input).into_iter().collect()
+    };
+    file_paths
+        .iter()
+        .map(|file_path| {
+            if Path::new(file_path).is_absolute() {
+                file_path.clone()
+            } else {
+                Path::new(cwd).join(file_path).to_string_lossy().to_string()
+            }
+        })
+        .collect()
 }
 
 /// Whether a hook feature is enabled by an opt-out environment variable.

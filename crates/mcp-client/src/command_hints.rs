@@ -34,6 +34,8 @@ pub const CACHE_MAX_AGE: Duration = Duration::from_secs(12 * 3600);
 
 /// Set to `off` to leave every command as it is.
 pub const ENV_SWITCH: &str = "CONTEXTSTREAM_HOSTED_TOOLS";
+/// Opt-in local override for debounced speculative background checks (`0` disables, `1` enables).
+pub const SPECULATIVE_ENV_SWITCH: &str = "CONTEXTSTREAM_SPECULATIVE_CHECKS";
 
 const CACHE_VERSION: u32 = 1;
 const MAX_PATTERNS: usize = 64;
@@ -188,6 +190,8 @@ pub struct Cache {
     /// different process must not resurrect a check the caller has turned off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_changed: Option<SystemTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative_checks: Option<bool>,
     pub tools: Vec<CachedTool>,
 }
 
@@ -199,8 +203,14 @@ impl Cache {
             api_url: normalized_url(api_url),
             written_at: now_secs(),
             settings_changed: CheckMarker::SettingsChanged.modified(identity, api_url),
+            speculative_checks: None,
             tools: tools.into_iter().take(MAX_TOOLS).collect(),
         }
+    }
+
+    pub fn with_speculative_checks(mut self, speculative_checks: Option<bool>) -> Self {
+        self.speculative_checks = speculative_checks;
+        self
     }
 
     /// Whether the last catalog read is younger than `ttl`.
@@ -296,6 +306,7 @@ pub fn write_to(path: &Path, cache: &Cache) -> std::io::Result<bool> {
     // A confirmed catalog read keeps CLI hints fresh even when the tools stay the same.
     if read_from(path, &cache.identity, &cache.api_url).is_some_and(|old| {
         old.settings_changed == cache.settings_changed
+            && old.speculative_checks == cache.speculative_checks
             && old.tools == cache.tools
             && old.version == cache.version
             && old.is_fresh(KNOWN_TTL / 4)
@@ -352,6 +363,50 @@ pub fn read(identity: &str, api_url: &str) -> Option<Cache> {
         cache.tools.retain(|tool| tool.name != "check");
     }
     Some(cache)
+}
+
+/// Per-account hook files contain only digests, counters and Git object identities.
+pub fn speculative_path(kind: &str, scope: &[&str]) -> Option<std::path::PathBuf> {
+    let digest = hex::encode(Sha256::digest(scope.join("\0")));
+    dirs::home_dir().map(|dir| {
+        dir.join(".contextstream")
+            .join(format!("speculative-{kind}-{digest}.json"))
+    })
+}
+
+/// Serialize updates across hook processes. A stable sibling lock survives atomic replacement.
+/// An unreadable budget must never be interpreted as a fresh allowance.
+pub fn update_speculative_state<S: Serialize + serde::de::DeserializeOwned + Default, T>(
+    path: &std::path::Path,
+    update: impl FnOnce(&mut S) -> T,
+) -> std::io::Result<T> {
+    let parent = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+    std::fs::create_dir_all(parent)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let mut state = match std::fs::read(path) {
+        Ok(raw) => serde_json::from_slice(&raw).map_err(std::io::Error::other)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => S::default(),
+        Err(err) => return Err(err),
+    };
+    let result = update(&mut state);
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(tmp.as_file_mut(), &state)?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(result)
+}
+
+pub fn command_digest(cwd: &str, command: &str) -> String {
+    hex::encode(Sha256::digest(format!(
+        "{}\0{}",
+        cwd.trim_matches('/'),
+        command.trim()
+    )))
 }
 
 /// Quote `text` as one word for a POSIX shell.

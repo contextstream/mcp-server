@@ -251,3 +251,31 @@ fn a_word_for_a_posix_shell_survives_quotes() {
     assert_eq!(shell_quote("echo 'hi' && x"), "'echo '\\''hi'\\'' && x'");
     assert_eq!(shell_quote(""), "''");
 }
+
+#[test]
+fn cache_preserves_version_1_compatibility_and_speculative_checks_opt_in() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("hints.json");
+    let legacy_json = json!({
+        "version": 1,
+        "identity": "local:aaaa",
+        "api_url": "https://api.example.com",
+        "written_at": now_secs(),
+        "tools": [tool()],
+    });
+    std::fs::write(&path, serde_json::to_string(&legacy_json).unwrap()).unwrap();
+    let read_legacy = read_from(&path, "local:aaaa", "https://api.example.com").unwrap();
+    assert_eq!(read_legacy.speculative_checks, None);
+
+    let enabled = Cache::new("local:aaaa", "https://api.example.com", vec![tool()])
+        .with_speculative_checks(Some(true));
+    assert!(write_to(&path, &enabled).unwrap());
+    let read_enabled = read_from(&path, "local:aaaa", "https://api.example.com").unwrap();
+    assert_eq!(read_enabled.speculative_checks, Some(true));
+    // Toggling speculative_checks rewrites the cache even when tools are unchanged.
+    let disabled = Cache::new("local:aaaa", "https://api.example.com", vec![tool()])
+        .with_speculative_checks(Some(false));
+    assert!(write_to(&path, &disabled).unwrap());
+    let read_disabled = read_from(&path, "local:aaaa", "https://api.example.com").unwrap();
+    assert_eq!(read_disabled.speculative_checks, Some(false));
+}

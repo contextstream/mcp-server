@@ -194,6 +194,25 @@ pub fn is_session_init_required(cwd: &str, input: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// One local caller and checkout. Only the latest edit can claim or finish a tree.
+#[derive(Default, Serialize, Deserialize)]
+pub(super) struct SpeculativeEdit {
+    pub last_edit_ns: u64,
+    pub repo_key: String,
+    pub target_tree: String,
+    pub last_checked_tree: String,
+    pub claimed: bool,
+}
+
+pub(super) fn record_edit(path: &Path, edit_ns: u64) -> std::io::Result<()> {
+    mcp_client::command_hints::update_speculative_state(path, |state: &mut SpeculativeEdit| {
+        if edit_ns > state.last_edit_ns {
+            state.last_edit_ns = edit_ns;
+            state.claimed = false;
+        }
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PromptStateFile {
     workspaces: HashMap<String, PromptStateEntry>,

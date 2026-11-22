@@ -184,15 +184,23 @@ fn the_catalog_keeps_only_usable_definitions() {
 #[test]
 fn a_blip_keeps_the_tools_known_before() {
     let gate = HostedToolsGate::new();
-    let known = Read::Known(Arc::new(parse_catalog(
-        &json!({"tools": [echo_definition("api")]}),
-    )));
+    let known = Read::Known {
+        tools: Arc::new(parse_catalog(&json!({"tools": [echo_definition("api")]}))),
+        speculative_checks: None,
+    };
     assert_eq!(gate.record("me", known, None).len(), 1);
     assert_eq!(gate.record("me", Read::Unreachable, None).len(), 1);
     assert_eq!(gate.fresh("me", None).map(|tools| tools.len()), Some(1));
     assert!(gate.record("new", Read::Unreachable, None).is_empty());
     assert!(gate
-        .record("me", Read::Known(Arc::new(Vec::new())), None)
+        .record(
+            "me",
+            Read::Known {
+                tools: Arc::new(Vec::new()),
+                speculative_checks: None,
+            },
+            None,
+        )
         .is_empty());
 }
 
@@ -341,9 +349,10 @@ async fn a_new_definition_after_a_listing_is_a_change() {
         .unwrap();
     gate.record(
         &identity,
-        Read::Known(Arc::new(parse_catalog(
-            &json!({"tools": [echo_definition("api")]}),
-        ))),
+        Read::Known {
+            tools: Arc::new(parse_catalog(&json!({"tools": [echo_definition("api")]}))),
+            speculative_checks: None,
+        },
         None,
     );
     assert!(listing_changed(&gate, &client, &session_for(&client), |_| false).await);
@@ -3037,4 +3046,125 @@ async fn fire_and_forget_prepare_sends_languages_dedups_by_repo_and_base_tree_an
         1
     );
     assert_eq!(busy_sockets.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn speculative_check_forwards_flag_and_429_does_not_poison_explicit_credit_cooldown() {
+    let top_level = json!({ "tools": [], "speculative_checks": true });
+    assert_eq!(parse_speculative_checks(&top_level), Some(true));
+    let nested = json!({
+        "tools": [{
+            "name": "check",
+            "command_hints": { "argument": "command", "patterns": ["^cargo check$"], "speculative_checks": false }
+        }]
+    });
+    assert_eq!(parse_speculative_checks(&nested), Some(false));
+
+    let (ws_url, sockets) = frames_service(vec![Step::Json(json!({
+        "type": "result", "ran": true, "exit": 0, "cache": "miss"
+    }))])
+    .await;
+    let call_answer = json!({
+        "stream": {
+            "url": ws_url,
+            "token": "call-token-spec",
+            "protocol": frames::PROTOCOL,
+            "request": {
+                "id": "call-spec-1",
+                "command": "cargo check",
+                "cwd": "",
+                "env_names": [],
+                "timeout_s": 60,
+                "wait_s": 1,
+                "pipefail": false,
+                "repo_key": "repo-key-1",
+                "speculative": true,
+            },
+        },
+        "call": {"id": "c-spec-1", "speculative_credit_limit": 3, "credits_per_10s": 1},
+    });
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let call_count_srv = call_count.clone();
+    let (api_url, seen) = stub(Arc::new(move |method, path, _| match (method, path) {
+        ("GET", "/mcp/hosted-tools") => {
+            let mut def = echo_definition("stream");
+            def["name"] = json!("check");
+            def["attachments"] = json!(["checkout_snapshot"]);
+            def["command_hints"]["speculative_checks"] = json!(true);
+            (200, json!({"tools": [def]}).to_string())
+        }
+        ("POST", "/mcp/hosted-tools/check/call") => {
+            let idx = call_count_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if idx == 0 {
+                (200, call_answer.to_string())
+            } else if idx == 1 {
+                (
+                    429,
+                    json!({"error": {"message": "speculative cap reached"}}).to_string(),
+                )
+            } else {
+                (200, call_answer.to_string())
+            }
+        }
+        _ => (404, "{}".to_string()),
+    }))
+    .await;
+
+    let client = client_in_workspace(&api_url);
+    let (repo, session) = changed_checkout(&client).await;
+    let snapshot = CheckoutSnapshot::capture(repo.path()).await.unwrap();
+
+    // 1. Speculative call succeeds and forwards speculative: true in both API & hello.
+    let status =
+        run_speculative_check_with_snapshot(&client, &session, &snapshot, "", "cargo check", 3)
+            .await;
+    assert!(
+        matches!(
+            status,
+            SpeculativeCallStatus::Completed {
+                ran: true,
+                exit: Some(0),
+                ..
+            }
+        ),
+        "{status:?}"
+    );
+    let post_body = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|s| s.method == "POST")
+        .unwrap()
+        .body
+        .clone();
+    assert_eq!(post_body["arguments"]["speculative"], true);
+    assert_eq!(post_body["arguments"]["wait_seconds"], 1);
+    assert_eq!(sockets.lock().unwrap()[0].hello["speculative"], true);
+
+    // 2. Speculative 429 returns RateLimited and does NOT trip explicit credit_cooldown.
+    let limited =
+        run_speculative_check_with_snapshot(&client, &session, &snapshot, "", "cargo check", 3)
+            .await;
+    assert!(
+        matches!(
+            limited,
+            SpeculativeCallStatus::RateLimited { status: 429, .. }
+        ),
+        "{limited:?}"
+    );
+
+    // 3. Explicit call_api still goes through cleanly (never blocked by speculative 429).
+    let tool = check_tool(&client, &session).await;
+    let explicit = call_api(
+        &client,
+        &session,
+        &tool,
+        &json!({"command": "cargo check"}),
+        Some(snapshot.identity()),
+    )
+    .await;
+    assert!(
+        explicit.is_ok(),
+        "explicit check must not be blocked: {explicit:?}"
+    );
 }

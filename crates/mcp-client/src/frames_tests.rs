@@ -784,3 +784,46 @@ async fn stage_progress_info_frames_parse_into_stage_progress_events() {
         ]
     );
 }
+
+#[tokio::test]
+async fn hello_forwards_optional_speculative_bool() {
+    let repo = changed_repo(0);
+    let snapshot = CheckoutSnapshot::capture(repo.path()).await.unwrap();
+    let mut req = json!({
+        "id": "call-spec",
+        "repo_key": "repo-key",
+        "cwd": "",
+        "command": "cargo check",
+        "timeout_s": 60,
+        "wait_s": 1,
+        "speculative": true,
+    });
+    let with_spec = hello(
+        &req,
+        snapshot.request_fields(),
+        Map::new(),
+        Delivery::ToolResult,
+    )
+    .unwrap();
+    assert_eq!(with_spec["speculative"], true);
+
+    req.as_object_mut().unwrap().remove("speculative");
+    let without_spec = hello(
+        &req,
+        snapshot.request_fields(),
+        Map::new(),
+        Delivery::ToolResult,
+    )
+    .unwrap();
+    assert!(without_spec.get("speculative").is_none());
+
+    req["speculative"] = json!("not-a-bool");
+    let non_bool = hello(
+        &req,
+        snapshot.request_fields(),
+        Map::new(),
+        Delivery::ToolResult,
+    )
+    .unwrap();
+    assert!(non_bool.get("speculative").is_none());
+}

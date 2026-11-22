@@ -20,8 +20,8 @@ use mcp_client::frames::{self, Delivery, Event};
 use mcp_client::ContextStreamClient;
 use mcp_session::SessionManager;
 use mcp_tools::domains::hosted_tools::{
-    begin_snapshot, call_api, command_hints_for_run, drive_stream, stream_call, Attachment,
-    CallRefusal, HostedTool, Transport, ADD_CREDITS, CREDIT_MESSAGE,
+    begin_snapshot, call_api, command_hints_for_run, drive_stream, format_diagnostic_report,
+    stream_call, Attachment, CallRefusal, HostedTool, Transport, ADD_CREDITS, CREDIT_MESSAGE,
 };
 use mcp_types::tool::ContentItem;
 use serde_json::Value;
@@ -194,7 +194,19 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path, verbose: bool
         }
         wrote
     };
-    let (result, wrote) = tokio::join!(drive_stream(&call, &snapshot, DELIVERY, events), writer);
+    let (mut result, wrote) =
+        tokio::join!(drive_stream(&call, &snapshot, DELIVERY, events), writer);
+    if let Ok(ref mut frame) = result {
+        mcp_tools::domains::hosted_tools::enrich_frame_diagnostics(
+            &client,
+            mcp_tools::domains::hosted_tools::call_id_of(&data),
+            config.workspace_id.as_deref(),
+            config.project_id.as_deref(),
+            mcp_tools::domains::hosted_tools::repo_key_of(&data),
+            frame,
+        )
+        .await;
+    }
     outcome(result, wrote)
 }
 
@@ -248,7 +260,15 @@ fn outcome(result: Result<Value, String>, wrote: bool) -> Remote {
             match host_fault(&frame) {
                 // The output shown is not the verdict: the command runs here, after a last line that says why.
                 Some(said) => Remote::Here(Some(said)),
-                None => Remote::Ran(exit_status(&frame), ran_line(&frame)),
+                None => {
+                    let mut line = ran_line(&frame);
+                    if exit_status(&frame) != 0 {
+                        if let Some(diag) = format_diagnostic_report(&frame, "") {
+                            line = format!("{diag}\n{line}");
+                        }
+                    }
+                    Remote::Ran(exit_status(&frame), line)
+                }
             }
         }
         // Refused after its output was shown (mcd's checks after the run): the output does not count; it runs here.
@@ -567,5 +587,193 @@ mod tests {
         let tool = hosted_tool(&cached).unwrap();
         assert_eq!(tool.attachments, vec![Attachment::CheckoutSnapshot]);
         assert_eq!(tool.transport, Transport::Stream);
+    }
+
+    #[test]
+    fn outcome_appends_compact_diagnostic_header_on_failing_run_with_diagnostics() {
+        let frame = json!({
+            "ran": true,
+            "exit": 101,
+            "seconds": 2.4,
+            "failing_on_base": {
+                "known": true,
+                "base_exit": 101,
+                "old": [{"file": "src/old.rs", "line": 3, "error_code": "E0425"}],
+                "new": [{"file": "src/new.rs", "line": 12, "symbol": "check", "error_code": "E0308", "message": "type mismatch"}]
+            },
+            "diagnostics": {
+                "new_failures_count": 1,
+                "base_failures_suppressed": 1,
+                "new_failures": [{"file": "src/new.rs", "line": 12, "symbol": "check", "error_code": "E0308", "message": "type mismatch"}],
+                "commits": [{"sha": "deadbeef", "message": "update check()"}],
+                "decisions": [],
+                "lessons": []
+            }
+        });
+        match outcome(Ok(frame), true) {
+            Remote::Ran(101, said) => {
+                assert!(
+                    said.contains("[diagnostics: 1 new failure(s), 1 base failure(s) suppressed]"),
+                    "{said}"
+                );
+                assert!(said.contains("commits: deadbeef update check()"), "{said}");
+                assert!(said.contains("src/new.rs:12 [E0308] (check)"), "{said}");
+                assert!(said.contains("[ran remotely: 2.4 s]"), "{said}");
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enrich_frame_diagnostics_and_outcome_fetch_diagnose_when_j_frame_has_none() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen_paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+        let seen_clone = seen_paths.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen_clone = seen_clone.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let header_end = loop {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_len = head
+                        .lines()
+                        .skip(1)
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_len {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let path = head
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    let body: Value =
+                        serde_json::from_slice(&buf[header_end..]).unwrap_or(Value::Null);
+                    seen_clone.lock().unwrap().push((path.clone(), body));
+                    let resp_body = if path == "/api/v1/mcp/hosted-tools/calls/call-run-1/diagnose"
+                    {
+                        json!({
+                            "success": true,
+                            "data": {
+                                "call_id": "00000000-0000-0000-0000-000000000001",
+                                "new_failures_count": 1,
+                                "base_failures_suppressed": 1,
+                                "new_failures": [{
+                                    "file": "src/new.rs",
+                                    "line": 12,
+                                    "symbol": "check",
+                                    "error_code": "E0308",
+                                    "message": "type mismatch",
+                                    "callers": ["main::dispatch"]
+                                }],
+                                "commits": [{"sha": "deadbeef", "message": "update check()", "matched_by": "symbol"}],
+                                "decisions": [{"id": "00000000-0000-0000-0000-000000000002", "summary": "Keep check strict"}],
+                                "lessons": [{"id": "00000000-0000-0000-0000-000000000003", "title": "Borrow &str in check", "prevention": "Use &str"}],
+                                "elapsed_ms": 11,
+                                "timed_out": false
+                            }
+                        })
+                        .to_string()
+                    } else {
+                        "{}".to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let client = ContextStreamClient::new(mcp_types::Config {
+            api_url: url,
+            api_key: Some("run-test-key".to_string()),
+            ..Default::default()
+        });
+        let call_data = json!({
+            "call": {"id": "call-run-1"},
+            "stream": {"request": {"id": "call-run-1", "repo_key": "repo-1234abcd"}}
+        });
+        let mut frame = json!({
+            "ran": true,
+            "exit": 101,
+            "seconds": 2.4,
+            "failures": [{"file": "src/new.rs", "line": 12, "symbol": "check", "error_code": "E0308", "message": "type mismatch"}],
+            "failing_on_base": {
+                "known": true,
+                "base_exit": 101,
+                "old": [{"file": "src/old.rs", "line": 3, "error_code": "E0425"}],
+                "new": [{"file": "src/new.rs", "line": 12, "symbol": "check", "error_code": "E0308", "message": "type mismatch"}]
+            }
+        });
+        assert!(frame.get("diagnostics").is_none());
+
+        mcp_tools::domains::hosted_tools::enrich_frame_diagnostics(
+            &client,
+            mcp_tools::domains::hosted_tools::call_id_of(&call_data),
+            Some("550e8400-e29b-41d4-a716-446655440000"),
+            Some("660e8400-e29b-41d4-a716-446655440000"),
+            mcp_tools::domains::hosted_tools::repo_key_of(&call_data),
+            &mut frame,
+        )
+        .await;
+
+        let seen = seen_paths.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].0,
+            "/api/v1/mcp/hosted-tools/calls/call-run-1/diagnose"
+        );
+        assert_eq!(seen[0].1["budget_ms"], 65);
+        assert_eq!(
+            seen[0].1["workspace_id"],
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+
+        match outcome(Ok(frame), true) {
+            Remote::Ran(101, said) => {
+                assert!(
+                    said.contains("[diagnostics: 1 new failure(s), 1 base failure(s) suppressed]"),
+                    "{said}"
+                );
+                assert!(said.contains("commits: deadbeef update check()"), "{said}");
+                assert!(said.contains("decisions: Keep check strict"), "{said}");
+                assert!(
+                    said.contains("lessons: Borrow &str in check: Use &str"),
+                    "{said}"
+                );
+                assert!(said.contains("callers: main::dispatch"), "{said}");
+                assert!(said.contains("[ran remotely: 2.4 s]"), "{said}");
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
     }
 }

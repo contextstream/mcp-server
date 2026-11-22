@@ -50,6 +50,10 @@ const MAX_ENTRIES: usize = 4096;
 pub const MAX_TOOLS: usize = 16;
 /// How long one hosted call may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Bounded (<100 ms) HTTP timeout for fail-open context-enriched failure diagnostics.
+const DIAGNOSE_TIMEOUT: Duration = Duration::from_millis(95);
+/// Server-side lookup budget requested from `/calls/{call_id}/diagnose`.
+const DIAGNOSE_BUDGET_MS: u64 = 65;
 /// Set to `off` to read no definitions and list no hosted tools.
 pub const ENV_SWITCH: &str = command_hints::ENV_SWITCH;
 
@@ -633,6 +637,141 @@ async fn workspace_of(client: &ContextStreamClient, session: &SessionManager) ->
         .map(|id| id.to_string())
 }
 
+/// The project the caller works in, when known to the session, request auth, or local config.
+async fn project_of(client: &ContextStreamClient, session: &SessionManager) -> Option<String> {
+    let state = session.state().await;
+    if let Some(project_id) = state.project_id {
+        return Some(project_id.to_string());
+    }
+    if let Some(project_id) = mcp_client::get_task_auth_override().and_then(|a| a.project_id) {
+        return Some(project_id.to_string());
+    }
+    let config = client.config().await;
+    if config.is_http_transport {
+        return None;
+    }
+    config.default_project_id.map(|id| id.to_string())
+}
+
+/// Extract the hosted call id from a `POST /hosted-tools/{name}/call` response payload.
+pub fn call_id_of(data: &Value) -> Option<&str> {
+    ["/call/id", "/stream/request/id"]
+        .into_iter()
+        .find_map(|path| data.pointer(path).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+/// Extract the hosted call `repo_key` from a `POST /hosted-tools/{name}/call` response payload.
+pub fn repo_key_of(data: &Value) -> Option<&str> {
+    data.pointer("/stream/request/repo_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+}
+
+fn frame_field<'a>(frame: &'a Value, key: &str) -> Option<&'a Value> {
+    frame.get(key).filter(|value| !value.is_null()).or_else(|| {
+        frame
+            .pointer(&format!("/tool_result/structuredContent/{key}"))
+            .filter(|value| !value.is_null())
+    })
+}
+
+fn frame_needs_diagnose(frame: &Value) -> bool {
+    if frame.get("ran").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    if frame
+        .get("environment")
+        .filter(|value| value.is_object())
+        .is_some()
+    {
+        return false;
+    }
+    let non_zero_exit = frame
+        .get("exit")
+        .or_else(|| frame.pointer("/tool_result/structuredContent/exit"))
+        .and_then(Value::as_i64)
+        .is_some_and(|code| code != 0)
+        || frame
+            .pointer("/tool_result/isError")
+            .and_then(Value::as_bool)
+            == Some(true);
+    if !non_zero_exit {
+        return false;
+    }
+    if frame_field(frame, "diagnostics").is_some_and(Value::is_object) {
+        return false;
+    }
+    let has_failures = frame_field(frame, "failures")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| !arr.is_empty());
+    let has_new_fob = frame_field(frame, "failing_on_base")
+        .and_then(|value| value.get("new"))
+        .and_then(Value::as_array)
+        .is_some_and(|arr| !arr.is_empty());
+    has_failures || has_new_fob
+}
+
+/// Enrich a failing streamed result frame in place from
+/// `POST /api/v1/mcp/hosted-tools/calls/{call_id}/diagnose` within a strict
+/// `<100 ms` fail-open budget.
+pub async fn enrich_frame_diagnostics(
+    client: &ContextStreamClient,
+    call_id: Option<&str>,
+    workspace_id: Option<&str>,
+    project_id: Option<&str>,
+    repo_key: Option<&str>,
+    frame: &mut Value,
+) {
+    if !frame_needs_diagnose(frame) {
+        return;
+    }
+    let Some(call_id) = call_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let mut body = serde_json::Map::new();
+    body.insert("budget_ms".to_string(), Value::from(DIAGNOSE_BUDGET_MS));
+    if let Some(ws) = workspace_id.map(str::trim).filter(|s| !s.is_empty()) {
+        body.insert("workspace_id".to_string(), Value::String(ws.to_string()));
+    }
+    if let Some(pid) = project_id.map(str::trim).filter(|s| !s.is_empty()) {
+        body.insert("project_id".to_string(), Value::String(pid.to_string()));
+    }
+    if let Some(rk) = repo_key.map(str::trim).filter(|s| !s.is_empty()) {
+        body.insert("repo_key".to_string(), Value::String(rk.to_string()));
+    }
+    if let Some(failures) = frame_field(frame, "failures").cloned() {
+        body.insert("failures".to_string(), failures);
+    }
+    if let Some(fob) = frame_field(frame, "failing_on_base").cloned() {
+        body.insert("failing_on_base".to_string(), fob);
+    }
+    let req_body = Value::Object(body);
+    let Ok(Ok(answer)) = tokio::time::timeout(
+        DIAGNOSE_TIMEOUT,
+        client.hosted_tool_diagnose(call_id, &req_body, DIAGNOSE_TIMEOUT),
+    )
+    .await
+    else {
+        return;
+    };
+    if !answer.is_success() || !answer.data.is_object() {
+        return;
+    }
+    let diag = answer.data;
+    if let Some(obj) = frame.as_object_mut() {
+        obj.insert("diagnostics".to_string(), diag.clone());
+    }
+    if let Some(sc) = frame
+        .pointer_mut("/tool_result/structuredContent")
+        .and_then(Value::as_object_mut)
+    {
+        sc.entry("diagnostics".to_string()).or_insert(diag);
+    }
+}
+
 /// The checkout a call is about: the session's folder, else this process's.
 async fn checkout_folder(session: &SessionManager) -> Option<std::path::PathBuf> {
     session
@@ -921,9 +1060,20 @@ pub async fn run(
             Err(refusal) => return refusal,
         };
     }
+    let workspace_id = workspace_of(client, session).await;
+    let project_id = project_of(client, session).await;
     match tool.transport {
         Transport::Api => result_from(&tool.name, &data, String::new()),
-        Transport::Stream => match run_stream(&tool.name, &data, snapshot.as_ref()).await {
+        Transport::Stream => match run_stream(
+            &tool.name,
+            &data,
+            snapshot.as_ref(),
+            client,
+            workspace_id.as_deref(),
+            project_id.as_deref(),
+        )
+        .await
+        {
             Streamed::Ran(result) => {
                 let abandoned = peer::current().is_some_and(|peer| peer.was_cancelled());
                 if let (true, Some(taken)) = (abandoned, &snapshot) {
@@ -1023,7 +1173,14 @@ pub async fn drive_stream(
 
 /// Run the call the API answered with a stream for, and turn its result into the tool's;
 /// the service's heartbeats are reported as progress while it runs.
-async fn run_stream(name: &str, data: &Value, snapshot: Option<&CheckoutSnapshot>) -> Streamed {
+async fn run_stream(
+    name: &str,
+    data: &Value,
+    snapshot: Option<&CheckoutSnapshot>,
+    client: &ContextStreamClient,
+    workspace_id: Option<&str>,
+    project_id: Option<&str>,
+) -> Streamed {
     let call = match stream_call(data) {
         Ok(call) => call,
         Err(message) => {
@@ -1058,7 +1215,18 @@ async fn run_stream(name: &str, data: &Value, snapshot: Option<&CheckoutSnapshot
         pump
     );
     match outcome {
-        Ok(frame) => interpret(name, call.command, call.cwd, &frame),
+        Ok(mut frame) => {
+            enrich_frame_diagnostics(
+                client,
+                call_id_of(data),
+                workspace_id,
+                project_id,
+                repo_key_of(data),
+                &mut frame,
+            )
+            .await;
+            interpret(name, call.command, call.cwd, &frame)
+        }
         Err(reason) => Streamed::NotRun(not_run(name, call.command, call.cwd, &reason)),
     }
 }
@@ -1084,19 +1252,62 @@ fn interpret(name: &str, command: &str, cwd: &str, frame: &Value) -> Streamed {
         );
         if let Some(Value::Object(fields)) = &mut result.structured_content {
             fields.insert("declined_reason".into(), Value::String(reason));
+            if frame.get("refused_code").is_some()
+                || frame.get("refused_class").is_some()
+                || frame.get("detail").is_some()
+            {
+                for key in ["refused_code", "refused_class", "detail"] {
+                    if let Some(val) = frame.get(key).and_then(Value::as_str) {
+                        fields.insert(key.into(), Value::String(val.to_string()));
+                    }
+                }
+            }
         }
         return Streamed::NotRun(result);
     }
     if let Some(made) = frame.get("tool_result").filter(|made| made.is_object()) {
-        return Streamed::Ran(result_from(name, made, String::new()));
+        let mut enriched = made.clone();
+        if let Some(sc) = enriched
+            .get_mut("structuredContent")
+            .and_then(Value::as_object_mut)
+        {
+            for key in ["failures", "failing_on_base", "diagnostics"] {
+                if !sc.contains_key(key) {
+                    if let Some(val) = frame.get(key).filter(|v| !v.is_null()) {
+                        sc.insert(key.to_string(), val.clone());
+                    }
+                }
+            }
+        } else if let Some(obj) = enriched.as_object_mut() {
+            let mut sc = serde_json::Map::new();
+            for key in ["failures", "failing_on_base", "diagnostics"] {
+                if let Some(val) = frame.get(key).filter(|v| !v.is_null()) {
+                    sc.insert(key.to_string(), val.clone());
+                }
+            }
+            if !sc.is_empty() {
+                obj.insert("structuredContent".to_string(), Value::Object(sc));
+            }
+        }
+        return Streamed::Ran(result_from(name, &enriched, String::new()));
     }
-    // It ran but sent no formatted result: the command's own status is all there is.
+    // It ran but sent no formatted result: the command's own status is all there is,
+    // enriched with diagnostics when present on the frame.
     let exit = frame.get("exit").and_then(Value::as_i64).unwrap_or(0);
+    let mut sc = serde_json::Map::new();
+    sc.insert("exit".to_string(), Value::from(exit));
+    sc.insert("ran".to_string(), Value::Bool(true));
+    for key in ["failures", "failing_on_base", "diagnostics"] {
+        if let Some(val) = frame.get(key).filter(|v| !v.is_null()) {
+            sc.insert(key.to_string(), val.clone());
+        }
+    }
+    let sc_val = Value::Object(sc);
+    let text = format_diagnostic_report(&sc_val, "")
+        .unwrap_or_else(|| format!("{name}: the command exited with status {exit}."));
     Streamed::Ran(ToolResult {
-        content: vec![ContentItem::text(format!(
-            "{name}: the command exited with status {exit}."
-        ))],
-        structured_content: Some(serde_json::json!({"exit": exit, "ran": true})),
+        content: vec![ContentItem::text(text)],
+        structured_content: Some(sc_val),
         is_error: exit != 0,
         meta: None,
     })
@@ -1132,6 +1343,977 @@ fn reason_of(error: &ExchangeError) -> &'static str {
     }
 }
 
+fn failure_label(item: &Value) -> String {
+    let file = item.get("file").and_then(Value::as_str).unwrap_or("");
+    let line = item.get("line").and_then(Value::as_i64);
+    let col = item.get("col").and_then(Value::as_i64);
+    let code = item
+        .get("error_code")
+        .or_else(|| item.get("code"))
+        .or_else(|| item.get("rule"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let symbol = item
+        .get("symbol")
+        .or_else(|| item.get("test"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let message = item.get("message").and_then(Value::as_str).unwrap_or("");
+    let mut loc = String::new();
+    if !file.is_empty() {
+        loc.push_str(file);
+        if let Some(l) = line.filter(|l| *l > 0) {
+            loc.push_str(&format!(":{l}"));
+            if let Some(c) = col.filter(|c| *c > 0) {
+                loc.push_str(&format!(":{c}"));
+            }
+        }
+    }
+    let mut parts = Vec::new();
+    if !loc.is_empty() {
+        parts.push(loc);
+    }
+    if !code.is_empty() {
+        parts.push(format!("[{code}]"));
+    }
+    if !symbol.is_empty() {
+        parts.push(format!("({symbol})"));
+    }
+    if !message.is_empty() {
+        let short: String = message.chars().take(160).collect();
+        parts.push(short);
+    }
+    let callers: Vec<&str> = item
+        .get("callers")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).take(3).collect())
+        .unwrap_or_default();
+    if !callers.is_empty() {
+        parts.push(format!("callers: {}", callers.join(", ")));
+    }
+    let defs: Vec<&str> = item
+        .get("definitions")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).take(2).collect())
+        .unwrap_or_default();
+    if !defs.is_empty() {
+        parts.push(format!("defs: {}", defs.join(", ")));
+    }
+    parts.join(" ")
+}
+
+fn is_noisy_passing_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("compiling ")
+        || lower.starts_with("checking ")
+        || lower.starts_with("downloading ")
+        || lower.starts_with("downloaded ")
+        || lower.starts_with("finished ")
+        || lower.starts_with("running ")
+        || lower.starts_with("pass ")
+        || lower.starts_with("✓ ")
+        || lower.starts_with("ok ")
+        || lower.starts_with("--- pass")
+        || lower.starts_with("=== run")
+        || (lower.starts_with("test ") && lower.ends_with(" ... ok"))
+        || (lower.starts_with("ok\t") || lower.starts_with("ok  "))
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn contains_token(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let h_bytes = haystack.as_bytes();
+    let mut start = 0usize;
+    while start <= haystack.len() {
+        let Some(rel) = haystack[start..].find(needle) else {
+            return false;
+        };
+        let idx = start + rel;
+        let end = idx + needle.len();
+        let left_ok = idx == 0 || !is_ident_byte(h_bytes[idx - 1]);
+        let right_ok = end == h_bytes.len() || !is_ident_byte(h_bytes[end]);
+        if left_ok && right_ok {
+            return true;
+        }
+        let step = haystack[idx..].chars().next().map_or(1, char::len_utf8);
+        start = idx + step;
+    }
+    false
+}
+
+fn item_codes_lower(items: &[Value]) -> std::collections::HashSet<String> {
+    let mut codes = std::collections::HashSet::new();
+    for item in items {
+        for key in ["error_code", "code", "rule"] {
+            if let Some(val) = item.get(key).and_then(Value::as_str) {
+                let v = val.trim();
+                if v.len() >= 3 {
+                    codes.insert(v.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    codes
+}
+
+fn item_files_lower(items: &[Value]) -> std::collections::HashSet<String> {
+    let mut files = std::collections::HashSet::new();
+    for item in items {
+        if let Some(val) = item.get("file").and_then(Value::as_str) {
+            let v = val.trim();
+            if v.len() >= 3 {
+                files.insert(v.to_ascii_lowercase());
+                if let Some(base) = v.rsplit('/').next() {
+                    if base.len() >= 3 {
+                        files.insert(base.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+    }
+    files
+}
+
+fn line_matches_any_token(line_lower: &str, tokens: &[String]) -> bool {
+    tokens.iter().any(|t| contains_token(line_lower, t))
+}
+
+fn line_matches_symbol_or_test(line_lower: &str, items: &[Value]) -> bool {
+    items.iter().any(|item| {
+        for key in ["symbol", "test"] {
+            if let Some(val) = item.get(key).and_then(Value::as_str) {
+                let v = val.trim();
+                if v.len() >= 3 && contains_token(line_lower, &v.to_ascii_lowercase()) {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+}
+
+fn line_matches_identity(line_lower: &str, items: &[Value]) -> bool {
+    items.iter().any(|item| {
+        for key in ["file", "symbol", "test"] {
+            if let Some(val) = item.get(key).and_then(Value::as_str) {
+                let v = val.trim();
+                if v.len() >= 3 && contains_token(line_lower, &v.to_ascii_lowercase()) {
+                    return true;
+                }
+                if key == "file" {
+                    if let Some(base) = v.rsplit('/').next() {
+                        if base.len() >= 3 && contains_token(line_lower, &base.to_ascii_lowercase())
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    })
+}
+
+fn line_matches_code(
+    line_lower: &str,
+    items: &[Value],
+    excluded_codes: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    items.iter().any(|item| {
+        for key in ["error_code", "code", "rule"] {
+            if let Some(val) = item.get(key).and_then(Value::as_str) {
+                let v = val.trim();
+                if v.len() >= 3 {
+                    let lower = v.to_ascii_lowercase();
+                    if excluded_codes.is_some_and(|ex| ex.contains(&lower)) {
+                        continue;
+                    }
+                    if contains_token(line_lower, &lower) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    })
+}
+
+fn is_pytest_failure_section_header(trimmed: &str) -> bool {
+    trimmed.starts_with("____ ")
+        || (trimmed.len() > 8 && trimmed.starts_with("____") && trimmed.ends_with("____"))
+}
+
+fn is_pytest_banner_header(trimmed: &str) -> bool {
+    trimmed.starts_with("==== ")
+        || (trimmed.len() > 8 && trimmed.starts_with("====") && trimmed.ends_with("===="))
+}
+
+fn is_pytest_captured_subheader(trimmed: &str) -> bool {
+    if !(trimmed.len() > 8 && trimmed.starts_with("----") && trimmed.ends_with("----")) {
+        return false;
+    }
+    let inner = trimmed.trim_matches('-').trim().to_ascii_lowercase();
+    inner.starts_with("live log ")
+        || (inner.starts_with("captured ")
+            && (inner.ends_with(" call")
+                || inner.ends_with(" setup")
+                || inner.ends_with(" teardown")))
+}
+
+fn is_cargo_test_section_header(trimmed: &str) -> bool {
+    !is_pytest_captured_subheader(trimmed)
+        && trimmed.len() > 8
+        && trimmed.starts_with("----")
+        && (trimmed.ends_with(" stdout ----") || trimmed.ends_with(" stderr ----"))
+}
+
+fn is_non_captured_dash_header(trimmed: &str) -> bool {
+    !is_pytest_captured_subheader(trimmed)
+        && (trimmed.starts_with("---- ")
+            || (trimmed.len() > 8 && trimmed.starts_with("----") && trimmed.ends_with("----")))
+}
+
+fn is_test_case_header_line(trimmed: &str) -> bool {
+    trimmed.starts_with("FAILED ")
+        || trimmed.starts_with("ERROR ")
+        || trimmed.starts_with("FAIL ")
+        || trimmed.starts_with("--- FAIL:")
+        || trimmed.starts_with("● ")
+        || trimmed.starts_with("× ")
+        || trimmed.starts_with("✗ ")
+}
+
+fn is_named_error_or_exception_line(trimmed: &str) -> bool {
+    let Some((prefix, rest)) = trimmed.split_once(':') else {
+        return false;
+    };
+    if prefix.is_empty()
+        || !(prefix.ends_with("Error") || prefix.ends_with("Exception"))
+        || prefix.contains("..")
+    {
+        return false;
+    }
+    let bytes = prefix.as_bytes();
+    if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+    {
+        return false;
+    }
+    let final_segment = prefix.rsplit('.').next().unwrap_or(prefix);
+    if !final_segment
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_uppercase())
+    {
+        return false;
+    }
+    rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace())
+}
+
+fn is_goroutine_header_line(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("goroutine ") else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    digits > 0 && rest[digits..].starts_with(" [")
+}
+
+fn is_go_stack_frame_line(trimmed: &str) -> bool {
+    trimmed.ends_with(')')
+        || trimmed.starts_with("created by ")
+        || trimmed.starts_with("...")
+        || trimmed.starts_with("[originating from goroutine ")
+}
+
+fn is_failure_header_line(trimmed: &str) -> bool {
+    let lower = trimmed.to_ascii_lowercase();
+    is_test_case_header_line(trimmed)
+        || trimmed.starts_with("error[")
+        || lower.starts_with("error:")
+        || lower.starts_with("fatal:")
+        || lower.starts_with("panic:")
+        || is_named_error_or_exception_line(trimmed)
+}
+
+fn is_failure_continuation_line(line: &str, trimmed: &str) -> bool {
+    if trimmed.is_empty() {
+        return false;
+    }
+    if line.starts_with(' ') || line.starts_with('\t') {
+        return true;
+    }
+    if trimmed.starts_with('|')
+        || trimmed.starts_with("-->")
+        || trimmed.starts_with("= ")
+        || trimmed.starts_with("> ")
+        || trimmed.starts_with("E ")
+        || trimmed.starts_with("E\t")
+        || trimmed.starts_with("at ")
+        || trimmed.starts_with("_ _ _")
+        || is_named_error_or_exception_line(trimmed)
+        || is_goroutine_header_line(trimmed)
+        || trimmed.starts_with("note:")
+        || trimmed.starts_with("help:")
+        || trimmed.starts_with("left:")
+        || trimmed.starts_with("right:")
+        || trimmed.starts_with("❯")
+        || trimmed.starts_with("Expected:")
+        || trimmed.starts_with("Received:")
+        || trimmed.starts_with("Caused by:")
+        || trimmed.starts_with("Serialized Error:")
+    {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if (lower.starts_with("assertion ") && lower.contains("failed"))
+        || (trimmed.starts_with("thread '") && trimmed.contains(" panicked"))
+    {
+        return true;
+    }
+    if let Some((prefix, _)) = trimmed.split_once('|') {
+        let p = prefix.trim();
+        if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiagBlockKind {
+    PytestSection {
+        in_captured: bool,
+    },
+    CargoTestSection,
+    FailureBlock {
+        is_test_case: bool,
+        in_goroutine_stack: bool,
+    },
+    Line,
+    ExitFooter,
+}
+
+#[derive(Clone, Copy)]
+struct DiagBlock {
+    kind: DiagBlockKind,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiagDisposition {
+    SuppressOld,
+    KeepNew,
+    KeepGeneric,
+    Skip,
+}
+
+fn line_starts_diagnostic_block(
+    trimmed_lower: &str,
+    new_items: &[Value],
+    old_items: &[Value],
+    shared_codes: &std::collections::HashSet<String>,
+) -> bool {
+    (!new_items.is_empty() && line_matches_identity(trimmed_lower, new_items))
+        || (!old_items.is_empty() && line_matches_identity(trimmed_lower, old_items))
+        || (!new_items.is_empty()
+            && line_matches_code(trimmed_lower, new_items, Some(shared_codes)))
+        || (!old_items.is_empty()
+            && line_matches_code(trimmed_lower, old_items, Some(shared_codes)))
+        || trimmed_lower.contains("error")
+        || trimmed_lower.contains("failed")
+        || trimmed_lower.contains("panic")
+        || trimmed_lower.contains("fatal")
+}
+
+fn segment_diagnostic_blocks(
+    lines: &[&str],
+    new_items: &[Value],
+    old_items: &[Value],
+    shared_codes: &std::collections::HashSet<String>,
+) -> Vec<DiagBlock> {
+    let mut blocks = Vec::new();
+    let mut active: Option<DiagBlock> = None;
+    let mut in_summary_list = false;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[exit ") && idx + 1 == lines.len() {
+            if let Some(b) = active.take() {
+                blocks.push(b);
+            }
+            in_summary_list = false;
+            blocks.push(DiagBlock {
+                kind: DiagBlockKind::ExitFooter,
+                start: idx,
+                end: idx + 1,
+            });
+            continue;
+        }
+
+        if let Some(mut b) = active {
+            match b.kind {
+                DiagBlockKind::PytestSection { in_captured } => {
+                    if is_pytest_captured_subheader(trimmed) {
+                        b.kind = DiagBlockKind::PytestSection { in_captured: true };
+                        b.end = idx + 1;
+                        active = Some(b);
+                        continue;
+                    }
+                    let exit_section = is_pytest_failure_section_header(trimmed)
+                        || is_pytest_banner_header(trimmed)
+                        || is_cargo_test_section_header(trimmed)
+                        || (!in_captured
+                            && (trimmed.starts_with("FAILED ")
+                                || trimmed.starts_with("FAIL ")
+                                || trimmed.starts_with("--- FAIL:")
+                                || trimmed.starts_with("error[")));
+                    if !exit_section {
+                        b.end = idx + 1;
+                        active = Some(b);
+                        continue;
+                    }
+                    blocks.push(b);
+                    active = None;
+                }
+                DiagBlockKind::CargoTestSection => {
+                    let exit_section = is_pytest_failure_section_header(trimmed)
+                        || is_pytest_banner_header(trimmed)
+                        || is_non_captured_dash_header(trimmed)
+                        || trimmed == "failures:"
+                        || trimmed.starts_with("test result:")
+                        || trimmed.starts_with("FAILED ")
+                        || trimmed.starts_with("FAIL ")
+                        || trimmed.starts_with("FAIL\t")
+                        || trimmed.starts_with("--- FAIL:")
+                        || trimmed.starts_with("error[")
+                        || (!trimmed.is_empty() && is_noisy_passing_line(trimmed));
+                    if !exit_section {
+                        b.end = idx + 1;
+                        active = Some(b);
+                        continue;
+                    }
+                    blocks.push(b);
+                    active = None;
+                }
+                DiagBlockKind::FailureBlock {
+                    is_test_case,
+                    in_goroutine_stack,
+                } => {
+                    let force_exit = is_pytest_failure_section_header(trimmed)
+                        || is_pytest_banner_header(trimmed)
+                        || is_non_captured_dash_header(trimmed)
+                        || trimmed == "failures:"
+                        || trimmed.starts_with("test result:")
+                        || is_test_case_header_line(trimmed)
+                        || trimmed.starts_with("FAIL\t")
+                        || trimmed.starts_with("error[")
+                        || (!trimmed.is_empty() && is_noisy_passing_line(trimmed));
+                    if force_exit {
+                        blocks.push(b);
+                        active = None;
+                    } else if trimmed.is_empty() {
+                        let keep_blank = (idx + 1..lines.len())
+                            .find(|&j| !lines[j].trim().is_empty())
+                            .is_some_and(|next_idx| {
+                                let next_line = lines[next_idx];
+                                let next_trimmed = next_line.trim();
+                                let next_exit = next_trimmed.starts_with("[exit ")
+                                    && next_idx + 1 == lines.len();
+                                let next_force_exit =
+                                    is_pytest_failure_section_header(next_trimmed)
+                                        || is_pytest_banner_header(next_trimmed)
+                                        || is_non_captured_dash_header(next_trimmed)
+                                        || next_trimmed == "failures:"
+                                        || next_trimmed.starts_with("test result:")
+                                        || is_test_case_header_line(next_trimmed)
+                                        || next_trimmed.starts_with("FAIL\t")
+                                        || next_trimmed.starts_with("error[")
+                                        || is_noisy_passing_line(next_trimmed);
+                                let next_lower = next_trimmed.to_ascii_lowercase();
+                                let next_is_test_case_detail = is_test_case
+                                    && (next_lower.starts_with("error:")
+                                        || next_lower.starts_with("fatal:")
+                                        || next_lower.starts_with("panic:")
+                                        || next_lower.starts_with("fatal error:")
+                                        || next_lower.starts_with("runtime error:"));
+                                !next_exit
+                                    && !next_force_exit
+                                    && ((is_failure_continuation_line(next_line, next_trimmed)
+                                        && (is_test_case || !is_failure_header_line(next_trimmed)))
+                                        || next_is_test_case_detail)
+                            });
+                        if keep_blank {
+                            b.end = idx + 1;
+                            active = Some(b);
+                        } else {
+                            blocks.push(b);
+                            active = None;
+                        }
+                        continue;
+                    } else if is_goroutine_header_line(trimmed) {
+                        b.kind = DiagBlockKind::FailureBlock {
+                            is_test_case,
+                            in_goroutine_stack: true,
+                        };
+                        b.end = idx + 1;
+                        active = Some(b);
+                        continue;
+                    } else if (is_failure_continuation_line(line, trimmed)
+                        && (is_test_case
+                            || line.starts_with(' ')
+                            || line.starts_with('\t')
+                            || !is_failure_header_line(trimmed)))
+                        || (in_goroutine_stack && is_go_stack_frame_line(trimmed))
+                    {
+                        b.end = idx + 1;
+                        active = Some(b);
+                        continue;
+                    } else {
+                        let lower = trimmed.to_ascii_lowercase();
+                        if (is_test_case || in_goroutine_stack)
+                            && (lower.starts_with("error:")
+                                || lower.starts_with("fatal:")
+                                || lower.starts_with("panic:")
+                                || lower.starts_with("fatal error:")
+                                || lower.starts_with("runtime error:"))
+                        {
+                            b.end = idx + 1;
+                            active = Some(b);
+                            continue;
+                        }
+                        blocks.push(b);
+                        active = None;
+                    }
+                }
+                DiagBlockKind::Line | DiagBlockKind::ExitFooter => {
+                    blocks.push(b);
+                    active = None;
+                }
+            }
+        }
+
+        if trimmed == "failures:" {
+            in_summary_list = true;
+            continue;
+        }
+        if trimmed.is_empty() || is_noisy_passing_line(trimmed) {
+            in_summary_list = false;
+            continue;
+        }
+        if trimmed.starts_with("test result:") || is_pytest_banner_header(trimmed) {
+            in_summary_list = false;
+            blocks.push(DiagBlock {
+                kind: DiagBlockKind::Line,
+                start: idx,
+                end: idx + 1,
+            });
+            continue;
+        }
+        if is_pytest_failure_section_header(trimmed) {
+            in_summary_list = false;
+            active = Some(DiagBlock {
+                kind: DiagBlockKind::PytestSection { in_captured: false },
+                start: idx,
+                end: idx + 1,
+            });
+            continue;
+        }
+        if is_non_captured_dash_header(trimmed) {
+            in_summary_list = false;
+            active = Some(DiagBlock {
+                kind: DiagBlockKind::CargoTestSection,
+                start: idx,
+                end: idx + 1,
+            });
+            continue;
+        }
+        if in_summary_list {
+            blocks.push(DiagBlock {
+                kind: DiagBlockKind::Line,
+                start: idx,
+                end: idx + 1,
+            });
+            continue;
+        }
+        if is_failure_header_line(trimmed) {
+            active = Some(DiagBlock {
+                kind: DiagBlockKind::FailureBlock {
+                    is_test_case: is_test_case_header_line(trimmed),
+                    in_goroutine_stack: false,
+                },
+                start: idx,
+                end: idx + 1,
+            });
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if !is_failure_continuation_line(line, trimmed)
+            && line_starts_diagnostic_block(&lower, new_items, old_items, shared_codes)
+        {
+            active = Some(DiagBlock {
+                kind: DiagBlockKind::FailureBlock {
+                    is_test_case: false,
+                    in_goroutine_stack: false,
+                },
+                start: idx,
+                end: idx + 1,
+            });
+            continue;
+        }
+        blocks.push(DiagBlock {
+            kind: DiagBlockKind::Line,
+            start: idx,
+            end: idx + 1,
+        });
+    }
+
+    if let Some(b) = active {
+        blocks.push(b);
+    }
+    blocks
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_diagnostic_block(
+    lines: &[&str],
+    block: DiagBlock,
+    new_items: &[Value],
+    old_items: &[Value],
+    shared_codes: &std::collections::HashSet<String>,
+    new_only_files: &[String],
+    old_only_files: &[String],
+) -> DiagDisposition {
+    if block.kind == DiagBlockKind::ExitFooter {
+        return DiagDisposition::KeepNew;
+    }
+
+    let hdr_lower = lines[block.start].trim().to_ascii_lowercase();
+    let hdr_new_id = !new_items.is_empty() && line_matches_identity(&hdr_lower, new_items);
+    let hdr_old_id = !old_items.is_empty() && line_matches_identity(&hdr_lower, old_items);
+    let hdr_new_sym = !new_items.is_empty() && line_matches_symbol_or_test(&hdr_lower, new_items);
+    let hdr_old_sym = !old_items.is_empty() && line_matches_symbol_or_test(&hdr_lower, old_items);
+    let hdr_new_only_file = line_matches_any_token(&hdr_lower, new_only_files);
+    let hdr_old_only_file = line_matches_any_token(&hdr_lower, old_only_files);
+    let hdr_new_unshared_code =
+        !new_items.is_empty() && line_matches_code(&hdr_lower, new_items, Some(shared_codes));
+    let hdr_old_unshared_code =
+        !old_items.is_empty() && line_matches_code(&hdr_lower, old_items, Some(shared_codes));
+
+    let mut any_new_id = false;
+    let mut any_old_id = false;
+    let mut any_new_sym = false;
+    let mut any_old_sym = false;
+    let mut any_new_only_file = false;
+    let mut any_old_only_file = false;
+    let mut any_generic_failure = false;
+
+    for line in &lines[block.start..block.end] {
+        let t = line.trim();
+        if t.is_empty() || is_noisy_passing_line(t) {
+            continue;
+        }
+        let lower = t.to_ascii_lowercase();
+        if !new_items.is_empty() {
+            any_new_id |= line_matches_identity(&lower, new_items);
+            any_new_sym |= line_matches_symbol_or_test(&lower, new_items);
+        }
+        if !old_items.is_empty() {
+            any_old_id |= line_matches_identity(&lower, old_items);
+            any_old_sym |= line_matches_symbol_or_test(&lower, old_items);
+        }
+        any_new_only_file |= line_matches_any_token(&lower, new_only_files);
+        any_old_only_file |= line_matches_any_token(&lower, old_only_files);
+        any_generic_failure |= lower.contains("error")
+            || lower.contains("failed")
+            || lower.contains("panic")
+            || lower.contains("fatal");
+    }
+
+    // Priority 1: Symbol/test disambiguation across whole block
+    if any_old_sym && !any_new_sym && !any_new_only_file {
+        return DiagDisposition::SuppressOld;
+    }
+    if any_new_sym && !any_old_sym && !any_old_only_file {
+        return DiagDisposition::KeepNew;
+    }
+
+    // Priority 2: Whole-block identity
+    if any_old_id && !any_new_id {
+        return DiagDisposition::SuppressOld;
+    }
+    if any_new_id && !any_old_id {
+        return DiagDisposition::KeepNew;
+    }
+    if any_new_id && any_old_id {
+        if hdr_old_sym && !hdr_new_sym && !hdr_new_only_file {
+            return DiagDisposition::SuppressOld;
+        }
+        if hdr_new_sym && !hdr_old_sym && !hdr_old_only_file {
+            return DiagDisposition::KeepNew;
+        }
+        if hdr_old_id && !hdr_new_id {
+            return DiagDisposition::SuppressOld;
+        }
+        if hdr_new_id && !hdr_old_id {
+            return DiagDisposition::KeepNew;
+        }
+        if any_old_only_file && !any_new_only_file {
+            return DiagDisposition::SuppressOld;
+        }
+        if any_new_only_file && !any_old_only_file {
+            return DiagDisposition::KeepNew;
+        }
+        if hdr_old_unshared_code && !hdr_new_unshared_code {
+            return DiagDisposition::SuppressOld;
+        }
+        if hdr_new_unshared_code && !hdr_old_unshared_code {
+            return DiagDisposition::KeepNew;
+        }
+        return DiagDisposition::KeepNew;
+    }
+
+    // Priority 3: Header-only unshared error_code (never body lines)
+    if hdr_old_unshared_code && !hdr_new_unshared_code {
+        return DiagDisposition::SuppressOld;
+    }
+    if hdr_new_unshared_code && !hdr_old_unshared_code {
+        return DiagDisposition::KeepNew;
+    }
+
+    // Priority 4: Generic unstructured failure fallback
+    if any_generic_failure {
+        return DiagDisposition::KeepGeneric;
+    }
+    DiagDisposition::Skip
+}
+
+fn trim_diagnostic_slice(
+    raw_text: &str,
+    new_items: &[Value],
+    old_items: &[Value],
+    max_bytes: usize,
+) -> String {
+    if raw_text.trim().is_empty() || max_bytes == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = raw_text.lines().collect();
+    let new_codes = item_codes_lower(new_items);
+    let old_codes = item_codes_lower(old_items);
+    let shared_codes: std::collections::HashSet<String> =
+        new_codes.intersection(&old_codes).cloned().collect();
+    let new_files = item_files_lower(new_items);
+    let old_files = item_files_lower(old_items);
+    let new_only_files: Vec<String> = new_files.difference(&old_files).cloned().collect();
+    let old_only_files: Vec<String> = old_files.difference(&new_files).cloned().collect();
+
+    let blocks = segment_diagnostic_blocks(&lines, new_items, old_items, &shared_codes);
+    let mut out = String::new();
+    let mut budget_exhausted = false;
+
+    for block in blocks {
+        let disp = classify_diagnostic_block(
+            &lines,
+            block,
+            new_items,
+            old_items,
+            &shared_codes,
+            &new_only_files,
+            &old_only_files,
+        );
+        if !matches!(
+            disp,
+            DiagDisposition::KeepNew | DiagDisposition::KeepGeneric
+        ) {
+            continue;
+        }
+        for line in &lines[block.start..block.end] {
+            if block.kind != DiagBlockKind::ExitFooter
+                && (line.trim().is_empty() || is_noisy_passing_line(line))
+            {
+                continue;
+            }
+            let sep = usize::from(!out.is_empty());
+            if out.len() + sep + line.len() > max_bytes {
+                budget_exhausted = true;
+                break;
+            }
+            if sep > 0 {
+                out.push('\n');
+            }
+            out.push_str(line);
+        }
+        if budget_exhausted {
+            break;
+        }
+    }
+    out
+}
+
+/// Format a compact structured diagnostic header and trimmed diagnostic slice
+/// from `structured` (`failures`, `failing_on_base`, `diagnostics`) and `raw_text`.
+/// Returns `None` when no structured failures or diagnostic enrichment are present.
+pub fn format_diagnostic_report(structured: &Value, raw_text: &str) -> Option<String> {
+    let diag = structured.get("diagnostics").filter(|v| v.is_object());
+    let fob = structured.get("failing_on_base").filter(|v| v.is_object());
+    let raw_failures = structured
+        .get("failures")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut new_items: Vec<Value> = diag
+        .and_then(|d| d.get("new_failures"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if new_items.is_empty() {
+        if let Some(fob_new) = fob.and_then(|f| f.get("new")).and_then(Value::as_array) {
+            new_items = fob_new.clone();
+        } else {
+            new_items = raw_failures;
+        }
+    }
+    let old_items: Vec<Value> = fob
+        .and_then(|f| f.get("old"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let base_suppressed = diag
+        .and_then(|d| d.get("base_failures_suppressed"))
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(old_items.len());
+    let new_count = diag
+        .and_then(|d| d.get("new_failures_count"))
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(new_items.len());
+
+    let decisions: Vec<&Value> = diag
+        .and_then(|d| d.get("decisions"))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().take(3).collect())
+        .unwrap_or_default();
+    let commits: Vec<&Value> = diag
+        .and_then(|d| d.get("commits"))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().take(3).collect())
+        .unwrap_or_default();
+    let lessons: Vec<&Value> = diag
+        .and_then(|d| d.get("lessons"))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().take(3).collect())
+        .unwrap_or_default();
+
+    if new_items.is_empty()
+        && base_suppressed == 0
+        && decisions.is_empty()
+        && commits.is_empty()
+        && lessons.is_empty()
+    {
+        return None;
+    }
+
+    let mut header = if base_suppressed > 0 || fob.is_some() {
+        format!(
+            "[diagnostics: {} new failure(s), {} base failure(s) suppressed]",
+            new_count, base_suppressed
+        )
+    } else {
+        format!("[diagnostics: {} failure(s)]", new_count)
+    };
+
+    if !commits.is_empty() {
+        let cited: Vec<String> = commits
+            .iter()
+            .filter_map(|c| {
+                let sha = c.get("sha").and_then(Value::as_str)?;
+                let msg = c.get("message").and_then(Value::as_str).unwrap_or("");
+                let short_msg: String = msg.chars().take(60).collect();
+                Some(format!("{sha} {short_msg}").trim().to_string())
+            })
+            .collect();
+        if !cited.is_empty() {
+            header.push_str(&format!("\ncommits: {}", cited.join(" | ")));
+        }
+    }
+    if !decisions.is_empty() {
+        let cited: Vec<String> = decisions
+            .iter()
+            .filter_map(|d| d.get("summary").and_then(Value::as_str))
+            .map(|s| s.chars().take(80).collect())
+            .collect();
+        if !cited.is_empty() {
+            header.push_str(&format!("\ndecisions: {}", cited.join(" | ")));
+        }
+    }
+    if !lessons.is_empty() {
+        let cited: Vec<String> = lessons
+            .iter()
+            .filter_map(|l| {
+                let title = l.get("title").and_then(Value::as_str)?;
+                let prev = l.get("prevention").and_then(Value::as_str).unwrap_or("");
+                if prev.is_empty() {
+                    Some(title.chars().take(80).collect())
+                } else {
+                    Some(format!(
+                        "{}: {}",
+                        title.chars().take(50).collect::<String>(),
+                        prev.chars().take(60).collect::<String>()
+                    ))
+                }
+            })
+            .collect();
+        if !cited.is_empty() {
+            header.push_str(&format!("\nlessons: {}", cited.join(" | ")));
+        }
+    }
+
+    for item in new_items.iter().take(10) {
+        let line = failure_label(item);
+        if !line.is_empty() {
+            header.push_str(&format!("\n- {line}"));
+        }
+    }
+    if new_items.len() > 10 {
+        header.push_str(&format!(
+            "\n(+{} more new failure(s))",
+            new_items.len() - 10
+        ));
+    }
+    if base_suppressed > 0 {
+        header.push_str(&format!(
+            "\n(+{base_suppressed} base failure(s) suppressed)"
+        ));
+    }
+
+    let raw_len = raw_text.len();
+    // Monotonic piecewise-linear budget: preserve at least 512 bytes for short
+    // outputs while keeping large noisy outputs well below 50% of raw bytes.
+    let scaled_budget = (raw_len * 45 / 100).saturating_sub(header.len()).min(4096);
+    let slice_budget = scaled_budget.max(512);
+    let slice = trim_diagnostic_slice(raw_text, &new_items, &old_items, slice_budget);
+    if slice.is_empty() {
+        Some(header)
+    } else {
+        Some(format!("{header}\n{slice}"))
+    }
+}
+
 /// A call's result from its answer (`{content, isError, structuredContent}`),
 /// after `output` when there is some.
 fn result_from(name: &str, data: &Value, output: String) -> ToolResult {
@@ -1161,6 +2343,19 @@ fn result_from(name: &str, data: &Value, output: String) -> ToolResult {
         .or_else(|| data.get("is_error"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if let Some(sc) = &structured_content {
+        let raw_text = content
+            .iter()
+            .filter_map(|item| match item {
+                ContentItem::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(formatted) = format_diagnostic_report(sc, &raw_text) {
+            content = vec![ContentItem::text(formatted)];
+        }
+    }
     ToolResult {
         content,
         structured_content,

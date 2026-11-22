@@ -97,6 +97,23 @@ impl ContextStreamClient {
             .await?;
         Ok(HostedToolsAnswer::from_body(raw.status, raw.body))
     }
+
+    /// Fetch bounded (<100 ms) context-enriched failure diagnostics for a failing hosted tool call.
+    pub async fn hosted_tool_diagnose(
+        &self,
+        call_id: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<HostedToolsAnswer> {
+        let path = format!(
+            "{HOSTED_TOOLS_PATH}/calls/{}/diagnose",
+            urlencoding::encode(call_id)
+        );
+        let raw = self
+            .send_raw_json("POST", &path, Some(body), timeout)
+            .await?;
+        Ok(HostedToolsAnswer::from_body(raw.status, raw.body))
+    }
 }
 
 #[cfg(test)]

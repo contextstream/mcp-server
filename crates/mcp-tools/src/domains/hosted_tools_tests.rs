@@ -845,7 +845,9 @@ async fn a_declined_run_includes_the_workers_reason_in_text_and_structured_conte
     );
     assert_eq!(
         result.structured_content,
-        Some(json!({"ran": false, "declined_reason": reason}))
+        Some(
+            json!({"ran": false, "declined_reason": reason, "refused_code": "node_version_mismatch"})
+        )
     );
 }
 
@@ -1431,5 +1433,1334 @@ async fn remote_checks_hosted_status_uses_the_projects_indexed_markers() {
             "This project: TypeScript and JavaScript (runs remotely) · .NET (runs remotely with extra engines)"
         ),
         "{text}"
+    );
+}
+
+#[test]
+fn diagnostic_header_orders_new_failures_first_cites_context_and_cuts_bytes_by_at_least_50_percent()
+{
+    let mut raw_lines = Vec::new();
+    for i in 0..30 {
+        raw_lines.push(format!(
+            "   Compiling crate-{i} v0.1.0 (/work/repo/crates/c{i})"
+        ));
+    }
+    for i in 0..20 {
+        raw_lines.push(format!("test module::passing_case_{i} ... ok"));
+    }
+    for i in 0..8 {
+        raw_lines.push(format!(
+            "error[E0425]: cannot find value `old_var_{i}` in src/legacy_{i}.rs:10:5"
+        ));
+    }
+    raw_lines
+        .push("error[E0308]: mismatched types at src/auth.rs:42:9 in verify_token".to_string());
+    raw_lines.push("[exit 101, 4.2 s]".to_string());
+    let raw_stderr = raw_lines.join("\n");
+
+    let old_failures: Vec<Value> = (0..8)
+        .map(|i| {
+            json!({
+                "file": format!("src/legacy_{i}.rs"),
+                "line": 10,
+                "col": 5,
+                "error_code": "E0425",
+                "message": format!("cannot find value `old_var_{i}`"),
+            })
+        })
+        .collect();
+    let new_failure = json!({
+        "file": "src/auth.rs",
+        "line": 42,
+        "col": 9,
+        "symbol": "verify_token",
+        "error_code": "E0308",
+        "message": "mismatched types",
+        "callers": ["routes::login"],
+        "definitions": ["JwtClaims"],
+    });
+    let frame = json!({
+        "type": "result",
+        "ran": true,
+        "exit": 101,
+        "tool_result": {
+            "content": [{"type": "text", "text": raw_stderr}],
+            "structuredContent": {
+                "exit": 101,
+                "ran": true,
+                "failures": [new_failure],
+                "failing_on_base": {
+                    "known": true,
+                    "base_exit": 101,
+                    "old": old_failures,
+                    "new": [new_failure],
+                },
+                "diagnostics": {
+                    "new_failures_count": 1,
+                    "base_failures_suppressed": 8,
+                    "new_failures": [new_failure],
+                    "commits": [{"sha": "abc1234", "message": "refactor verify_token", "matched_by": "symbol"}],
+                    "decisions": [{"id": "00000000-0000-0000-0000-000000000001", "summary": "Require typed claims in auth"}],
+                    "lessons": [{"id": "00000000-0000-0000-0000-000000000002", "title": "Avoid E0308 in auth", "prevention": "Borrow &str"}],
+                }
+            },
+            "isError": true
+        }
+    });
+
+    let Streamed::Ran(result) = interpret("check", "cargo test", "", &frame) else {
+        panic!("expected Streamed::Ran");
+    };
+    let text = text_of(&result).join("\n");
+    assert!(
+        text.starts_with("[diagnostics: 1 new failure(s), 8 base failure(s) suppressed]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("commits: abc1234 refactor verify_token"),
+        "{text}"
+    );
+    assert!(
+        text.contains("decisions: Require typed claims in auth"),
+        "{text}"
+    );
+    assert!(
+        text.contains("lessons: Avoid E0308 in auth: Borrow &str"),
+        "{text}"
+    );
+    assert!(
+        text.contains("src/auth.rs:42:9 [E0308] (verify_token)"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("old_var_0"),
+        "base failures must be suppressed: {text}"
+    );
+    assert!(
+        !text.contains("Compiling crate-0"),
+        "passing build noise must be omitted: {text}"
+    );
+    assert!(
+        text.len() * 2 <= raw_stderr.len(),
+        "expected >=50% reduction: formatted={} bytes vs raw={} bytes\n{text}",
+        text.len(),
+        raw_stderr.len()
+    );
+}
+
+#[test]
+fn interpret_preserves_exit_75_cause_metadata_on_declined_frame() {
+    let frame = json!({
+        "type": "result",
+        "ran": false,
+        "exit": 75,
+        "refused": "no such engine here",
+        "refused_code": "engine_unavailable",
+        "refused_class": "host",
+        "detail": "no such engine here (ruby)",
+    });
+    let Streamed::NotRun(result) = interpret("check", "bundle exec rspec", "", &frame) else {
+        panic!("expected Streamed::NotRun");
+    };
+    let sc = result.structured_content.expect("structured_content");
+    assert_eq!(sc["refused_code"], "engine_unavailable");
+    assert_eq!(sc["refused_class"], "host");
+    assert_eq!(sc["detail"], "no such engine here (ruby)");
+}
+
+#[derive(Debug, Clone)]
+struct StubReq {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Value,
+}
+
+async fn stub_with_headers(
+    respond: Arc<
+        dyn Fn(
+                &StubReq,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = (u16, String)> + Send>>
+            + Send
+            + Sync,
+    >,
+) -> (String, Arc<StdMutex<Vec<StubReq>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let respond = respond.clone();
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let header_end = loop {
+                    let read = socket.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+                let headers: Vec<(String, String)> = head
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                    })
+                    .collect();
+                let length = headers
+                    .iter()
+                    .find(|(k, _)| k == "content-length")
+                    .and_then(|(_, v)| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                while buffer.len() < header_end + length {
+                    let read = socket.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+                let mut parts = head.lines().next().unwrap_or("").split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let target = parts.next().unwrap_or("").to_string();
+                let path = target.split('?').next().unwrap_or("").to_string();
+                let req = StubReq {
+                    method,
+                    path: path.strip_prefix("/api/v1").unwrap_or(&path).to_string(),
+                    headers,
+                    body: serde_json::from_slice(&buffer[header_end..]).unwrap_or(Value::Null),
+                };
+                let (status, body) = respond(&req).await;
+                log.lock().unwrap().push(req);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (url, seen)
+}
+
+#[tokio::test]
+async fn run_enriches_failing_stream_from_diagnose_endpoint_without_prestuffed_frame_diagnostics() {
+    let mut raw_lines = Vec::new();
+    for i in 0..30 {
+        raw_lines.push(format!(
+            "   Compiling crate-{i} v0.1.0 (/work/repo/crates/c{i})"
+        ));
+    }
+    for i in 0..8 {
+        raw_lines.push(format!(
+            "error[E0425]: cannot find value `old_var_{i}` in src/legacy_{i}.rs:10:5"
+        ));
+    }
+    raw_lines
+        .push("error[E0308]: mismatched types at src/auth.rs:42:9 in verify_token".to_string());
+    raw_lines.push("[exit 101, 4.2 s]".to_string());
+    let raw_stderr = raw_lines.join("\n");
+
+    let old_failures: Vec<Value> = (0..8)
+        .map(|i| {
+            json!({
+                "file": format!("src/legacy_{i}.rs"),
+                "line": 10,
+                "col": 5,
+                "error_code": "E0425",
+                "message": format!("cannot find value `old_var_{i}`"),
+            })
+        })
+        .collect();
+    let new_failure = json!({
+        "file": "src/auth.rs",
+        "line": 42,
+        "col": 9,
+        "symbol": "verify_token",
+        "error_code": "E0308",
+        "message": "mismatched types",
+    });
+
+    // J frame emitted by mcd.py/worker.ts has NO "diagnostics" key!
+    let j_frame = json!({
+        "type": "result",
+        "ran": true,
+        "exit": 101,
+        "failures": [new_failure],
+        "failing_on_base": {
+            "known": true,
+            "base_exit": 101,
+            "old": old_failures,
+            "new": [new_failure],
+        },
+        "tool_result": {
+            "content": [{"type": "text", "text": raw_stderr}],
+            "structuredContent": {
+                "exit": 101,
+                "ran": true,
+                "failures": [new_failure],
+                "failing_on_base": {
+                    "known": true,
+                    "base_exit": 101,
+                    "old": old_failures,
+                    "new": [new_failure],
+                },
+            },
+            "isError": true,
+        }
+    });
+    assert!(j_frame.get("diagnostics").is_none());
+    assert!(j_frame
+        .pointer("/tool_result/structuredContent/diagnostics")
+        .is_none());
+
+    let (ws_url, _) = frames_service(vec![Step::Json(j_frame)]).await;
+    let mut def = echo_definition("stream");
+    def["name"] = json!("check");
+    def["attachments"] = json!(["checkout_snapshot"]);
+    let mut answer = stream_answer(&ws_url, "frames/1");
+    answer["call"]["id"] = json!("call-diag-1");
+
+    let (url, seen) = stub_with_headers(Arc::new(move |req| {
+        let def = def.clone();
+        let answer = answer.clone();
+        let method = req.method.clone();
+        let path = req.path.clone();
+        let headers = req.headers.clone();
+        let body = req.body.clone();
+        Box::pin(async move {
+            match (method.as_str(), path.as_str()) {
+                ("GET", "/mcp/hosted-tools") => {
+                    (200, json!({"tools": [def]}).to_string())
+                }
+                ("POST", "/mcp/hosted-tools/check/call") => (200, answer.to_string()),
+                ("POST", "/mcp/hosted-tools/calls/call-diag-1/diagnose") => {
+                    let has_key = headers
+                        .iter()
+                        .any(|(k, v)| k == "x-api-key" && v == "hosted-tools-test-key");
+                    assert!(has_key, "missing X-API-Key header: {headers:?}");
+                    assert_eq!(body["workspace_id"], WORKSPACE);
+                    assert_eq!(body["budget_ms"], 65);
+                    assert!(body["failures"].is_array());
+                    assert!(body["failing_on_base"].is_object());
+                    (
+                        200,
+                        json!({
+                            "success": true,
+                            "data": {
+                                "call_id": "00000000-0000-0000-0000-000000000001",
+                                "new_failures_count": 1,
+                                "base_failures_suppressed": 8,
+                                "new_failures": [{
+                                    "file": "src/auth.rs",
+                                    "line": 42,
+                                    "col": 9,
+                                    "symbol": "verify_token",
+                                    "error_code": "E0308",
+                                    "message": "mismatched types",
+                                    "callers": ["routes::login"],
+                                    "definitions": ["JwtClaims"]
+                                }],
+                                "commits": [{"sha": "abc1234", "message": "refactor verify_token", "matched_by": "symbol"}],
+                                "decisions": [{"id": "00000000-0000-0000-0000-000000000002", "summary": "Require typed claims in auth"}],
+                                "lessons": [{"id": "00000000-0000-0000-0000-000000000003", "title": "Avoid E0308 in auth", "prevention": "Borrow &str"}],
+                                "elapsed_ms": 14,
+                                "timed_out": false
+                            }
+                        })
+                        .to_string(),
+                    )
+                }
+                _ => (404, "{}".to_string()),
+            }
+        })
+    }))
+    .await;
+
+    let client = client_in_workspace(&url);
+    let (_repo, session) = changed_checkout(&client).await;
+    let tool = check_tool(&client, &session).await;
+    let result = run(&client, &session, &tool, json!({"command": "cargo test"})).await;
+    assert!(result.is_error);
+
+    let text = text_of(&result).join("\n");
+    assert!(
+        text.starts_with("[diagnostics: 1 new failure(s), 8 base failure(s) suppressed]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("commits: abc1234 refactor verify_token"),
+        "{text}"
+    );
+    assert!(
+        text.contains("decisions: Require typed claims in auth"),
+        "{text}"
+    );
+    assert!(
+        text.contains("lessons: Avoid E0308 in auth: Borrow &str"),
+        "{text}"
+    );
+    assert!(text.contains("callers: routes::login"), "{text}");
+    assert!(text.contains("defs: JwtClaims"), "{text}");
+    assert!(!text.contains("old_var_0"), "{text}");
+    assert!(!text.contains("Compiling crate-0"), "{text}");
+    assert!(
+        text.len() * 2 <= raw_stderr.len(),
+        "expected >=50% reduction: {} vs {}",
+        text.len(),
+        raw_stderr.len()
+    );
+
+    let seen = seen.lock().unwrap();
+    assert!(seen
+        .iter()
+        .any(|r| r.method == "POST" && r.path == "/mcp/hosted-tools/calls/call-diag-1/diagnose"));
+}
+
+#[tokio::test]
+async fn run_fails_open_when_diagnose_endpoint_fails_or_times_out() {
+    for mode in ["http_500", "timeout_250ms"] {
+        let j_frame = json!({
+            "type": "result",
+            "ran": true,
+            "exit": 101,
+            "tool_result": {
+                "content": [{"type": "text", "text": "error[E0308]: mismatched types at src/auth.rs:42:9\nerror[E0425]: cannot find `old` in src/old.rs:1:1"}],
+                "structuredContent": {
+                    "exit": 101,
+                    "ran": true,
+                    "failures": [{"file": "src/auth.rs", "line": 42, "error_code": "E0308"}],
+                    "failing_on_base": {
+                        "known": true,
+                        "old": [{"file": "src/old.rs", "line": 1, "error_code": "E0425"}],
+                        "new": [{"file": "src/auth.rs", "line": 42, "error_code": "E0308"}]
+                    }
+                },
+                "isError": true,
+            }
+        });
+        let (ws_url, _) = frames_service(vec![Step::Json(j_frame)]).await;
+        let mut def = echo_definition("stream");
+        def["name"] = json!("check");
+        def["attachments"] = json!(["checkout_snapshot"]);
+        let mut answer = stream_answer(&ws_url, "frames/1");
+        answer["call"]["id"] = json!("call-failopen-1");
+
+        let mode_str = mode.to_string();
+        let (url, _) = stub_with_headers(Arc::new(move |req| {
+            let def = def.clone();
+            let answer = answer.clone();
+            let method = req.method.clone();
+            let path = req.path.clone();
+            let mode_str = mode_str.clone();
+            Box::pin(async move {
+                match (method.as_str(), path.as_str()) {
+                    ("GET", "/mcp/hosted-tools") => (200, json!({"tools": [def]}).to_string()),
+                    ("POST", "/mcp/hosted-tools/check/call") => (200, answer.to_string()),
+                    ("POST", "/mcp/hosted-tools/calls/call-failopen-1/diagnose") => {
+                        if mode_str == "timeout_250ms" {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                        (500, json!({"error": "boom"}).to_string())
+                    }
+                    _ => (404, "{}".to_string()),
+                }
+            })
+        }))
+        .await;
+
+        let client = client_in_workspace(&url);
+        let (_repo, session) = changed_checkout(&client).await;
+        let tool = check_tool(&client, &session).await;
+
+        let started = Instant::now();
+        let result = run(&client, &session, &tool, json!({"command": "cargo test"})).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_error, "{mode}: expected is_error");
+        // Entire run (including checkout snapshot + WS + 95ms fail-open) must not block 250ms+ on /diagnose.
+        assert!(
+            elapsed < Duration::from_millis(240),
+            "{mode}: took too long ({elapsed:?}), /diagnose did not time out within <100ms"
+        );
+        let text = text_of(&result).join("\n");
+        assert!(
+            text.contains("[diagnostics: 1 new failure(s), 1 base failure(s) suppressed]"),
+            "{mode}: {text}"
+        );
+        assert!(text.contains("src/auth.rs:42 [E0308]"), "{mode}: {text}");
+        assert!(!text.contains("src/old.rs"), "{mode}: {text}");
+    }
+}
+
+#[test]
+fn trim_diagnostic_slice_suppresses_shared_error_code_and_multiline_pytest_base_failures() {
+    // Shared E0308 in both old and new (single-line and multi-line rustc)
+    let new_items = vec![json!({
+        "file": "src/new.rs",
+        "line": 20,
+        "error_code": "E0308",
+    })];
+    let old_items = vec![json!({
+        "file": "src/old.rs",
+        "line": 10,
+        "error_code": "E0308",
+    })];
+    let rustc_raw = "\
+error[E0308]: mismatched types at src/old.rs:10:5
+error[E0308]: mismatched types
+ --> src/old.rs:10:5
+  |
+10|     let x: i32 = \"old\";
+  |                  ^^^^^ expected `i32`, found `&str`
+
+error[E0308]: mismatched types at src/new.rs:20:5
+";
+    let sliced = trim_diagnostic_slice(rustc_raw, &new_items, &old_items, 4096);
+    assert!(!sliced.contains("src/old.rs"), "{sliced}");
+    assert!(!sliced.contains("let x: i32"), "{sliced}");
+    assert_eq!(sliced.matches("error[E0308]").count(), 1, "{sliced}");
+    assert!(sliced.contains("src/new.rs:20:5"), "{sliced}");
+
+    // Multi-line pytest base failure trace
+    let py_new = vec![json!({
+        "file": "tests/new.py",
+        "test": "test_new",
+    })];
+    let py_old = vec![json!({
+        "file": "tests/old.py",
+        "test": "test_old",
+    })];
+    let pytest_raw = "\
+FAILED tests/old.py::test_old
+E       AssertionError: base failure detail
+E       assert 1 == 2
+
+FAILED tests/new.py::test_new
+E       AssertionError: new failure detail
+";
+    let py_sliced = trim_diagnostic_slice(pytest_raw, &py_new, &py_old, 4096);
+    assert!(!py_sliced.contains("test_old"), "{py_sliced}");
+    assert!(!py_sliced.contains("base failure detail"), "{py_sliced}");
+    assert!(!py_sliced.contains("assert 1 == 2"), "{py_sliced}");
+    assert!(py_sliced.contains("test_new"), "{py_sliced}");
+    assert!(py_sliced.contains("new failure detail"), "{py_sliced}");
+}
+
+#[test]
+fn trim_diagnostic_slice_suppresses_pytest_tb_auto_vitest_and_cargo_test_base_failures() {
+    // (a) pytest --tb=auto parametrized blank-line trace
+    let py_auto_new = vec![json!({
+        "file": "tests/test_new.py",
+        "test": "test_new_param[case2]",
+    })];
+    let py_auto_old = vec![json!({
+        "file": "tests/test_old.py",
+        "test": "test_old_param[case1]",
+    })];
+    let pytest_auto_raw = "\
+____ test_old_param[case1] ____
+
+x = 1
+
+    def test_old_param(x):
+>       assert x == 2
+E       AssertionError: old_param_base_detail
+
+tests/test_old.py:10: AssertionError
+____ test_new_param[case2] ____
+
+    def test_new_param(x):
+>       assert x == 4
+E       AssertionError: new_param_detail
+
+tests/test_new.py:20: AssertionError
+";
+    let py_auto_sliced = trim_diagnostic_slice(pytest_auto_raw, &py_auto_new, &py_auto_old, 4096);
+    assert!(
+        !py_auto_sliced.contains("old_param_base_detail"),
+        "{py_auto_sliced}"
+    );
+    assert!(
+        !py_auto_sliced.contains("test_old_param"),
+        "{py_auto_sliced}"
+    );
+    assert!(
+        py_auto_sliced.contains("test_new_param[case2]"),
+        "{py_auto_sliced}"
+    );
+    assert!(
+        py_auto_sliced.contains("new_param_detail"),
+        "{py_auto_sliced}"
+    );
+
+    // (b) vitest / jest column-0 AssertionError / Error / TypeError / ReferenceError
+    let vitest_new = vec![json!({
+        "file": "tests/new.test.ts",
+        "test": "new case",
+    })];
+    let vitest_old = vec![json!({
+        "file": "tests/old.test.ts",
+        "test": "old case",
+    })];
+    let vitest_raw = "\
+ FAIL  tests/old.test.ts > suite > old case
+AssertionError: old_vitest_base_detail
+Error: old_vitest_error_detail
+TypeError: old_vitest_type_detail
+ReferenceError: old_vitest_ref_detail
+ ❯ tests/old.test.ts:10:5
+
+ FAIL  tests/new.test.ts > suite > new case
+AssertionError: new_vitest_detail
+ ❯ tests/new.test.ts:25:5
+";
+    let vitest_sliced = trim_diagnostic_slice(vitest_raw, &vitest_new, &vitest_old, 4096);
+    assert!(
+        !vitest_sliced.contains("old_vitest_base_detail"),
+        "{vitest_sliced}"
+    );
+    assert!(
+        !vitest_sliced.contains("old_vitest_error_detail"),
+        "{vitest_sliced}"
+    );
+    assert!(
+        !vitest_sliced.contains("old_vitest_type_detail"),
+        "{vitest_sliced}"
+    );
+    assert!(
+        !vitest_sliced.contains("old_vitest_ref_detail"),
+        "{vitest_sliced}"
+    );
+    assert!(
+        vitest_sliced.contains("new_vitest_detail"),
+        "{vitest_sliced}"
+    );
+
+    // (c) cargo test column-0 assertion failed panic trace (including shared file)
+    let cargo_new = vec![json!({
+        "file": "src/lib.rs",
+        "test": "tests::test_new_panic",
+    })];
+    let cargo_old = vec![json!({
+        "file": "src/lib.rs",
+        "test": "tests::test_old_panic",
+    })];
+    let cargo_raw = "\
+---- tests::test_old_panic stdout ----
+thread 'tests::test_old_panic' panicked at src/lib.rs:10:5:
+assertion `left == right` failed: old_panic_base_detail
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+help: old_panic_help_detail
+
+---- tests::test_new_panic stdout ----
+thread 'tests::test_new_panic' panicked at src/lib.rs:25:5:
+assertion `left == right` failed: new_panic_detail
+  left: 3
+ right: 4
+";
+    let cargo_sliced = trim_diagnostic_slice(cargo_raw, &cargo_new, &cargo_old, 4096);
+    assert!(
+        !cargo_sliced.contains("old_panic_base_detail"),
+        "{cargo_sliced}"
+    );
+    assert!(!cargo_sliced.contains("left: 1"), "{cargo_sliced}");
+    assert!(
+        !cargo_sliced.contains("old_panic_help_detail"),
+        "{cargo_sliced}"
+    );
+    assert!(
+        cargo_sliced.contains("tests::test_new_panic"),
+        "{cargo_sliced}"
+    );
+    assert!(cargo_sliced.contains("new_panic_detail"), "{cargo_sliced}");
+    assert!(cargo_sliced.contains("left: 3"), "{cargo_sliced}");
+}
+
+#[test]
+fn trim_diagnostic_slice_blocks_unshared_error_code_leak_and_pytest_captured_sections() {
+    // Challenge 1: new_items has error_code "AssertionError", old_items omits error_code,
+    // both on disjoint files and on shared file (tests/helpers.py).
+    for (new_file, old_file) in [
+        ("tests/test_new.py", "tests/helpers.py"),
+        ("tests/helpers.py", "tests/helpers.py"),
+    ] {
+        let new_items = vec![json!({
+            "file": new_file,
+            "test": "test_new_param[case2]",
+            "error_code": "AssertionError",
+        })];
+        let old_items = vec![json!({
+            "file": old_file,
+            "test": "test_old_param[case1]",
+        })];
+        let raw = format!(
+            "\
+____ test_old_param[case1] ____
+
+x = 1
+
+    def test_old_param(x):
+>       assert x == 2
+E       AssertionError: old_param_base_detail
+
+{old_file}:10: AssertionError
+____ test_new_param[case2] ____
+
+    def test_new_param(x):
+>       assert x == 4
+E       AssertionError: new_param_detail
+
+{new_file}:20: AssertionError
+"
+        );
+        let sliced = trim_diagnostic_slice(&raw, &new_items, &old_items, 4096);
+        assert!(
+            !sliced.contains("old_param_base_detail"),
+            "{new_file}/{old_file}: {sliced}"
+        );
+        assert!(
+            !sliced.contains("test_old_param"),
+            "{new_file}/{old_file}: {sliced}"
+        );
+        if new_file != old_file {
+            assert!(
+                !sliced.contains("tests/helpers.py"),
+                "{new_file}/{old_file}: {sliced}"
+            );
+        }
+        assert!(
+            sliced.contains("test_new_param[case2]"),
+            "{new_file}/{old_file}: {sliced}"
+        );
+        assert!(
+            sliced.contains("new_param_detail"),
+            "{new_file}/{old_file}: {sliced}"
+        );
+    }
+
+    // Challenge 1b + Edge case: vitest col-0 AssertionError / Error: with unshared error_code on shared & disjoint files
+    for (new_file, old_file) in [
+        ("tests/new.test.ts", "tests/old.test.ts"),
+        ("tests/shared.test.ts", "tests/shared.test.ts"),
+    ] {
+        let new_items = vec![json!({
+            "file": new_file,
+            "test": "new case",
+            "error_code": "AssertionError",
+        })];
+        let old_items = vec![json!({
+            "file": old_file,
+            "test": "old case",
+        })];
+        let raw = format!(
+            "\
+ FAIL  {old_file} > suite > old case
+AssertionError: old_vitest_base_detail
+Error: old_vitest_error_detail
+ ❯ {old_file}:10:5
+
+ FAIL  {new_file} > suite > new case
+AssertionError: new_vitest_detail
+Error: new_vitest_error_detail
+ ❯ {new_file}:25:5
+"
+        );
+        let sliced = trim_diagnostic_slice(&raw, &new_items, &old_items, 4096);
+        assert!(
+            !sliced.contains("old_vitest_base_detail"),
+            "{new_file}/{old_file}: {sliced}"
+        );
+        assert!(
+            !sliced.contains("old_vitest_error_detail"),
+            "{new_file}/{old_file}: {sliced}"
+        );
+        assert!(
+            sliced.contains("new_vitest_detail"),
+            "{new_file}/{old_file}: {sliced}"
+        );
+        assert!(
+            sliced.contains("new_vitest_error_detail"),
+            "{new_file}/{old_file}: {sliced}"
+        );
+    }
+
+    // Challenge 2: pytest Captured stderr call / stdout setup / log teardown + transition to cargo test
+    let mixed_new = vec![
+        json!({
+            "file": "tests/test_new.py",
+            "test": "test_new_param[case2]",
+            "error_code": "AssertionError",
+        }),
+        json!({
+            "file": "src/lib.rs",
+            "test": "tests::test_new",
+        }),
+    ];
+    let mixed_old = vec![json!({
+        "file": "tests/test_old.py",
+        "test": "test_old_param[case1]",
+    })];
+    let mixed_raw = "\
+____ test_old_param[case1] ____
+
+    def test_old_param(x):
+>       assert x == 2
+E       AssertionError: old_param_base_detail
+
+----------------------------- Captured stderr call -----------------------------
+ERROR: old_test_captured_stderr_leak
+----------------------------- Captured stdout setup ----------------------------
+ERROR: old_test_captured_stdout_leak
+------------------------------ Captured log teardown ---------------------------
+ERROR: old_test_captured_log_leak
+
+tests/test_old.py:10: AssertionError
+____ test_new_param[case2] ____
+
+    def test_new_param(x):
+>       assert x == 4
+E       AssertionError: new_param_detail
+
+tests/test_new.py:20: AssertionError
+---- tests::test_new stdout ----
+thread 'tests::test_new' panicked at src/lib.rs:25:5:
+assertion `left == right` failed: new_rust_after_pytest
+";
+    let mixed_sliced = trim_diagnostic_slice(mixed_raw, &mixed_new, &mixed_old, 4096);
+    assert!(
+        !mixed_sliced.contains("old_test_captured_stderr_leak"),
+        "{mixed_sliced}"
+    );
+    assert!(
+        !mixed_sliced.contains("old_test_captured_stdout_leak"),
+        "{mixed_sliced}"
+    );
+    assert!(
+        !mixed_sliced.contains("old_test_captured_log_leak"),
+        "{mixed_sliced}"
+    );
+    assert!(
+        !mixed_sliced.contains("old_param_base_detail"),
+        "{mixed_sliced}"
+    );
+    assert!(mixed_sliced.contains("new_param_detail"), "{mixed_sliced}");
+    assert!(
+        mixed_sliced.contains("new_rust_after_pytest"),
+        "{mixed_sliced}"
+    );
+}
+
+#[test]
+fn format_diagnostic_report_monotonic_budget_preserves_short_cargo_and_bounds_large() {
+    // Challenge 3: ~494B unpadded cargo test with prefix-overlapping test name (test_old_panic vs test_old_panic_v2)
+    let raw_494 = "\
+---- tests::test_old_panic stdout ----
+thread 'tests::test_old_panic' panicked at src/lib.rs:10:5:
+assertion `left == right` failed: old_panic_base_detail
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::test_old_panic_v2 stdout ----
+thread 'tests::test_old_panic_v2' panicked at src/lib.rs:25:5:
+assertion `left == right` failed: new_panic_detail
+  left: 3
+ right: 4
+
+failures:
+    tests::test_old_panic
+    tests::test_old_panic_v2
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored
+";
+    let structured = json!({
+        "failures": [{
+            "file": "src/lib.rs",
+            "line": 25,
+            "test": "tests::test_old_panic_v2",
+            "message": "new_panic_detail",
+        }],
+        "failing_on_base": {
+            "known": true,
+            "old": [{
+                "file": "src/lib.rs",
+                "line": 10,
+                "test": "tests::test_old_panic",
+                "message": "old_panic_base_detail",
+            }],
+            "new": [{
+                "file": "src/lib.rs",
+                "line": 25,
+                "test": "tests::test_old_panic_v2",
+                "message": "new_panic_detail",
+            }],
+        }
+    });
+    let report = format_diagnostic_report(&structured, raw_494).expect("formatted report");
+    assert!(
+        !report.contains("old_panic_base_detail"),
+        "base panic leaked:\n{report}"
+    );
+    assert!(!report.contains("left: 1"), "base left leaked:\n{report}");
+    assert!(
+        !report.contains("tests::test_old_panic\n"),
+        "old summary leaked:\n{report}"
+    );
+    assert!(
+        report.contains("tests::test_old_panic_v2"),
+        "new test missing:\n{report}"
+    );
+    assert!(
+        report.contains("new_panic_detail"),
+        "new panic detail missing:\n{report}"
+    );
+    assert!(report.contains("left: 3"), "new left missing:\n{report}");
+
+    // Monotonicity check across 300B..14.7KB + >=50% reduction on >=2048B and 14.7KB outputs
+    let mut prev_len = 0usize;
+    let short_raw = "\
+---- tests::test_old_panic_v2 stdout ----
+thread 'tests::test_old_panic_v2' panicked at src/lib.rs:25:5:
+assertion `left == right` failed: new_panic_detail
+  left: 3
+ right: 4
+";
+    let short_out = format_diagnostic_report(&structured, short_raw).expect("short report");
+    assert!(short_out.contains("new_panic_detail"), "{short_out}");
+    assert!(short_out.contains("left: 3"), "{short_out}");
+
+    let filler_line = "   Compiling padding-crate v0.1.0 (/work/repo/crates/pad)\n";
+    let padded_new = "thread 'tests::test_old_panic_v2' panicked at src/lib.rs:25:5:\n";
+    for target_len in [550usize, 700, 1200, 2048, 3072, 4096, 14700] {
+        let mut raw = raw_494.to_string();
+        while raw.len() < target_len {
+            if raw.len() % 3 == 0 {
+                raw.push_str(padded_new);
+            } else {
+                raw.push_str(filler_line);
+            }
+        }
+        let out = format_diagnostic_report(&structured, &raw).expect("report");
+        assert!(
+            out.len() >= prev_len,
+            "output shrank at {target_len} (raw {}): {} < {prev_len}",
+            raw.len(),
+            out.len()
+        );
+        prev_len = out.len();
+        if target_len >= 2048 {
+            assert!(
+                out.len() * 2 <= raw.len(),
+                "expected >=50% reduction at {target_len} (raw {}): {} vs {}",
+                raw.len(),
+                out.len(),
+                raw.len()
+            );
+        }
+    }
+
+    // Large 14.7KB noisy multi-runner output check
+    let mut big_lines = Vec::new();
+    for i in 0..180 {
+        big_lines.push(format!(
+            "   Compiling noisy-crate-{i} v0.1.0 (/work/repo/crates/n{i})"
+        ));
+    }
+    for i in 0..40 {
+        big_lines.push(format!(
+            "____ test_old_param_{i} ____\nE       AssertionError: old_base_{i}\ntests/old.py:{i}: AssertionError"
+        ));
+    }
+    big_lines.push(raw_494.to_string());
+    let big_raw = big_lines.join("\n");
+    assert!(big_raw.len() >= 14_000, "got {}", big_raw.len());
+    let big_report = format_diagnostic_report(&structured, &big_raw).expect("big report");
+    assert!(
+        big_report.len() * 2 <= big_raw.len(),
+        "expected >=50% reduction on 14.7KB: {} vs {}",
+        big_report.len(),
+        big_raw.len()
+    );
+    assert!(big_report.contains("new_panic_detail"), "{big_report}");
+}
+
+#[test]
+fn contains_token_handles_boundaries_and_utf8_safely() {
+    assert!(contains_token("error[e0308]: mismatched", "e0308"));
+    assert!(contains_token(
+        "tests::test_old_panic stdout",
+        "tests::test_old_panic"
+    ));
+    assert!(!contains_token(
+        "---- tests::test_old_panic_v2 stdout ----",
+        "tests::test_old_panic"
+    ));
+    assert!(!contains_token("assertionerror: x", "error"));
+    assert!(!contains_token("old_vitest_error_detail", "error"));
+    assert!(contains_token(
+        "✓ ❯ tests/old.test.ts:10:5 ●",
+        "tests/old.test.ts"
+    ));
+    assert!(contains_token("❯foo ❯ bar", "❯"));
+    assert!(!contains_token("✓_foo", "✓"));
+}
+
+#[test]
+fn trim_diagnostic_slice_and_report_remediate_r4_adversarial_leaks_and_parity() {
+    // 1. vitest arbitrary <Name>Error: / <Name>Exception: on shared file with unshared error_code
+    let vitest_new = vec![json!({
+        "file": "tests/shared.test.ts",
+        "test": "new case",
+        "error_code": "AssertionError",
+    })];
+    let vitest_old = vec![json!({
+        "file": "tests/shared.test.ts",
+        "test": "old case",
+    })];
+    let vitest_raw = "\
+ FAIL  tests/shared.test.ts > suite > old case
+SyntaxError: old_vitest_syntax_leak
+RangeError: old_vitest_range_leak
+EvalError: old_vitest_eval_leak
+URIError: old_vitest_uri_leak
+AggregateError: old_vitest_agg_leak
+ZodError: old_vitest_zod_leak
+CustomException: old_vitest_custom_exception_leak
+pkg.CustomError: old_vitest_dotted_error_leak
+
+SyntaxError: old_vitest_after_blank_leak
+ ❯ tests/shared.test.ts:10:5
+
+ FAIL  tests/shared.test.ts > suite > new case
+AssertionError: new_vitest_detail
+ ❯ tests/shared.test.ts:25:5
+";
+    let vitest_sliced = trim_diagnostic_slice(vitest_raw, &vitest_new, &vitest_old, 4096);
+    for leak in [
+        "old_vitest_syntax_leak",
+        "old_vitest_range_leak",
+        "old_vitest_eval_leak",
+        "old_vitest_uri_leak",
+        "old_vitest_agg_leak",
+        "old_vitest_zod_leak",
+        "old_vitest_custom_exception_leak",
+        "old_vitest_dotted_error_leak",
+        "old_vitest_after_blank_leak",
+    ] {
+        assert!(!vitest_sliced.contains(leak), "{leak}: {vitest_sliced}");
+    }
+    assert!(
+        vitest_sliced.contains("new_vitest_detail"),
+        "{vitest_sliced}"
+    );
+
+    // 2. Go --- FAIL: blank line before goroutine N [running]:, stack frames, and panic:
+    let go_new = vec![json!({
+        "file": "pkg/a_test.go",
+        "test": "TestNewPanic",
+    })];
+    let go_old = vec![json!({
+        "file": "pkg/a_test.go",
+        "test": "TestOldPanic",
+    })];
+    let go_raw = "\
+--- FAIL: TestOldPanic (0.00s)
+panic: old_go_panic_leak [recovered]
+\tpanic: old_go_panic_leak
+
+goroutine 19 [running]:
+testing.tRunner.func1.2({0x100, 0x200})
+\t/usr/local/go/src/testing/testing.go:1632 +0x230
+panic: old_secondary_panic_leak
+
+panic: old_tertiary_panic_after_blank_leak
+--- FAIL: TestNewPanic (0.00s)
+panic: new_go_panic_detail
+";
+    let go_sliced = trim_diagnostic_slice(go_raw, &go_new, &go_old, 4096);
+    for leak in [
+        "TestOldPanic",
+        "old_go_panic_leak",
+        "old_secondary_panic_leak",
+        "old_tertiary_panic_after_blank_leak",
+    ] {
+        assert!(!go_sliced.contains(leak), "{leak}: {go_sliced}");
+    }
+    assert!(go_sliced.contains("TestNewPanic"), "{go_sliced}");
+    assert!(go_sliced.contains("new_go_panic_detail"), "{go_sliced}");
+
+    // 3. pytest Captured stderr/stdout/log containing FAILED / FAIL / --- FAIL: / error[
+    let py_new = vec![json!({
+        "file": "tests/test_new.py",
+        "test": "test_new_param[case2]",
+        "error_code": "AssertionError",
+    })];
+    let py_old = vec![json!({
+        "file": "tests/test_old.py",
+        "test": "test_old_param[case1]",
+    })];
+    let py_raw = "\
+____ test_old_param[case1] ____
+----------------------------- Captured stderr call -----------------------------
+FAILED subprocess check: old_captured_subproc_leak
+FAIL old_captured_fail_leak
+--- FAIL: OldCapturedGoLeak
+error[E0308]: old_captured_rustc_leak
+____ test_new_param[case2] ____
+E       AssertionError: new_param_detail
+";
+    let py_sliced = trim_diagnostic_slice(py_raw, &py_new, &py_old, 4096);
+    for leak in [
+        "old_captured_subproc_leak",
+        "old_captured_fail_leak",
+        "OldCapturedGoLeak",
+        "old_captured_rustc_leak",
+    ] {
+        assert!(!py_sliced.contains(leak), "{leak}: {py_sliced}");
+    }
+    assert!(py_sliced.contains("test_new_param[case2]"), "{py_sliced}");
+    assert!(py_sliced.contains("new_param_detail"), "{py_sliced}");
+
+    // 4. CRLF interior line normalization & 5. explicit base_failures_suppressed: 0
+    let mut crlf_lines = vec!["error[E0425]: old_crlf_leak at src/old.rs:1:1".to_string()];
+    let mut diag_new = Vec::new();
+    for i in 0..12 {
+        crlf_lines.push(format!("error[E0308]: msg_{i} at src/f{i}.rs:1:1"));
+        crlf_lines.push(format!(" --> src/f{i}.rs:1:1"));
+        diag_new.push(json!({
+            "file": format!("src/f{i}.rs"),
+            "line": 1,
+            "error_code": "E0308",
+            "message": format!("msg_{i}"),
+        }));
+    }
+    let crlf_raw = crlf_lines.join("\r\n") + "\r\n";
+    let structured_zero = json!({
+        "failing_on_base": {
+            "known": true,
+            "old": [{"file": "src/old.rs", "line": 1, "error_code": "E0425"}],
+            "new": diag_new,
+        },
+        "diagnostics": {
+            "new_failures_count": 12,
+            "base_failures_suppressed": 0,
+            "new_failures": diag_new,
+            "commits": [{"sha": "abc1234", "message": "update f0"}],
+            "decisions": [{"id": "d1", "summary": "keep strict"}],
+            "lessons": [{"id": "l1", "title": "check E0308"}],
+        }
+    });
+    let report = format_diagnostic_report(&structured_zero, &crlf_raw).expect("report");
+    assert!(!report.contains('\r'), "CR leaked in report: {report:?}");
+    assert!(!report.contains("old_crlf_leak"), "{report}");
+    assert!(
+        report.starts_with("[diagnostics: 12 new failure(s), 0 base failure(s) suppressed]"),
+        "{report}"
+    );
+}
+
+#[test]
+fn trim_diagnostic_slice_and_report_remediate_r5_adversarial_leaks_and_parity() {
+    // 1. a5_go_standalone_panic_goroutine: standalone panic + blank + goroutine N [running]: + stack + secondary panic
+    let a5_new = vec![json!({
+        "file": "pkg/new_test.go",
+        "symbol": "NewFn",
+    })];
+    let a5_old = vec![json!({
+        "file": "pkg/old_test.go",
+        "symbol": "OldFn",
+    })];
+    let a5_raw = "\
+panic: old_standalone_panic
+
+goroutine 19 [running]:
+pkg.OldFn()
+\t/work/pkg/old_test.go:10 +0x20
+panic: old_secondary_leak
+
+panic: new_standalone_panic
+goroutine 21 [running]:
+pkg.NewFn()
+\t/work/pkg/new_test.go:30 +0x10
+";
+    let a5_sliced = trim_diagnostic_slice(a5_raw, &a5_new, &a5_old, 4096);
+    assert!(
+        !a5_sliced.contains("old_standalone_panic"),
+        "a5 old standalone panic leaked:\n{a5_sliced}"
+    );
+    assert!(
+        !a5_sliced.contains("old_secondary_leak"),
+        "a5 old secondary panic leaked:\n{a5_sliced}"
+    );
+    assert!(
+        a5_sliced.contains("new_standalone_panic"),
+        "a5 missing new standalone panic:\n{a5_sliced}"
+    );
+    assert!(
+        a5_sliced.contains("pkg.NewFn()"),
+        "a5 missing new goroutine stack:\n{a5_sliced}"
+    );
+
+    // 2. a1_standalone_named_errors_no_blank: consecutive standalone SyntaxError + TypeError with no blank line
+    let a1_new = vec![json!({
+        "file": "tests/new.ts",
+        "error_code": "TypeError",
+    })];
+    let a1_old = vec![json!({
+        "file": "tests/old.ts",
+        "error_code": "SyntaxError",
+    })];
+    let a1_raw = "\
+SyntaxError: old_syntax_err in tests/old.ts:5
+TypeError: new_type_err in tests/new.ts:10
+";
+    let a1_sliced = trim_diagnostic_slice(a1_raw, &a1_new, &a1_old, 4096);
+    assert!(
+        !a1_sliced.contains("old_syntax_err"),
+        "a1 old SyntaxError leaked:\n{a1_sliced}"
+    );
+    assert!(
+        a1_sliced.contains("new_type_err"),
+        "a1 new TypeError was suppressed:\n{a1_sliced}"
+    );
+
+    // 3. a6_vitest_caused_by_and_serialized_error: Caused by: and Serialized Error: inside FAIL block,
+    //    and plain Caused by: / Serialized Error: outside a failure block do not swallow subsequent failures
+    let a6_new = vec![json!({
+        "file": "tests/shared.test.ts",
+        "test": "new case",
+        "error_code": "AssertionError",
+    })];
+    let a6_old = vec![json!({
+        "file": "tests/shared.test.ts",
+        "test": "old case",
+    })];
+    let a6_raw = "\
+ FAIL  tests/shared.test.ts > suite > old case
+SyntaxError: old_top_err
+Caused by: TypeError: old_caused_by_leak
+Serialized Error: { code: 'OLD_ERR' }
+
+ FAIL  tests/shared.test.ts > suite > new case
+AssertionError: new_vitest_ok
+";
+    let a6_sliced = trim_diagnostic_slice(a6_raw, &a6_new, &a6_old, 4096);
+    assert!(
+        !a6_sliced.contains("old_top_err"),
+        "a6 old_top_err leaked:\n{a6_sliced}"
+    );
+    assert!(
+        !a6_sliced.contains("old_caused_by_leak"),
+        "a6 old_caused_by_leak leaked:\n{a6_sliced}"
+    );
+    assert!(
+        !a6_sliced.contains("OLD_ERR"),
+        "a6 OLD_ERR leaked:\n{a6_sliced}"
+    );
+    assert!(
+        a6_sliced.contains("new_vitest_ok"),
+        "a6 missing new_vitest_ok:\n{a6_sliced}"
+    );
+
+    let a6_outside_raw = "\
+Caused by: note mentioning tests/shared.test.ts old case
+Serialized Error: context mentioning tests/shared.test.ts old case
+TypeError: new_standalone_after_caused_by in tests/other.ts:12
+";
+    let a6_outside_new = vec![json!({
+        "file": "tests/other.ts",
+        "error_code": "TypeError",
+    })];
+    let a6_outside_sliced = trim_diagnostic_slice(a6_outside_raw, &a6_outside_new, &a6_old, 4096);
+    assert!(
+        a6_outside_sliced.contains("new_standalone_after_caused_by"),
+        "plain Caused by / Serialized Error outside failure block swallowed next line:\n{a6_outside_sliced}"
+    );
+
+    // 4. a9_fob_missing_new_key_with_failures: omitted `new` or `new: null` falls back to `failures`,
+    //    while `new: []` reports 0 new failures
+    for fob_val in [
+        json!({"known": true, "old": [{"file": "src/old.rs"}]}),
+        json!({"known": true, "old": [{"file": "src/old.rs"}], "new": null}),
+    ] {
+        let structured_a9 = json!({
+            "failing_on_base": fob_val,
+            "failures": [{
+                "file": "src/new.rs",
+                "line": 10,
+                "error_code": "E0308",
+                "message": "type mismatch"
+            }]
+        });
+        let report_a9 = format_diagnostic_report(
+            &structured_a9,
+            "error[E0308]: type mismatch at src/new.rs:10:1\n",
+        )
+        .expect("a9 report");
+        assert!(
+            report_a9.starts_with("[diagnostics: 1 new failure(s), 1 base failure(s) suppressed]"),
+            "a9 expected 1 new failure:\n{report_a9}"
+        );
+        assert!(
+            report_a9.contains("src/new.rs:10 [E0308] type mismatch"),
+            "a9 missing fallback failure label:\n{report_a9}"
+        );
+    }
+    let structured_a9_empty = json!({
+        "failing_on_base": {"known": true, "old": [{"file": "src/old.rs"}], "new": []},
+        "failures": [{"file": "src/new.rs", "line": 10, "error_code": "E0308", "message": "type mismatch"}]
+    });
+    let report_a9_empty = format_diagnostic_report(
+        &structured_a9_empty,
+        "error[E0308]: type mismatch at src/new.rs:10:1\n",
+    )
+    .expect("a9 empty report");
+    assert!(
+        report_a9_empty
+            .starts_with("[diagnostics: 0 new failure(s), 1 base failure(s) suppressed]"),
+        "a9 empty new array should report 0 new:\n{report_a9_empty}"
+    );
+
+    // 5. fp_lowercase_ident_error: camelCase/lowercase final segment like `lastError:` or `pkg.lastError:`
+    //    does NOT match is_named_error_or_exception_line and must not be swallowed into an old FAIL block
+    assert!(!is_named_error_or_exception_line("lastError: x"));
+    assert!(!is_named_error_or_exception_line("pkg.lastError: x"));
+    assert!(!is_named_error_or_exception_line("_CustomError: x"));
+    assert!(is_named_error_or_exception_line("SyntaxError: x"));
+    assert!(is_named_error_or_exception_line("pkg.CustomError: x"));
+
+    let fp_new = vec![json!({
+        "file": "tests/new.test.ts",
+        "test": "new case",
+    })];
+    let fp_old = vec![json!({
+        "file": "tests/old.test.ts",
+        "test": "old case",
+    })];
+    let fp_raw = "\
+ FAIL  tests/old.test.ts > suite > old case
+SyntaxError: old_leak
+lastError: new_failure_in_tests/new.test.ts new case
+";
+    let fp_sliced = trim_diagnostic_slice(fp_raw, &fp_new, &fp_old, 4096);
+    assert!(
+        !fp_sliced.contains("old_leak"),
+        "fp old_leak leaked:\n{fp_sliced}"
+    );
+    assert!(
+        fp_sliced.contains("lastError: new_failure_in_tests/new.test.ts new case"),
+        "fp lowercase ident error was swallowed:\n{fp_sliced}"
     );
 }

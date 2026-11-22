@@ -34,12 +34,12 @@ fn only_the_names_the_api_lists_are_asked_about() {
 }
 
 #[test]
-fn at_most_sixteen_tools_are_asked_about() {
+fn at_most_thirty_two_tools_are_asked_about() {
     let many: Vec<String> = (0..40).map(|n| format!("tool{n}")).collect();
     let asked = names(json!({ "versions": many }));
-    assert_eq!(asked.len(), 16);
+    assert_eq!(asked.len(), 32);
     assert_eq!(asked[0], "tool0");
-    assert_eq!(asked[15], "tool15");
+    assert_eq!(asked[31], "tool31");
 }
 
 #[test]

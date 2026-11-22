@@ -34,8 +34,9 @@ use tokio::process::Command;
 /// the service then treats it as unknown.
 pub const ENV_SWITCH: &str = "CONTEXTSTREAM_HOSTED_ENV";
 
-/// How many tools one call asks about.
-const MAX_TOOLS: usize = 16;
+/// How many tools one call asks about: a session's :prepare names every
+/// language the workers can run, more than 16 since the toolchain store.
+const MAX_TOOLS: usize = 32;
 /// How long one tool has to answer.
 const PROBE_LIMIT: Duration = Duration::from_secs(2);
 /// How much of a tool's answer is kept.

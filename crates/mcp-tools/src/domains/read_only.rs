@@ -734,7 +734,12 @@ mod tests {
         tool.execute(json!({"action": "code_drift", "refresh": false}))
             .await
             .expect("explicit refresh=false code_drift read runs");
-        for new_read in ["lineage", "meeting_brief", "universal_impact", "entity_search"] {
+        for new_read in [
+            "lineage",
+            "meeting_brief",
+            "universal_impact",
+            "entity_search",
+        ] {
             tool.execute(json!({"action": new_read}))
                 .await
                 .expect(new_read);
@@ -756,7 +761,8 @@ mod tests {
                 .await
                 .expect_err(write_action);
             assert!(
-                err.to_string().contains(&format!("Use `graph` for `{write_action}`")),
+                err.to_string()
+                    .contains(&format!("Use `graph` for `{write_action}`")),
                 "{write_action}: {err}"
             );
         }

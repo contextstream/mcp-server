@@ -112,17 +112,11 @@ pub(crate) fn is_code_edit_tool(tool_lower: &str) -> bool {
 }
 
 pub(crate) fn extract_edit_target_rel_path(tool_input: &Value, cwd: &str) -> Option<String> {
-    let raw = [
-        "file_path",
-        "path",
-        "target_file",
-        "TargetFile",
-        "file",
-    ]
-    .iter()
-    .find_map(|key| tool_input.get(*key).and_then(Value::as_str))
-    .map(str::trim)
-    .filter(|s| !s.is_empty())?;
+    let raw = ["file_path", "path", "target_file", "TargetFile", "file"]
+        .iter()
+        .find_map(|key| tool_input.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
 
     let rel = to_repo_relative(raw, cwd)?;
     let ext = Path::new(&rel)

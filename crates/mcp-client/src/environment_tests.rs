@@ -653,6 +653,82 @@ async fn the_environment_holds_the_machine_and_the_tools_asked_about() {
     assert_eq!(none["versions"], json!({}));
 }
 
+#[test]
+fn only_gos_own_platform_word_survives_the_path_filter() {
+    let none = Names::default();
+    let go = |line: &str| redact_with_product_label(line, &none, go_platform(line));
+    assert_eq!(
+        go("go version go1.25.4 linux/amd64").as_deref(),
+        Some("go version go1.25.4 linux/amd64")
+    );
+    assert_eq!(
+        go("go version go1.25.4 /home/someone/sdk").as_deref(),
+        Some("go version go1.25.4")
+    );
+    assert_eq!(
+        go("go version go1.25.4 home/../etc").as_deref(),
+        Some("go version go1.25.4")
+    );
+    assert_eq!(go_platform("gopls linux/amd64"), None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn go_and_java_probes_send_the_workers_version_lines() {
+    let scratch = tempfile::tempdir().unwrap();
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let installed = scratch.path().join("installed");
+    let java8 = scratch.path().join("java8");
+    // Go has no --version: `go version` answers, and must not fetch a toolchain.
+    plant(
+        &installed,
+        "go",
+        r#"#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = version ] && [ "$GOTOOLCHAIN" = local ] || exit 2
+echo 'go version go1.25.4 linux/amd64'
+"#,
+    );
+    // Java 9 and later answer --version on standard output.
+    plant(
+        &installed,
+        "java",
+        r#"#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = --version ] || exit 1
+printf '%s\n' 'openjdk 21.0.5 2024-10-15 LTS' 'OpenJDK Runtime Environment Temurin-21.0.5+11 (build 21.0.5+11-LTS)'
+"#,
+    );
+    // Java 8 refuses --version and answers -version on standard error.
+    plant(
+        &java8,
+        "java",
+        r#"#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = -version ] || { echo 'Unrecognized option: --version' >&2; exit 1; }
+printf '%s\n' 'openjdk version "1.8.0_432"' 'OpenJDK Runtime Environment (Temurin)(build 1.8.0_432-b06)' >&2
+"#,
+    );
+    for (dirs, java) in [
+        (vec![installed.as_path()], "openjdk 21.0.5 2024-10-15 LTS"),
+        (
+            vec![java8.as_path(), installed.as_path()],
+            "openjdk version \"1.8.0_432\"",
+        ),
+    ] {
+        let path = path_of(&dirs);
+        let environment = describe_using(
+            &json!({"versions": ["go", "java"]}),
+            &repo,
+            |name| find_program(name, Some(path.as_os_str()), &repo),
+            &Names::default(),
+        )
+        .await;
+        assert_eq!(
+            environment["versions"],
+            json!({"go": "go version go1.25.4 linux/amd64", "java": java})
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn zig_and_elixir_probes_send_the_workers_version_lines() {

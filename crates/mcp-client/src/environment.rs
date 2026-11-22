@@ -201,9 +201,21 @@ fn is_program(file: &Path) -> bool {
     file.is_file()
 }
 
-/// Run Zig with `version` and other tools with `--version`. Read a version
-/// line from standard output, then standard error, and redact it. Return
-/// `None` if the probe fails, times out or has no usable version line.
+/// The arguments that ask `tool` its version, the way the worker asks
+/// (mc-tool-versions.sh): Go and Zig take `version`; Java takes `--version`,
+/// and Java 8, which refuses that, `-version`; every other tool `--version`.
+fn version_args(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "go" | "zig" => &["version"],
+        "java" => &["--version", "-version"],
+        _ => &["--version"],
+    }
+}
+
+/// Ask `tool` its version with each of [`version_args`] in turn until one
+/// answers. Read a version line from standard output, then standard error, and
+/// redact it. Return `None` if every probe fails, the probes take longer than
+/// `limit` together, or no answer has a usable version line.
 async fn version_of(
     tool: &str,
     program: &OsStr,
@@ -211,11 +223,25 @@ async fn version_of(
     limit: Duration,
     hidden: &Names,
 ) -> Option<String> {
-    let arg = if tool == "zig" {
-        "version"
-    } else {
-        "--version"
+    let run = async {
+        for arg in version_args(tool) {
+            if let Some(line) = probe_once(tool, program, arg, folder, hidden).await {
+                return Some(line);
+            }
+        }
+        None
     };
+    tokio::time::timeout(limit, run).await.ok().flatten()
+}
+
+/// One probe of `program` with `arg`.
+async fn probe_once(
+    tool: &str,
+    program: &OsStr,
+    arg: &str,
+    folder: &Path,
+    hidden: &Names,
+) -> Option<String> {
     let mut command = Command::new(program);
     command
         .arg(arg)
@@ -223,25 +249,27 @@ async fn version_of(
         // A probe must never install or ask about installing anything.
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
         .env("RUSTUP_AUTO_INSTALL", "0")
+        .env("GOTOOLCHAIN", "local")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let run = async {
-        let mut child = command.spawn().ok()?;
-        let out = read_some(child.stdout.take()?);
-        let err = read_some(child.stderr.take()?);
-        let (out, err, status) = tokio::join!(out, err, child.wait());
-        if !status.ok()?.success() {
-            return None;
-        }
-        let line = version_line(tool, &out).or_else(|| version_line(tool, &err))?;
-        // The worker compares Elixir's full line, including this product name.
-        let product_label = (tool == "elixir" && line.contains(" (compiled with Erlang/OTP "))
-            .then_some("Erlang/OTP");
-        redact_with_product_label(&line, hidden, product_label)
+    let mut child = command.spawn().ok()?;
+    let out = read_some(child.stdout.take()?);
+    let err = read_some(child.stderr.take()?);
+    let (out, err, status) = tokio::join!(out, err, child.wait());
+    if !status.ok()?.success() {
+        return None;
+    }
+    let line = version_line(tool, &out).or_else(|| version_line(tool, &err))?;
+    // The worker compares Elixir's full line, including this product name, and
+    // Go's with its platform word (`go version go1.25.4 linux/amd64`).
+    let product_label = match tool {
+        "elixir" if line.contains(" (compiled with Erlang/OTP ") => Some("Erlang/OTP"),
+        "go" => go_platform(&line),
+        _ => None,
     };
-    tokio::time::timeout(limit, run).await.ok().flatten()
+    redact_with_product_label(&line, hidden, product_label)
 }
 
 /// The first [`MAX_OUTPUT_BYTES`] of `pipe`. The rest is read and dropped, so a
@@ -322,6 +350,24 @@ fn redact_with_product_label(
         .collect();
     let cleaned = hidden.hide_in(&kept.join(" "));
     (!cleaned.is_empty()).then(|| cleaned.chars().take(MAX_LINE_CHARS).collect())
+}
+
+/// The `os/arch` word that ends `go version`'s line, when it is only that:
+/// two words of lowercase letters and digits around one slash, never a path.
+fn go_platform(line: &str) -> Option<&str> {
+    if !line.starts_with("go version go") {
+        return None;
+    }
+    let last = line.split_whitespace().last()?;
+    let (os, arch) = last.split_once('/')?;
+    let plain = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 16
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    };
+    (plain(os) && plain(arch)).then_some(last)
 }
 
 /// Whether a word of a version line names a place on a disk or a server.

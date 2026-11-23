@@ -100,14 +100,16 @@ If the worker declines the check, `run` runs the command on your machine.
   graph to choose checks. It widens the run for changes such as lockfiles,
   migrations, auth code, shared fixtures or configuration, and when the graph
   finds broad impact or cannot map the changes to tests. Ask for `scope="full"`
-  to run the full suite before completing a task. Checks run remotely when
-  available, with a local fallback. To choose checks by directory, open
-  **Verification Map** in the workspace's **Capsules** panel. Saved rules take
-  effect on the next targeted call and the panel flags stale rules.
+  to run the full detected suite before completing a task. Checks run remotely
+  when available, with a local fallback, and stop at the first failure. To
+  choose checks by directory, open **Verification Map** in the workspace's
+  **Capsules** panel. The next targeted plan uses the most specific matching
+  rules alongside the graph's checks. The panel flags stale rules.
 - **Check more commands in one run.** Supported `&&` chains use one checkout
   upload and stop on the first failure. The MCP reports stages as they run
   when the client supplies a progress token. Try
-  `npx prisma generate && npx tsc --noEmit` or
+  `npx prisma generate && npx tsc --noEmit`,
+  `npx next typegen && npx tsc --noEmit` or
   `npx svelte-kit sync && npx svelte-check`. Checks also cover tools such as
   `tsgo`, Oxlint, Oxfmt in check mode, `vue-tsc --noEmit`, `astro check`,
   `ty check`, Pyrefly, Basedpyright, `cargo fmt --check` and `go tool staticcheck`.
@@ -118,13 +120,13 @@ If the worker declines the check, `run` runs the command on your machine.
 - **See what broke.** When base-tree results are available, failure diagnostics
   put new failures ahead of existing ones. The report can cite a matching
   lesson, decision or commit.
-- **Check consumers of a shared contract.** After a successful hosted MCP
-  `check`, ContextStream can check affected, indexed projects in the same
-  workspace. It applies eligible changed contract files to each reachable
-  consumer's default branch in the worker and returns compiler errors with
-  your result. The worker needs the consumer's default-branch tree from a
-  previous check. A consumer whose change cannot be applied is reported as
-  unverified.
+- **Check consumers of a shared contract.** After a successful remote
+  `check` from a local MCP session, ContextStream can check indexed consumers
+  in the same workspace. It applies eligible changed contract files to each
+  reachable consumer's default branch in the worker and returns compiler
+  errors with your result. The worker needs the consumer's default-branch
+  tree from a previous check. A consumer whose change cannot be applied is
+  reported as unverified.
 - **Prepare before the first check.** Supported local editor hooks can send a
   free `:prepare` call in the background to set up the worker's checkout and
   dependencies. A busy worker or failed preparation leaves the next check to

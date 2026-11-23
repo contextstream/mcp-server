@@ -32,8 +32,8 @@ The local `verify` tool asks the hosted planner for graph-selected and
 verification-map checks. It can execute planned commands through `check` or
 fall back to local execution. After an eligible MCP `check`, the client can
 request consumer contract checks. The API resolves the consumers and supplies
-the worker requests. Those streams carry the mapped contract changes, and the
-worker supplies the consumer's base tree.
+the worker requests. Those streams carry the mapped contract changes. The
+consumer's base tree must already be available on the worker.
 
 The hosted API verifies signed usage reports and stores eligible passing
 receipts. Local editor hooks query policy and receipts before supported actions.

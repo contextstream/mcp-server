@@ -66,6 +66,7 @@ counts and withheld path names and reasons.
 `CONTEXTSTREAM_CHECKOUT_SNAPSHOT=off` stops snapshots. You can also commit
 `"checkout_snapshot": false` in `.contextstream/config.json`, or restrict
 eligible repositories with `CONTEXTSTREAM_CHECKOUT_SNAPSHOT_REPOS`.
+Gate lookups can still send the tree ID calculated locally.
 
 ### Tool calls and environment
 
@@ -86,6 +87,14 @@ stays local. By default the stream also includes the OS and CPU architecture,
 CPU count, whether the process runs as root, the time zone and up to 32 tool
 versions. `CONTEXTSTREAM_HOSTED_ENV=off` removes that description and skips
 the probes. Forwarding requested environment variables uses its own filter.
+
+The standard request can ask for `NODE_OPTIONS`, `NODE_ENV`, `TZ`, `LANG`,
+`LC_ALL`, `LC_COLLATE`, `LC_MESSAGES`, `LC_NUMERIC`, `LC_TIME`, `LC_MONETARY`,
+`CI`, `FORCE_COLOR`, `NO_COLOR`, `TERM`, `COLUMNS`, `RUST_BACKTRACE`,
+`RUSTFLAGS`, `CARGO_TERM_COLOR` and `CARGO_INCREMENTAL`. Some engines request
+additional names. These values come from the process environment when set.
+The environment description also derives the time zone from `TZ` or the
+system's zoneinfo link when available.
 
 The client probes a tool found on `PATH` outside the repository, running it
 directly in the command's folder for up to two seconds with install-suppression
@@ -118,31 +127,31 @@ metadata already received by the service.
 
 A supported session-start hook or post-edit hook can start `:prepare` in the
 background when remote checks are available. The HTTP call sends the repository
-identity, workspace ID when known, the `:prepare` request and language IDs
-inferred from local marker filenames. If the API issues a stream, the client
-sends a checkout snapshot with the current changes and the usual environment
-fields described above. The worker can fetch missing base tree data over
-that stream, materialize the checkout and prepare dependencies. There is no
-check command from your session to run. Preparation costs no credits and
-failures are silent.
+identity, workspace ID when known, the `:prepare` command with the preparation
+flag and a five-second worker wait, and language IDs inferred from local
+marker filenames. If the API issues a stream, the client sends a checkout
+snapshot with the current changes and the usual environment fields described
+above. The worker can fetch missing base tree data over that stream,
+materialize the checkout and prepare dependencies. Preparation costs no
+credits and failures are silent.
 
-Opted-in speculative checks start after a successful edit reported by the
-post-tool hook and a debounce period. The snapshot is of the checkout at that
+Opted-in speculative checks start after the post-tool hook sees a successful
+edit and the debounce period elapses. The snapshot is of the checkout at that
 point, so it can include other uncommitted changes. When a workspace is
 configured, the planner receives its ID, the project ID when configured, the
 repository key, up to 128 repository-relative changed or deleted paths from
 the snapshot, and targeted scope. The client sends no file contents to the
 planner. A background check admitted to run sends the selected command,
 working directory when applicable, speculative flag and credit limit, local
-opt-in when used, repository identity and workspace scope. Each check then
-uses the normal snapshot and environment stream. The local credit limits
-control execution. The planning request can still happen when those limits
-have been reached.
+opt-in when used, a one-second worker wait, repository identity and workspace
+scope. Each check then uses the normal snapshot and environment stream.
+The local credit limits control execution. The planning request can still
+happen when those limits have been reached.
 
 ### Contract checks
 
-After a successful hosted MCP `check` with recorded changes and a workspace,
-the client can make a second request to
+After a successful remote `check` from a local MCP session with recorded
+changes and a workspace, the client can make a second request to
 `POST /api/v1/mcp/hosted-tools/contract-check`. The request carries the workspace
 ID, the session's project ID when known, the checkout folder name and origin
 digest, and up to 200 distinct repository-relative paths from the snapshot.

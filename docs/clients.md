@@ -124,6 +124,14 @@ in an existing checkout, run `contextstream-mcp git-hooks` there. It
 preserves any existing user hooks. When a receipt is missing, the gate
 reports the check to run before you retry.
 
+Set the policy through `GET` and `PUT /api/v1/mcp/hosted-tools/gate-policy`.
+Include `workspace_id`, `project_id` or both. Use query parameters for reads
+and a JSON body for writes. A project policy can override its workspace's. Set
+`require_verified_tree_before_push`, `require_verified_tree_before_pr` or
+`require_verified_tree_before_complete` to turn on a gate. The policy can
+set `required_command_families` and change the receipt age limit with
+`receipt_ttl_secs`, which defaults to 24 hours.
+
 [What remote checks and verification send](data-handling.md#remote-checks-and-verification).
 
 ## One-click install

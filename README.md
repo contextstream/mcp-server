@@ -142,13 +142,13 @@ If the worker declines the check, `run` runs the command on your machine.
   credits per account per hour in addition to the client's limits below.
   Explicit checks can still run when the speculative budget is spent.
 - **Require a passing receipt.** Workspace owners and admins can set a gate
-  for pushes, pull-request creation or completion through
-  `GET` and `PUT /api/v1/mcp/hosted-tools/gate-policy`. Gates start off.
-  Set `required_command_families` to require specific checks. An enabled
-  gate names what is missing when the exact Git tree lacks a fresh passing
-  receipt. Git's managed `pre-push` hook checks the trees being pushed,
-  including from a terminal. Setup installs the hook where Git capture
-  is enabled. [How the hooks apply gates](docs/clients.md#remote-checks-and-verification-hooks).
+  for pushes, pull-request creation or completion through the API.
+  Gates start off.
+  The policy can require specific check families. An enabled gate names
+  what is missing when the exact Git tree lacks a fresh passing receipt.
+  Git's managed `pre-push` hook checks the trees being pushed, including
+  from a terminal. Setup installs it where Git capture is enabled.
+  [Set up verification gates](docs/clients.md#remote-checks-and-verification-hooks).
 
 ### Remote check environment variables
 

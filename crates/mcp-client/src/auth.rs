@@ -66,10 +66,26 @@ fn api_url() -> String {
         .unwrap_or_else(|_| "https://api.contextstream.io".to_string())
 }
 
+/// MachineStream starts the same device grant as other clients. Only its browser
+/// approval page changes, and only for the hosted API that issued the code.
+fn device_approval_url(api: &str, portal: Option<&str>, response: &DeviceLoginResponse) -> String {
+    if api.trim_end_matches('/') == "https://api.contextstream.io"
+        && portal == Some("machinestream")
+    {
+        format!(
+            "https://console.machinestream.io/device?user_code={}",
+            urlencoding::encode(&response.user_code)
+        )
+    } else {
+        response.verification_uri.clone()
+    }
+}
+
 /// Start device login flow.
 pub async fn start_device_login() -> Result<DeviceLoginResponse> {
     let client = crate::http::client();
-    let url = format!("{}/api/v1/auth/device/start", api_url());
+    let api = api_url();
+    let url = format!("{api}/api/v1/auth/device/start");
 
     let response = client
         .post(&url)
@@ -89,7 +105,12 @@ pub async fn start_device_login() -> Result<DeviceLoginResponse> {
         ));
     }
 
-    let device_response: DeviceLoginResponse = response.json().await?;
+    let mut device_response: DeviceLoginResponse = response.json().await?;
+    device_response.verification_uri = device_approval_url(
+        &api,
+        std::env::var("CONTEXTSTREAM_DEVICE_PORTAL").ok().as_deref(),
+        &device_response,
+    );
     Ok(device_response)
 }
 
@@ -527,5 +548,39 @@ mod tests {
     #[test]
     fn test_default_expires_in() {
         assert_eq!(default_expires_in(), 600);
+    }
+}
+
+#[cfg(test)]
+mod device_portal_tests {
+    use super::*;
+
+    #[test]
+    fn only_machinestream_setup_on_the_hosted_api_opens_its_console() {
+        let response = DeviceLoginResponse {
+            device_code: "private-device-code".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: "https://contextstream.io/device".into(),
+            interval: 5,
+            expires_in: 600,
+        };
+        assert_eq!(
+            device_approval_url(
+                "https://api.contextstream.io",
+                Some("machinestream"),
+                &response
+            ),
+            "https://console.machinestream.io/device?user_code=ABCD-EFGH"
+        );
+        for (api, portal) in [
+            ("https://api.contextstream.io", None),
+            ("https://api.contextstream.io", Some("unrecognized")),
+            ("https://self-hosted.example", Some("machinestream")),
+        ] {
+            assert_eq!(
+                device_approval_url(api, portal, &response),
+                response.verification_uri
+            );
+        }
     }
 }

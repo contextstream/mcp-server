@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.96
+
+- Setup started from MachineStream opens the terminal approval in the MachineStream console. The console shows the same code as the terminal and uses the account already signed in there.
+
 ## 1.0.95
 
 - `verify` (also `ms_verify`) picks the checks an edit needs from the project graph, and widens to the full suite for lockfiles, migrations and auth code, and when a task completes.

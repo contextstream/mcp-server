@@ -85,6 +85,7 @@ const TOOL_NAMES: &[&str] = &[
     "session",
     "memory",
     "graph",
+    "graph_read",
     "workspace",
     "project",
     "integration",
@@ -380,19 +381,26 @@ const PROJECT_SCOPE_GUIDANCE: &str = r#"## Project Scope Discipline
 - See or change links with `workspace(action="sharing")`, `workspace(action="share", with="<name or id>")` (both ways by default; `direction="use"` or `"share"` for one way; `include_code=false` leaves code out) and `workspace(action="unshare", with="...")`. Linking takes an owner or admin of both workspaces.
 "#;
 
-/// Shared guidance for Code Health / graph quality workflows.
+/// Shared guidance for Code Health, Knowledge Graph, and Entity Spine workflows.
 const GRAPH_QUALITY_GUIDANCE: &str = r#"## Code Health and Dependency Recommendations
 
-When the user asks about code quality, dependency risk, circular dependencies, unused code, complexity, dashboard scans, or whether prior dashboard analysis can guide work, use the `graph` tool before guessing from source alone:
+Prefer **`graph_read`** (read-only, zero confirmation) for all graph queries; use **`graph`** only for mutations (`ingest`, `quality_snapshot`, `entity_upsert`, `relation_upsert`, `event_ingest`, `schema_upsert`, `install_domain_pack`).
 
-- Dashboard freshness/cache state → `graph(action="quality_freshness", project_id="...")`
-- Trend counts over time → `graph(action="quality_trends", project_id="...", limit=30)`
-- Saved scan/run lifecycle → `graph(action="quality_history", project_id="...", limit=18)`
-- Circular dependencies → `graph(action="circular_dependencies", project_id="...", limit=50)`
-- Unused code → `graph(action="unused_code", project_id="...", limit=200, element_type="Function|Type|Module|Variable")`
-- Complexity and long functions → `graph(action="complexity_metrics", project_id="...", limit=20)`
-- Module/function dependency blast radius → `graph(action="dependencies", target_type="module|function|type|variable", target_id="...")`
+### Code Structure, Blast Radius & Health (`graph_read`)
+When asking about dependencies, refactor blast radius, covering tests, linked decisions, retired-value code drift, circular dependencies, unused code, complexity, or dashboard scans, use `graph_read` before guessing from source alone:
+- Module/function blast radius & covering tests → `graph_read(action="impact", target_type="module|function|type|variable", target_id="...")`
+- Imports/callers/dependencies & usages → `graph_read(action="dependencies"|"usages"|"call_path"|"related", ...)`
+- Decisions/lessons tied to a file or module → `graph_read(action="decisions", target_id="<file_path>")`
+- Retired values still present in code → `graph_read(action="code_drift", project_id="...")`
+- Dashboard freshness/cache, trends, history → `graph_read(action="quality_freshness"|"quality_trends"|"quality_history", project_id="...")`
+- Circular dependencies, unused code, complexity → `graph_read(action="circular_dependencies"|"unused_code"|"complexity_metrics", project_id="...")`
 - Save a fresh dashboard baseline after scans/fixes → `graph(action="quality_snapshot", project_id="...")`
+
+### Cross-Artifact Lineage, Pre-Meeting Briefs & Universal Ripple (`graph_read`)
+- Feature/initiative lineage (OKR ↔ PRD ↔ Design ↔ Ticket ↔ Code ↔ Experiment ↔ Release) + drift detection → `graph_read(action="lineage", query="...", workspace_id="<current_workspace_id>")`
+- Proactive pre-meeting context brief (open commitments, risks, blocked tickets, decisions, at-risk OKRs) → `graph_read(action="meeting_brief", title="...", workspace_id="<current_workspace_id>")`
+- Multi-hop cross-entity & cross-workspace ripple impact → `graph_read(action="universal_impact", query="...", include_code=true, workspace_id="<current_workspace_id>")`
+- Search canonical Entity Spine records → `graph_read(action="entity_search", query="...", workspace_id="<current_workspace_id>")`
 
 Use the returned `recommendations` field and text summary to propose next steps. If results show non-zero cycles, unused code, complexity, regressions, or missing caches, recommend a small tracked plan/ticket set before editing. If results are clean, mention the clean baseline and suggest recording/refreshing snapshots only when useful.
 "#;
@@ -3504,6 +3512,11 @@ mod tests {
         assert!(rules.contains(mcp_types::HARNESS_TEACHING_VERSION));
         assert!(rules.contains("session(action=\"ground\", user_message=\"...\")"));
         assert!(rules.contains("Code Health and Dependency Recommendations"));
+        assert!(rules.contains("mcp__contextstream__graph_read"));
+        assert!(rules.contains("lineage"));
+        assert!(rules.contains("meeting_brief"));
+        assert!(rules.contains("universal_impact"));
+        assert!(rules.contains("entity_search"));
         assert!(rules.contains("quality_trends"));
         assert!(rules.contains("Do NOT save plans this way"));
         assert!(rules.contains("event_type=\"plan\""));

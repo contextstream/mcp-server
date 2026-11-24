@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.100
+
+- `context()` keeps a new `[GRAPH_SIGNALS]` block on warm-cache and delta turns, instead of dropping it when the rest of the context is unchanged. A block already shown is not repeated.
+- The pre-edit Edit Safety Card (PreToolUse hook) adds the file's hotspot risk score and tier, open code drift on the file (retired values with line numbers), files that usually change with it (co-change peers) and its owners. Signal text is sanitized so it cannot inject bracketed instruction tags.
+
 ## 1.0.99
 
 - Code search results now show a `[GRAPH_SIGNALS]` block when the server flags high-risk files among the matches (hotspots, open code drift, untested hubs): up to four sanitized lines with kind, severity, file and summary, and a pointer to `graph_read` (`hotspots`, `code_drift`, `impact`, `pr_brief`) before editing. Additive; older API versions that send no signals render as before.

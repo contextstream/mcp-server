@@ -866,6 +866,11 @@ pub struct GraphInput {
     // PR Graph Brief fields
     pub changed_files: Option<Vec<String>>,
     pub pull_number: Option<i64>,
+    // Contradiction resolution fields (resolve_contradiction)
+    pub relation_id: Option<String>,
+    pub resolution: Option<String>,
+    pub reason: Option<String>,
+    pub trigger_drift_scan: Option<bool>,
 }
 
 /// Unified graph tool handler.
@@ -2764,14 +2769,64 @@ impl GraphTool {
                 .await?;
                 let result = self
                     .client
-                    .graph_contradictions(node_id, scope.workspace_id, input.limit)
+                    .graph_contradictions(node_id, scope.workspace_id, scope.project_id, input.limit)
                     .await?;
-                let contradictions = result.get("contradictions").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                let text = if contradictions > 0 {
-                    format!("Found {} potential contradictions.", contradictions)
-                } else {
-                    "No contradictions found.".to_string()
-                };
+                let text = format_contradictions_text(&result);
+                let mut output = ToolResult::with_structured(text, result);
+                if let Some(note) = scope.note.as_deref() {
+                    output = output.with_prefix(format!("{}\n", note));
+                }
+                Ok(output)
+            }
+            "resolve_contradiction" => {
+                let relation_id = input
+                    .relation_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        Error::Validation(
+                            "relation_id (UUID) is required for resolve_contradiction".to_string(),
+                        )
+                    })
+                    .and_then(|s| {
+                        Uuid::parse_str(s).map_err(|_| {
+                            Error::Validation("relation_id must be a valid UUID".to_string())
+                        })
+                    })?;
+                let resolution = input
+                    .resolution
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+                if !matches!(
+                    resolution.as_str(),
+                    "supersede_older" | "supersede_newer" | "dismiss"
+                ) {
+                    return Err(Error::Validation(
+                        "resolution is required for resolve_contradiction and must be one of: supersede_older, supersede_newer, dismiss".to_string(),
+                    ));
+                }
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let result = self
+                    .client
+                    .graph_resolve_contradiction(
+                        scope.workspace_id,
+                        scope.project_id,
+                        relation_id,
+                        &resolution,
+                        input.reason.as_deref(),
+                        input.trigger_drift_scan,
+                    )
+                    .await?;
+                let text = format_resolve_contradiction_text(&result);
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note.as_deref() {
                     output = output.with_prefix(format!("{}\n", note));
@@ -2801,15 +2856,7 @@ impl GraphTool {
                         input.limit,
                     )
                     .await?;
-                let count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-                let text = if count > 0 {
-                    format!(
-                        "Found {} stale code reference(s) to retired knowledge.",
-                        count
-                    )
-                } else {
-                    "No knowledge-code drift found.".to_string()
-                };
+                let text = format_code_drift_text(&result);
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note.as_deref() {
                     output = output.with_prefix(format!("{}\n", note));
@@ -3726,6 +3773,7 @@ impl ToolHandler for GraphTool {
             "health_digest",
             "pr_brief",
             "hotspots",
+            "resolve_contradiction",
             "entity_upsert",
             "relation_upsert",
             "event_ingest",
@@ -3864,6 +3912,10 @@ impl ToolHandler for GraphTool {
             .boolean("include_linked_workspaces", "Include ACL-checked linked workspaces (universal_impact)", false)
             .array("changed_files", "Repository-relative changed file paths (pr_brief)", "string", false)
             .integer("pull_number", "Optional pull request number for header metadata (pr_brief)", false)
+            .uuid("relation_id", "Contradiction relation UUID (resolve_contradiction)", false)
+            .string("resolution", "Contradiction resolution: supersede_older, supersede_newer, or dismiss (resolve_contradiction)", false)
+            .string("reason", "Optional reason for contradiction resolution (resolve_contradiction)", false)
+            .boolean("trigger_drift_scan", "Whether to trigger an incremental code-drift scan after supersede (resolve_contradiction, default true)", false)
             .build()
     }
 }
@@ -4088,6 +4140,199 @@ pub(crate) fn format_health_digest_text(result: &Value) -> String {
         }
     }
     text
+}
+
+/// Format workspace-wide or single-node `graph_read(action="contradictions")` output
+/// with decision/constraint/lesson priority, summaries, confidence, and `relation_id`s.
+pub(crate) fn format_contradictions_text(result: &Value) -> String {
+    let items: Option<&Vec<Value>> = result
+        .get("contradictions")
+        .and_then(Value::as_array)
+        .or_else(|| result.as_array());
+    let open_count = result
+        .get("open_count")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| items.map_or(0, |v| v.len() as i64));
+    let hp_count = result
+        .get("high_priority_count")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+
+    let Some(list) = items.filter(|v| !v.is_empty()) else {
+        if open_count > 0 {
+            return format!("Found {open_count} active contradiction(s).");
+        }
+        return "No active knowledge contradictions found.".to_string();
+    };
+
+    let hp_note = if hp_count > 0 {
+        format!(" ({hp_count} decision/constraint/lesson priority)")
+    } else {
+        String::new()
+    };
+    let mut text = format!(
+        "Active knowledge contradictions: {open_count} open{hp_note} (showing {}):",
+        list.len().min(15)
+    );
+    let mut has_relation_id = false;
+    for item in list.iter().take(15) {
+        if let Some(rel_id) = item.get("relation_id").and_then(Value::as_str) {
+            has_relation_id = true;
+            let hp_tag = if item
+                .get("is_high_priority")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "[HIGH] "
+            } else {
+                ""
+            };
+            let a_type = item
+                .get("node_a_type")
+                .or_else(|| item.pointer("/node_a/node_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("node");
+            let a_sum = item
+                .get("node_a_summary")
+                .or_else(|| item.pointer("/node_a/summary"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let b_type = item
+                .get("node_b_type")
+                .or_else(|| item.pointer("/node_b/node_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("node");
+            let b_sum = item
+                .get("node_b_summary")
+                .or_else(|| item.pointer("/node_b/summary"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let strength = item
+                .get("strength")
+                .and_then(Value::as_f64)
+                .map(|s| format!(", strength={s:.2}"))
+                .unwrap_or_default();
+            text.push_str(&format!(
+                "\n- {hp_tag}[{a_type} vs {b_type}] \"{a_sum}\" vs \"{b_sum}\" (relation_id={rel_id}{strength})"
+            ));
+        } else {
+            let nt = item
+                .get("node_type")
+                .and_then(Value::as_str)
+                .unwrap_or("node");
+            let summary = item
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("(no summary)");
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("?");
+            text.push_str(&format!("\n- [{nt}] {summary} (node_id={id})"));
+        }
+    }
+    if has_relation_id {
+        text.push_str(
+            "\n\nResolve with: graph(action=\"resolve_contradiction\", relation_id=\"<id>\", resolution=\"supersede_older|supersede_newer|dismiss\")",
+        );
+    }
+    text
+}
+
+/// Format `graph_read(action="code_drift")` output with file paths, lines, retired values,
+/// replacements, kinds, and confidence.
+pub(crate) fn format_code_drift_text(result: &Value) -> String {
+    let findings = result
+        .get("findings")
+        .or_else(|| result.get("items"))
+        .or_else(|| result.get("drift"))
+        .and_then(Value::as_array)
+        .or_else(|| result.as_array());
+    let count = result
+        .get("count")
+        .or_else(|| result.get("total"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| findings.map_or(0, |v| v.len() as u64));
+
+    let Some(list) = findings.filter(|v| !v.is_empty()) else {
+        if count > 0 {
+            return format!("Found {count} stale code reference(s) to retired knowledge.");
+        }
+        return "No knowledge-code drift found.".to_string();
+    };
+
+    let mut text = format!(
+        "Found {count} stale code reference(s) to retired knowledge (showing {}):",
+        list.len().min(15)
+    );
+    for item in list.iter().take(15) {
+        let fp = item.get("file_path").and_then(Value::as_str).unwrap_or("?");
+        let loc = item
+            .get("line")
+            .and_then(Value::as_i64)
+            .filter(|l| *l > 0)
+            .map_or_else(|| fp.to_string(), |l| format!("{fp}:{l}"));
+        let kind = item.get("kind").and_then(Value::as_str).unwrap_or("symbol");
+        let old_v = item.get("old_value").and_then(Value::as_str).unwrap_or("?");
+        let replacement = item
+            .get("new_value")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|nv| format!(" -> `{nv}`"))
+            .unwrap_or_default();
+        let conf = item
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .map(|c| format!(" (conf {:.0}%)", c * 100.0))
+            .unwrap_or_default();
+        let summary = item
+            .get("knowledge_summary")
+            .or_else(|| item.get("decision_summary"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" — {s}"))
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "\n- [{kind}] `{loc}`: retired `{old_v}`{replacement}{conf}{summary}"
+        ));
+    }
+    text
+}
+
+/// Format `graph(action="resolve_contradiction")` confirmation output.
+pub(crate) fn format_resolve_contradiction_text(result: &Value) -> String {
+    let action = result
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("resolved");
+    let rel_id = result
+        .get("relation_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    if action == "dismiss" {
+        return format!("Dismissed contradiction relation {rel_id}.");
+    }
+    let superseded = result
+        .get("superseded_node_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let retained = result
+        .get("retained_node_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let stamped = result
+        .get("stamped_event_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let drift_note = if result
+        .get("drift_scan_triggered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        " Incremental code-drift scan queued."
+    } else {
+        ""
+    };
+    format!(
+        "Resolved contradiction {rel_id} ({action}): superseded {superseded}, retained {retained}, stamped {stamped} source event(s).{drift_note}"
+    )
 }
 
 /// Register all graph tools.

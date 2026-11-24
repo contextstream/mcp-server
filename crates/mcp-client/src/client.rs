@@ -16945,17 +16945,91 @@ impl ContextStreamClient {
     }
 
     /// Find contradictions in decisions.
+    /// When `node_id` is provided, queries `GET /graph/knowledge/contradictions/{node_id}`.
+    /// When `node_id` is omitted, queries `POST /graph/contradictions` for workspace/project-wide
+    /// decision-priority contradictions.
     pub async fn graph_contradictions(
         &self,
         node_id: Option<Uuid>,
-        _workspace_id: Option<Uuid>,
-        _limit: Option<i64>,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        limit: Option<i64>,
     ) -> Result<serde_json::Value> {
-        let node_id = node_id.ok_or_else(|| {
-            Error::Validation("node_id is required for contradictions".to_string())
-        })?;
-        self.get(&format!("/graph/knowledge/contradictions/{}", node_id))
+        if let Some(node_id) = node_id {
+            return self
+                .get(&format!("/graph/knowledge/contradictions/{}", node_id))
+                .await;
+        }
+        let mut body = serde_json::Map::new();
+        if let Some(ws) = workspace_id {
+            body.insert(
+                "workspace_id".to_string(),
+                serde_json::Value::String(ws.to_string()),
+            );
+        }
+        if let Some(pid) = project_id {
+            body.insert(
+                "project_id".to_string(),
+                serde_json::Value::String(pid.to_string()),
+            );
+        }
+        if let Some(l) = limit {
+            body.insert("limit".to_string(), serde_json::Value::Number(l.into()));
+        }
+        self.post("/graph/contradictions", serde_json::Value::Object(body))
             .await
+    }
+
+    /// Resolve an active knowledge contradiction relation by superseding the older or newer
+    /// node (cascading into source-event retirement and incremental code-drift scan) or
+    /// dismissing a false positive.
+    pub async fn graph_resolve_contradiction(
+        &self,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        relation_id: Uuid,
+        resolution: &str,
+        reason: Option<&str>,
+        trigger_drift_scan: Option<bool>,
+    ) -> Result<serde_json::Value> {
+        let mut body = serde_json::Map::new();
+        if let Some(ws) = workspace_id {
+            body.insert(
+                "workspace_id".to_string(),
+                serde_json::Value::String(ws.to_string()),
+            );
+        }
+        if let Some(pid) = project_id {
+            body.insert(
+                "project_id".to_string(),
+                serde_json::Value::String(pid.to_string()),
+            );
+        }
+        body.insert(
+            "relation_id".to_string(),
+            serde_json::Value::String(relation_id.to_string()),
+        );
+        body.insert(
+            "action".to_string(),
+            serde_json::Value::String(resolution.to_string()),
+        );
+        if let Some(r) = reason.map(str::trim).filter(|s| !s.is_empty()) {
+            body.insert(
+                "reason".to_string(),
+                serde_json::Value::String(r.to_string()),
+            );
+        }
+        if let Some(trigger) = trigger_drift_scan {
+            body.insert(
+                "trigger_drift_scan".to_string(),
+                serde_json::Value::Bool(trigger),
+            );
+        }
+        self.post(
+            "/graph/contradictions/resolve",
+            serde_json::Value::Object(body),
+        )
+        .await
     }
 
     /// Find code that still references retired (superseded) knowledge.

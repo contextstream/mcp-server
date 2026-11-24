@@ -1247,3 +1247,68 @@ fn format_health_digest_renders_priority_contradictions() {
     assert!(text.contains("Active contradictions (2 open, 1 decision/constraint/lesson priority):"));
     assert!(text.contains("[decision vs decision] \"Use Redis pubsub\" vs \"Use Postgres LISTEN/NOTIFY\" (relation_id=rel-1)"));
 }
+
+#[test]
+fn format_contradictions_renders_workspace_pairs_and_resolution_hint() {
+    let payload = json!({
+        "open_count": 3,
+        "high_priority_count": 2,
+        "contradictions": [
+            {
+                "relation_id": "rel-abc",
+                "strength": 0.91,
+                "is_high_priority": true,
+                "node_a_type": "decision",
+                "node_a_summary": "Keep Qdrant for code search",
+                "node_b_type": "decision",
+                "node_b_summary": "Migrate code search to PG18"
+            }
+        ]
+    });
+    let text = format_contradictions_text(&payload);
+    assert!(text.contains(
+        "Active knowledge contradictions: 3 open (2 decision/constraint/lesson priority)"
+    ));
+    assert!(text.contains("[HIGH] [decision vs decision] \"Keep Qdrant for code search\" vs \"Migrate code search to PG18\" (relation_id=rel-abc, strength=0.91)"));
+    assert!(text.contains("graph(action=\"resolve_contradiction\""));
+}
+
+#[test]
+fn format_code_drift_renders_file_locations_and_replacements() {
+    let payload = json!({
+        "count": 1,
+        "findings": [
+            {
+                "file_path": "src/config.rs",
+                "line": 88,
+                "kind": "env_var",
+                "old_value": "LEGACY_BROKER_URL",
+                "new_value": "PRIMARY_BROKER_URL",
+                "confidence": 0.92,
+                "knowledge_summary": "Retire legacy broker URL"
+            }
+        ]
+    });
+    let text = format_code_drift_text(&payload);
+    assert!(text.contains("Found 1 stale code reference(s) to retired knowledge"));
+    assert!(text.contains("[env_var] `src/config.rs:88`: retired `LEGACY_BROKER_URL` -> `PRIMARY_BROKER_URL` (conf 92%) — Retire legacy broker URL"));
+}
+
+#[test]
+fn format_resolve_contradiction_summarizes_supersede_and_dismiss() {
+    let sup = json!({
+        "relation_id": "rel-1",
+        "action": "supersede_older",
+        "superseded_node_id": "node-old",
+        "retained_node_id": "node-new",
+        "stamped_event_count": 2,
+        "drift_scan_triggered": true
+    });
+    let text = format_resolve_contradiction_text(&sup);
+    assert!(text.contains("Resolved contradiction rel-1 (supersede_older): superseded node-old, retained node-new, stamped 2 source event(s). Incremental code-drift scan queued."));
+    let dismiss = json!({"relation_id": "rel-2", "action": "dismiss"});
+    assert_eq!(
+        format_resolve_contradiction_text(&dismiss),
+        "Dismissed contradiction relation rel-2."
+    );
+}

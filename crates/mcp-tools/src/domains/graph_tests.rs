@@ -1259,7 +1259,7 @@ fn format_contradictions_renders_workspace_pairs_and_resolution_hint() {
                 "strength": 0.91,
                 "is_high_priority": true,
                 "node_a_type": "decision",
-                "node_a_summary": "Keep Qdrant for code search",
+                "node_a_summary": "Keep the current index for code search",
                 "node_b_type": "decision",
                 "node_b_summary": "Migrate code search to PG18"
             }
@@ -1269,7 +1269,7 @@ fn format_contradictions_renders_workspace_pairs_and_resolution_hint() {
     assert!(text.contains(
         "Active knowledge contradictions: 3 open (2 decision/constraint/lesson priority)"
     ));
-    assert!(text.contains("[HIGH] [decision vs decision] \"Keep Qdrant for code search\" vs \"Migrate code search to PG18\" (relation_id=rel-abc, strength=0.91)"));
+    assert!(text.contains("[HIGH] [decision vs decision] \"Keep the current index for code search\" vs \"Migrate code search to PG18\" (relation_id=rel-abc, strength=0.91)"));
     assert!(text.contains("graph(action=\"resolve_contradiction\""));
 }
 

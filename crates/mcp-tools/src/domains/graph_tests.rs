@@ -1191,3 +1191,59 @@ fn graph_tool_schema_exposes_pr_brief_and_changed_files() {
         "expected pull_number property in graph schema"
     );
 }
+
+#[test]
+fn format_impact_analysis_renders_wave8_enrichment_fields() {
+    let payload = json!({
+        "directly_affected": 4,
+        "affected_modules": ["src/checkout.rs"],
+        "affected_functions": ["charge_card"],
+        "risk_level": "High",
+        "hotspot_risk_score": 76.4,
+        "hotspot_risk_tier": "critical",
+        "open_code_drift": [
+            {"line": 42, "old_value": "LEGACY_URL", "new_value": "PRIMARY_URL", "kind": "env_var"}
+        ],
+        "co_change_peers": [
+            {"file_path": "src/refund.rs", "co_change_count": 7}
+        ],
+        "owners": ["@payments-team", "alice"],
+        "covering_tests": ["tests/billing_test.rs"],
+        "cross_service_edges": [
+            {"direction": "out", "call_type": "event", "via": "order.paid", "peer_name": "notify"}
+        ],
+        "linked_knowledge": [
+            {"node_type": "decision", "summary": "Always pass idempotency key"}
+        ]
+    });
+    let text = format_impact_analysis_text("src/charge.rs", &payload);
+    assert!(text.contains("Hotspot risk: critical (76/100)"));
+    assert!(text.contains("L42: retired `LEGACY_URL` -> `PRIMARY_URL`"));
+    assert!(text.contains("- src/refund.rs (7x)"));
+    assert!(text.contains("Owners (OWNED_BY): @payments-team, alice"));
+    assert!(text.contains("Covering tests (TESTED_BY): tests/billing_test.rs"));
+    assert!(text.contains("out event:order.paid -> notify"));
+    assert!(text.contains("[decision] Always pass idempotency key"));
+}
+
+#[test]
+fn format_health_digest_renders_priority_contradictions() {
+    let payload = json!({
+        "headline": "2 active knowledge contradictions need review.",
+        "highlights": ["2 active knowledge contradictions awaiting triage."],
+        "active_contradictions": {
+            "open_count": 2,
+            "high_priority_count": 1,
+            "top_pairs": [
+                {
+                    "relation_id": "rel-1",
+                    "node_a": {"node_type": "decision", "summary": "Use Redis pubsub"},
+                    "node_b": {"node_type": "decision", "summary": "Use Postgres LISTEN/NOTIFY"}
+                }
+            ]
+        }
+    });
+    let text = format_health_digest_text(&payload);
+    assert!(text.contains("Active contradictions (2 open, 1 decision/constraint/lesson priority):"));
+    assert!(text.contains("[decision vs decision] \"Use Redis pubsub\" vs \"Use Postgres LISTEN/NOTIFY\" (relation_id=rel-1)"));
+}

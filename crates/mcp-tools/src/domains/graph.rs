@@ -715,67 +715,7 @@ impl ToolHandler for GraphImpactTool {
         };
         let _ = (cache_hit, cache_age_ms); // markers stamped into envelope below
 
-        let directly_affected = result
-            .get("directly_affected")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let affected_functions = result
-            .get("affected_functions")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        let affected_modules = result
-            .get("affected_modules")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-
-        let risk_level = result
-            .get("risk_level")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-
-        let mut text = format!(
-            "Impact analysis for \"{}\":\n\
-             Risk level: {}\n\
-             directly affected: {}\n\
-             affected modules: {}\n\
-             affected functions: {}\n\n",
-            input.target_id, risk_level, directly_affected, affected_modules, affected_functions
-        );
-
-        if let Some(modules) = result.get("affected_modules").and_then(|v| v.as_array()) {
-            if !modules.is_empty() {
-                text.push_str("Affected modules:\n");
-                for (i, item) in modules.iter().take(10).enumerate() {
-                    let path = item.as_str().unwrap_or("Unknown");
-                    text.push_str(&format!("{}. {}\n", i + 1, path));
-                }
-            }
-        }
-        if let Some(functions) = result.get("affected_functions").and_then(|v| v.as_array()) {
-            if !functions.is_empty() {
-                text.push_str("\nAffected functions:\n");
-                for (i, item) in functions.iter().take(10).enumerate() {
-                    let name = item.as_str().unwrap_or("Unknown");
-                    text.push_str(&format!("{}. {}\n", i + 1, name));
-                }
-            }
-        }
-
-        if let Some(knowledge) = result.get("linked_knowledge").and_then(|v| v.as_array()) {
-            if !knowledge.is_empty() {
-                text.push_str("\nWhy it is this way (team knowledge that refers to it):\n");
-                for (i, item) in knowledge.iter().take(10).enumerate() {
-                    let node_type = item
-                        .get("node_type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("note");
-                    let summary = item.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-                    text.push_str(&format!("{}. [{}] {}\n", i + 1, node_type, summary));
-                }
-            }
-        }
+        let text = format_impact_analysis_text(&input.target_id, &result);
 
         // A8b: stamp warm-cache provenance on the structured envelope
         // without changing the response shape clients consume.
@@ -3232,20 +3172,10 @@ impl GraphTool {
                     "project_id": scope.project_id,
                     "drift_limit": input.limit,
                     "hotspot_limit": input.limit,
+                    "contradiction_limit": input.limit,
                 });
                 let result: Value = self.client.post("/graph/health-digest", body).await?;
-                let headline = result
-                    .get("headline")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Graph & decision health digest generated.");
-                let mut text = headline.to_string();
-                if let Some(arr) = result.get("highlights").and_then(Value::as_array) {
-                    for h in arr.iter().take(6) {
-                        if let Some(s) = h.as_str() {
-                            text.push_str(&format!("\n- {}", s));
-                        }
-                    }
-                }
+                let text = format_health_digest_text(&result);
                 let mut output = ToolResult::with_structured(text, result);
                 if let Some(note) = scope.note.as_deref() {
                     output = output.with_prefix(format!("{}\n", note));
@@ -3936,6 +3866,228 @@ impl ToolHandler for GraphTool {
             .integer("pull_number", "Optional pull request number for header metadata (pr_brief)", false)
             .build()
     }
+}
+
+/// Format enriched `graph_read(action="impact")` output including Wave 7-8
+/// hotspot risk, open retired-decision code drift, co-change peers, owners,
+/// covering tests, cross-service contracts, and linked team knowledge.
+pub(crate) fn format_impact_analysis_text(target_id: &str, result: &Value) -> String {
+    let directly_affected = result
+        .get("directly_affected")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let affected_functions = result
+        .get("affected_functions")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let affected_modules = result
+        .get("affected_modules")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let risk_level = result
+        .get("risk_level")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    let mut text = format!(
+        "Impact analysis for \"{}\":\n\
+         Risk level: {}\n\
+         directly affected: {}\n\
+         affected modules: {}\n\
+         affected functions: {}\n",
+        target_id, risk_level, directly_affected, affected_modules, affected_functions
+    );
+
+    if let Some(score) = result.get("hotspot_risk_score").and_then(Value::as_f64) {
+        let tier = result
+            .get("hotspot_risk_tier")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("scored");
+        text.push_str(&format!("Hotspot risk: {} ({:.0}/100)\n", tier, score));
+    }
+    text.push('\n');
+
+    if let Some(drifts) = result.get("open_code_drift").and_then(Value::as_array) {
+        if !drifts.is_empty() {
+            text.push_str("Open retired-decision code drift:\n");
+            for d in drifts.iter().take(5) {
+                let line = d.get("line").and_then(Value::as_i64).unwrap_or(0);
+                let old_val = d.get("old_value").and_then(Value::as_str).unwrap_or("");
+                let new_val = d
+                    .get("new_value")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                let loc = if line > 0 {
+                    format!("L{line}: ")
+                } else {
+                    String::new()
+                };
+                match new_val {
+                    Some(nv) => text.push_str(&format!("- {loc}retired `{old_val}` -> `{nv}`\n")),
+                    None => text.push_str(&format!("- {loc}retired `{old_val}`\n")),
+                }
+            }
+            text.push('\n');
+        }
+    }
+
+    if let Some(modules) = result.get("affected_modules").and_then(Value::as_array) {
+        if !modules.is_empty() {
+            text.push_str("Affected modules:\n");
+            for (i, item) in modules.iter().take(10).enumerate() {
+                let path = item.as_str().unwrap_or("Unknown");
+                text.push_str(&format!("{}. {}\n", i + 1, path));
+            }
+        }
+    }
+    if let Some(functions) = result.get("affected_functions").and_then(Value::as_array) {
+        if !functions.is_empty() {
+            text.push_str("\nAffected functions:\n");
+            for (i, item) in functions.iter().take(10).enumerate() {
+                let name = item.as_str().unwrap_or("Unknown");
+                text.push_str(&format!("{}. {}\n", i + 1, name));
+            }
+        }
+    }
+
+    if let Some(peers) = result.get("co_change_peers").and_then(Value::as_array) {
+        if !peers.is_empty() {
+            text.push_str("\nCo-change peers (CO_CHANGES_WITH):\n");
+            for peer in peers.iter().take(5) {
+                let path = peer
+                    .get("file_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown");
+                let count = peer
+                    .get("co_change_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1);
+                text.push_str(&format!("- {} ({}x)\n", path, count));
+            }
+        }
+    }
+
+    if let Some(owners) = result.get("owners").and_then(Value::as_array) {
+        let names: Vec<&str> = owners.iter().filter_map(Value::as_str).take(5).collect();
+        if !names.is_empty() {
+            text.push_str(&format!("\nOwners (OWNED_BY): {}\n", names.join(", ")));
+        }
+    }
+
+    if let Some(tests) = result.get("covering_tests").and_then(Value::as_array) {
+        let paths: Vec<&str> = tests.iter().filter_map(Value::as_str).take(5).collect();
+        if !paths.is_empty() {
+            text.push_str(&format!(
+                "\nCovering tests (TESTED_BY): {}\n",
+                paths.join(", ")
+            ));
+        }
+    }
+
+    if let Some(edges) = result.get("cross_service_edges").and_then(Value::as_array) {
+        if !edges.is_empty() {
+            text.push_str("\nCross-service edges:\n");
+            for e in edges.iter().take(5) {
+                let dir = e.get("direction").and_then(Value::as_str).unwrap_or("out");
+                let call_type = e.get("call_type").and_then(Value::as_str).unwrap_or("http");
+                let via = e.get("via").and_then(Value::as_str).unwrap_or("");
+                let peer = e.get("peer_name").and_then(Value::as_str).unwrap_or("peer");
+                let arrow = if dir == "in" { "<-" } else { "->" };
+                if via.is_empty() {
+                    text.push_str(&format!("- {} {} {} {}\n", dir, call_type, arrow, peer));
+                } else {
+                    text.push_str(&format!(
+                        "- {} {}:{} {} {}\n",
+                        dir, call_type, via, arrow, peer
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(knowledge) = result.get("linked_knowledge").and_then(Value::as_array) {
+        if !knowledge.is_empty() {
+            text.push_str("\nWhy it is this way (team knowledge that refers to it):\n");
+            for (i, item) in knowledge.iter().take(10).enumerate() {
+                let node_type = item
+                    .get("node_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("note");
+                let summary = item.get("summary").and_then(Value::as_str).unwrap_or("");
+                text.push_str(&format!("{}. [{}] {}\n", i + 1, node_type, summary));
+            }
+        }
+    }
+
+    text
+}
+
+/// Format `graph_read(action="health_digest")` output including highlights and
+/// decision-prioritized active knowledge contradictions.
+pub(crate) fn format_health_digest_text(result: &Value) -> String {
+    let headline = result
+        .get("headline")
+        .and_then(Value::as_str)
+        .unwrap_or("Graph & decision health digest generated.");
+    let mut text = headline.to_string();
+    if let Some(arr) = result.get("highlights").and_then(Value::as_array) {
+        for h in arr.iter().take(6) {
+            if let Some(s) = h.as_str() {
+                text.push_str(&format!("\n- {}", s));
+            }
+        }
+    }
+    if let Some(conflicts) = result.get("active_contradictions") {
+        let open_count = conflicts
+            .get("open_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let hp_count = conflicts
+            .get("high_priority_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if let Some(pairs) = conflicts.get("top_pairs").and_then(Value::as_array) {
+            if !pairs.is_empty() {
+                let hp_note = if hp_count > 0 {
+                    format!(", {hp_count} decision/constraint/lesson priority")
+                } else {
+                    String::new()
+                };
+                text.push_str(&format!(
+                    "\n\nActive contradictions ({open_count} open{hp_note}):"
+                ));
+                for pair in pairs.iter().take(5) {
+                    let rel_id = pair
+                        .get("relation_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?");
+                    let a_type = pair
+                        .pointer("/node_a/node_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("node");
+                    let a_sum = pair
+                        .pointer("/node_a/summary")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let b_type = pair
+                        .pointer("/node_b/node_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("node");
+                    let b_sum = pair
+                        .pointer("/node_b/summary")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    text.push_str(&format!(
+                        "\n- [{a_type} vs {b_type}] \"{a_sum}\" vs \"{b_sum}\" (relation_id={rel_id})"
+                    ));
+                }
+            }
+        }
+    }
+    text
 }
 
 /// Register all graph tools.

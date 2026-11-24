@@ -2,7 +2,7 @@
 
 ## 1.0.102
 
-- `graph_read` with `action: "contradictions"` works without a `node_id`: it lists open contradictions across the workspace or project, decisions, constraints and lessons first, with their summaries, strength and relation ids. With a `node_id` it reads that node's contradictions as before. The workspace-wide list needs a ContextStream API that serves it.
+- `graph_read` with `action: "contradictions"` works without a `node_id`: it lists open contradictions across the workspace or project with their summaries, strength and relation ids, and counts and tags those that involve a decision, constraint or lesson. With a `node_id` it reads that node's contradictions as before. The workspace-wide list needs a ContextStream API that serves it.
 - `graph_read` with `action: "code_drift"` shows each drift with file and line, kind, the retired value and its replacement, confidence and the retired decision's summary.
 - `graph` adds a `resolve_contradiction` action: given a relation id, supersede the older or the newer node, or dismiss a false positive, with an optional reason and an optional drift scan afterwards. It writes, so `graph_read` refuses it.
 

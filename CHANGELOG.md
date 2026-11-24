@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.99
+
+- Code search results now show a `[GRAPH_SIGNALS]` block when the server flags high-risk files among the matches (hotspots, open code drift, untested hubs): up to four sanitized lines with kind, severity, file and summary, and a pointer to `graph_read` (`hotspots`, `code_drift`, `impact`, `pr_brief`) before editing. Additive; older API versions that send no signals render as before.
+
 ## 1.0.98
 
 - `graph` and its read-only twin `graph_read` add a `hotspots` action: risk-weighted refactoring hotspots across code and knowledge (complexity and cycles weighed by blast radius, co-change churn, missing tests, open code drift and ownership). Editor rules teach it.

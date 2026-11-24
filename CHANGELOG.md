@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.101
+
+- `graph_read` with `action: "impact"` adds the target's hotspot risk score and tier, open retired-decision code drift (with line numbers), co-change peers, owners, covering tests, cross-service edges and the team knowledge that refers to it, when the server sends them.
+- `graph_read` with `action: "health_digest"` passes `contradiction_limit` to the server and shows active contradictions: the open count, how many involve a decision, constraint or lesson, and the top pairs with their relation ids. No input schema changes.
+
 ## 1.0.100
 
 - `context()` keeps a new `[GRAPH_SIGNALS]` block on warm-cache and delta turns, instead of dropping it when the rest of the context is unchanged. A block already shown is not repeated.

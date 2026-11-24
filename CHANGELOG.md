@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.103
+
+- `graph_read` with `action: "code_drift"` reports the total number of open findings next to how many it lists ("Found N ... (showing M)"), shows each finding's id, and points to `resolve_drift` for dismissing or closing one. The total needs a ContextStream API that sends it; otherwise it counts the findings returned.
+- `graph` adds a `resolve_drift` action: given a finding id, mark a code drift finding `dismissed` (the default, for a false positive), `resolved` (fixed) or `open` again. It writes, so `graph_read` refuses it.
+
 ## 1.0.102
 
 - `graph_read` with `action: "contradictions"` works without a `node_id`: it lists open contradictions across the workspace or project with their summaries, strength and relation ids, and counts and tags those that involve a decision, constraint or lesson. With a `node_id` it reads that node's contradictions as before. The workspace-wide list needs a ContextStream API that serves it.

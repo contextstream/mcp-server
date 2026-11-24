@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.98
+
+- `graph` and its read-only twin `graph_read` add a `hotspots` action: risk-weighted refactoring hotspots across code and knowledge (complexity and cycles weighed by blast radius, co-change churn, missing tests, open code drift and ownership). Editor rules teach it.
+
 ## 1.0.97
 
 - `graph` and its read-only twin `graph_read` add three actions: `cross_project` (the workspace's dependencies across projects: shared HTTP and event contracts, entity links, knowledge shared between repositories), `health_digest` (open code drift, how well decisions are connected, circular dependencies and complexity hotspots) and `pr_brief` (for a pull request's changed files: blast radius, missing co-changes, covering tests, code drift, consumers in other repositories and reviewers by ownership). Editor rules teach them, with `graph_read` and the entity actions.

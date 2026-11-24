@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.102
+
+- `graph_read` with `action: "contradictions"` works without a `node_id`: it lists open contradictions across the workspace or project, decisions, constraints and lessons first, with their summaries, strength and relation ids. With a `node_id` it reads that node's contradictions as before. The workspace-wide list needs a ContextStream API that serves it.
+- `graph_read` with `action: "code_drift"` shows each drift with file and line, kind, the retired value and its replacement, confidence and the retired decision's summary.
+- `graph` adds a `resolve_contradiction` action: given a relation id, supersede the older or the newer node, or dismiss a false positive, with an optional reason and an optional drift scan afterwards. It writes, so `graph_read` refuses it.
+
 ## 1.0.101
 
 - `graph_read` with `action: "impact"` adds the target's hotspot risk score and tier, open retired-decision code drift (with line numbers), co-change peers, owners, covering tests and cross-service edges, when the server sends them, next to the team knowledge it already showed.

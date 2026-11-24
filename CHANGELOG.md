@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.97
+
+- `graph` and its read-only twin `graph_read` add three actions: `cross_project` (the workspace's dependencies across projects: shared HTTP and event contracts, entity links, knowledge shared between repositories), `health_digest` (open code drift, how well decisions are connected, circular dependencies and complexity hotspots) and `pr_brief` (for a pull request's changed files: blast radius, missing co-changes, covering tests, code drift, consumers in other repositories and reviewers by ownership). Editor rules teach them, with `graph_read` and the entity actions.
+- Remote checks take commands wrapped in shell (leading variables, `2>&1 | grep | head`, redirects, a trailing `; echo $PIPESTATUS`), and keep the command's exit status through `| head`.
+- In Claude Code, a check that ran remotely says so: the command's description, its output and a closing message name MachineStream. Session start mentions a missing local toolchain and prefers `cargo check`, `clippy` and `test` over `cargo build`.
+- A check answered from the cache of the exact tree says so plainly, with how long the original run took, so it is not rerun locally.
+- Concurrent workspace preparations share one run, and edits start one only when they touch a manifest, lockfile or toolchain pin.
+- `remote-checks off` on an account whose policy keeps them on explains the policy and the local `CONTEXTSTREAM_HOSTED_TOOLS=off` override, and fails instead of reporting "on".
+- `verify` is not offered over the hosted (HTTP) MCP, which cannot read local checkouts. Cursor and Codex rules show the `contextstream-mcp run -- <command>` wrapper, and setup fetches command hints.
+
 ## 1.0.96
 
 - Setup started from MachineStream opens the terminal approval in the MachineStream console. The console shows the same code as the terminal and uses the account already signed in there.

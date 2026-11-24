@@ -1039,13 +1039,18 @@ fn main() -> Result<()> {
 ///
 /// Sockets are unaffected: std and mio send with `MSG_NOSIGNAL` on Linux and
 /// set `SO_NOSIGPIPE` on Apple platforms. Must run before any thread exists.
+fn keeps_ignoring_sigpipe(command: &Option<Commands>) -> bool {
+    matches!(
+        command,
+        None | Some(
+            Commands::Http { .. } | Commands::Hook { .. } | Commands::Watch | Commands::Run { .. }
+        )
+    )
+}
+
 #[cfg(unix)]
 fn restore_default_sigpipe(command: &Option<Commands>) {
-    let keeps_ignoring = matches!(
-        command,
-        None | Some(Commands::Http { .. } | Commands::Hook { .. } | Commands::Watch)
-    );
-    if !keeps_ignoring {
+    if !keeps_ignoring_sigpipe(command) {
         // SAFETY: called from `main` before any tokio runtime or other thread
         // exists, so no signal disposition is changed under a running thread.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
@@ -1363,6 +1368,15 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
                 };
             let project =
                 remote_checks::local_languages(std::env::current_dir().ok().as_deref(), &state);
+            if let Some(notice) = state.policy_locked_off_notice(enabled) {
+                if json {
+                    let mut report = remote_checks::report(&state, project.as_ref());
+                    report["policy_locked"] = serde_json::json!(true);
+                    report["notice"] = serde_json::json!(notice);
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                anyhow::bail!("{notice}");
+            }
             if json {
                 println!(
                     "{}",
@@ -5472,5 +5486,22 @@ mod tests {
             }
             _ => panic!("expected exclude remove command"),
         }
+    }
+
+    #[test]
+    fn run_command_keeps_sigpipe_ignored_for_piped_checks() {
+        let run = Cli::try_parse_from([
+            "contextstream-mcp",
+            "run",
+            "--tool",
+            "check",
+            "--",
+            "cargo check",
+        ])
+        .unwrap();
+        assert!(keeps_ignoring_sigpipe(&run.command));
+
+        let about = Cli::try_parse_from(["contextstream-mcp", "about"]).unwrap();
+        assert!(!keeps_ignoring_sigpipe(&about.command));
     }
 }

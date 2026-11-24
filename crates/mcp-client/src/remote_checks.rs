@@ -63,6 +63,10 @@ pub struct RemoteChecks {
     pub tool: String,
     pub enabled: bool,
     pub available: bool,
+    /// True when the account is explicitly enabled on the server's policy row
+    /// (`account_ids`), so self-service `off` cannot disable it account-wide.
+    #[serde(default)]
+    pub policy_locked: bool,
     pub more_engines: Option<bool>,
     /// Omitted by older APIs (use the published price); explicitly null for free checks.
     #[serde(default = "default_pricing")]
@@ -293,6 +297,22 @@ impl RemoteChecks {
         }
     }
 
+    /// Returns a clear explanation when the user asked to turn remote checks
+    /// off (`requested_enabled == Some(false)`) but the account stayed enabled
+    /// because of server-side account policy.
+    pub fn policy_locked_off_notice(
+        &self,
+        requested_enabled: Option<bool>,
+    ) -> Option<&'static str> {
+        if requested_enabled == Some(false) && self.enabled {
+            Some(
+                "Remote checks remain on because this account is enabled by account policy and cannot be turned off via the account toggle. To disable remote checks locally, set CONTEXTSTREAM_HOSTED_TOOLS=off.",
+            )
+        } else {
+            None
+        }
+    }
+
     pub fn price_line(&self) -> String {
         match &self.pricing {
             Some(price) if !self.credits.as_ref().is_some_and(|c| c.no_charge) => format!(
@@ -325,8 +345,13 @@ impl RemoteChecks {
             Some(false) => "off",
             None => "unknown",
         };
+        let state_label = if self.enabled && self.policy_locked {
+            "on (account policy)"
+        } else {
+            self.state()
+        };
         let mut lines = vec![
-            format!("Remote checks: {} · Extra engines: {more}", self.state()),
+            format!("Remote checks: {state_label} · Extra engines: {more}"),
             self.price_line(),
         ];
         lines.extend(self.balance_line());
@@ -433,5 +458,39 @@ mod tests {
             state.price_line(),
             "Remote checks are free for this account."
         );
+    }
+
+    #[test]
+    fn policy_locked_off_notice_explains_account_policy_and_local_override() {
+        let locked: RemoteChecks = serde_json::from_value(json!({
+            "tool": "check",
+            "enabled": true,
+            "available": true,
+            "policy_locked": true,
+            "more_engines": false
+        }))
+        .unwrap();
+        assert!(locked.policy_locked);
+        assert!(locked
+            .status_text(None)
+            .contains("Remote checks: on (account policy)"));
+        let notice = locked
+            .policy_locked_off_notice(Some(false))
+            .expect("policy-locked off must return a clear notice");
+        assert!(notice.contains("account policy"));
+        assert!(notice.contains("CONTEXTSTREAM_HOSTED_TOOLS=off"));
+        assert!(locked.policy_locked_off_notice(Some(true)).is_none());
+        assert!(locked.policy_locked_off_notice(None).is_none());
+
+        // Also catches older APIs that omit `policy_locked` yet keep `enabled: true`.
+        let older_api: RemoteChecks = serde_json::from_value(json!({
+            "tool": "check",
+            "enabled": true,
+            "available": true,
+            "more_engines": false
+        }))
+        .unwrap();
+        assert!(!older_api.policy_locked);
+        assert!(older_api.policy_locked_off_notice(Some(false)).is_some());
     }
 }

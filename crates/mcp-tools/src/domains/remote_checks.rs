@@ -181,6 +181,15 @@ pub(super) async fn session_action(
             .or_else(|| std::env::current_dir().ok());
         local_languages(folder.as_deref(), &state)
     };
+    if let Some(notice) = state.policy_locked_off_notice(enabled) {
+        let mut data = report(&state, project.as_ref());
+        data["policy_locked"] = json!(true);
+        data["notice"] = json!(notice);
+        let text = format!("{notice}\n\n{}", state.status_text(project.as_ref()));
+        let mut result = ToolResult::with_structured(text, data);
+        result.is_error = true;
+        return Ok(result);
+    }
     Ok(ToolResult::with_structured(
         state.status_text(project.as_ref()),
         report(&state, project.as_ref()),

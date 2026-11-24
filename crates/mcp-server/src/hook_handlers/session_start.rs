@@ -72,7 +72,7 @@ pub async fn handle() -> Result<()> {
     let cursor = super::input_is_cursor(&input);
     let context_fut = async {
         if config.api_key.is_empty() {
-            (None, None, None)
+            (None, None, None, None)
         } else {
             tokio::join!(
                 async {
@@ -83,7 +83,8 @@ pub async fn handle() -> Result<()> {
                     }
                 },
                 fetch_initial_context(&config),
-                fetch_standing_rules(&config, session_id, &cwd, cursor)
+                fetch_standing_rules(&config, session_id, &cwd, cursor),
+                ensure_remote_checks_hints(&config),
             )
         }
     };
@@ -91,7 +92,7 @@ pub async fn handle() -> Result<()> {
     // Reconcile unflushed local edits (P6 content freshness): drain
     // `dirty-files.json` concurrently with the context fetch so it adds no
     // latency to the session-start budget. Best-effort + bounded + non-billed.
-    let ((restored_context, context, standing_rules), _) = tokio::join!(
+    let ((restored_context, context, standing_rules, refreshed_hints), _) = tokio::join!(
         context_fut,
         super::dirty_drain::drain_best_effort(std::time::Duration::from_secs(8)),
     );
@@ -210,9 +211,11 @@ pub async fn handle() -> Result<()> {
         output_text
     };
     if super::input_is_cursor(&input) {
-        if let Some(hint) = cursor_remote_checks_hint(&config) {
+        if let Some(hint) = remote_checks_hint(&config, refreshed_hints.as_ref(), true) {
             output_text.push_str(hint);
         }
+    } else if let Some(hint) = remote_checks_hint(&config, refreshed_hints.as_ref(), false) {
+        output_text.push_str(hint);
     }
     super::prewarm::maybe_spawn(&cwd);
     super::write_context_and_notice_for_input(
@@ -227,8 +230,13 @@ pub async fn handle() -> Result<()> {
 }
 
 const CURSOR_REMOTE_CHECKS_HINT: &str = "\n\n⚡ Remote checks (MachineStream) are enabled for this account: wrap supported test, lint, type-check, and build shell commands with `contextstream-mcp run -- <command>` (e.g. `contextstream-mcp run -- npm test`).";
+const CLAUDE_REMOTE_CHECKS_HINT: &str = "\n\n⚡ Remote checks (MachineStream) are enabled for this account: supported test, lint, type-check, and build commands run remotely via the Bash hook even if the language toolchain (such as Rust/cargo, Node, Python, or Go) is not installed locally. Run checks normally through Bash (do not skip them just because a local toolchain is absent). For Rust verification, prefer `cargo check`, `cargo clippy`, or `cargo test` (which run remotely) rather than `cargo build` (which stays local).";
 
-fn cursor_remote_checks_hint(config: &ApiConfig) -> Option<&'static str> {
+const SESSION_HINTS_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
+async fn ensure_remote_checks_hints(
+    config: &ApiConfig,
+) -> Option<mcp_client::command_hints::Cache> {
     if config.api_key.is_empty()
         || mcp_client::command_hints::switched_off(
             std::env::var(mcp_client::command_hints::ENV_SWITCH)
@@ -238,17 +246,78 @@ fn cursor_remote_checks_hint(config: &ApiConfig) -> Option<&'static str> {
     {
         return None;
     }
+    let identity = mcp_client::command_hints::local_identity(&config.api_key);
+    if let Some(cached) = mcp_client::command_hints::read(&identity, &config.api_url) {
+        if cached.is_fresh(mcp_client::hosted_tools::KNOWN_TTL) {
+            return Some(cached);
+        }
+    }
+    let client_config = mcp_types::Config {
+        api_url: config.api_url.clone(),
+        api_key: Some(config.api_key.clone()),
+        default_workspace_id: config
+            .workspace_id
+            .as_ref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok()),
+        default_project_id: config
+            .project_id
+            .as_ref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok()),
+        ..Default::default()
+    };
+    let client = mcp_client::ContextStreamClient::new(client_config.clone());
+    let session = mcp_session::SessionManager::new(client.clone(), client_config);
+    mcp_tools::domains::hosted_tools::command_hints_for_run(
+        &client,
+        &session,
+        &identity,
+        SESSION_HINTS_BUDGET,
+    )
+    .await
+}
+
+fn remote_checks_hint(
+    config: &ApiConfig,
+    refreshed: Option<&mcp_client::command_hints::Cache>,
+    cursor: bool,
+) -> Option<&'static str> {
+    if config.api_key.is_empty()
+        || mcp_client::command_hints::switched_off(
+            std::env::var(mcp_client::command_hints::ENV_SWITCH)
+                .ok()
+                .as_deref(),
+        )
+    {
+        return None;
+    }
+    if let Some(cache) = refreshed {
+        return remote_checks_hint_from_cache(cache, cursor);
+    }
     let cache = mcp_client::command_hints::read(
         &mcp_client::command_hints::local_identity(&config.api_key),
         &config.api_url,
     )?;
-    cursor_remote_checks_hint_from_cache(&cache)
+    remote_checks_hint_from_cache(&cache, cursor)
 }
 
+fn remote_checks_hint_from_cache(
+    cache: &mcp_client::command_hints::Cache,
+    cursor: bool,
+) -> Option<&'static str> {
+    cache.tool_named("check").map(|_| {
+        if cursor {
+            CURSOR_REMOTE_CHECKS_HINT
+        } else {
+            CLAUDE_REMOTE_CHECKS_HINT
+        }
+    })
+}
+
+#[cfg(test)]
 fn cursor_remote_checks_hint_from_cache(
     cache: &mcp_client::command_hints::Cache,
 ) -> Option<&'static str> {
-    cache.tool_named("check").map(|_| CURSOR_REMOTE_CHECKS_HINT)
+    remote_checks_hint_from_cache(cache, true)
 }
 
 // ============================================================================
@@ -1012,11 +1081,19 @@ mod tests {
         assert!(hint.is_some());
         assert!(hint.unwrap().contains("contextstream-mcp run -- <command>"));
 
+        let claude_hint = remote_checks_hint_from_cache(&with_check, false)
+            .expect("Claude Code should receive MachineStream remote-checks guidance");
+        assert!(claude_hint.contains("MachineStream"));
+        assert!(claude_hint.contains("not installed locally"));
+        assert!(claude_hint.contains("cargo check"));
+        assert!(claude_hint.contains("cargo build"));
+
         let without_check = mcp_client::command_hints::Cache::new(
             "test-id",
             "https://api.contextstream.io",
             vec![],
         );
         assert!(cursor_remote_checks_hint_from_cache(&without_check).is_none());
+        assert!(remote_checks_hint_from_cache(&without_check, false).is_none());
     }
 }

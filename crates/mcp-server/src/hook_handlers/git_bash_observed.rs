@@ -206,10 +206,10 @@ pub async fn handle() -> Result<()> {
     let input = read_stdin_json()?;
     let command = extract_command(&input);
 
+    let cwd = common::extract_cwd(&input);
     if !command.trim().is_empty() {
         let verbs = classify(&command);
         if verbs.mutating {
-            let cwd = common::extract_cwd(&input);
             if let Some(root) = git_common::repo_root_from(&cwd).await {
                 let session_id = api_session_id(&input);
                 // The harness that ran the hook, so the event records who acted
@@ -234,6 +234,18 @@ pub async fn handle() -> Result<()> {
                 }
             }
         }
+    }
+
+    if let Some((user_message, agent_context)) =
+        crate::hosted_run::remote_run_hook_feedback(&input, &command, &cwd)
+    {
+        let mut output = match agent_context {
+            Some(ctx) => HookOutput::context(ctx),
+            None => HookOutput::empty(),
+        };
+        output.system_message = Some(user_message);
+        write_stdout_json(&output)?;
+        return Ok(());
     }
 
     write_stdout_json(&HookOutput::empty())?;

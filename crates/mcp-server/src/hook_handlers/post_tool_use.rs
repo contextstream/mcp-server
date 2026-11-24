@@ -1205,7 +1205,13 @@ pub async fn handle() -> Result<()> {
         super::dirty_drain::drain_best_effort(std::time::Duration::from_millis(1200)).await;
     }
 
-    super::prewarm::maybe_spawn(&cwd);
+    // Only re-prewarm after edits that touch dependency manifests, lockfiles, or
+    // toolchain pins — SessionStart already warms the workspace, and spawning
+    // `:prepare` on ordinary source edits right before `cargo check` / `pytest`
+    // contends on the worker's per-repo workspace lock.
+    if edited_paths_affect_prewarm(&absolute_paths) {
+        super::prewarm::maybe_spawn(&cwd);
+    }
     if mirror_notes.is_empty() {
         write_stdout_json(&HookOutput::empty())?;
     } else {
@@ -1236,6 +1242,68 @@ fn edited_paths(cwd: &str, tool_name: &str, input: &Value, tool_input: &Value) -
             }
         })
         .collect()
+}
+
+/// Whether any edited path is a dependency manifest, lockfile, or toolchain pin
+/// that warrants re-running background workspace `:prepare`.
+fn edited_paths_affect_prewarm(paths: &[String]) -> bool {
+    paths.iter().any(|path| {
+        let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let lower = name.to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "cargo.toml"
+                | "cargo.lock"
+                | "rust-toolchain"
+                | "rust-toolchain.toml"
+                | "package.json"
+                | "pnpm-lock.yaml"
+                | "pnpm-workspace.yaml"
+                | "package-lock.json"
+                | "npm-shrinkwrap.json"
+                | "yarn.lock"
+                | ".npmrc"
+                | ".nvmrc"
+                | ".node-version"
+                | "pyproject.toml"
+                | "uv.lock"
+                | "poetry.lock"
+                | "setup.py"
+                | "setup.cfg"
+                | "go.mod"
+                | "go.sum"
+                | "go.work"
+                | "gemfile"
+                | "gemfile.lock"
+                | "composer.json"
+                | "composer.lock"
+                | "pom.xml"
+                | "build.gradle"
+                | "build.gradle.kts"
+                | "settings.gradle"
+                | "settings.gradle.kts"
+                | "cmakelists.txt"
+                | "makefile"
+                | "meson.build"
+                | "bun.lock"
+                | "bun.lockb"
+                | "deno.json"
+                | "deno.jsonc"
+                | "pubspec.yaml"
+                | "pubspec.lock"
+                | "mix.exs"
+                | "mix.lock"
+                | "build.zig"
+                | "build.zig.zon"
+                | "package.swift"
+                | "global.json"
+        ) || (lower.starts_with("requirements") && lower.ends_with(".txt"))
+            || lower.ends_with(".csproj")
+            || lower.ends_with(".fsproj")
+            || lower.ends_with(".sln")
+    })
 }
 
 /// Whether a hook feature is enabled by an opt-out environment variable.
@@ -2318,5 +2386,31 @@ mod init_session_id_tests {
             Some((ws, Some(project)))
         );
         assert_eq!(resolved_scope_from_response(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn edited_paths_affect_prewarm_only_for_manifests_and_lockfiles() {
+        assert!(!edited_paths_affect_prewarm(&[
+            "/work/ruff/crates/ruff_text_size/src/range.rs".to_string(),
+            "/work/app/src/index.ts".to_string(),
+            "/work/py/app/main.py".to_string(),
+        ]));
+        for manifest in [
+            "/work/ruff/Cargo.toml",
+            "/work/ruff/Cargo.lock",
+            "/work/ruff/rust-toolchain.toml",
+            "/work/app/package.json",
+            "/work/app/pnpm-lock.yaml",
+            "/work/py/pyproject.toml",
+            "/work/py/uv.lock",
+            "/work/py/requirements-dev.txt",
+            "/work/go/go.mod",
+            "/work/ruby/Gemfile.lock",
+        ] {
+            assert!(
+                edited_paths_affect_prewarm(&[manifest.to_string()]),
+                "expected prewarm trigger for {manifest}"
+            );
+        }
     }
 }

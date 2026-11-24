@@ -11,9 +11,11 @@
 //! When the host declines or says a failure was its own, the command runs
 //! here after a line that says why.
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::Write;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mcp_client::command_hints::{self, CachedTool};
 use mcp_client::frames::{self, Delivery, Event};
@@ -29,16 +31,41 @@ use serde_json::Value;
 /// How long a command will wait to discover the caller's hosted tools.
 const HINTS_BUDGET: Duration = Duration::from_millis(1500);
 
+/// Maximum age of a local remote-run receipt consumed by PostToolUse / PostToolUseFailure.
+const RECEIPT_MAX_AGE_MS: u64 = 30_000;
+
+/// Local receipt written when `contextstream-mcp run` completes remotely so
+/// Claude Code's `PostToolUse` / `PostToolUseFailure` hooks can surface a
+/// user-visible `systemMessage` even when Bash output is collapsed or piped
+/// through `grep`/`head`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteRunReceipt {
+    pub written_at_ms: u64,
+    pub cwd: String,
+    pub command: String,
+    pub exit: i32,
+    pub seconds: Option<f64>,
+    pub ran_seconds: Option<f64>,
+    pub cached: bool,
+    pub line: String,
+}
+
 /// How a try at running the command on the service came out.
 #[derive(Debug, PartialEq)]
 enum Remote {
-    /// The service ran it: its exit status, and the line said after its output.
-    Ran(i32, String),
+    /// The service ran it: its exit status, the line said after its output, and metadata for the receipt.
+    Ran(i32, String, Option<RemoteRunReceipt>),
     /// It was not run there, so it is run here; the reason when a call was tried.
     Here(Option<String>),
     /// It started on the service and then the stream broke: its output was already written.
     Broken,
     OutOfCredits,
+}
+
+fn write_stderr_line(line: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{line}");
+    let _ = stderr.flush();
 }
 
 /// Run `command` and return the process's exit status.
@@ -50,21 +77,28 @@ pub async fn run(tool: Option<String>, command: String) -> i32 {
 pub async fn run_with_verbosity(tool: Option<String>, command: String, verbose: bool) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     match try_remote(tool.as_deref(), &command, &cwd, verbose).await {
-        Remote::Ran(status, said) => {
-            eprintln!("{said}");
+        Remote::Ran(status, said, receipt) => {
+            if let Some(mut receipt) = receipt {
+                receipt.cwd = cwd.to_string_lossy().to_string();
+                receipt.command = command.clone();
+                write_remote_receipt(&receipt);
+            }
+            write_stderr_line(&said);
             status
         }
         Remote::OutOfCredits => {
-            eprintln!("{}", out_of_credits_line());
+            write_stderr_line(&out_of_credits_line());
             run_here(&command, &cwd)
         }
         Remote::Broken => {
-            eprintln!("contextstream: the remote run ended without a result");
+            write_stderr_line("contextstream: the remote run ended without a result");
             1
         }
         Remote::Here(reason) => {
             if let Some(reason) = reason {
-                eprintln!("contextstream: running it here instead ({reason})");
+                write_stderr_line(&format!(
+                    "contextstream: running it here instead ({reason})"
+                ));
             }
             run_here(&command, &cwd)
         }
@@ -163,7 +197,7 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path, verbose: bool
                     .and_then(frames::display_text)
             })
         {
-            eprintln!("contextstream: remote call {id}");
+            write_stderr_line(&format!("contextstream: remote call {id}"));
         }
     }
     let call = match stream_call(&data) {
@@ -183,7 +217,7 @@ async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path, verbose: bool
             if let Event::Output(bytes) = event {
                 if !wrote {
                     if let Some(mark) = output_mark(DELIVERY) {
-                        eprintln!("{mark}");
+                        write_stderr_line(mark);
                     }
                 }
                 let mut out = stdout.lock();
@@ -219,8 +253,7 @@ const DELIVERY: Delivery = Delivery::Streamed;
 /// The line said on stderr before the first byte of the run's output, when it is shown as it prints.
 fn output_mark(delivery: Delivery) -> Option<&'static str> {
     (delivery == Delivery::Streamed).then_some(
-        "contextstream: the remote run's output, as it prints; if the host does not stand by it, \
-         a line from contextstream says so and the command runs here",
+        "contextstream: running remotely on MachineStream (output as it prints; if the host does not stand by it, it runs here)",
     )
 }
 
@@ -261,13 +294,25 @@ fn outcome(result: Result<Value, String>, wrote: bool) -> Remote {
                 // The output shown is not the verdict: the command runs here, after a last line that says why.
                 Some(said) => Remote::Here(Some(said)),
                 None => {
-                    let mut line = ran_line(&frame);
-                    if exit_status(&frame) != 0 {
+                    let exit = exit_status(&frame);
+                    let summary_line = ran_line(&frame);
+                    let receipt = RemoteRunReceipt {
+                        written_at_ms: now_unix_ms(),
+                        cwd: String::new(),
+                        command: String::new(),
+                        exit,
+                        seconds: frame.get("seconds").and_then(Value::as_f64),
+                        ran_seconds: frame.get("ran_seconds").and_then(Value::as_f64),
+                        cached: frame.get("cache").and_then(Value::as_str) == Some("hit"),
+                        line: summary_line.clone(),
+                    };
+                    let mut line = summary_line;
+                    if exit != 0 {
                         if let Some(diag) = format_diagnostic_report(&frame, "") {
                             line = format!("{diag}\n{line}");
                         }
                     }
-                    Remote::Ran(exit_status(&frame), line)
+                    Remote::Ran(exit, line, Some(receipt))
                 }
             }
         }
@@ -321,11 +366,325 @@ fn exit_status(frame: &Value) -> i32 {
 fn ran_line(frame: &Value) -> String {
     let seconds = frame.get("seconds").and_then(Value::as_f64);
     let cached = frame.get("cache").and_then(Value::as_str) == Some("hit");
-    match (seconds, cached) {
-        (Some(seconds), true) => format!("[ran remotely: {seconds:.1} s, answered from a cache]"),
-        (Some(seconds), false) => format!("[ran remotely: {seconds:.1} s]"),
-        (None, _) => "[ran remotely]".to_string(),
+    let ran_seconds = frame.get("ran_seconds").and_then(Value::as_f64);
+    match (seconds, cached, ran_seconds) {
+        (Some(seconds), true, Some(ran_s)) => format!(
+            "[ran remotely: {seconds:.1} s, verified exact-tree cache hit (previously ran in {ran_s:.1} s; identical git tree and command, no rerun needed)]"
+        ),
+        (Some(seconds), true, None) => format!(
+            "[ran remotely: {seconds:.1} s, verified exact-tree cache hit (identical git tree and command, no rerun needed)]"
+        ),
+        (Some(seconds), false, _) => format!("[ran remotely: {seconds:.1} s]"),
+        (None, _, _) => "[ran remotely]".to_string(),
     }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn receipt_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".contextstream"))
+}
+
+fn receipt_path_in(dir: &Path, command: &str) -> PathBuf {
+    let digest = hex::encode(Sha256::digest(command.trim().as_bytes()));
+    dir.join(format!("remote-run-receipt-{}.json", &digest[..16]))
+}
+
+fn write_remote_receipt(receipt: &RemoteRunReceipt) {
+    if let Some(dir) = receipt_dir() {
+        write_remote_receipt_in(&dir, receipt);
+    }
+}
+
+/// Persist a remote-run receipt atomically under `dir`.
+pub(crate) fn write_remote_receipt_in(dir: &Path, receipt: &RemoteRunReceipt) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let path = receipt_path_in(dir, &receipt.command);
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.is_file()) {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(receipt) else {
+        return;
+    };
+    let tmp = dir.join(format!(
+        ".remote-run-receipt-{}-{}.tmp",
+        std::process::id(),
+        now_unix_ms()
+    ));
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    else {
+        return;
+    };
+    if file.write_all(&bytes).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    drop(file);
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+pub(crate) fn take_remote_receipt_in(
+    dir: &Path,
+    command: &str,
+    cwd: &str,
+    now_ms: u64,
+) -> Option<RemoteRunReceipt> {
+    let path = receipt_path_in(dir, command);
+    if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        return None;
+    }
+    let raw = std::fs::read(&path).ok()?;
+    let receipt: RemoteRunReceipt = serde_json::from_slice(&raw).ok()?;
+    let age = now_ms.saturating_sub(receipt.written_at_ms);
+    if age > RECEIPT_MAX_AGE_MS {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    if !cwd.is_empty() && !receipt.cwd.is_empty() {
+        let receipt_path = Path::new(&receipt.cwd);
+        let hook_path = Path::new(cwd);
+        if receipt_path != hook_path
+            && !receipt_path.starts_with(hook_path)
+            && !hook_path.starts_with(receipt_path)
+        {
+            return None;
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    Some(receipt)
+}
+
+/// Extract inner command string(s) wrapped by `... run --tool <tool> -- <quoted_cmd>`
+/// in a shell command executed by Claude Code's Bash tool.
+pub(crate) fn extract_run_commands(shell_command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = shell_command;
+    while let Some(idx) = rest.find(" run --tool ") {
+        let after_tool_flag = &rest[idx + " run --tool ".len()..];
+        let Some((_, after_tool)) = take_shell_word(after_tool_flag.trim_start()) else {
+            rest = after_tool_flag;
+            continue;
+        };
+        let after_tool = after_tool.trim_start();
+        let Some(after_sep) = after_tool.strip_prefix("--") else {
+            rest = after_tool;
+            continue;
+        };
+        let Some(after_sep) = after_sep
+            .strip_prefix(' ')
+            .or_else(|| after_sep.strip_prefix('\t'))
+        else {
+            rest = after_tool;
+            continue;
+        };
+        if let Some((cmd, tail)) = take_shell_word(after_sep.trim_start()) {
+            if !cmd.trim().is_empty() {
+                out.push(cmd);
+            }
+            rest = tail;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Parse one POSIX shell word (supporting adjacent `'...'`, `"..."`, and backslash escapes)
+/// and return `(unquoted_word, remaining_slice)`.
+fn take_shell_word(input: &str) -> Option<(String, &str)> {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return None;
+    }
+    let mut i = 0;
+    let mut word = String::new();
+    while i < len {
+        match bytes[i] {
+            b' ' | b'\t' | b'\n' | b';' | b'|' | b'&' | b'<' | b'>' => break,
+            b'\'' => {
+                i += 1;
+                let start = i;
+                while i < len && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i >= len {
+                    return None;
+                }
+                word.push_str(&input[start..i]);
+                i += 1;
+            }
+            b'"' => {
+                i += 1;
+                while i < len && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 1;
+                    }
+                    let ch = input[i..].chars().next()?;
+                    word.push(ch);
+                    i += ch.len_utf8();
+                }
+                if i >= len {
+                    return None;
+                }
+                i += 1;
+            }
+            b'\\' => {
+                i += 1;
+                if i >= len {
+                    return None;
+                }
+                let ch = input[i..].chars().next()?;
+                word.push(ch);
+                i += ch.len_utf8();
+            }
+            _ => {
+                let ch = input[i..].chars().next()?;
+                word.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    if i == 0 {
+        None
+    } else {
+        Some((word, &input[i..]))
+    }
+}
+
+/// Format a concise user-facing banner for Claude Code's `systemMessage` field
+/// (shown outside collapsed Bash output).
+pub(crate) fn format_user_notice(receipt: &RemoteRunReceipt) -> String {
+    let timing = match (receipt.seconds, receipt.cached, receipt.ran_seconds) {
+        (Some(s), true, Some(ran_s)) => format!(
+            "ran remotely in {s:.1} s (verified exact-tree cache hit; previously ran in {ran_s:.1} s)"
+        ),
+        (Some(s), true, None) => format!("ran remotely in {s:.1} s (verified exact-tree cache hit)"),
+        (Some(s), false, _) => format!("ran remotely in {s:.1} s"),
+        (None, true, _) => "ran remotely (verified exact-tree cache hit)".to_string(),
+        (None, false, _) => "ran remotely".to_string(),
+    };
+    if receipt.exit == 0 {
+        format!("MachineStream: {timing}")
+    } else {
+        format!("MachineStream: {timing} (exit {})", receipt.exit)
+    }
+}
+
+/// Extract a `[ran remotely...]` line directly from tool output when no local
+/// receipt file is present.
+pub(crate) fn extract_ran_remotely_line(text: &str) -> Option<String> {
+    let start = text.rfind("[ran remotely")?;
+    let tail = &text[start..];
+    let end = tail.find(']')?;
+    Some(tail[..=end].to_string())
+}
+
+fn extract_hook_output_text(input: &Value) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "tool_response",
+        "response",
+        "output",
+        "stdout",
+        "stderr",
+        "error",
+        "tool_error",
+    ] {
+        match input.get(key) {
+            Some(Value::String(s)) if !s.is_empty() => parts.push(s.as_str()),
+            Some(Value::Object(map)) => {
+                for sub in ["stdout", "stderr", "output", "text", "error"] {
+                    if let Some(s) = map.get(sub).and_then(Value::as_str) {
+                        if !s.is_empty() {
+                            parts.push(s);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n")
+}
+
+/// Inspect a finished Claude Code `Bash` hook payload for `contextstream-mcp run`
+/// invocations and return `(system_message_for_user, optional_additional_context_for_agent)`.
+///
+/// The `system_message` is always shown outside Claude Code's collapsed Bash output
+/// so the user immediately sees that MachineStream ran the check remotely.
+/// `additional_context` is emitted when the command's output does not already contain
+/// `[ran remotely` (for example, when `2>&1 | grep ... | head` filtered out stderr).
+pub(crate) fn remote_run_hook_feedback(
+    input: &Value,
+    command: &str,
+    cwd: &str,
+) -> Option<(String, Option<String>)> {
+    let dir = receipt_dir();
+    remote_run_hook_feedback_in(input, command, cwd, dir.as_deref(), now_unix_ms())
+}
+
+pub(crate) fn remote_run_hook_feedback_in(
+    input: &Value,
+    command: &str,
+    cwd: &str,
+    dir: Option<&Path>,
+    now_ms: u64,
+) -> Option<(String, Option<String>)> {
+    let inner_cmds = extract_run_commands(command);
+    if inner_cmds.is_empty() {
+        return None;
+    }
+    let output_text = extract_hook_output_text(input);
+    let output_shows_remote = output_text.contains("[ran remotely");
+
+    let mut receipts = Vec::new();
+    if let Some(dir) = dir {
+        for inner in &inner_cmds {
+            if let Some(receipt) = take_remote_receipt_in(dir, inner, cwd, now_ms) {
+                receipts.push(receipt);
+            }
+        }
+    }
+
+    if !receipts.is_empty() {
+        let user_msg = receipts
+            .iter()
+            .map(format_user_notice)
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let agent_ctx = if output_shows_remote {
+            None
+        } else {
+            let lines = receipts
+                .iter()
+                .map(|r| r.line.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(format!(
+                "MachineStream ran this check remotely ({lines}). Do not rerun locally unless you changed code."
+            ))
+        };
+        return Some((user_msg, agent_ctx));
+    }
+
+    // Fallback when no receipt file was present: parse `[ran remotely...]` from tool output.
+    let line = extract_ran_remotely_line(&output_text)?;
+    let trimmed = line.trim_start_matches('[').trim_end_matches(']').trim();
+    let user_msg = format!("MachineStream: {trimmed}");
+    Some((user_msg, None))
 }
 
 /// The shell a command runs with here, outside Windows: bash, the shell the
@@ -356,7 +715,7 @@ fn run_here_with(local_shell: &str, command: &str, cwd: &Path) -> i32 {
         Err(error)
             if !cfg!(windows) && error.kind() == std::io::ErrorKind::NotFound && cwd.is_dir() =>
         {
-            eprintln!("{}", missing_shell_message(local_shell));
+            write_stderr_line(&missing_shell_message(local_shell));
             127
         }
         Err(error) => {
@@ -460,10 +819,14 @@ mod tests {
     #[test]
     fn a_run_the_host_stands_by_is_its_exit_and_the_ran_line() {
         let frame = json!({"ran": true, "exit": 101, "seconds": 4.26, "environment": null});
-        assert_eq!(
-            outcome(Ok(frame), true),
-            Remote::Ran(101, "[ran remotely: 4.3 s]".to_string())
-        );
+        match outcome(Ok(frame), true) {
+            Remote::Ran(101, line, Some(receipt)) => {
+                assert_eq!(line, "[ran remotely: 4.3 s]");
+                assert_eq!(receipt.exit, 101);
+                assert!(!receipt.cached);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
         assert_eq!(
             outcome(Ok(json!({"ran": false})), true),
             Remote::Here(Some(
@@ -522,9 +885,103 @@ mod tests {
         assert_eq!(line, "[ran remotely: 4.3 s]");
         assert_eq!(
             ran_line(&json!({"seconds": 0.04, "cache": "hit"})),
-            "[ran remotely: 0.0 s, answered from a cache]"
+            "[ran remotely: 0.0 s, verified exact-tree cache hit (identical git tree and command, no rerun needed)]"
+        );
+        assert_eq!(
+            ran_line(&json!({"seconds": 0.81, "cache": "hit", "ran_seconds": 12.93})),
+            "[ran remotely: 0.8 s, verified exact-tree cache hit (previously ran in 12.9 s; identical git tree and command, no rerun needed)]"
         );
         assert_eq!(ran_line(&json!({})), "[ran remotely]");
+    }
+
+    #[test]
+    fn remote_run_receipt_round_trips_extracts_wrapped_commands_and_formats_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = "CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets";
+        let receipt = RemoteRunReceipt {
+            written_at_ms: 1_700_000_000_000,
+            cwd: "/work/ruff/crates/ruff".to_string(),
+            command: cmd.to_string(),
+            exit: 0,
+            seconds: Some(0.81),
+            ran_seconds: Some(12.93),
+            cached: true,
+            line: "[ran remotely: 0.8 s, verified exact-tree cache hit (previously ran in 12.9 s; identical git tree and command, no rerun needed)]".to_string(),
+        };
+        write_remote_receipt_in(tmp.path(), &receipt);
+
+        // Unrelated directory cannot consume the receipt.
+        assert!(
+            take_remote_receipt_in(tmp.path(), cmd, "/other/repo", 1_700_000_001_000).is_none()
+        );
+        // Repo root consumes receipt written from a subdirectory (`cd crates/ruff && ...`).
+        let loaded =
+            take_remote_receipt_in(tmp.path(), cmd, "/work/ruff", 1_700_000_001_000).unwrap();
+        assert_eq!(loaded, receipt);
+        // Consumed once.
+        assert!(take_remote_receipt_in(tmp.path(), cmd, "/work/ruff", 1_700_000_001_000).is_none());
+
+        // Expired receipt is dropped.
+        write_remote_receipt_in(tmp.path(), &receipt);
+        assert!(take_remote_receipt_in(tmp.path(), cmd, "/work/ruff", 1_700_000_060_000).is_none());
+
+        assert_eq!(
+            format_user_notice(&receipt),
+            "MachineStream: ran remotely in 0.8 s (verified exact-tree cache hit; previously ran in 12.9 s)"
+        );
+        let mut failed = receipt.clone();
+        failed.cached = false;
+        failed.exit = 101;
+        failed.seconds = Some(14.4);
+        assert_eq!(
+            format_user_notice(&failed),
+            "MachineStream: ran remotely in 14.4 s (exit 101)"
+        );
+
+        let wrapped = r#"cd crates/ruff && '/usr/local/bin/contextstream-mcp' run --tool 'check' -- 'CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets' 2>&1 | grep error | head -n 40; echo "exit: ${PIPESTATUS[0]}""#;
+        assert_eq!(extract_run_commands(wrapped), vec![cmd.to_string()]);
+
+        // Piped output that stripped stderr still gets both user systemMessage AND agent additionalContext.
+        write_remote_receipt_in(tmp.path(), &receipt);
+        let piped_input = json!({"tool_response": {"stdout": "exit: 0\n", "stderr": ""}});
+        let (user_msg, agent_ctx) = remote_run_hook_feedback_in(
+            &piped_input,
+            wrapped,
+            "/work/ruff",
+            Some(tmp.path()),
+            1_700_000_001_000,
+        )
+        .unwrap();
+        assert!(user_msg.contains("MachineStream: ran remotely in 0.8 s"));
+        let ctx = agent_ctx.expect("piped output without [ran remotely] should inform the agent");
+        assert!(ctx.contains("verified exact-tree cache hit"));
+
+        // Unpiped output that already shows [ran remotely] gets systemMessage without duplicate agent context.
+        write_remote_receipt_in(tmp.path(), &receipt);
+        let unpiped_input =
+            json!({"tool_response": {"stdout": "", "stderr": format!("{}\n", receipt.line)}});
+        let (user_msg, agent_ctx) = remote_run_hook_feedback_in(
+            &unpiped_input,
+            wrapped,
+            "/work/ruff",
+            Some(tmp.path()),
+            1_700_000_001_000,
+        )
+        .unwrap();
+        assert!(user_msg.contains("MachineStream: ran remotely in 0.8 s"));
+        assert!(agent_ctx.is_none());
+
+        // Fallback when no receipt file exists parses [ran remotely...] from tool output.
+        let (user_msg, agent_ctx) = remote_run_hook_feedback_in(
+            &json!({"tool_response": "ok\n[ran remotely: 12.9 s]\n"}),
+            wrapped,
+            "/work/ruff",
+            Some(tmp.path()),
+            1_700_000_001_000,
+        )
+        .unwrap();
+        assert_eq!(user_msg, "MachineStream: ran remotely: 12.9 s");
+        assert!(agent_ctx.is_none());
     }
 
     #[cfg(unix)]
@@ -611,7 +1068,7 @@ mod tests {
             }
         });
         match outcome(Ok(frame), true) {
-            Remote::Ran(101, said) => {
+            Remote::Ran(101, said, _) => {
                 assert!(
                     said.contains("[diagnostics: 1 new failure(s), 1 base failure(s) suppressed]"),
                     "{said}"
@@ -759,7 +1216,7 @@ mod tests {
         );
 
         match outcome(Ok(frame), true) {
-            Remote::Ran(101, said) => {
+            Remote::Ran(101, said, _) => {
                 assert!(
                     said.contains("[diagnostics: 1 new failure(s), 1 base failure(s) suppressed]"),
                     "{said}"

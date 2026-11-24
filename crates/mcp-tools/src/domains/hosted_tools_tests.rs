@@ -3049,6 +3049,71 @@ async fn fire_and_forget_prepare_sends_languages_dedups_by_repo_and_base_tree_an
 }
 
 #[tokio::test]
+async fn fire_and_forget_prepare_dedups_concurrent_inflight_calls() {
+    let (ws_url, sockets) = frames_service(vec![Step::Json(json!({
+        "type": "result",
+        "ran": true,
+        "exit": 0,
+        "seconds": 0.2
+    }))])
+    .await;
+    let answer = stream_answer(&ws_url, "frames/1");
+    let posts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let posts_clone = posts.clone();
+    let (url, _seen) = stub(Arc::new(move |method, path, _| {
+        if method == "GET" && path == "/mcp/hosted-tools" {
+            (
+                200,
+                json!({"tools": [{
+                    "name": "check",
+                    "description": "Remote checks",
+                    "input_schema": {"type": "object"},
+                    "transport": {"kind": "stream"},
+                    "attachments": ["checkout_snapshot"],
+                    "command_hints": {"argument": "command", "patterns": ["^cargo check$"]}
+                }]})
+                .to_string(),
+            )
+        } else if method == "POST" && path == "/mcp/hosted-tools/check/call" {
+            posts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(120));
+            (200, answer.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    }))
+    .await;
+    let client = client_in_workspace(&url);
+    let (repo, session) = changed_checkout(&client).await;
+    let _ = check_tool(&client, &session).await;
+    let dedup = tempfile::tempdir().unwrap();
+
+    // Two overlapping spawns (like SessionStart + PostToolUse) must only run ONE `:prepare`.
+    tokio::join!(
+        fire_and_forget_prepare_with(
+            &client,
+            &session,
+            repo.path(),
+            Some(dedup.path()),
+            Duration::from_secs(600),
+        ),
+        fire_and_forget_prepare_with(
+            &client,
+            &session,
+            repo.path(),
+            Some(dedup.path()),
+            Duration::from_secs(600),
+        ),
+    );
+    assert_eq!(
+        posts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "concurrent :prepare calls must deduplicate before hitting the API/workspace lock"
+    );
+    assert_eq!(sockets.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn speculative_check_forwards_flag_and_429_does_not_poison_explicit_credit_cooldown() {
     let top_level = json!({ "tools": [], "speculative_checks": true });
     assert_eq!(parse_speculative_checks(&top_level), Some(true));

@@ -2641,6 +2641,49 @@ pub async fn fire_and_forget_prepare(
     .await;
 }
 
+const PREWARM_INFLIGHT_TTL: Duration = Duration::from_secs(120);
+
+/// Atomically claim an in-flight prewarm stamp so concurrent hook spawns
+/// (`SessionStart` + `PostToolUse`) never stack `:prepare` calls onto the same
+/// remote workspace lock. Returns `false` if another live or recent prewarm
+/// already holds the stamp.
+fn claim_prewarm_inflight(stamp_path: &std::path::Path, inflight_ttl: Duration) -> bool {
+    use std::io::Write;
+    let Some(parent) = stamp_path.parent() else {
+        return true;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return true;
+    }
+    if prewarm_dedup_active(stamp_path) {
+        return false;
+    }
+    // Remove an expired regular stamp so `create_new` can race cleanly between
+    // two processes starting at the same moment.
+    if let Ok(meta) = std::fs::symlink_metadata(stamp_path) {
+        if !meta.is_file() {
+            return false;
+        }
+        let _ = std::fs::remove_file(stamp_path);
+    }
+    let until = now_unix_secs().saturating_add(inflight_ttl.as_secs().max(1));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(stamp_path)
+    {
+        Ok(mut file) => {
+            let _ = file.write_all(until.to_string().as_bytes());
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another concurrent caller won the race.
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 /// Testable implementation of [`fire_and_forget_prepare`] with configurable dedup directory and TTL.
 pub async fn fire_and_forget_prepare_with(
     client: &ContextStreamClient,
@@ -2665,17 +2708,26 @@ pub async fn fire_and_forget_prepare_with(
     let Ok(start) = CheckoutSnapshot::begin(folder).await else {
         return;
     };
-    let checkout_identity = start.identity();
-    let Ok(snapshot) = start.complete().await else {
-        return;
-    };
-    let repo_key = prepare_repo_key(&snapshot.repo_name, &snapshot.origin_sha256);
-    let stamp_path = dedup_dir.map(|dir| prewarm_stamp_path(dir, &repo_key, &snapshot.base_tree));
+    // Check and claim the dedup stamp BEFORE taking a full checkout snapshot or
+    // hitting the API so already-warmed checkouts exit in milliseconds and two
+    // overlapping hooks never pile up on the worker's workspace lock.
+    let base_tree = start.base_tree().await;
+    let repo_key = prepare_repo_key(start.repo_name(), start.origin_sha256());
+    let stamp_path = dedup_dir.map(|dir| prewarm_stamp_path(dir, &repo_key, &base_tree));
     if let Some(path) = stamp_path.as_deref() {
-        if prewarm_dedup_active(path) {
+        let inflight_ttl = ttl.min(PREWARM_INFLIGHT_TTL);
+        if !claim_prewarm_inflight(path, inflight_ttl) {
             return;
         }
     }
+    let failure_backoff = ttl.min(PREWARM_FAILURE_BACKOFF);
+    let checkout_identity = start.identity();
+    let Ok(snapshot) = start.complete().await else {
+        if let Some(path) = stamp_path.as_deref() {
+            write_prewarm_stamp(path, failure_backoff);
+        }
+        return;
+    };
     let languages = mcp_client::remote_checks::local_language_ids(&snapshot.root);
     let mut arguments = serde_json::json!({
         "command": ":prepare",
@@ -2693,7 +2745,6 @@ pub async fn fire_and_forget_prepare_with(
         body["workspace_id"] = Value::String(workspace);
     }
 
-    let failure_backoff = ttl.min(PREWARM_FAILURE_BACKOFF);
     let Ok(answer) = client
         .hosted_tool_call("check", &body, PREWARM_CALL_TIMEOUT)
         .await

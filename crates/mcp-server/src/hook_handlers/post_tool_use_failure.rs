@@ -106,17 +106,40 @@ pub async fn handle() -> Result<()> {
     )
     .await;
 
+    let remote_feedback = if tool_name.eq_ignore_ascii_case("bash") {
+        let cmd = input
+            .get("tool_input")
+            .and_then(|v| v.get("command"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        crate::hosted_run::remote_run_hook_feedback(&input, cmd, &cwd)
+    } else {
+        None
+    };
+
     let guidance = (count >= 2).then(|| format!(
         "The `{}` tool has failed {} times with a similar error in this session. Read the error details carefully, avoid repeating the same call unchanged, and switch to a narrower or fallback path if needed.",
         tool_name, count
     ));
-    match (guidance, contextagents) {
-        (None, None) => write_stdout_json(&HookOutput::empty())?,
-        (Some(guidance), Some(agents)) => {
-            write_stdout_json(&HookOutput::context(format!("{guidance}\n\n{agents}")))?
-        }
-        (Some(one), None) | (None, Some(one)) => write_stdout_json(&HookOutput::context(one))?,
+    let mut context_parts = Vec::new();
+    if let Some(ref g) = guidance {
+        context_parts.push(g.clone());
     }
+    if let Some(ref agents) = contextagents {
+        context_parts.push(agents.clone());
+    }
+    let user_message = remote_feedback.as_ref().map(|(msg, _)| msg.clone());
+    if let Some(ctx) = remote_feedback.and_then(|(_, ctx)| ctx) {
+        context_parts.push(ctx);
+    }
+
+    let mut output = if context_parts.is_empty() {
+        HookOutput::empty()
+    } else {
+        HookOutput::context(context_parts.join("\n\n"))
+    };
+    output.system_message = user_message;
+    write_stdout_json(&output)?;
     Ok(())
 }
 

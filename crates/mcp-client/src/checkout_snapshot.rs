@@ -609,6 +609,32 @@ impl SnapshotStart {
         identity_of(&self.repo_name, &self.origin_sha256)
     }
 
+    /// The repository's normalized name.
+    pub fn repo_name(&self) -> &str {
+        &self.repo_name
+    }
+
+    /// SHA-256 hex digest of the repository's origin remote URL (or empty).
+    pub fn origin_sha256(&self) -> &str {
+        &self.origin_sha256
+    }
+
+    /// The current `HEAD^{tree}` OID (or the empty tree OID), computed without
+    /// running `git status` or building a working-tree snapshot.
+    pub async fn base_tree(&self) -> String {
+        match git(
+            &self.root,
+            &[],
+            None,
+            &["rev-parse", "-q", "--verify", "HEAD^{tree}"],
+        )
+        .await
+        {
+            Ok(out) if is_oid(&text(&out)) => text(&out),
+            _ => EMPTY_TREE.to_string(),
+        }
+    }
+
     /// The rest of the snapshot: the two trees, the changes and what was withheld.
     pub async fn complete(self) -> Result<CheckoutSnapshot, SnapshotError> {
         let SnapshotStart {

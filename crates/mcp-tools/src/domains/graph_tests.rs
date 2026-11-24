@@ -1179,6 +1179,10 @@ fn graph_tool_schema_exposes_pr_brief_and_changed_files() {
         "expected pr_brief in graph action enum"
     );
     assert!(
+        actions.iter().any(|v| v.as_str() == Some("hotspots")),
+        "expected hotspots in graph action enum"
+    );
+    assert!(
         schema["properties"]["changed_files"].is_object(),
         "expected changed_files property in graph schema"
     );

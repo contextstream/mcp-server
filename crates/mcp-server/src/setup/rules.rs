@@ -398,6 +398,7 @@ When asking about dependencies, refactor blast radius, covering tests, linked de
 
 ### Cross-Artifact Lineage, PR Briefs, Cross-Project Coupling & Health Digest (`graph_read`)
 - Graph-powered PR brief & reviewer routing (blast radius, missing co-changes, covering tests, code drift, cross-repo consumers & `OWNED_BY` reviewers) → `graph_read(action="pr_brief", changed_files=["..."], project_id="<current_project_id>")`
+- Risk-weighted refactoring hotspots (complexity/cycles × blast radius × co-change churn × missing tests × open drift × owners) → `graph_read(action="hotspots", workspace_id="<current_workspace_id>")`
 - Workspace cross-project dependency map (shared HTTP/event contracts, Entity Spine links, cross-repo knowledge) → `graph_read(action="cross_project", workspace_id="<current_workspace_id>")`
 - Team graph & decision health digest (open code drift, decision connectivity, circular deps & complexity hotspots) → `graph_read(action="health_digest", workspace_id="<current_workspace_id>")`
 - Feature/initiative lineage (OKR ↔ PRD ↔ Design ↔ Ticket ↔ Code ↔ Experiment ↔ Release) + drift detection → `graph_read(action="lineage", query="...", workspace_id="<current_workspace_id>")`

@@ -3317,6 +3317,56 @@ impl GraphTool {
                 }
                 Ok(output)
             }
+            "hotspots" => {
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": scope.project_id,
+                    "limit": input.limit,
+                });
+                let result: Value = self.client.post("/graph/hotspots", body).await?;
+                let summary = result
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Risk-weighted code & knowledge hotspots computed.");
+                let mut text = summary.to_string();
+                if let Some(arr) = result.get("hotspots").and_then(Value::as_array) {
+                    for h in arr.iter().take(10) {
+                        let tier = h
+                            .get("risk_tier")
+                            .and_then(Value::as_str)
+                            .unwrap_or("medium");
+                        let score = h.get("risk_score").and_then(Value::as_f64).unwrap_or(0.0);
+                        let fp = h.get("file_path").and_then(Value::as_str).unwrap_or("?");
+                        let proj = h.get("project_name").and_then(Value::as_str).unwrap_or("");
+                        let reasons = h
+                            .get("reasons")
+                            .and_then(Value::as_array)
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(" · ")
+                            })
+                            .unwrap_or_default();
+                        text.push_str(&format!(
+                            "\n- [{tier} {score:.1}] `{fp}` ({proj}) — {reasons}"
+                        ));
+                    }
+                }
+                let mut output = ToolResult::with_structured(text, result);
+                if let Some(note) = scope.note.as_deref() {
+                    output = output.with_prefix(format!("{}\n", note));
+                }
+                Ok(output)
+            }
             "entity_upsert" => {
                 let kind = input.kind.ok_or_else(|| {
                     Error::Validation("kind is required for entity_upsert".to_string())
@@ -3745,6 +3795,7 @@ impl ToolHandler for GraphTool {
             "cross_project",
             "health_digest",
             "pr_brief",
+            "hotspots",
             "entity_upsert",
             "relation_upsert",
             "event_ingest",

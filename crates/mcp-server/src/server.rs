@@ -3517,16 +3517,17 @@ mod tests {
         ),
         (
             // Wave 4 additive action: `pr_brief` (`changed_files`, `pull_number`).
+            // Wave 5 additive action: `hotspots` (risk-weighted code & knowledge hotspots).
             "graph",
-            "0e848ece8491fe980ad13eadc03bb5fc4075c58ea092da7a999b05cb81816b05",
+            "c90105853d4a1c476d55ac85615f91de6e16efa2ec2918068f0f903ba4d604c7",
         ),
         (
             // Read-only twin of `graph` (readOnlyHint: true) exposing pure-read
             // code, knowledge, lineage, meeting_brief, universal_impact, entity_search,
-            // cross_project, health_digest & pr_brief actions without approval prompts and
-            // refusing `code_drift` refresh=true.
+            // cross_project, health_digest, pr_brief & hotspots actions without approval
+            // prompts and refusing `code_drift` refresh=true.
             "graph_read",
-            "f69a8579150eed158dc1d34a56a1d9d42151fbe99858f5468adbef52d0c960fe",
+            "e6a7a0418bc8aca5fbef5fd90b9087831bf0e7abc632f896603204eb078798b1",
         ),
         (
             // Advanced when the `feeds` bundle joined the `bundle` enum

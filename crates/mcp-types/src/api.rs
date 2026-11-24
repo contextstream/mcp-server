@@ -315,6 +315,10 @@ pub struct SearchResponse {
     /// How each of those linked searches went: `{workspace_id, name, include_code, status, hits}`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub linked_workspaces: Vec<serde_json::Value>,
+    /// Automatic Postgres code & knowledge graph alerts (`code_drift`, `hotspot`, `untested_hub`)
+    /// for files returned in this search.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_signals: Vec<serde_json::Value>,
 }
 
 impl SearchResponse {

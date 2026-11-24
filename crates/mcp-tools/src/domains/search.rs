@@ -14037,6 +14037,9 @@ impl SearchTool {
                 "Use graph(action=\"dependencies|impact|usages|call_path\") for deeper analysis.\n",
             );
         }
+        if let Some(signals_block) = format_search_graph_signals(&result.graph_signals) {
+            text.push_str(&signals_block);
+        }
         if let Some(footer) = health_footer.as_deref() {
             text.push_str(footer);
         }
@@ -15063,6 +15066,72 @@ pub fn register_search_tools(
             index_keeper,
         )),
     );
+}
+
+/// Format bounded, sanitized `[GRAPH_SIGNALS]` lines returned by the server for
+/// high-risk files present in a code search response.
+pub(crate) fn format_search_graph_signals(signals: &[Value]) -> Option<String> {
+    if signals.is_empty() {
+        return None;
+    }
+    let clean = |s: &str, max: usize| -> String {
+        s.chars()
+            .filter(|c| !c.is_control())
+            .map(|c| match c {
+                '[' | ']' => ' ',
+                other => other,
+            })
+            .take(max)
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut lines = Vec::with_capacity(signals.len().min(4) + 2);
+    for sig in signals.iter().take(4) {
+        let Some(file_path) = sig.get("file_path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(summary) = sig.get("summary").and_then(Value::as_str) else {
+            continue;
+        };
+        let kind = match sig.get("kind").and_then(Value::as_str).unwrap_or("hotspot") {
+            "code_drift" => "drift",
+            "untested_hub" => "untested-hub",
+            _ => "hotspot",
+        };
+        let severity = clean(
+            sig.get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("high"),
+            16,
+        );
+        let loc = sig
+            .get("line")
+            .and_then(Value::as_i64)
+            .map(|l| format!(":{l}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- [{}:{}] `{}{}` — {}",
+            kind,
+            severity,
+            clean(file_path, 120),
+            loc,
+            clean(summary, 180)
+        ));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out = String::from("\n[GRAPH_SIGNALS] Graph alerts on matched files:\n");
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(
+        "Use graph_read(action=\"hotspots|code_drift|impact|pr_brief\") before editing.\n",
+    );
+    Some(out)
 }
 
 #[cfg(test)]

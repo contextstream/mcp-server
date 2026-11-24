@@ -135,11 +135,16 @@ pub fn build_registry(
     // Agent Coach Kit: registered everywhere, visible only on the coach
     // surface (`/coach`, or CONTEXTSTREAM_TOOL_SURFACE_PROFILE=coach).
     domains::coach::register_coach_tools(&mut registry, client.clone());
-    domains::remote_checks::register_remote_checks_tools(
-        &mut registry,
-        Arc::new(client.clone()),
-        session.clone(),
-    );
+    // Graph-driven verification (`verify` / `ms_verify`) reads local git status
+    // and executes checks against the caller's checkout. Stdio only: the hosted
+    // HTTP gateway cannot access the user's local filesystem.
+    if !config.is_http_transport {
+        domains::remote_checks::register_remote_checks_tools(
+            &mut registry,
+            Arc::new(client.clone()),
+            session.clone(),
+        );
+    }
     domains::skill::register_skill_tools(&mut registry, client, session.clone());
     // Compatibility chart/job surfaces self-gate when no provider is available.
     domains::charts::register_charts_tools(&mut registry, session.clone());
@@ -6473,5 +6478,34 @@ mod review_go_ahead {
             assert_eq!(structured["scope"], "full");
             assert_eq!(structured["passed"], true);
         }
+    }
+
+    #[test]
+    fn http_transport_omits_verify_and_ms_verify_tools() {
+        let stdio_config = Config {
+            is_http_transport: false,
+            ..Config::default()
+        };
+        let stdio_client = ContextStreamClient::new(stdio_config.clone());
+        let stdio_session = Arc::new(SessionManager::new(
+            stdio_client.clone(),
+            stdio_config.clone(),
+        ));
+        let stdio_registry = build_registry(&stdio_config, stdio_client, stdio_session);
+        assert!(stdio_registry.get("verify").is_some());
+        assert!(stdio_registry.get("ms_verify").is_some());
+
+        let http_config = Config {
+            is_http_transport: true,
+            ..Config::default()
+        };
+        let http_client = ContextStreamClient::new(http_config.clone());
+        let http_session = Arc::new(SessionManager::new(
+            http_client.clone(),
+            http_config.clone(),
+        ));
+        let http_registry = build_registry(&http_config, http_client, http_session);
+        assert!(http_registry.get("verify").is_none());
+        assert!(http_registry.get("ms_verify").is_none());
     }
 }

@@ -42,6 +42,7 @@ pub(super) struct Step {
     state: RemoteChecks,
     project: Option<ProjectLanguages>,
     pub choice: Choice,
+    already_on: bool,
 }
 
 fn on_line(state: &RemoteChecks, project: Option<&ProjectLanguages>) -> String {
@@ -65,6 +66,10 @@ fn on_line(state: &RemoteChecks, project: Option<&ProjectLanguages>) -> String {
 }
 
 impl Step {
+    pub(super) fn is_editable(&self) -> bool {
+        !self.already_on
+    }
+
     pub(super) async fn prepare(
         client: &ContextStreamClient,
         folder: Option<&Path>,
@@ -85,7 +90,17 @@ impl Step {
         }
         if state.enabled && explicit != Some(false) {
             ui::say(Mark::Ok, &on_line(&state, project.as_ref()), None);
-            return Ok(None);
+            let choice = if state.more_engines == Some(true) {
+                Choice::More
+            } else {
+                Choice::Standard
+            };
+            return Ok(Some(Self {
+                state,
+                project,
+                choice,
+                already_on: true,
+            }));
         }
         if !state.available && !state.enabled {
             ui::say(
@@ -108,6 +123,7 @@ impl Step {
             state,
             project,
             choice,
+            already_on: false,
         };
         if explicit.is_none() {
             step.prompt()?;
@@ -153,6 +169,16 @@ impl Step {
     }
 
     pub(super) async fn apply(&self, client: &ContextStreamClient, workspace: Option<&str>) {
+        if self.already_on {
+            if !safe_edit::is_dry_run() {
+                // Account already has remote checks enabled (e.g. MachineStream
+                // web sign-up): populate the local command_hints cache now so the
+                // first Bash/check command routes immediately without waiting for
+                // an async SessionStart refresh.
+                mcp_tools::domains::hosted_tools::refresh_settings(client, workspace).await;
+            }
+            return;
+        }
         let enabled = self.choice != Choice::Off;
         if !enabled && !self.state.enabled {
             ui::say(Mark::Info, "Remote checks: off", None);
@@ -226,6 +252,8 @@ pub(super) async fn scripted(
         if let Ok(Some(step)) = Step::prepare(client, folder, Some(choice), false).await {
             step.apply(client, workspace).await;
         }
+    } else if !safe_edit::is_dry_run() {
+        mcp_tools::domains::hosted_tools::refresh_settings(client, workspace).await;
     }
 }
 

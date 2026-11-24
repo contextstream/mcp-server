@@ -204,11 +204,16 @@ pub async fn handle() -> Result<()> {
     // `additional_context` field and uses raw (unprefixed) tool names. Strip the
     // Claude `mcp__contextstream__` prefix so the primer is callable there;
     // Claude/other editors keep the prefixed HookOutput schema.
-    let output_text = if super::input_is_cursor(&input) {
+    let mut output_text = if super::input_is_cursor(&input) {
         output_text.replace("mcp__contextstream__", "")
     } else {
         output_text
     };
+    if super::input_is_cursor(&input) {
+        if let Some(hint) = cursor_remote_checks_hint(&config) {
+            output_text.push_str(hint);
+        }
+    }
     super::prewarm::maybe_spawn(&cwd);
     super::write_context_and_notice_for_input(
         &input,
@@ -219,6 +224,31 @@ pub async fn handle() -> Result<()> {
     )?;
 
     Ok(())
+}
+
+const CURSOR_REMOTE_CHECKS_HINT: &str = "\n\n⚡ Remote checks (MachineStream) are enabled for this account: wrap supported test, lint, type-check, and build shell commands with `contextstream-mcp run -- <command>` (e.g. `contextstream-mcp run -- npm test`).";
+
+fn cursor_remote_checks_hint(config: &ApiConfig) -> Option<&'static str> {
+    if config.api_key.is_empty()
+        || mcp_client::command_hints::switched_off(
+            std::env::var(mcp_client::command_hints::ENV_SWITCH)
+                .ok()
+                .as_deref(),
+        )
+    {
+        return None;
+    }
+    let cache = mcp_client::command_hints::read(
+        &mcp_client::command_hints::local_identity(&config.api_key),
+        &config.api_url,
+    )?;
+    cursor_remote_checks_hint_from_cache(&cache)
+}
+
+fn cursor_remote_checks_hint_from_cache(
+    cache: &mcp_client::command_hints::Cache,
+) -> Option<&'static str> {
+    cache.tool_named("check").map(|_| CURSOR_REMOTE_CHECKS_HINT)
 }
 
 // ============================================================================
@@ -960,5 +990,33 @@ mod tests {
             "captured_at": old,
         });
         assert!(!is_noise_lesson(&lesson));
+    }
+
+    #[test]
+    fn cursor_remote_checks_hint_only_shows_when_check_tool_is_cached() {
+        let with_check = mcp_client::command_hints::Cache::new(
+            "test-id",
+            "https://api.contextstream.io",
+            vec![mcp_client::command_hints::CachedTool {
+                name: "check".to_string(),
+                transport: "stream".to_string(),
+                attachments: vec!["checkout_snapshot".to_string()],
+                hints: mcp_client::command_hints::Hints {
+                    argument: "command".to_string(),
+                    cwd_argument: None,
+                    patterns: vec!["^npm test$".to_string()],
+                },
+            }],
+        );
+        let hint = cursor_remote_checks_hint_from_cache(&with_check);
+        assert!(hint.is_some());
+        assert!(hint.unwrap().contains("contextstream-mcp run -- <command>"));
+
+        let without_check = mcp_client::command_hints::Cache::new(
+            "test-id",
+            "https://api.contextstream.io",
+            vec![],
+        );
+        assert!(cursor_remote_checks_hint_from_cache(&without_check).is_none());
     }
 }

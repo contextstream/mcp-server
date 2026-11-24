@@ -635,7 +635,7 @@ pub async fn listing_changed(
 
 /// Refresh both the advertised tools and the editor hook's disk cache after
 /// an account change, even before this caller's first tools/list.
-pub(super) async fn refresh_settings(client: &ContextStreamClient, workspace: Option<&str>) {
+pub async fn refresh_settings(client: &ContextStreamClient, workspace: Option<&str>) {
     if let Some(identity) = crate::domains::slipstream::caller_identity(client).await {
         HostedToolsGate::global()
             .read_catalog(client, &identity, workspace, LISTING_BUDGET, true)

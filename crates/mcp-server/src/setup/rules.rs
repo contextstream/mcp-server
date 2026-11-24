@@ -2540,7 +2540,11 @@ const CURSOR_SUPPLEMENT: &str = r#"
 - **Do NOT** use `TodoWrite` for persistent todos — use `memory(action="create_todo", title="...", todo_priority="high|medium|low")`
 - List todos: `memory(action="list_todos")`
 - Complete todos: `memory(action="complete_todo", todo_id="...")`
-- ContextStream todos persist across sessions and are searchable"#;
+- ContextStream todos persist across sessions and are searchable
+
+### Remote Checks (MachineStream)
+- When running supported test, lint, type-check, or build commands in the terminal (e.g. `cargo check`, `cargo test`, `npm test`, `npx vitest run`, `npx tsc --noEmit`, `uv run pytest`, `go test ./...`, `vite build`), run them via `contextstream-mcp run -- <command>` (for example `contextstream-mcp run -- npm test`)
+- When remote checks are enabled for the account, `contextstream-mcp run` offloads the command to MachineStream; otherwise it runs locally with the exact same exit code and output"#;
 
 /// Supplement for Codex/OpenCode to override their built-in search tools.
 /// Codex uses Explore subagents and "Searched for" built-in operations that
@@ -2579,7 +2583,11 @@ const AGENTS_MD_SUPPLEMENT: &str = r#"
 - **Do NOT** use built-in todo/plan tools (`TodoWrite`, `todo_list`, `plan_mode_respond`) for persistent plans or tasks
 - **Do NOT** save plans as `session(action="capture", event_type="plan")` or `memory(action="create_event", event_type="plan")`
 - **ALWAYS** save plans: `session(action="capture_plan", title="...", description="...", goals=[...], steps=[{"id":"plan-step-1","title":"...","order":1,"description":"what changes, where, how it is verified (1-3 sentences)"}], create_tasks=true)`
-- **ALWAYS** create linked tasks: `memory(action="create_task", title="...", description="what to do and how it is verified (1-3 sentences)", plan_id="...", plan_step_id="...", priority="medium", task_status="pending")`"#;
+- **ALWAYS** create linked tasks: `memory(action="create_task", title="...", description="what to do and how it is verified (1-3 sentences)", plan_id="...", plan_step_id="...", priority="medium", task_status="pending")`
+
+### Remote Checks (MachineStream)
+- When running supported test, lint, type-check, or build commands in the shell (e.g. `cargo check`, `cargo test`, `npm test`, `npx vitest run`, `npx tsc --noEmit`, `uv run pytest`, `go test ./...`, `vite build`), wrap them with `contextstream-mcp run -- <command>` (for example `contextstream-mcp run -- cargo test`)
+- When remote checks are enabled for the account, `contextstream-mcp run` offloads the command to MachineStream; otherwise it runs locally with the exact same exit code and output"#;
 
 const COPILOT_SUPPLEMENT: &str = r#"
 ---
@@ -6466,5 +6474,11 @@ mod project_rules_form_machine_tests {
         assert_eq!(elsewhere, Full);
         assert_eq!(written, Header);
         assert_eq!(opted_out, Full);
+    }
+
+    #[test]
+    fn cursor_and_codex_supplements_include_remote_checks_run_guidance() {
+        assert!(CURSOR_SUPPLEMENT.contains("contextstream-mcp run -- <command>"));
+        assert!(AGENTS_MD_SUPPLEMENT.contains("contextstream-mcp run -- <command>"));
     }
 }

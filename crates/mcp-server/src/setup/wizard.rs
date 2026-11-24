@@ -333,7 +333,12 @@ pub(super) async fn run(
             offer_learning_toggle,
             choices.claude_auto_memory_off,
         );
-        if explicit_checks.is_none() && choices.remote_checks.is_some() {
+        if explicit_checks.is_none()
+            && choices
+                .remote_checks
+                .as_ref()
+                .is_some_and(|step| step.is_editable())
+        {
             actions.insert(3, (ReviewAction::RemoteChecks, "Change remote checks"));
         }
         let labels: Vec<&str> = actions.iter().map(|(_, label)| *label).collect();
@@ -936,7 +941,9 @@ fn print_review(choices: &Choices) {
     }
     rows.push(ui.row("Indexing", choices.index.summary()));
     if let Some(step) = &choices.remote_checks {
-        rows.push(ui.row("Remote checks", step.choice.label()));
+        if step.is_editable() {
+            rows.push(ui.row("Remote checks", step.choice.label()));
+        }
     }
     if choices.explicit_learning || choices.learning_state.should_prompt_in_wizard() {
         rows.push(ui.row(

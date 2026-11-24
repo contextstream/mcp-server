@@ -108,24 +108,103 @@ async fn cli_opt_in_updates_hints_and_credit_refusals_run_locally_across_process
     server.abort();
 }
 
+fn add_setup_discovery_routes(router: Router) -> Router {
+    const WS: &str = "11111111-1111-4111-8111-111111111111";
+    const PROJ: &str = "22222222-2222-4222-8222-222222222222";
+    router
+        .route(
+            "/api/v1/workspaces",
+            get(|| async {
+                Json(json!({
+                    "data": {
+                        "items": [{
+                            "id": WS,
+                            "name": "Testing",
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "updated_at": "2026-01-01T00:00:00Z"
+                        }]
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/workspaces/{id}",
+            get(|| async {
+                Json(json!({
+                    "data": {
+                        "id": WS,
+                        "name": "Testing",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:00:00Z"
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/projects",
+            get(|| async {
+                Json(json!({
+                    "data": {
+                        "items": [],
+                        "total": 0,
+                        "page": 1,
+                        "page_size": 50,
+                        "total_pages": 1
+                    }
+                }))
+            })
+            .post(|| async {
+                Json(json!({
+                    "data": {
+                        "id": PROJ,
+                        "name": "demo",
+                        "workspace_id": WS
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/projects/{id}",
+            get(|| async {
+                Json(json!({
+                    "data": {
+                        "id": PROJ,
+                        "name": "demo",
+                        "workspace_id": WS
+                    }
+                }))
+            }),
+        )
+        .fallback(
+            |method: axum::http::Method, uri: axum::http::Uri| async move {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("unmocked route: {method} {uri}")})),
+                )
+            },
+        )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn setup_remote_checks_is_opt_in_and_a_refusal_never_breaks_setup() {
     let reads = Arc::new(AtomicUsize::new(0));
     let writes = Arc::new(AtomicUsize::new(0));
     let gets = reads.clone();
     let puts = writes.clone();
-    let api = Router::new()
-        .route("/api/v1/auth/me", get(|| async {
-            Json(json!({"data":{"id":"11111111-1111-4111-8111-111111111111","email":"tester@example.test","created_at":"2026-01-01T00:00:00Z"}}))
-        }))
-        .route("/api/v1/mcp/hosted-tools/enabled", get(move || async move {
-            gets.fetch_add(1,Ordering::SeqCst);
-            Json(json!({"enabled":false,"more_engines":false,"available":true,"tool":"check"}))
-        }).put(move |Json(body): Json<Value>| async move {
-            puts.fetch_add(1,Ordering::SeqCst);
-            assert_eq!(body,json!({"enabled":true,"more_engines":true}));
-            StatusCode::FORBIDDEN
-        }));
+    let api = add_setup_discovery_routes(
+        Router::new()
+            .route("/api/v1/auth/me", get(|| async {
+                Json(json!({"data":{"id":"11111111-1111-4111-8111-111111111111","email":"tester@example.test","created_at":"2026-01-01T00:00:00Z"}}))
+            }))
+            .route("/api/v1/mcp/hosted-tools/enabled", get(move || async move {
+                gets.fetch_add(1,Ordering::SeqCst);
+                Json(json!({"enabled":false,"more_engines":false,"available":true,"tool":"check"}))
+            }).put(move |Json(body): Json<Value>| async move {
+                puts.fetch_add(1,Ordering::SeqCst);
+                assert_eq!(body,json!({"enabled":true,"more_engines":true}));
+                StatusCode::FORBIDDEN
+            })),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
@@ -163,5 +242,104 @@ async fn setup_remote_checks_is_opt_in_and_a_refusal_never_breaks_setup() {
                 .contains("Remote checks are unavailable for this account."));
         }
     }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_seeds_command_hints_when_remote_checks_already_enabled() {
+    let puts = Arc::new(AtomicUsize::new(0));
+    let puts_ref = puts.clone();
+    let api = add_setup_discovery_routes(
+        Router::new()
+            .route("/api/v1/auth/me", get(|| async {
+                Json(json!({"data":{"id":"11111111-1111-4111-8111-111111111111","email":"tester@example.test","created_at":"2026-01-01T00:00:00Z"}}))
+            }))
+            .route(
+                "/api/v1/mcp/hosted-tools/enabled",
+                get(|| async {
+                    Json(json!({"enabled":true,"more_engines":false,"available":true,"tool":"check"}))
+                })
+                .put(move || async move {
+                    puts_ref.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }),
+            )
+            .route("/api/v1/mcp/hosted-tools", get(|| async {
+                Json(json!({"tools":[{"name":"check","description":"Remote checks","input_schema":{"type":"object"},
+                    "transport":{"kind":"stream"}, "attachments":["checkout_snapshot"],
+                    "command_hints":{"argument":"command","patterns":["^cargo check$"]}}]}))
+            })),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname=\"demo\"\n").unwrap();
+
+    // --dry-run must NOT write command_hints cache to disk.
+    let dry_home = tempfile::tempdir().unwrap();
+    let dry_out = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+        .args(["setup", "--yes", "--dry-run", "--remote-checks"])
+        .current_dir(repo.path())
+        .env_clear()
+        .env("HOME", dry_home.path())
+        .env("PATH", "")
+        .env("NO_COLOR", "1")
+        .env("CONTEXTSTREAM_API_URL", &url)
+        .env("CONTEXTSTREAM_API_KEY", "stub-already-on")
+        .output()
+        .unwrap();
+    assert!(
+        dry_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_out.stderr)
+    );
+    assert!(
+        !dry_home.path().join(".contextstream").exists(),
+        "dry-run should not write local cache files"
+    );
+
+    // Real setup --yes (both with and without --remote-checks) must seed command_hints without PUTting.
+    for extra in [&[][..], &["--remote-checks"][..]] {
+        let home = tempfile::tempdir().unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+            .args(["setup", "--yes"])
+            .args(extra)
+            .current_dir(repo.path())
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "")
+            .env("NO_COLOR", "1")
+            .env("CONTEXTSTREAM_API_URL", &url)
+            .env("CONTEXTSTREAM_API_KEY", "stub-already-on")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let hints_file = std::fs::read_dir(home.path().join(".contextstream"))
+            .unwrap()
+            .flatten()
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("hosted-command-hints-")
+            });
+        let hints_path = hints_file
+            .unwrap_or_else(|| {
+                panic!("expected hosted-command-hints cache file to be written for extra={extra:?}")
+            })
+            .path();
+        let identity = mcp_client::command_hints::local_identity("stub-already-on");
+        let cache = mcp_client::command_hints::read_from(&hints_path, &identity, &url)
+            .expect("valid command_hints cache");
+        assert!(
+            cache.tool_for("cargo check").is_some(),
+            "expected cached check tool to match cargo check for extra={extra:?}"
+        );
+    }
+    assert_eq!(puts.load(Ordering::SeqCst), 0);
     server.abort();
 }

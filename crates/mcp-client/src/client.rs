@@ -17071,6 +17071,40 @@ impl ContextStreamClient {
             .await
     }
 
+    /// Resolve or dismiss a single knowledge-to-code drift finding (`dismissed`,
+    /// `resolved`, or `open`).
+    pub async fn graph_resolve_drift(
+        &self,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        finding_id: Uuid,
+        status: &str,
+    ) -> Result<serde_json::Value> {
+        let mut body = serde_json::Map::new();
+        if let Some(ws) = workspace_id {
+            body.insert(
+                "workspace_id".to_string(),
+                serde_json::Value::String(ws.to_string()),
+            );
+        }
+        if let Some(pid) = project_id {
+            body.insert(
+                "project_id".to_string(),
+                serde_json::Value::String(pid.to_string()),
+            );
+        }
+        body.insert(
+            "finding_id".to_string(),
+            serde_json::Value::String(finding_id.to_string()),
+        );
+        body.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.to_string()),
+        );
+        self.post("/graph/code-drift/resolve", serde_json::Value::Object(body))
+            .await
+    }
+
     // =========================================================================
     // Integrations
     // =========================================================================

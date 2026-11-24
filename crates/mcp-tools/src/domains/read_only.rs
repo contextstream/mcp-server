@@ -144,7 +144,7 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
                       lineage, meeting_brief, universal_impact, entity_search, cross_project, \
                       health_digest, pr_brief and hotspots. Same arguments as \
                       graph(action=...) for these actions. Use this for every read; use `graph` \
-                      only for writes (ingest, quality_snapshot, resolve_contradiction, entity_upsert, relation_upsert, \
+                      only for writes (ingest, quality_snapshot, resolve_contradiction, resolve_drift, entity_upsert, relation_upsert, \
                       event_ingest, install_domain_pack, outbox ops or code_drift refresh=true).",
         actions: &[
             "dependencies",
@@ -704,7 +704,7 @@ mod tests {
                             "quality_freshness", "lineage", "meeting_brief",
                             "universal_impact", "entity_search", "ingest", "outbox_status",
                             "outbox_canary", "quality_snapshot", "resolve_contradiction",
-                            "entity_upsert", "relation_upsert", "event_ingest", "install_domain_pack"
+                            "resolve_drift", "entity_upsert", "relation_upsert", "event_ingest", "install_domain_pack"
                         ]
                     },
                     "target_id": {"type": "string"},
@@ -759,6 +759,7 @@ mod tests {
             "outbox_canary",
             "outbox_status",
             "resolve_contradiction",
+            "resolve_drift",
             "entity_upsert",
             "relation_upsert",
             "event_ingest",

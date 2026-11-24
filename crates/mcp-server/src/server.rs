@@ -3519,16 +3519,17 @@ mod tests {
             // Wave 4 additive action: `pr_brief` (`changed_files`, `pull_number`).
             // Wave 5 additive action: `hotspots` (risk-weighted code & knowledge hotspots).
             // Wave 9 additive write action: `resolve_contradiction` (`relation_id`, `resolution`, `reason`, `trigger_drift_scan`).
+            // Wave 10 additive write action: `resolve_drift` (`finding_id`, `status`).
             "graph",
-            "6431f7f97362905e4a81e8aedd79d20f64709168c8cad62e58607cb75126b45a",
+            "5fee513f7c5686aeae4c894f0a9510e83e1df71131fa22f4a445e54ff682cdf9",
         ),
         (
             // Read-only twin of `graph` (readOnlyHint: true) exposing pure-read
             // code, knowledge, lineage, meeting_brief, universal_impact, entity_search,
             // cross_project, health_digest, pr_brief & hotspots actions without approval
-            // prompts and refusing `code_drift` refresh=true and `resolve_contradiction`.
+            // prompts and refusing `code_drift` refresh=true, `resolve_contradiction`, and `resolve_drift`.
             "graph_read",
-            "89a960f0fbd6b728945615c07e031753628bc4f787dff7383dba02116feb1730",
+            "83e5b4babd8e9520727cb590efc6c64ec7d9a6b4ea16d32300041ee8e159acfb",
         ),
         (
             // Advanced when the `feeds` bundle joined the `bundle` enum

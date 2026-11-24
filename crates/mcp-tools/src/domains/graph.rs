@@ -866,11 +866,12 @@ pub struct GraphInput {
     // PR Graph Brief fields
     pub changed_files: Option<Vec<String>>,
     pub pull_number: Option<i64>,
-    // Contradiction resolution fields (resolve_contradiction)
+    // Contradiction & code-drift resolution fields (resolve_contradiction, resolve_drift)
     pub relation_id: Option<String>,
     pub resolution: Option<String>,
     pub reason: Option<String>,
     pub trigger_drift_scan: Option<bool>,
+    pub finding_id: Option<String>,
 }
 
 /// Unified graph tool handler.
@@ -2863,6 +2864,52 @@ impl GraphTool {
                 }
                 Ok(output)
             }
+            "resolve_drift" => {
+                let finding_id = input
+                    .finding_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        Error::Validation(
+                            "finding_id (UUID) is required for resolve_drift".to_string(),
+                        )
+                    })
+                    .and_then(|s| {
+                        Uuid::parse_str(s).map_err(|_| {
+                            Error::Validation("finding_id must be a valid UUID".to_string())
+                        })
+                    })?;
+                let status = input
+                    .status
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_else(|| "dismissed".to_string());
+                if !matches!(status.as_str(), "dismissed" | "resolved" | "open") {
+                    return Err(Error::Validation(
+                        "status for resolve_drift must be one of: dismissed, resolved, open"
+                            .to_string(),
+                    ));
+                }
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let result = self
+                    .client
+                    .graph_resolve_drift(scope.workspace_id, scope.project_id, finding_id, &status)
+                    .await?;
+                let text = format_resolve_drift_text(&result);
+                let mut output = ToolResult::with_structured(text, result);
+                if let Some(note) = scope.note.as_deref() {
+                    output = output.with_prefix(format!("{}\n", note));
+                }
+                Ok(output)
+            }
             "decisions" => {
                 if input.node_id.is_none() && input.target_id.is_none() {
                     return Err(Error::Validation(
@@ -3774,6 +3821,7 @@ impl ToolHandler for GraphTool {
             "pr_brief",
             "hotspots",
             "resolve_contradiction",
+            "resolve_drift",
             "entity_upsert",
             "relation_upsert",
             "event_ingest",
@@ -3916,6 +3964,7 @@ impl ToolHandler for GraphTool {
             .string("resolution", "Contradiction resolution: supersede_older, supersede_newer, or dismiss (resolve_contradiction)", false)
             .string("reason", "Optional reason for contradiction resolution (resolve_contradiction)", false)
             .boolean("trigger_drift_scan", "Whether to trigger an incremental code-drift scan after supersede (resolve_contradiction, default true)", false)
+            .uuid("finding_id", "Code drift finding UUID (resolve_drift)", false)
             .build()
     }
 }
@@ -4236,8 +4285,8 @@ pub(crate) fn format_contradictions_text(result: &Value) -> String {
     text
 }
 
-/// Format `graph_read(action="code_drift")` output with file paths, lines, retired values,
-/// replacements, kinds, and confidence.
+/// Format `graph_read(action="code_drift")` output with true total open count,
+/// file paths, lines, retired values, replacements, kinds, confidence, and finding IDs.
 pub(crate) fn format_code_drift_text(result: &Value) -> String {
     let findings = result
         .get("findings")
@@ -4245,23 +4294,25 @@ pub(crate) fn format_code_drift_text(result: &Value) -> String {
         .or_else(|| result.get("drift"))
         .and_then(Value::as_array)
         .or_else(|| result.as_array());
-    let count = result
-        .get("count")
+    let total = result
+        .get("total_count")
         .or_else(|| result.get("total"))
+        .or_else(|| result.get("count"))
         .and_then(Value::as_u64)
         .unwrap_or_else(|| findings.map_or(0, |v| v.len() as u64));
 
     let Some(list) = findings.filter(|v| !v.is_empty()) else {
-        if count > 0 {
-            return format!("Found {count} stale code reference(s) to retired knowledge.");
+        if total > 0 {
+            return format!("Found {total} stale code reference(s) to retired knowledge.");
         }
         return "No knowledge-code drift found.".to_string();
     };
 
+    let shown = list.len().min(15);
     let mut text = format!(
-        "Found {count} stale code reference(s) to retired knowledge (showing {}):",
-        list.len().min(15)
+        "Found {total} open stale code reference(s) to retired knowledge (showing {shown}):"
     );
+    let mut has_finding_id = false;
     for item in list.iter().take(15) {
         let fp = item.get("file_path").and_then(Value::as_str).unwrap_or("?");
         let loc = item
@@ -4282,6 +4333,15 @@ pub(crate) fn format_code_drift_text(result: &Value) -> String {
             .and_then(Value::as_f64)
             .map(|c| format!(" (conf {:.0}%)", c * 100.0))
             .unwrap_or_default();
+        let id_note = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|id| {
+                has_finding_id = true;
+                format!(" [id={id}]")
+            })
+            .unwrap_or_default();
         let summary = item
             .get("knowledge_summary")
             .or_else(|| item.get("decision_summary"))
@@ -4290,10 +4350,41 @@ pub(crate) fn format_code_drift_text(result: &Value) -> String {
             .map(|s| format!(" — {s}"))
             .unwrap_or_default();
         text.push_str(&format!(
-            "\n- [{kind}] `{loc}`: retired `{old_v}`{replacement}{conf}{summary}"
+            "\n- [{kind}] `{loc}`: retired `{old_v}`{replacement}{conf}{id_note}{summary}"
         ));
     }
+    if has_finding_id {
+        text.push_str(
+            "\n\nDismiss false positive or mark fixed with: graph(action=\"resolve_drift\", finding_id=\"<id>\", status=\"dismissed|resolved\")",
+        );
+    }
     text
+}
+
+/// Format `graph(action="resolve_drift")` confirmation output.
+pub(crate) fn format_resolve_drift_text(result: &Value) -> String {
+    let finding_id = result
+        .get("finding_id")
+        .or_else(|| result.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("updated");
+    let fp = result.get("file_path").and_then(Value::as_str);
+    let line = result
+        .get("line")
+        .and_then(Value::as_i64)
+        .filter(|l| *l > 0);
+    let old_v = result.get("old_value").and_then(Value::as_str);
+    match (fp, old_v) {
+        (Some(path), Some(old)) => {
+            let loc = line.map_or_else(|| path.to_string(), |l| format!("{path}:{l}"));
+            format!("Marked code drift finding {finding_id} as {status} (`{old}` at `{loc}`).")
+        }
+        _ => format!("Marked code drift finding {finding_id} as {status}."),
+    }
 }
 
 /// Format `graph(action="resolve_contradiction")` confirmation output.

@@ -1277,8 +1277,10 @@ fn format_contradictions_renders_workspace_pairs_and_resolution_hint() {
 fn format_code_drift_renders_file_locations_and_replacements() {
     let payload = json!({
         "count": 1,
+        "total_count": 12,
         "findings": [
             {
+                "id": "drift-1",
                 "file_path": "src/config.rs",
                 "line": 88,
                 "kind": "env_var",
@@ -1290,8 +1292,24 @@ fn format_code_drift_renders_file_locations_and_replacements() {
         ]
     });
     let text = format_code_drift_text(&payload);
-    assert!(text.contains("Found 1 stale code reference(s) to retired knowledge"));
-    assert!(text.contains("[env_var] `src/config.rs:88`: retired `LEGACY_BROKER_URL` -> `PRIMARY_BROKER_URL` (conf 92%) — Retire legacy broker URL"));
+    assert!(text.contains("Found 12 open stale code reference(s) to retired knowledge (showing 1)"));
+    assert!(text.contains("[env_var] `src/config.rs:88`: retired `LEGACY_BROKER_URL` -> `PRIMARY_BROKER_URL` (conf 92%) [id=drift-1] — Retire legacy broker URL"));
+    assert!(text.contains("graph(action=\"resolve_drift\""));
+}
+
+#[test]
+fn format_resolve_drift_summarizes_status_and_location() {
+    let payload = json!({
+        "finding_id": "drift-1",
+        "status": "dismissed",
+        "file_path": "src/render.rs",
+        "line": 1,
+        "old_value": "Render"
+    });
+    assert_eq!(
+        format_resolve_drift_text(&payload),
+        "Marked code drift finding drift-1 as dismissed (`Render` at `src/render.rs:1`)."
+    );
 }
 
 #[test]

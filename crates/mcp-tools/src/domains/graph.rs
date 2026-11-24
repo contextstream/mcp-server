@@ -3161,6 +3161,94 @@ impl GraphTool {
                 }
                 Ok(output)
             }
+            "cross_project" => {
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": scope.project_id,
+                    "max_edges": input.limit,
+                });
+                let result: Value = self.client.post("/graph/cross-project", body).await?;
+                let summary = result.get("summary");
+                let total_projects = summary
+                    .and_then(|s| s.get("total_projects"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let connected = summary
+                    .and_then(|s| s.get("connected_projects"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let total_edges = summary
+                    .and_then(|s| s.get("total_edges"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let mut text = format!(
+                    "Cross-project graph: {} project(s), {} connected, {} link(s).",
+                    total_projects, connected, total_edges
+                );
+                if let Some(arr) = result.get("edges").and_then(Value::as_array) {
+                    for edge in arr.iter().take(10) {
+                        let from = edge
+                            .get("from_project_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?");
+                        let to = edge
+                            .get("to_project_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?");
+                        let sig = edge
+                            .get("signal")
+                            .and_then(Value::as_str)
+                            .unwrap_or("link");
+                        let w = edge.get("weight").and_then(Value::as_u64).unwrap_or(1);
+                        text.push_str(&format!("\n- {} <-> {} [{} | weight={}]", from, to, sig, w));
+                    }
+                }
+                let mut output = ToolResult::with_structured(text, result);
+                if let Some(note) = scope.note.as_deref() {
+                    output = output.with_prefix(format!("{}\n", note));
+                }
+                Ok(output)
+            }
+            "health_digest" => {
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": scope.project_id,
+                    "drift_limit": input.limit,
+                    "hotspot_limit": input.limit,
+                });
+                let result: Value = self.client.post("/graph/health-digest", body).await?;
+                let headline = result
+                    .get("headline")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Graph & decision health digest generated.");
+                let mut text = headline.to_string();
+                if let Some(arr) = result.get("highlights").and_then(Value::as_array) {
+                    for h in arr.iter().take(6) {
+                        if let Some(s) = h.as_str() {
+                            text.push_str(&format!("\n- {}", s));
+                        }
+                    }
+                }
+                let mut output = ToolResult::with_structured(text, result);
+                if let Some(note) = scope.note.as_deref() {
+                    output = output.with_prefix(format!("{}\n", note));
+                }
+                Ok(output)
+            }
             "entity_upsert" => {
                 let kind = input.kind.ok_or_else(|| {
                     Error::Validation("kind is required for entity_upsert".to_string())
@@ -3586,6 +3674,8 @@ impl ToolHandler for GraphTool {
             "meeting_brief",
             "universal_impact",
             "entity_search",
+            "cross_project",
+            "health_digest",
             "entity_upsert",
             "relation_upsert",
             "event_ingest",

@@ -396,7 +396,9 @@ When asking about dependencies, refactor blast radius, covering tests, linked de
 - Circular dependencies, unused code, complexity → `graph_read(action="circular_dependencies"|"unused_code"|"complexity_metrics", project_id="...")`
 - Save a fresh dashboard baseline after scans/fixes → `graph(action="quality_snapshot", project_id="...")`
 
-### Cross-Artifact Lineage, Pre-Meeting Briefs & Universal Ripple (`graph_read`)
+### Cross-Artifact Lineage, Cross-Project Coupling, Health Digest & Pre-Meeting Briefs (`graph_read`)
+- Workspace cross-project dependency map (shared HTTP/event contracts, Entity Spine links, cross-repo knowledge) → `graph_read(action="cross_project", workspace_id="<current_workspace_id>")`
+- Team graph & decision health digest (open code drift, decision connectivity, circular deps & complexity hotspots) → `graph_read(action="health_digest", workspace_id="<current_workspace_id>")`
 - Feature/initiative lineage (OKR ↔ PRD ↔ Design ↔ Ticket ↔ Code ↔ Experiment ↔ Release) + drift detection → `graph_read(action="lineage", query="...", workspace_id="<current_workspace_id>")`
 - Proactive pre-meeting context brief (open commitments, risks, blocked tickets, decisions, at-risk OKRs) → `graph_read(action="meeting_brief", title="...", workspace_id="<current_workspace_id>")`
 - Multi-hop cross-entity & cross-workspace ripple impact → `graph_read(action="universal_impact", query="...", include_code=true, workspace_id="<current_workspace_id>")`
@@ -6493,5 +6495,7 @@ mod project_rules_form_machine_tests {
     fn cursor_and_codex_supplements_include_remote_checks_run_guidance() {
         assert!(CURSOR_SUPPLEMENT.contains("contextstream-mcp run -- <command>"));
         assert!(AGENTS_MD_SUPPLEMENT.contains("contextstream-mcp run -- <command>"));
+        assert!(GRAPH_QUALITY_GUIDANCE.contains("action=\"cross_project\""));
+        assert!(GRAPH_QUALITY_GUIDANCE.contains("action=\"health_digest\""));
     }
 }

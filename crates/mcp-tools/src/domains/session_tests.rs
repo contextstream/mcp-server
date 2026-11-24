@@ -2577,6 +2577,7 @@ mod project_routing_tests {
 
 mod delta_emit_tests {
     use super::{
+        append_new_graph_signals, extract_graph_signals_block,
         format_acceleration_context_warm_cache_marker, format_delta_summary,
         overlay_has_new_dynamic_content,
     };
@@ -2648,6 +2649,30 @@ mod delta_emit_tests {
             without_age,
             "[WARM_CACHE] context served from acceleration cache\n"
         );
+    }
+
+    #[test]
+    fn extracts_and_deduplicates_graph_signals_blocks_across_warm_turns() {
+        let overlay = "[CTX] W:Engineering\n\n[GRAPH_SIGNALS] Automatic alerts:\n- [drift:high] `src/config.rs:42` — retired LEGACY_URL\nInspect with graph_read.\n\n[COACHING] rule";
+        let extracted = extract_graph_signals_block(overlay).expect("graph signals extracted");
+        assert!(extracted.starts_with("[GRAPH_SIGNALS]"));
+        assert!(extracted.contains("src/config.rs:42"));
+        assert!(!extracted.contains("[COACHING]"));
+
+        // Appends when cached_text had no graph signals yet
+        let mut delta = "[CTX-DELTA] unchanged".to_string();
+        assert!(append_new_graph_signals(
+            &mut delta,
+            overlay,
+            "[CTX] W:Engineering"
+        ));
+        assert!(delta.contains("[GRAPH_SIGNALS]"));
+        assert!(delta.contains("src/config.rs:42"));
+
+        // Deduplicates when cached_text already contained the exact same signals
+        let mut delta_same = "[CTX-DELTA] unchanged".to_string();
+        assert!(!append_new_graph_signals(&mut delta_same, overlay, overlay));
+        assert!(!delta_same.contains("[GRAPH_SIGNALS]"));
     }
 }
 

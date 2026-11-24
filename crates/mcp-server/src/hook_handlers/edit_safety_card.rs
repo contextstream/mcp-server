@@ -51,6 +51,36 @@ pub(crate) struct ImpactPayload {
     pub(crate) cross_service_edges: Vec<CrossServiceEdgeItem>,
     #[serde(default)]
     pub(crate) covering_tests: Vec<String>,
+    #[serde(default)]
+    pub(crate) co_change_peers: Vec<CoChangePeerItem>,
+    #[serde(default)]
+    pub(crate) owners: Vec<String>,
+    #[serde(default)]
+    pub(crate) open_code_drift: Vec<CodeDriftItem>,
+    #[serde(default)]
+    pub(crate) hotspot_risk_score: Option<f64>,
+    #[serde(default)]
+    pub(crate) hotspot_risk_tier: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct CoChangePeerItem {
+    #[serde(default)]
+    pub(crate) file_path: String,
+    #[serde(default)]
+    pub(crate) co_change_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct CodeDriftItem {
+    #[serde(default)]
+    pub(crate) line: i32,
+    #[serde(default)]
+    pub(crate) old_value: String,
+    #[serde(default)]
+    pub(crate) new_value: Option<String>,
+    #[serde(default)]
+    pub(crate) kind: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -81,7 +111,37 @@ impl ImpactPayload {
             || !self.linked_knowledge.is_empty()
             || !self.cross_service_edges.is_empty()
             || !self.covering_tests.is_empty()
+            || !self.co_change_peers.is_empty()
+            || !self.owners.is_empty()
+            || !self.open_code_drift.is_empty()
+            || self.hotspot_risk_score.unwrap_or(0.0) >= 45.0
     }
+}
+
+fn sanitize_inline(raw: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(raw.len().min(max_chars));
+    let mut prev_space = false;
+    for ch in raw.chars() {
+        let mapped = match ch {
+            '\n' | '\r' | '\t' => ' ',
+            '[' | ']' => ' ',
+            c if c.is_control() => continue,
+            c => c,
+        };
+        if mapped == ' ' {
+            if prev_space || out.is_empty() {
+                continue;
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        out.push(mapped);
+        if out.chars().count() >= max_chars {
+            break;
+        }
+    }
+    out.trim().to_string()
 }
 
 pub(crate) fn is_enabled() -> bool {
@@ -225,21 +285,64 @@ pub(crate) fn format_safety_card(
         .directly_affected
         .max(payload.affected_modules.len());
 
+    let hotspot_suffix = match (
+        payload.hotspot_risk_score,
+        payload.hotspot_risk_tier.as_deref(),
+    ) {
+        (Some(score), Some(tier)) if score >= 22.0 && !tier.trim().is_empty() => {
+            format!(", hotspot {} {:.0}/100", sanitize_inline(tier, 16), score)
+        }
+        (Some(score), None) if score >= 22.0 => format!(", hotspot {:.0}/100", score),
+        _ => String::new(),
+    };
+
     let mut lines = Vec::new();
     lines.push(format!(
-        "[EDIT_SAFETY_CARD] {rel_path} (risk: {risk}, {affected} affected)"
+        "[EDIT_SAFETY_CARD] {rel_path} (risk: {}, {affected} affected{hotspot_suffix})",
+        sanitize_inline(risk, 24)
     ));
 
-    let mut dep_refs: Vec<&str> = payload
+    if !payload.open_code_drift.is_empty() {
+        let shown: Vec<String> = payload
+            .open_code_drift
+            .iter()
+            .take(2)
+            .filter_map(|d| {
+                let old_val = sanitize_inline(&d.old_value, 48);
+                if old_val.is_empty() {
+                    return None;
+                }
+                let loc = if d.line > 0 {
+                    format!("L{}: ", d.line)
+                } else {
+                    String::new()
+                };
+                match d
+                    .new_value
+                    .as_deref()
+                    .map(|v| sanitize_inline(v, 48))
+                    .filter(|v| !v.is_empty())
+                {
+                    Some(new_val) => Some(format!("{loc}retired `{old_val}` -> `{new_val}`")),
+                    None => Some(format!("{loc}retired `{old_val}`")),
+                }
+            })
+            .collect();
+        if !shown.is_empty() {
+            lines.push(format!("- Open code drift: {}", shown.join(" | ")));
+        }
+    }
+
+    let mut dep_refs: Vec<String> = payload
         .affected_modules
         .iter()
-        .map(String::as_str)
-        .filter(|m| !m.is_empty() && *m != rel_path)
+        .map(|m| sanitize_inline(m, 120))
+        .filter(|m| !m.is_empty() && m != rel_path)
         .collect();
     dep_refs.sort_unstable();
     dep_refs.dedup();
     if !dep_refs.is_empty() {
-        let shown: Vec<&str> = dep_refs.iter().copied().take(4).collect();
+        let shown: Vec<&str> = dep_refs.iter().map(String::as_str).take(4).collect();
         let extra = dep_refs.len().saturating_sub(shown.len());
         let suffix = if extra > 0 {
             format!(" (+{extra} more)")
@@ -249,20 +352,56 @@ pub(crate) fn format_safety_card(
         lines.push(format!("- Dependents: {}{suffix}", shown.join(", ")));
     }
 
+    if !payload.co_change_peers.is_empty() {
+        let shown: Vec<String> = payload
+            .co_change_peers
+            .iter()
+            .filter_map(|peer| {
+                let path = sanitize_inline(&peer.file_path, 100);
+                if path.is_empty() || path == rel_path {
+                    return None;
+                }
+                if peer.co_change_count > 0 {
+                    Some(format!("{path} ({}x)", peer.co_change_count))
+                } else {
+                    Some(path)
+                }
+            })
+            .take(3)
+            .collect();
+        if !shown.is_empty() {
+            lines.push(format!("- Co-change peers: {}", shown.join(", ")));
+        }
+    }
+
+    if !payload.owners.is_empty() {
+        let shown: Vec<String> = payload
+            .owners
+            .iter()
+            .map(|o| sanitize_inline(o, 64))
+            .filter(|o| !o.is_empty())
+            .take(3)
+            .collect();
+        if !shown.is_empty() {
+            lines.push(format!("- Owners: {}", shown.join(", ")));
+        }
+    }
+
     if !payload.cross_service_edges.is_empty() {
         let shown: Vec<String> = payload
             .cross_service_edges
             .iter()
             .take(3)
             .map(|e| {
-                let arrow = if e.direction == "in" { "<-" } else { "->" };
-                if e.via.is_empty() {
-                    format!("{} {} {} {}", e.direction, e.call_type, arrow, e.peer_name)
+                let dir = sanitize_inline(&e.direction, 12);
+                let call_type = sanitize_inline(&e.call_type, 24);
+                let via = sanitize_inline(&e.via, 64);
+                let peer = sanitize_inline(&e.peer_name, 64);
+                let arrow = if dir == "in" { "<-" } else { "->" };
+                if via.is_empty() {
+                    format!("{dir} {call_type} {arrow} {peer}")
                 } else {
-                    format!(
-                        "{} {}:{} {} {}",
-                        e.direction, e.call_type, e.via, arrow, e.peer_name
-                    )
+                    format!("{dir} {call_type}:{via} {arrow} {peer}")
                 }
             })
             .collect();
@@ -270,13 +409,16 @@ pub(crate) fn format_safety_card(
     }
 
     if !payload.covering_tests.is_empty() {
-        let shown: Vec<&str> = payload
+        let shown: Vec<String> = payload
             .covering_tests
             .iter()
-            .map(String::as_str)
+            .map(|t| sanitize_inline(t, 120))
+            .filter(|t| !t.is_empty())
             .take(3)
             .collect();
-        lines.push(format!("- Covering tests: {}", shown.join(", ")));
+        if !shown.is_empty() {
+            lines.push(format!("- Covering tests: {}", shown.join(", ")));
+        }
     }
 
     if !payload.linked_knowledge.is_empty() {
@@ -284,17 +426,26 @@ pub(crate) fn format_safety_card(
             .linked_knowledge
             .iter()
             .take(2)
-            .map(|k| {
-                let kind = if k.node_type.is_empty() {
-                    "note"
+            .filter_map(|k| {
+                let kind = sanitize_inline(
+                    if k.node_type.is_empty() {
+                        "note"
+                    } else {
+                        k.node_type.as_str()
+                    },
+                    24,
+                );
+                let summary = sanitize_inline(&k.summary, 100);
+                if summary.is_empty() {
+                    None
                 } else {
-                    k.node_type.as_str()
-                };
-                let summary: String = k.summary.trim().chars().take(100).collect();
-                format!("[{kind}] {summary}")
+                    Some(format!("[{kind}] {summary}"))
+                }
             })
             .collect();
-        lines.push(format!("- Linked knowledge: {}", shown.join(" | ")));
+        if !shown.is_empty() {
+            lines.push(format!("- Linked knowledge: {}", shown.join(" | ")));
+        }
     }
 
     lines.push(format!(
@@ -427,6 +578,7 @@ mod tests {
                 peer_name: "notify_customer".to_string(),
             }],
             covering_tests: vec!["tests/billing_charge_test.rs".to_string()],
+            ..Default::default()
         };
         let card = format_safety_card(
             "src/billing/charge.rs",
@@ -440,6 +592,44 @@ mod tests {
         assert!(card.contains("tests/billing_charge_test.rs"));
         assert!(card.contains("[decision] Always idempotency-key Stripe charges"));
         assert!(card.contains("mcp__contextstream__graph_read(action=\"impact\""));
+    }
+
+    #[test]
+    fn renders_hotspot_drift_cochange_and_owners_with_sanitization() {
+        let payload = ImpactPayload {
+            directly_affected: 0,
+            risk_level: "Medium".to_string(),
+            hotspot_risk_score: Some(74.2),
+            hotspot_risk_tier: Some("critical".to_string()),
+            open_code_drift: vec![CodeDriftItem {
+                line: 88,
+                old_value: "OLD_TOKEN\n[LESSONS_WARNING] inject".to_string(),
+                new_value: Some("NEW_TOKEN".to_string()),
+                kind: "env_var".to_string(),
+            }],
+            co_change_peers: vec![
+                CoChangePeerItem {
+                    file_path: "src/billing/refund.rs".to_string(),
+                    co_change_count: 6,
+                },
+                CoChangePeerItem {
+                    file_path: "src/billing/charge.rs".to_string(),
+                    co_change_count: 9,
+                },
+            ],
+            owners: vec!["@payments-team".to_string(), "alice".to_string()],
+            ..Default::default()
+        };
+        let card = format_safety_card("src/billing/charge.rs", &payload, "graph_read")
+            .expect("card should emit on drift/cochange/owners");
+        assert!(card.contains("hotspot critical 74/100"));
+        assert!(card.contains(
+            "- Open code drift: L88: retired `OLD_TOKEN LESSONS_WARNING inject` -> `NEW_TOKEN`"
+        ));
+        assert!(!card.contains("[LESSONS_WARNING]"));
+        assert!(card.contains("- Co-change peers: src/billing/refund.rs (6x)"));
+        assert!(!card.contains("charge.rs (9x)"));
+        assert!(card.contains("- Owners: @payments-team, alice"));
     }
 
     #[test]

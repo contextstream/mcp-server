@@ -5881,6 +5881,59 @@ fn overlay_has_new_dynamic_content(hook_ctx: &str) -> bool {
     hook_ctx.contains("[FLASH]") || hook_ctx.contains("[ACTION_REQUIRED]")
 }
 
+/// Extract the `[GRAPH_SIGNALS]` block from a hook or context text payload, if present.
+fn extract_graph_signals_block(text: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut capturing = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !capturing {
+            if trimmed.starts_with("[GRAPH_SIGNALS]") {
+                capturing = true;
+                lines.push(trimmed);
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.starts_with('[') && !trimmed.starts_with("[GRAPH_SIGNALS]") {
+            break;
+        }
+        lines.push(trimmed);
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// Append a `[GRAPH_SIGNALS]` block from `overlay_ctx` onto `target` when it carries
+/// signals not already shown in `already_seen_text`. Returns `true` if appended.
+fn append_new_graph_signals(
+    target: &mut String,
+    overlay_ctx: &str,
+    already_seen_text: &str,
+) -> bool {
+    let Some(block) = extract_graph_signals_block(overlay_ctx) else {
+        return false;
+    };
+    if let Some(existing) = extract_graph_signals_block(already_seen_text) {
+        if existing == block {
+            return false;
+        }
+    }
+    if !target.is_empty() && !target.ends_with('\n') {
+        target.push('\n');
+    }
+    if !target.is_empty() {
+        target.push('\n');
+    }
+    target.push_str(&block);
+    true
+}
+
 /// The modes `context` advertises; leaving `mode` out is adaptive routing.
 const CONTEXT_MODES: &[&str] = &["standard", "pack", "fast"];
 
@@ -5948,6 +6001,7 @@ fn is_high_priority_context_line(line: &str) -> bool {
         || upper.contains("SKILL")
         || upper.contains("DECISION")
         || upper.contains("PREFERENCE")
+        || upper.contains("GRAPH_SIGNALS")
 }
 
 const BOILERPLATE_RULE_PATTERNS: &[&str] = &[
@@ -9029,21 +9083,32 @@ impl ToolHandler for ContextTool {
                     )
                     .await;
 
-                // Extract overlay context (if any) so we can decide between
-                // delta and full emit.
-                let overlay_context: Option<String> = match hook_overlay {
-                    Ok(hook_data) => hook_data
-                        .get("context")
-                        .and_then(|c| c.as_str())
-                        .or_else(|| {
-                            hook_data
-                                .get("data")
-                                .and_then(|d| d.get("context"))
+                // Extract overlay context + structured graph_signals (if any) so we can
+                // decide between delta and full emit while preserving new graph alerts.
+                let (overlay_context, overlay_graph_signals): (Option<String>, Option<Value>) =
+                    match hook_overlay {
+                        Ok(hook_data) => {
+                            let ctx = hook_data
+                                .get("context")
                                 .and_then(|c| c.as_str())
-                        })
-                        .map(str::to_string),
-                    Err(_) => None,
-                };
+                                .or_else(|| {
+                                    hook_data
+                                        .get("data")
+                                        .and_then(|d| d.get("context"))
+                                        .and_then(|c| c.as_str())
+                                })
+                                .map(str::to_string);
+                            let gs = hook_data
+                                .get("graph_signals")
+                                .or_else(|| {
+                                    hook_data.get("data").and_then(|d| d.get("graph_signals"))
+                                })
+                                .filter(|v| v.as_array().is_some_and(|arr| !arr.is_empty()))
+                                .cloned();
+                            (ctx, gs)
+                        }
+                        Err(_) => (None, None),
+                    };
                 let overlay_has_new = overlay_context
                     .as_deref()
                     .map(overlay_has_new_dynamic_content)
@@ -9067,15 +9132,26 @@ impl ToolHandler for ContextTool {
                         caller_identity,
                         &context_request_identity,
                     );
-                    let delta_text = format_delta_summary(
+                    let mut delta_text = format_delta_summary(
                         &cached_response,
                         scope_authoritative,
                         &routing_scope_key(workspace_id, project_id, folder_path.as_deref()),
                     );
+                    let appended_graph_signals = overlay_context
+                        .as_deref()
+                        .map(|hook_ctx| {
+                            append_new_graph_signals(&mut delta_text, hook_ctx, &cached_text)
+                        })
+                        .unwrap_or(false);
                     let mut structured = serde_json::to_value(&cached_response).unwrap_or_default();
                     attach_scope_guidance(&mut structured, workspace_id, project_id);
                     if let Some(obj) = structured.as_object_mut() {
                         obj.insert("delta_emit".to_string(), serde_json::json!(true));
+                        if appended_graph_signals {
+                            if let Some(gs) = overlay_graph_signals {
+                                obj.insert("graph_signals".to_string(), gs);
+                            }
+                        }
                     }
                     tracing::debug!(
                         "context warm-cache delta emit (turn {}, delta #{}/{})",
@@ -9108,6 +9184,10 @@ impl ToolHandler for ContextTool {
                         }
                     }
                 }
+                let appended_graph_signals = overlay_context
+                    .as_deref()
+                    .map(|hook_ctx| append_new_graph_signals(&mut text, hook_ctx, &cached_text))
+                    .unwrap_or(false);
 
                 tracing::debug!(
                     "context warm-cache hit (turn {}, full emit after {} deltas)",
@@ -9116,6 +9196,13 @@ impl ToolHandler for ContextTool {
                 );
                 let mut structured = serde_json::to_value(&cached_response).unwrap_or_default();
                 attach_scope_guidance(&mut structured, workspace_id, project_id);
+                if appended_graph_signals {
+                    if let Some(gs) = overlay_graph_signals {
+                        if let Some(obj) = structured.as_object_mut() {
+                            obj.insert("graph_signals".to_string(), gs);
+                        }
+                    }
+                }
                 // Refresh the cache so delta_emits resets to 0 for the next
                 // window of warm hits.
                 warm_cache_put(

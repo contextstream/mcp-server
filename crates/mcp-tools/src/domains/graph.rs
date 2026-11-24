@@ -923,6 +923,9 @@ pub struct GraphInput {
     pub direction: Option<String>,
     pub include_code: Option<bool>,
     pub include_linked_workspaces: Option<bool>,
+    // PR Graph Brief fields
+    pub changed_files: Option<Vec<String>>,
+    pub pull_number: Option<i64>,
 }
 
 /// Unified graph tool handler.
@@ -3249,6 +3252,71 @@ impl GraphTool {
                 }
                 Ok(output)
             }
+            "pr_brief" => {
+                let scope = resolve_read_scope(
+                    &self.client,
+                    self.session.as_ref(),
+                    input.workspace_id.as_deref(),
+                    input.project_id.as_deref(),
+                )
+                .await?;
+                let project_id = scope.project_id.ok_or_else(|| {
+                    Error::Validation("project_id is required for pr_brief".to_string())
+                })?;
+                let mut changed_files: Vec<String> = input
+                    .changed_files
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|f| f.trim().to_string())
+                    .filter(|f| !f.is_empty())
+                    .collect();
+                if changed_files.is_empty() {
+                    if let Some(raw) = input.target_id.as_deref().or(input.query.as_deref()) {
+                        changed_files = raw
+                            .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string)
+                            .collect();
+                    }
+                }
+                if changed_files.is_empty() {
+                    return Err(Error::Validation(
+                        "changed_files (or target_id/query file list) is required for pr_brief"
+                            .to_string(),
+                    ));
+                }
+                let body = json!({
+                    "workspace_id": scope.workspace_id,
+                    "project_id": project_id,
+                    "changed_files": changed_files,
+                    "title": input.title,
+                    "pull_number": input.pull_number,
+                });
+                let result: Value = self.client.post("/graph/pr-brief", body).await?;
+                let text = result
+                    .get("summary_markdown")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        let risk = result
+                            .get("risk_level")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        let deps = result
+                            .get("downstream_dependents_count")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        format!(
+                            "Graph PR brief: risk={risk}, downstream_dependents={deps}."
+                        )
+                    });
+                let mut output = ToolResult::with_structured(text, result);
+                if let Some(note) = scope.note.as_deref() {
+                    output = output.with_prefix(format!("{}\n", note));
+                }
+                Ok(output)
+            }
             "entity_upsert" => {
                 let kind = input.kind.ok_or_else(|| {
                     Error::Validation("kind is required for entity_upsert".to_string())
@@ -3676,6 +3744,7 @@ impl ToolHandler for GraphTool {
             "entity_search",
             "cross_project",
             "health_digest",
+            "pr_brief",
             "entity_upsert",
             "relation_upsert",
             "event_ingest",
@@ -3812,6 +3881,8 @@ impl ToolHandler for GraphTool {
             .string("direction", "Traversal direction for universal_impact: downstream, upstream, or both", false)
             .boolean("include_code", "Bridge into code graph callers & cross-service edges (universal_impact)", false)
             .boolean("include_linked_workspaces", "Include ACL-checked linked workspaces (universal_impact)", false)
+            .array("changed_files", "Repository-relative changed file paths (pr_brief)", "string", false)
+            .integer("pull_number", "Optional pull request number for header metadata (pr_brief)", false)
             .build()
     }
 }

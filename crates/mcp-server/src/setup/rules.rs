@@ -396,7 +396,8 @@ When asking about dependencies, refactor blast radius, covering tests, linked de
 - Circular dependencies, unused code, complexity → `graph_read(action="circular_dependencies"|"unused_code"|"complexity_metrics", project_id="...")`
 - Save a fresh dashboard baseline after scans/fixes → `graph(action="quality_snapshot", project_id="...")`
 
-### Cross-Artifact Lineage, Cross-Project Coupling, Health Digest & Pre-Meeting Briefs (`graph_read`)
+### Cross-Artifact Lineage, PR Briefs, Cross-Project Coupling & Health Digest (`graph_read`)
+- Graph-powered PR brief & reviewer routing (blast radius, missing co-changes, covering tests, code drift, cross-repo consumers & `OWNED_BY` reviewers) → `graph_read(action="pr_brief", changed_files=["..."], project_id="<current_project_id>")`
 - Workspace cross-project dependency map (shared HTTP/event contracts, Entity Spine links, cross-repo knowledge) → `graph_read(action="cross_project", workspace_id="<current_workspace_id>")`
 - Team graph & decision health digest (open code drift, decision connectivity, circular deps & complexity hotspots) → `graph_read(action="health_digest", workspace_id="<current_workspace_id>")`
 - Feature/initiative lineage (OKR ↔ PRD ↔ Design ↔ Ticket ↔ Code ↔ Experiment ↔ Release) + drift detection → `graph_read(action="lineage", query="...", workspace_id="<current_workspace_id>")`

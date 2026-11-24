@@ -1166,3 +1166,24 @@ fn item_path_text_follows_each_link_in_the_direction_it_was_walked() {
         "No path links these items within reach."
     );
 }
+
+#[test]
+fn graph_tool_schema_exposes_pr_brief_and_changed_files() {
+    let tool = GraphTool::new(create_mock_client());
+    let schema = tool.input_schema();
+    let actions = schema["properties"]["action"]["enum"]
+        .as_array()
+        .expect("action enum");
+    assert!(
+        actions.iter().any(|v| v.as_str() == Some("pr_brief")),
+        "expected pr_brief in graph action enum"
+    );
+    assert!(
+        schema["properties"]["changed_files"].is_object(),
+        "expected changed_files property in graph schema"
+    );
+    assert!(
+        schema["properties"]["pull_number"].is_object(),
+        "expected pull_number property in graph schema"
+    );
+}

@@ -141,8 +141,8 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
         description: "Read ContextStream code, knowledge, product/design and business ops graphs \
                       without changing anything: dependencies, impact, usages, call_path, related, \
                       path, decisions, contradictions, cached code_drift, quality metrics, \
-                      lineage, meeting_brief, universal_impact, entity_search, cross_project and \
-                      health_digest. Same arguments as \
+                      lineage, meeting_brief, universal_impact, entity_search, cross_project, \
+                      health_digest and pr_brief. Same arguments as \
                       graph(action=...) for these actions. Use this for every read; use `graph` \
                       only for writes (ingest, quality_snapshot, entity_upsert, relation_upsert, \
                       event_ingest, install_domain_pack, outbox ops or code_drift refresh=true).",
@@ -168,6 +168,7 @@ pub const READ_ONLY_TWINS: &[ReadOnlyTwin] = &[
             "entity_search",
             "cross_project",
             "health_digest",
+            "pr_brief",
         ],
     },
 ];

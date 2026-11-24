@@ -3516,17 +3516,17 @@ mod tests {
             "ff8a4876fecdbfa7732d298a19c788ac2f42f2d149bdfa3c65aa85a25f2aa942",
         ),
         (
-            // Wave 3 additive actions: `cross_project` and `health_digest`.
+            // Wave 4 additive action: `pr_brief` (`changed_files`, `pull_number`).
             "graph",
-            "4274418c46147d61ab822272f2ba80acd6576b300971b355c06708912f1b6fb5",
+            "0e848ece8491fe980ad13eadc03bb5fc4075c58ea092da7a999b05cb81816b05",
         ),
         (
             // Read-only twin of `graph` (readOnlyHint: true) exposing pure-read
             // code, knowledge, lineage, meeting_brief, universal_impact, entity_search,
-            // cross_project & health_digest actions without approval prompts and
+            // cross_project, health_digest & pr_brief actions without approval prompts and
             // refusing `code_drift` refresh=true.
             "graph_read",
-            "df959ac824b75a672b6cf80e2796124715af6d39425062656e3845e855f6717f",
+            "f69a8579150eed158dc1d34a56a1d9d42151fbe99858f5468adbef52d0c960fe",
         ),
         (
             // Advanced when the `feeds` bundle joined the `bundle` enum

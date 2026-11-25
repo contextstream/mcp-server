@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.104
+
+- `memory` `get_node`, `get_event`, `get_task`, `get_todo` and `get_doc` handed an id that belongs to another kind, or to a coordination item or notice, now answer with that record, after "`<id>` is not a <kind>: it is <what>, which <call> reads." The structured result names the asked kind, the record's kind and the call that reads it. An id that matches nothing is refused as before. Only the read getters do this; updates, deletes and completions still act only on their own kind.
+- `coordination` with `action: "get"` on an item shows its summary, why it matters, status and linked artifacts, not just its title.
+
 ## 1.0.103
 
 - `graph_read` with `action: "code_drift"` reports the total number of open findings next to how many it lists ("Found N ... (showing M)"), shows each finding's id, and points to `resolve_drift` for dismissing or closing one. The total needs a ContextStream API that sends it; otherwise it counts the findings returned.

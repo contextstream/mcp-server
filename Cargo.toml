@@ -93,7 +93,7 @@ ignore = "0.4"
 fs2 = "0.4"
 
 # Filesystem watching (content-freshness watcher: `contextstream-mcp watch`)
-notify = "8"
+notify = "9"
 
 # Workspace crates
 mcp-types = { version = "=1.0.104", path = "crates/mcp-types" }

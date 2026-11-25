@@ -770,14 +770,59 @@ fn format_share(result: &Value, title: &str) -> String {
     format!("{shared}{addressed} This is not a handoff.")
 }
 
-fn format_item(result: &Value, id: &str) -> String {
+/// One coordination item as `get` shows it: its title line, then what it
+/// says. The title alone left an agent that asked for an item nothing to act
+/// on, and agents went on to look its id up with memory's getters
+/// (2026-11-24).
+pub(crate) fn format_item(result: &Value, id: &str) -> String {
     let payload = result.get("data").unwrap_or(result);
-    let title = payload.get("title").and_then(Value::as_str).unwrap_or(id);
-    let kind = payload
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("item");
-    format!("Coordination item {id} ({kind}): {title}")
+    let text = |field: &str| {
+        payload
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let title = text("title").unwrap_or(id);
+    let kind = text("kind").unwrap_or("item");
+    let mut out = match text("status") {
+        Some(status) => format!("Coordination item {id} ({kind}, {status}): {title}"),
+        None => format!("Coordination item {id} ({kind}): {title}"),
+    };
+    if let Some(summary) = text("summary") {
+        out.push_str("\n\n");
+        out.push_str(summary);
+    }
+    if let Some(why) = text("why_it_matters") {
+        out.push_str("\n\nWhy it matters: ");
+        out.push_str(why);
+    }
+    let linked: Vec<String> = payload
+        .get("linked_artifacts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|artifact| match artifact {
+            Value::String(reference) => Some(reference.clone()),
+            Value::Object(fields) => {
+                let kind = fields
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("artifact");
+                fields
+                    .get("id")
+                    .or_else(|| fields.get("url"))
+                    .and_then(Value::as_str)
+                    .map(|reference| format!("{kind} {reference}"))
+            }
+            _ => None,
+        })
+        .collect();
+    if !linked.is_empty() {
+        out.push_str("\n\nLinked: ");
+        out.push_str(&linked.join(", "));
+    }
+    out
 }
 
 /// The longest reply the API takes (`ReplyNoticeRequest`).
@@ -818,7 +863,7 @@ fn format_reply(result: &Value, notice_id: &str) -> String {
     }
 }
 
-fn format_notice(result: &Value, id: &str) -> String {
+pub(crate) fn format_notice(result: &Value, id: &str) -> String {
     let payload = result.get("data").unwrap_or(result);
     let reason = payload
         .get("reason")

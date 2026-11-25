@@ -1427,3 +1427,176 @@ async fn a_doc_reference_that_names_nothing_names_doc_id() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A read getter handed another kind's id (2026-11-24: coordination items read
+// as nodes, events or docs; nodes and events swapped)
+// ---------------------------------------------------------------------------
+
+/// Empty listings for the getters that list before they fetch.
+fn empty_listings(ws: Uuid) -> Vec<Route> {
+    vec![
+        route(
+            "GET",
+            &format!("/api/v1/memory/nodes/workspace/{ws}"),
+            200,
+            items(json!([])),
+        ),
+        route("GET", "/api/v1/tasks?", 200, items(json!([]))),
+        route("GET", "/api/v1/todos?", 200, items(json!([]))),
+    ]
+}
+
+#[tokio::test]
+async fn get_node_with_a_coordination_items_id_shows_the_item_and_names_its_call() {
+    let item = Uuid::new_v4();
+    let api = Api::start_with(|ws| {
+        let mut routes = empty_listings(ws);
+        routes.push(route(
+            "GET",
+            &format!("/api/v1/coordinations/{item}"),
+            200,
+            json!({"data": {
+                "id": item, "kind": "decision", "status": "active",
+                "title": "MCP Release GO: Wave 10",
+                "summary": "Wave 10 is verified and pushed; release from latest main.",
+                "why_it_matters": "Closes the drift resolution loop.",
+                "linked_artifacts": [{"kind": "commit", "id": "820c74d"}]
+            }}),
+        ));
+        routes
+    })
+    .await;
+
+    let result = api
+        .memory()
+        .execute(json!({"action": "get_node", "node_id": item.to_string(), "workspace_id": api.ws}))
+        .await
+        .expect("the item, not an error");
+
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    assert!(
+        text.starts_with(&format!(
+            "`{item}` is not a node: it is a coordination item, which coordination(action=\"get\", id=\"{item}\") reads. Here it is."
+        )),
+        "{text}"
+    );
+    assert!(text.contains("Coordination item"), "{text}");
+    assert!(
+        text.contains("(decision, active): MCP Release GO: Wave 10"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Wave 10 is verified and pushed; release from latest main."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Why it matters: Closes the drift resolution loop."),
+        "{text}"
+    );
+    assert!(text.contains("Linked: commit 820c74d"), "{text}");
+    let structured = result.structured_content.as_ref().expect("structured");
+    assert_eq!(structured["asked_kind"], "node");
+    assert_eq!(structured["kind"], "coordination_item");
+}
+
+#[tokio::test]
+async fn get_task_with_a_knowledge_nodes_id_shows_the_node() {
+    let node = Uuid::new_v4();
+    let api = Api::start_with(|ws| {
+        let mut routes = empty_listings(ws);
+        routes.push(route(
+            "GET",
+            &format!("/api/v1/memory/nodes/{node}"),
+            200,
+            json!({"id": node, "node_type": "decision", "summary": "OpenAI is a routing provider", "details": "Sent on the Responses wire."}),
+        ));
+        routes
+    })
+    .await;
+
+    let result = api
+        .memory()
+        .execute(json!({"action": "get_task", "task_id": node.to_string(), "workspace_id": api.ws}))
+        .await
+        .expect("the node, not an error");
+
+    let text = text_of(&result);
+    assert!(!result.is_error, "{text}");
+    assert!(
+        text.starts_with(&format!(
+            "`{node}` is not a task: it is a knowledge node, which memory(action=\"get_node\", node_id=\"{node}\") reads."
+        )),
+        "{text}"
+    );
+    assert!(text.contains("OpenAI is a routing provider"), "{text}");
+}
+
+#[tokio::test]
+async fn get_event_with_a_nodes_id_shows_the_node_instead_of_not_found() {
+    let node = Uuid::new_v4();
+    let api = Api::start_with(|ws| {
+        let mut routes = empty_listings(ws);
+        routes.push(route(
+            "GET",
+            &format!("/api/v1/memory/events/workspace/{ws}"),
+            200,
+            items(json!([])),
+        ));
+        routes.push(route(
+            "GET",
+            &format!("/api/v1/memory/nodes/{node}"),
+            200,
+            json!({"id": node, "node_type": "fact", "summary": "Wave 9 backfills succeeded"}),
+        ));
+        routes
+    })
+    .await;
+
+    let result = api
+        .memory()
+        .execute(
+            json!({"action": "get_event", "event_id": node.to_string(), "workspace_id": api.ws}),
+        )
+        .await
+        .expect("the node");
+
+    let text = text_of(&result);
+    assert!(
+        text.starts_with(&format!("`{node}` is not an event: it is a knowledge node")),
+        "{text}"
+    );
+    assert_eq!(result.structured_content.as_ref().unwrap()["kind"], "node");
+}
+
+#[tokio::test]
+async fn an_id_that_is_nothing_is_still_refused_as_not_found() {
+    let nothing = Uuid::new_v4();
+    let api = Api::start_with(empty_listings).await;
+
+    for (action, param, plural) in [
+        ("get_node", "node_id", "nodes"),
+        ("get_task", "task_id", "tasks"),
+        ("get_todo", "todo_id", "todos"),
+        ("get_doc", "doc_id", "docs"),
+    ] {
+        let outcome = api
+            .memory()
+            .execute(json!({"action": action, param: nothing.to_string(), "workspace_id": api.ws}))
+            .await;
+        let message = match outcome {
+            Ok(result) => {
+                assert!(result.is_error, "{action}: {}", text_of(&result));
+                text_of(&result)
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains(&format!(
+                "No {plural} found matching `{param}` \"{nothing}\""
+            )),
+            "{action}: {message}"
+        );
+    }
+}

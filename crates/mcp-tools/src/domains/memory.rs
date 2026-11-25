@@ -4203,6 +4203,157 @@ fn task_status_from_result(result: &Value) -> Option<&str> {
 }
 
 impl MemoryTool {
+    /// What `id` is when the getter for `asked` could not find it: another
+    /// memory record (a node, an event, a doc, a task, a todo) or a
+    /// coordination item or notice, read and shown as its own getter shows it,
+    /// with the call that reads it. `None` when it is none of those, or not
+    /// the caller's to read.
+    ///
+    /// Agents carry an id from one surface to another's getter. Of the 32 ids
+    /// the API could not find for two accounts on 2026-11-24, 19 named a
+    /// record of another kind: coordination items read as nodes, events or
+    /// docs (the notices name them `item=<id>`), a node read as an event and a
+    /// decision event read as a node. The probes run together, only after a
+    /// miss, and only for the read getters: nothing is written to a record of
+    /// another kind.
+    async fn read_elsewhere(
+        &self,
+        asked: &MemoryRecord,
+        id: Uuid,
+        workspace_id: Option<Uuid>,
+    ) -> Option<ToolResult> {
+        let asked_kind = asked.kind.singular;
+        let probe = |kind: &str| asked_kind != kind;
+        let id_text = id.to_string();
+        let client = &self.client;
+        let (task, todo, doc, node, item, notice, event) = tokio::join!(
+            async {
+                if probe("task") {
+                    client.get_task(id).await.ok()
+                } else {
+                    None
+                }
+            },
+            async {
+                if probe("todo") {
+                    client.get_todo(id).await.ok()
+                } else {
+                    None
+                }
+            },
+            async {
+                if probe("doc") {
+                    client.get_doc(id).await.ok()
+                } else {
+                    None
+                }
+            },
+            async {
+                if probe("node") {
+                    client.get_memory_node(id).await.ok()
+                } else {
+                    None
+                }
+            },
+            async { client.get_coordination_item(id).await.ok() },
+            async { client.get_coordination_notice(id, workspace_id).await.ok() },
+            // Last: every task is an event too, and the task getter says more.
+            async {
+                if probe("event") {
+                    client.get_memory_event(id).await.ok()
+                } else {
+                    None
+                }
+            },
+        );
+        let (kind, what, call, text, record) = if let Some(record) = task {
+            let text = format_task_detail(&record);
+            (
+                "task",
+                "a task",
+                format!("memory(action=\"get_task\", task_id=\"{id}\")"),
+                text,
+                record,
+            )
+        } else if let Some(record) = todo {
+            let text = format_todo_detail(&record);
+            (
+                "todo",
+                "a todo",
+                format!("memory(action=\"get_todo\", todo_id=\"{id}\")"),
+                text,
+                record,
+            )
+        } else if let Some(mut record) = doc {
+            let text = show_doc(&mut record, None, None);
+            (
+                "doc",
+                "a doc",
+                format!("memory(action=\"get_doc\", doc_id=\"{id}\")"),
+                text,
+                record,
+            )
+        } else if let Some(record) = node {
+            let text = format_node_detail(&record);
+            (
+                "node",
+                "a knowledge node",
+                format!("memory(action=\"get_node\", node_id=\"{id}\")"),
+                text,
+                record,
+            )
+        } else if let Some(record) = item {
+            let text = super::coordination::format_item(&record, &id_text);
+            (
+                "coordination_item",
+                "a coordination item",
+                format!("coordination(action=\"get\", id=\"{id}\")"),
+                text,
+                record,
+            )
+        } else if let Some(record) = notice {
+            let text = super::coordination::format_notice(&record, &id_text);
+            (
+                "coordination_notice",
+                "a coordination notice",
+                format!("coordination(action=\"get\", id=\"{id}\")"),
+                text,
+                record,
+            )
+        } else if let Some(record) = event {
+            let text = format_event_detail(&record);
+            (
+                "event",
+                "a memory event",
+                format!("memory(action=\"get_event\", event_id=\"{id}\")"),
+                text,
+                record,
+            )
+        } else {
+            return None;
+        };
+        let asked_article = if asked_kind.starts_with(['a', 'e', 'i', 'o', 'u']) {
+            "an"
+        } else {
+            "a"
+        };
+        consume_grounding_memory_tool(&self.session).await;
+        Some(ToolResult::with_structured(
+            format!(
+                "`{id}` is not {asked_article} {asked_kind}: it is {what}, which {call} reads. Here it is.\n\n{text}"
+            ),
+            serde_json::json!({
+                "found": true,
+                "asked_kind": asked_kind,
+                "kind": kind,
+                "read_with": call,
+                "record": record,
+            }),
+        ))
+    }
+}
+
+impl MemoryTool {
     pub fn new(
         client: ContextStreamClient,
         session: Arc<mcp_session::SessionManager>,
@@ -4518,11 +4669,16 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self
-                    .client
-                    .get_memory_node(id)
-                    .await
-                    .map_err(|error| NODE.unknown_id(id, error))?;
+                let result = match self.client.get_memory_node(id).await {
+                    Ok(result) => result,
+                    Err(error) if is_not_found_error(&error) => {
+                        if let Some(elsewhere) = self.read_elsewhere(&NODE, id, workspace_id).await {
+                            return Ok(elsewhere);
+                        }
+                        return Err(NODE.unknown_id(id, error));
+                    }
+                    Err(error) => return Err(error),
+                };
                 let text = format_node_detail(&result);
                 Ok(found.tool_result(text, result))
             }
@@ -4998,6 +5154,9 @@ impl MemoryTool {
                         Ok(found.tool_result(text, result))
                     }
                     Err(err) if is_not_found_error(&err) => {
+                        if let Some(elsewhere) = self.read_elsewhere(&EVENT, id, workspace_id).await {
+                            return Ok(elsewhere);
+                        }
                         consume_grounding_memory_tool(&self.session).await;
                         Ok(ToolResult::with_structured(
                             format!(
@@ -5483,11 +5642,16 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self
-                    .client
-                    .get_task(id)
-                    .await
-                    .map_err(|error| TASK.unknown_id(id, error))?;
+                let result = match self.client.get_task(id).await {
+                    Ok(result) => result,
+                    Err(error) if is_not_found_error(&error) => {
+                        if let Some(elsewhere) = self.read_elsewhere(&TASK, id, workspace_id).await {
+                            return Ok(elsewhere);
+                        }
+                        return Err(TASK.unknown_id(id, error));
+                    }
+                    Err(error) => return Err(error),
+                };
                 consume_grounding_memory_tool(&self.session).await;
                 let text = format_task_detail(&result);
                 Ok(found.tool_result(text, result))
@@ -5832,11 +5996,16 @@ impl MemoryTool {
                     Lookup::Candidates(candidates) => return Ok(candidates),
                 };
                 let id = found.id;
-                let result = self
-                    .client
-                    .get_todo(id)
-                    .await
-                    .map_err(|error| TODO.unknown_id(id, error))?;
+                let result = match self.client.get_todo(id).await {
+                    Ok(result) => result,
+                    Err(error) if is_not_found_error(&error) => {
+                        if let Some(elsewhere) = self.read_elsewhere(&TODO, id, workspace_id).await {
+                            return Ok(elsewhere);
+                        }
+                        return Err(TODO.unknown_id(id, error));
+                    }
+                    Err(error) => return Err(error),
+                };
                 consume_grounding_memory_tool(&self.session).await;
                 let text = format_todo_detail(&result);
                 Ok(found.tool_result(text, result))
@@ -6403,9 +6572,19 @@ impl MemoryTool {
                         300,
                         || async move { client.get_doc(id).await },
                     )
-                    .await
-                    .map_err(|error| DOC.unknown_id(id, error))?;
-                    let mut result = result;
+                    .await;
+                    let mut result = match result {
+                        Ok(result) => result,
+                        Err(error) if is_not_found_error(&error) => {
+                            if let Some(elsewhere) =
+                                self.read_elsewhere(&DOC, id, workspace_id).await
+                            {
+                                return Ok(elsewhere);
+                            }
+                            return Err(DOC.unknown_id(id, error));
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let text = show_doc(&mut result, input.offset, input.max_chars);
                     consume_grounding_memory_tool(&self.session).await;
                     return Ok(ToolResult::with_structured(text, result));

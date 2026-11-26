@@ -81,13 +81,23 @@ mod degraded_memory_search_tests {
         config.api_url = format!("http://{addr}");
         config.api_key = Some("test-key".to_string());
         let tool = MemorySearchTool::new(ContextStreamClient::new(config));
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            tool.execute(json!({"query": "replica lag", "limit": 5})),
+        // The attempts are counted where they are sent: a retry counts even
+        // when it comes after the server above has answered its three requests
+        // and gone. A one-second bound on the call measured the machine
+        // instead; this one only keeps a call that hangs from hanging the test.
+        let (result, sent) = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            mcp_client::run_counting_api_calls(
+                tool.execute(json!({"query": "replica lag", "limit": 5})),
+            ),
         )
         .await
-        .expect("memory fallback must not enter retry backoff")
-        .expect("scoped docs fallback must remain a successful tool result");
+        .expect("memory fallback must come back");
+        let result = result.expect("scoped docs fallback must remain a successful tool result");
+        assert_eq!(
+            sent.calls, 3,
+            "memory fallback must not retry: one memory search and two docs requests"
+        );
 
         assert!(!result.is_error);
         let text = match &result.content[0] {

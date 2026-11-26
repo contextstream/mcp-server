@@ -2214,6 +2214,9 @@ const MEMORY_SEARCH_CACHE_TTL: Duration = Duration::from_secs(10);
 // Keep one bounded HTTP attempt and leave transport-level retry decisions to
 // callers that can prove the operation is safe to replay.
 const MEMORY_SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+/// How long `help_version` waits for the API's release metadata before it
+/// answers from what this build knows.
+const RELEASE_LOOKUP_BUDGET: Duration = Duration::from_secs(2);
 const DOC_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(10);
 const SEARCH_CACHE_TTL: Duration = Duration::from_secs(60);
 const LOCAL_INDEX_READY_MAX_AGE_HOURS: i64 = 48;
@@ -19008,13 +19011,17 @@ impl ContextStreamClient {
 
     /// Get the running server version plus the latest public release metadata.
     pub async fn help_version(&self) -> Result<serde_json::Value> {
+        self.help_version_within(RELEASE_LOOKUP_BUDGET).await
+    }
+
+    /// `help_version`, waiting `budget` for the API's release metadata. The
+    /// budget is given so that a test of what is made of the API's answer does
+    /// not also measure how fast the machine is.
+    async fn help_version_within(&self, budget: Duration) -> Result<serde_json::Value> {
         let current_version = env!("CARGO_PKG_VERSION");
 
-        let release_lookup = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.get::<serde_json::Value>("/mcp/version"),
-        )
-        .await;
+        let release_lookup =
+            tokio::time::timeout(budget, self.get::<serde_json::Value>("/mcp/version")).await;
         let result = match release_lookup {
             Ok(Ok(remote)) => normalize_remote_release_metadata(remote, current_version),
             Ok(Err(error)) => {
@@ -25192,6 +25199,38 @@ mod tests {
         }
     }
 
+    /// The retry backoff a test gives its client to show that a call does not
+    /// enter it: longer than any load can make a request to a local server
+    /// take. A bound just under the real one-second backoff measured the
+    /// machine instead, and one stall of the host failed every such test.
+    const UNMISTAKABLE_BACKOFF: Duration = Duration::from_secs(600);
+    /// What a call that must not back off is given: far more than a loaded
+    /// machine needs for it, and a ninth of the shortest wait
+    /// `UNMISTAKABLE_BACKOFF` makes (its jitter takes a tenth off).
+    const NO_BACKOFF_BOUND: Duration = Duration::from_secs(60);
+
+    /// `client`, backing off for `UNMISTAKABLE_BACKOFF` wherever it backs off.
+    fn with_unmistakable_backoff(mut client: ContextStreamClient) -> ContextStreamClient {
+        client.retry_config.base_delay = UNMISTAKABLE_BACKOFF;
+        client.retry_config.max_delay = UNMISTAKABLE_BACKOFF;
+        client
+    }
+
+    /// Run `call`, made on a client from `with_unmistakable_backoff`: what it
+    /// answered and how many API attempts it sent, refused ones included.
+    /// Panics with `entered_backoff` when it is not back within
+    /// `NO_BACKOFF_BOUND`. The attempts are counted where they are sent, so a
+    /// retry counts even when the test's server is gone by then.
+    async fn attempts_without_backoff<F: std::future::Future>(
+        entered_backoff: &str,
+        call: F,
+    ) -> (F::Output, u32) {
+        let (output, sent) = tokio::time::timeout(NO_BACKOFF_BOUND, run_counting_api_calls(call))
+            .await
+            .unwrap_or_else(|_| panic!("{entered_backoff}"));
+        (output, sent.calls)
+    }
+
     async fn client_with_http_sequence(
         responses: Vec<(&'static str, String)>,
     ) -> (ContextStreamClient, tokio::task::JoinHandle<Vec<String>>) {
@@ -25342,13 +25381,14 @@ mod tests {
             r#"{"error":{"code":"internal","message":"boom"}}"#.to_string(),
         )])
         .await;
-        let result = tokio::time::timeout(
-            Duration::from_millis(900),
+        let client = with_unmistakable_backoff(client);
+        let (result, attempts) = attempts_without_backoff(
+            "a write that may have applied must not enter retry backoff",
             client.post::<serde_json::Value, _>("/docs", serde_json::json!({"title": "t"})),
         )
-        .await
-        .expect("a write that may have applied must not enter retry backoff");
+        .await;
         assert!(matches!(result, Err(Error::Http { status: 500, .. })));
+        assert_eq!(attempts, 1, "exactly one attempt");
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 1, "exactly one attempt");
         let key = request_header(&requests[0], IDEMPOTENCY_KEY_HEADER)
@@ -25736,13 +25776,14 @@ mod tests {
             r#"{"error":{"code":"internal","message":"stored outcome"}}"#.to_string(),
         )])
         .await;
-        let result = tokio::time::timeout(
-            Duration::from_millis(900),
+        let client = with_unmistakable_backoff(client);
+        let (result, attempts) = attempts_without_backoff(
+            "a replayed outcome must not enter retry backoff",
             client.post::<serde_json::Value, _>("/docs", serde_json::json!({"title": "t"})),
         )
-        .await
-        .expect("a replayed outcome must not enter retry backoff");
+        .await;
         assert!(matches!(result, Err(Error::Http { status: 500, .. })));
+        assert_eq!(attempts, 1, "a replay is final");
         assert_eq!(server.await.unwrap().len(), 1, "a replay is final");
     }
 
@@ -26372,17 +26413,18 @@ mod tests {
             .to_string(),
         )])
         .await;
+        let client = with_unmistakable_backoff(client);
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(750),
+        let (result, attempts) = attempts_without_backoff(
+            "one-shot Answer request must not enter retry backoff",
             client.answer_query(AnswerRequestV1::coflow_recent_changes(
                 None, "UTC", None, None, None,
             )),
         )
-        .await
-        .expect("one-shot Answer request must not enter retry backoff");
+        .await;
 
         assert!(matches!(result, Err(Error::Http { status: 503, .. })));
+        assert_eq!(attempts, 1, "Answer must send exactly one API attempt");
         let requests = server.await.expect("answer server task");
         assert_eq!(
             requests.len(),
@@ -26394,19 +26436,23 @@ mod tests {
     #[tokio::test]
     async fn answer_query_does_not_retry_transport_failures() {
         let (client, shutdown, server) = client_with_counted_http_behavior(None).await;
+        let client = with_unmistakable_backoff(client);
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(750),
+        let (result, attempts) = attempts_without_backoff(
+            "one-shot Answer transport failure must not enter retry backoff",
             client.answer_query(AnswerRequestV1::coflow_recent_changes(
                 None, "UTC", None, None, None,
             )),
         )
-        .await
-        .expect("one-shot Answer transport failure must not enter retry backoff");
+        .await;
 
         assert!(
             matches!(&result, Err(Error::Network(_))),
             "the connection close must return a transport error, got {result:?}"
+        );
+        assert_eq!(
+            attempts, 1,
+            "Answer must send exactly one API attempt after a transport failure"
         );
         shutdown
             .send(())
@@ -26527,15 +26573,16 @@ mod tests {
             .to_string(),
         )])
         .await;
+        let client = with_unmistakable_backoff(client);
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(750),
+        let (result, attempts) = attempts_without_backoff(
+            "one-shot receipt must not enter retry backoff",
             client.answer_receipt(Uuid::from_u128(1)),
         )
-        .await
-        .expect("one-shot receipt must not enter retry backoff");
+        .await;
 
         assert!(matches!(result, Err(Error::Http { status: 503, .. })));
+        assert_eq!(attempts, 1, "a receipt must send exactly one API attempt");
         let requests = server.await.expect("receipt server task");
         assert_eq!(requests.len(), 1);
     }
@@ -27307,16 +27354,16 @@ mod tests {
             .to_string(),
         )))
         .await;
+        let client = with_unmistakable_backoff(client);
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(750),
+        let (result, attempts) = attempts_without_backoff(
+            "memory-search response must not enter retry backoff",
             client.search_memory(MemorySearchParams {
                 query: format!("single-attempt-{status}"),
                 ..MemorySearchParams::default()
             }),
         )
-        .await
-        .expect("memory-search response must not enter retry backoff");
+        .await;
 
         assert!(
             matches!(
@@ -27324,6 +27371,10 @@ mod tests {
                 Err(Error::Http { status, .. }) if *status == expected_status
             ),
             "the API must return the intended HTTP {expected_status} error, got {result:?}"
+        );
+        assert_eq!(
+            attempts, 1,
+            "memory search must send exactly one API attempt for {status}"
         );
         shutdown
             .send(())
@@ -27642,12 +27693,17 @@ mod tests {
         assert!(requests[1].contains(&format!("\"workspace_id\":\"{workspace_id}\"")));
     }
 
+    /// The wait these tests give the release lookup. They are about what is
+    /// made of the API's answer, and `RELEASE_LOOKUP_BUDGET` gave them the
+    /// local fallback instead whenever the host stalled for two seconds.
+    const PATIENT_RELEASE_LOOKUP: Duration = Duration::from_secs(60);
+
     #[tokio::test]
     async fn help_version_http_error_uses_public_local_fallback() {
         let (client, server) = client_with_release_response("404 Not Found", "{}").await;
 
         let metadata = client
-            .help_version()
+            .help_version_within(PATIENT_RELEASE_LOOKUP)
             .await
             .expect("local fallback succeeds");
         let request = server.await.expect("release metadata server task");
@@ -27670,7 +27726,7 @@ mod tests {
         let (client, server) = client_with_release_response("200 OK", "this is not json").await;
 
         let metadata = client
-            .help_version()
+            .help_version_within(PATIENT_RELEASE_LOOKUP)
             .await
             .expect("local fallback succeeds");
         server.await.expect("release metadata server task");
@@ -27735,7 +27791,10 @@ mod tests {
         for (body, expected_latest_version, expected_release_url) in cases {
             let (client, server) = client_with_release_response("200 OK", body).await;
 
-            let metadata = client.help_version().await.expect("normalization succeeds");
+            let metadata = client
+                .help_version_within(PATIENT_RELEASE_LOOKUP)
+                .await
+                .expect("normalization succeeds");
             server.await.expect("release metadata server task");
 
             assert_release_metadata_contract(&metadata);
@@ -27756,7 +27815,7 @@ mod tests {
         let (client, server) = client_with_release_response("200 OK", &body).await;
 
         let metadata = client
-            .help_version()
+            .help_version_within(PATIENT_RELEASE_LOOKUP)
             .await
             .expect("remote metadata succeeds");
         server.await.expect("release metadata server task");
@@ -31529,19 +31588,27 @@ mod tests {
             api_key: Some("cs_test_refused".to_string()),
             ..Default::default()
         };
-        let client = ContextStreamClient::new(config);
-        let started = std::time::Instant::now();
-        let error = client.me().await.expect_err("nothing listens there");
+        let client = with_unmistakable_backoff(ContextStreamClient::new(config));
+        let (result, attempts) = attempts_without_backoff(
+            "a refused connection must fail without entering retry backoff",
+            client.me(),
+        )
+        .await;
+        let error = result.expect_err("nothing listens there");
         assert!(matches!(error, Error::Network(_)), "{error}");
         // #338: the text says why, not only which URL.
         assert!(
             error.to_string().to_lowercase().contains("refused"),
             "{error}"
         );
+        // Quickly: one retry for a blip instead of the schedule's three, after
+        // a fixed short wait instead of the backoff. How long the two refused
+        // attempts themselves take is the machine's business.
+        assert_eq!(attempts, 1 + CONNECT_FAILURE_RETRIES);
+        let waited_on_purpose = CONNECT_FAILURE_RETRY_DELAY * CONNECT_FAILURE_RETRIES;
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "took {:?}",
-            started.elapsed()
+            waited_on_purpose < Duration::from_secs(3),
+            "waits {waited_on_purpose:?} between attempts"
         );
         drop(socket);
     }
@@ -31762,21 +31829,23 @@ mod tests {
             .to_string(),
         )])
         .await;
+        let client = with_unmistakable_backoff(client);
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(750),
+        let (result, attempts) = attempts_without_backoff(
+            "terminal memory-search response must not enter retry backoff",
             client.search_memory(MemorySearchParams {
                 query: "replica lag".to_string(),
                 ..MemorySearchParams::default()
             }),
         )
-        .await
-        .expect("terminal memory-search response must not enter retry backoff");
+        .await;
 
+        // The response itself, not the timeout a backoff would run into.
         assert!(
-            result.is_err(),
-            "the terminal API response must be returned"
+            matches!(&result, Err(Error::Http { status: 500, .. })),
+            "the terminal API response must be returned, got {result:?}"
         );
+        assert_eq!(attempts, 1, "memory search must send one API attempt");
         let requests = server.await.expect("memory-search server task");
         assert_eq!(requests.len(), 1, "memory search must make one API attempt");
         assert!(
@@ -31804,20 +31873,24 @@ mod tests {
     #[tokio::test]
     async fn memory_search_does_not_retry_transport_failure() {
         let (client, shutdown, server) = client_with_counted_http_behavior(None).await;
+        let client = with_unmistakable_backoff(client);
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(750),
+        let (result, attempts) = attempts_without_backoff(
+            "transport failure must not enter retry backoff",
             client.search_memory(MemorySearchParams {
                 query: "single-attempt-transport-failure".to_string(),
                 ..MemorySearchParams::default()
             }),
         )
-        .await
-        .expect("transport failure must not enter retry backoff");
+        .await;
 
         assert!(
             matches!(&result, Err(Error::Network(_))),
             "the connection close must return a transport error, got {result:?}"
+        );
+        assert_eq!(
+            attempts, 1,
+            "memory search must send exactly one API attempt after a transport failure"
         );
         shutdown
             .send(())
@@ -31862,19 +31935,23 @@ mod tests {
                 })
             }))
             .await;
+        // A replay that waited for status backoff would wait
+        // `UNMISTAKABLE_BACKOFF`, and memory search's own six-second bound
+        // would answer with a timeout instead of the healthy response.
+        let client = with_unmistakable_backoff(client);
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(750),
+        let (result, attempts) = attempts_without_backoff(
+            "auth refresh replay must not wait for status backoff",
             client.search_memory(MemorySearchParams {
                 query: "refresh scope".to_string(),
                 ..MemorySearchParams::default()
             }),
         )
-        .await
-        .expect("auth refresh replay must not wait for status backoff")
-        .expect("the one auth refresh replay should reach the healthy response");
+        .await;
+        let result = result.expect("the one auth refresh replay should reach the healthy response");
 
         assert_eq!(result["total"], 0);
+        assert_eq!(attempts, 2, "the first attempt and its one replay");
         assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 1);
         let requests = server.await.expect("memory-search server task");
         assert_eq!(requests.len(), 2);

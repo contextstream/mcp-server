@@ -1902,9 +1902,28 @@ async fn run_enriches_failing_stream_from_diagnose_endpoint_without_prestuffed_f
         .any(|r| r.method == "POST" && r.path == "/mcp/hosted-tools/calls/call-diag-1/diagnose"));
 }
 
+/// What a `/diagnose` stub saw, for a test that measures how long `run` went on
+/// waiting for its answer.
+#[derive(Default)]
+struct DiagnoseAsked {
+    /// When the request reached the stub. The runtime's clock is frozen from
+    /// then on, so time passes only as far as the timers waited on.
+    at: Option<tokio::time::Instant>,
+    /// `run` is back. A request that only reaches the stub now (the caller gave
+    /// up before it arrived) must leave the clock alone.
+    run_returned: bool,
+}
+
 #[tokio::test]
 async fn run_fails_open_when_diagnose_endpoint_fails_or_times_out() {
-    for mode in ["http_500", "timeout_250ms"] {
+    // What `run` may go on waiting once /diagnose has the request: the "<100 ms"
+    // of `DIAGNOSE_TIMEOUT`.
+    const FAIL_OPEN_BOUND: Duration = Duration::from_millis(100);
+    // How long the slow endpoint holds its answer: 300 times the bound, so
+    // "did not wait for it" cannot be confused with anything else.
+    const HELD_ANSWER: Duration = Duration::from_secs(30);
+
+    for mode in ["http_500", "answer_held_30s"] {
         let j_frame = json!({
             "type": "result",
             "ran": true,
@@ -1931,20 +1950,37 @@ async fn run_fails_open_when_diagnose_endpoint_fails_or_times_out() {
         let mut answer = stream_answer(&ws_url, "frames/1");
         answer["call"]["id"] = json!("call-failopen-1");
 
-        let mode_str = mode.to_string();
+        let asked = Arc::new(StdMutex::new(DiagnoseAsked::default()));
+        let stub_asked = asked.clone();
         let (url, _) = stub_with_headers(Arc::new(move |req| {
             let def = def.clone();
             let answer = answer.clone();
             let method = req.method.clone();
             let path = req.path.clone();
-            let mode_str = mode_str.clone();
+            let asked = stub_asked.clone();
             Box::pin(async move {
                 match (method.as_str(), path.as_str()) {
                     ("GET", "/mcp/hosted-tools") => (200, json!({"tools": [def]}).to_string()),
                     ("POST", "/mcp/hosted-tools/check/call") => (200, answer.to_string()),
                     ("POST", "/mcp/hosted-tools/calls/call-failopen-1/diagnose") => {
-                        if mode_str == "timeout_250ms" {
-                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        // The snapshot, the stream and this request crossed real
+                        // sockets on the host's clock, however slow the host is.
+                        // All that is left is the wait for this answer, so it is
+                        // measured on a frozen clock: an idle runtime moves it
+                        // straight to the next timer, and a busy host adds nothing.
+                        let freeze = {
+                            let mut asked = asked.lock().unwrap();
+                            let first = asked.at.is_none() && !asked.run_returned;
+                            if first {
+                                asked.at = Some(tokio::time::Instant::now());
+                            }
+                            first
+                        };
+                        if freeze {
+                            tokio::time::pause();
+                        }
+                        if mode == "answer_held_30s" {
+                            tokio::time::sleep(HELD_ANSWER).await;
                         }
                         (500, json!({"error": "boom"}).to_string())
                     }
@@ -1958,16 +1994,26 @@ async fn run_fails_open_when_diagnose_endpoint_fails_or_times_out() {
         let (_repo, session) = changed_checkout(&client).await;
         let tool = check_tool(&client, &session).await;
 
-        let started = Instant::now();
         let result = run(&client, &session, &tool, json!({"command": "cargo test"})).await;
-        let elapsed = started.elapsed();
+        let waited = {
+            let mut asked = asked.lock().unwrap();
+            asked.run_returned = true;
+            asked.at.map(|at| at.elapsed())
+        };
+        if waited.is_some() {
+            tokio::time::resume();
+        }
 
         assert!(result.is_error, "{mode}: expected is_error");
-        // Entire run (including checkout snapshot + WS + 95ms fail-open) must not block 250ms+ on /diagnose.
-        assert!(
-            elapsed < Duration::from_millis(240),
-            "{mode}: took too long ({elapsed:?}), /diagnose did not time out within <100ms"
-        );
+        // No `waited`: the caller's own bound ran out on a stalled host before
+        // the request reached the stub, so `run` did not wait for an answer at
+        // all. Without that bound the request always arrives and is measured.
+        if let Some(waited) = waited {
+            assert!(
+                waited < FAIL_OPEN_BOUND,
+                "{mode}: run went on waiting {waited:?} for /diagnose, it did not fail open within <100ms"
+            );
+        }
         let text = text_of(&result).join("\n");
         assert!(
             text.contains("[diagnostics: 1 new failure(s), 1 base failure(s) suppressed]"),

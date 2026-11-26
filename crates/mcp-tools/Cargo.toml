@@ -41,6 +41,9 @@ tiktoken-rs = { workspace = true }
 metrics = "0.24"
 
 [dev-dependencies]
+# The pausable clock: a test measures a bounded wait on the runtime's clock
+# instead of the host's (hosted_tools_tests.rs, the /diagnose fail-open).
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 base64 = "0.23"
 tokio-tungstenite = { workspace = true }

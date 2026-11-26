@@ -562,7 +562,8 @@ fn cli_doctor_executes_codex_hook_migrates_broken_install_and_checks_trust_witho
     let dry_stderr = String::from_utf8_lossy(&dry_run.stderr);
     assert!(
         dry_stdout.contains("hooks.json") && dry_stdout.contains("/hooks"),
-        "expected dry-run repair output to mention hooks.json and /hooks:\nstdout:\n{dry_stdout}\nstderr:\n{dry_stderr}"
+        "expected dry-run repair output to mention hooks.json and /hooks ({}):\nstdout:\n{dry_stdout}\nstderr:\n{dry_stderr}",
+        dry_run.status
     );
     assert_eq!(
         snapshot_tree(&home),

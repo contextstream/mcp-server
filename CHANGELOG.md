@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `update`, `setup` and every MCP config refresh (`update-configs`, `migrate-remote`, `configure --api-key-stdin`, `doctor --repair`) no longer switch an existing ContextStream MCP entry to another account without a word. When an entry (a project `.mcp.json`, `~/.claude.json` or another editor's config) holds an API key for a different account than the one being written, they name the file and both accounts by email (from `/auth/me`; a key it does not answer for is "an unknown account") and ask on a terminal, default No. Without a terminal, or under `setup --yes`, they keep the entry's key and installation id, refresh the rest, and say how to switch on purpose. The new global `--switch-account` flag switches without asking; `update --switch-account` hands it to its config migration. The same key, a new key for the same account and an entry with no key are written as before. Replacing a key the API no longer accepts (a rotation whose old key is already revoked) now also needs `--switch-account` or a yes.
+
 ## 1.0.106
 
 - A read that names a `project_id` from another workspace now uses that project's workspace when the session's workspace is only the connection's default (the `X-ContextStream-Workspace-Id` header, with no workspace passed, no `init`, no task sign-in and no folder mapping). Before, hosted graph reads such as impact and call paths answered "Choose a project for code graph queries" until `init` had run.

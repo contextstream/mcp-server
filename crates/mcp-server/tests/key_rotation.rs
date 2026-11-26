@@ -7,6 +7,10 @@
 //!    differs from `~/.contextstream/credentials.json` without leaking secret values,
 //!    and `doctor --repair` rewrites the config to match current credentials and
 //!    reports the modified paths rather than `No managed changes were needed`.
+//!
+//! A revoked key names no account, so replacing it is an account switch (ticket
+//! e69fbc52): without a terminal both commands keep it and warn unless given
+//! `--switch-account`.
 #![cfg(unix)]
 
 use axum::{
@@ -350,12 +354,48 @@ async fn configure_api_key_stdin_rotates_editor_configs_and_doctor_repairs_stale
 
     // 3. Revoke KEY_A on server, switch active valid key to KEY_B, and rotate via `configure --api-key-stdin`.
     *valid_key.lock().unwrap() = KEY_B.to_string();
-    let rotate_out = run_cli_with_stdin(
+    // The revoked KEY_A no longer names an account, so without a terminal the
+    // rotation keeps it in every config and says how to switch on purpose
+    // (ticket e69fbc52), never printing either key.
+    let unagreed_out = run_cli_with_stdin(
         &bin,
         &home,
         &home,
         &api_url,
         &["configure", "--api-key-stdin"],
+        Some(&format!(
+            "{KEY_B}
+"
+        )),
+    );
+    let unagreed_stderr = String::from_utf8_lossy(&unagreed_out.stderr);
+    assert!(
+        unagreed_out.status.success(),
+        "configure without --switch-account failed: {unagreed_stderr}"
+    );
+    assert!(
+        unagreed_stderr.contains("signs in as an unknown account")
+            && unagreed_stderr.contains("keyrot@example.test")
+            && unagreed_stderr.contains("--switch-account"),
+        "expected the account-switch warning: {unagreed_stderr}"
+    );
+    assert!(!unagreed_stderr.contains(KEY_A) && !unagreed_stderr.contains(KEY_B));
+    for path in [&claude_path, &cursor_path, &codex_path] {
+        let raw = std::fs::read_to_string(path).expect("read config after unagreed rotation");
+        assert!(
+            raw.contains(KEY_A) && !raw.contains(KEY_B),
+            "{} switched without --switch-account:
+{raw}",
+            path.display()
+        );
+    }
+
+    let rotate_out = run_cli_with_stdin(
+        &bin,
+        &home,
+        &home,
+        &api_url,
+        &["configure", "--api-key-stdin", "--switch-account"],
         Some(&format!(
             "{KEY_B}
 "
@@ -444,9 +484,16 @@ async fn configure_api_key_stdin_rotates_editor_configs_and_doctor_repairs_stale
     assert!(!stale_combined.contains(REVOKED_DEAD_KEY));
     assert!(!stale_combined.contains(KEY_B));
 
-    // 5. `doctor --repair` must replace the dead keys with KEY_B, report the modified files, and pass.
-    let repair_out =
-        run_cli_with_stdin(&bin, &home, &home, &api_url, &["doctor", "--repair"], None);
+    // 5. `doctor --repair --switch-account` must replace the dead keys with KEY_B, report the modified files, and
+    //    pass. The dead keys name no account, so the repair switches them only when told to (ticket e69fbc52).
+    let repair_out = run_cli_with_stdin(
+        &bin,
+        &home,
+        &home,
+        &api_url,
+        &["doctor", "--repair", "--switch-account"],
+        None,
+    );
     let repair_stdout = String::from_utf8_lossy(&repair_out.stdout);
     let repair_stderr = String::from_utf8_lossy(&repair_out.stderr);
     assert!(

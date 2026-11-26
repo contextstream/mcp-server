@@ -324,6 +324,7 @@ async fn setup_keep_claude_auto_memory_persists_passes_doctor_and_survives_repai
     tokio::task::spawn_blocking(move || {
         let mut child = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
             .args(["configure", "--api-key-stdin"])
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &cfg_home)
             .env("USERPROFILE", &cfg_home)
             .env("CONTEXTSTREAM_API_URL", &cfg_url)
@@ -358,6 +359,7 @@ async fn setup_keep_claude_auto_memory_persists_passes_doctor_and_survives_repai
                 "--keep-claude-auto-memory",
                 &format!("--workspace-id={WORKSPACE_ID}"),
             ])
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &setup_home)
             .env("USERPROFILE", &setup_home)
             .env("CONTEXTSTREAM_API_URL", &setup_url)
@@ -400,6 +402,7 @@ async fn setup_keep_claude_auto_memory_persists_passes_doctor_and_survives_repai
     let doc_out = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
             .args(["doctor", "--json"])
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &doc_home)
             .env("USERPROFILE", &doc_home)
             .env("CONTEXTSTREAM_API_URL", &doc_url)
@@ -459,6 +462,7 @@ async fn setup_keep_claude_auto_memory_persists_passes_doctor_and_survives_repai
         let rep_out = tokio::task::spawn_blocking(move || {
             Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
                 .args(&args)
+                .env("CONTEXTSTREAM_WATCH", "0")
                 .env("HOME", &rep_home)
                 .env("USERPROFILE", &rep_home)
                 .env("CONTEXTSTREAM_API_URL", &rep_url)
@@ -501,6 +505,7 @@ async fn setup_keep_claude_auto_memory_persists_passes_doctor_and_survives_repai
         let mut child = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
             .args(["hook", "pre-tool-use", "--contextstream-managed-hook=v1"])
             .env_clear()
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &hook_home)
             .env("USERPROFILE", &hook_home)
             .env("CLAUDE_CONFIG_DIR", hook_home.join(".claude"))
@@ -560,6 +565,7 @@ async fn setup_then_uninstall_restores_claude_auto_memory_and_cleans_settings() 
                 "--workspace-id",
                 "11111111-1111-4111-8111-111111111111",
             ])
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &h1)
             .env("USERPROFILE", &h1)
             .env("CONTEXTSTREAM_API_URL", &u1)
@@ -644,6 +650,7 @@ async fn setup_then_uninstall_restores_claude_auto_memory_and_cleans_settings() 
                 "--workspace-id",
                 "11111111-1111-4111-8111-111111111111",
             ])
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &h2)
             .env("USERPROFILE", &h2)
             .env("CONTEXTSTREAM_API_URL", &u2)
@@ -707,7 +714,7 @@ async fn run_cli(
             .env("CONTEXTSTREAM_API_URL", &api_url)
             .env("CONTEXTSTREAM_API_KEY", api_key)
             .env("CONTEXTSTREAM_NO_BROWSER", "1")
-            .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("NO_COLOR", "1")
             .env_remove("CONTEXTSTREAM_KEEP_CLAUDE_AUTO_MEMORY")
             .env_remove("CONTEXTSTREAM_ALLOW_LOCAL_MEMORY")

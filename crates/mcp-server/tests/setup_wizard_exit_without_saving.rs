@@ -434,7 +434,7 @@ sys.exit(124)
             .env("USERPROFILE", &home)
             .env("CONTEXTSTREAM_API_URL", &api_url)
             .env("CONTEXTSTREAM_NO_BROWSER", "1")
-            .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")
             .env_remove("CONTEXTSTREAM_WORKSPACE_ID");

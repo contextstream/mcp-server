@@ -48,6 +48,7 @@ async fn run_profile_failure(status: StatusCode) -> (String, String) {
             .args(["setup", "--account-only", "--profile-file"])
             .arg(profile_path)
             .env_clear()
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &isolated_home)
             .env("CONTEXTSTREAM_API_URL", api_url)
             .env("NO_COLOR", "1")

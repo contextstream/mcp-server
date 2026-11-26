@@ -2259,9 +2259,13 @@ fn normalize_exclude_patterns(patterns: &[String], adding: bool) -> Result<Vec<S
 /// The binary an update just installed, once `run_update` has located it.
 static UPDATED_BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// Run one post-update refresh with the binary the update installed. With
+/// `bridge_off`, it runs under `CONTEXTSTREAM_WATCH=0`, so it neither starts
+/// the sync bridge nor registers its service.
 async fn run_post_update_command_with_installed_binary(
     args: &[&str],
     description: &str,
+    bridge_off: bool,
 ) -> Result<()> {
     // After an install the new binary is wherever the installer put it; with
     // nothing installed, the running binary is already the current one.
@@ -2271,7 +2275,11 @@ async fn run_post_update_command_with_installed_binary(
         .or_else(|| std::env::current_exe().ok())
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(expected_install_path);
-    let status = std::process::Command::new(&install_path)
+    let mut command = std::process::Command::new(&install_path);
+    if bridge_off {
+        command.env("CONTEXTSTREAM_WATCH", "0");
+    }
+    let status = command
         .args(args)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -2519,12 +2527,31 @@ async fn refresh_editor_integrations_after_update(
         api_key = Some(setup::ensure_authenticated_api_key().await?);
     }
 
+    // A home used in another user's folder does not start its sync bridge
+    // from there: the refresh below runs with the bridge turned off.
+    let other_users_folder =
+        std::env::current_dir()
+            .ok()
+            .zip(dirs::home_dir())
+            .filter(|(folder, home)| {
+                mcp_server::watch::watch_enabled() && folder_belongs_to_another_user(folder, home)
+            });
+    if let Some((folder, home)) = &other_users_folder {
+        update_skip(format!(
+            "Sync bridge not started: {} belongs to another user than {}. Run `contextstream-mcp update-hooks` from a folder of your own to start it.",
+            folder.display(),
+            home.display()
+        ));
+    }
+    let bridge_off = other_users_folder.is_some();
+
     let migrated = api_key.is_some();
     if migrated {
         update_detail("Ensuring MCP configs use the hosted remote gateway");
         run_post_update_command_with_installed_binary(
             &migrate_remote_args(setup::account_switch::switch_allowed()),
             "hosted remote migration",
+            bridge_off,
         )
         .await?;
         update_ok("Hosted remote MCP configs and hooks refreshed");
@@ -2534,7 +2561,12 @@ async fn refresh_editor_integrations_after_update(
 
     for command in post_update_steps(refresh_project_rules, migrated) {
         update_detail(command.start_message);
-        match run_post_update_command_with_installed_binary(command.args, command.description).await
+        match run_post_update_command_with_installed_binary(
+            command.args,
+            command.description,
+            bridge_off,
+        )
+        .await
         {
             Ok(()) => update_ok(command.success_message),
             Err(e) => update_warn(format!("{}: {}", command.warning_message, e)),
@@ -2545,6 +2577,31 @@ async fn refresh_editor_integrations_after_update(
     }
 
     Ok(())
+}
+
+/// Whether `folder` belongs to another user than `home`: its owner is neither
+/// the home's owner nor root (a system folder such as `/` or `/tmp` is no
+/// one's checkout). Unknown, and on Windows, counts as no.
+fn folder_belongs_to_another_user(folder: &std::path::Path, home: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(folder), std::fs::metadata(home)) {
+            (Ok(folder), Ok(home)) => owned_by_another_user(folder.uid(), home.uid()),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (folder, home);
+        false
+    }
+}
+
+/// [`folder_belongs_to_another_user`] for the folder's and the home's owners.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn owned_by_another_user(folder_owner: u32, home_owner: u32) -> bool {
+    folder_owner != 0 && folder_owner != home_owner
 }
 
 /// What `update` says when the folder it ran in is no set-up project, so only
@@ -4964,6 +5021,32 @@ mod tests {
             Some(older)
         );
         assert!(post_update_refresh_skipped_note("1.0.63").contains("update-rules --scope=global"));
+    }
+
+    #[test]
+    fn update_starts_no_sync_bridge_from_another_users_folder() {
+        // Another (non-root) user's folder: no bridge from there.
+        assert!(owned_by_another_user(1001, 1000));
+        assert!(owned_by_another_user(1000, 0));
+        // The home's own folder, and a system folder (root's), are fine.
+        assert!(!owned_by_another_user(1000, 1000));
+        assert!(!owned_by_another_user(0, 1000));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(!folder_belongs_to_another_user(&repo, &home));
+        assert!(!folder_belongs_to_another_user(
+            &temp.path().join("missing"),
+            &home
+        ));
+        #[cfg(unix)]
+        assert!(!folder_belongs_to_another_user(
+            std::path::Path::new("/"),
+            &home
+        ));
     }
 
     #[test]

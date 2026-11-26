@@ -177,8 +177,6 @@ pub struct WatchTarget {
     pub workspace_id: Option<Uuid>,
 }
 
-/// Whether the watcher is enabled. On by default; opt out with
-/// `CONTEXTSTREAM_WATCH=0` (also accepts false/off/no).
 /// The background project-link audit, on unless
 /// `CONTEXTSTREAM_LINK_AUDIT=0|false`.
 fn link_audit_enabled() -> bool {
@@ -187,6 +185,10 @@ fn link_audit_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the watcher (the hosted sync bridge) is enabled. On by default;
+/// `CONTEXTSTREAM_WATCH=0` (also false/off/no) is the one opt-out: no
+/// command starts a watcher or registers its service then (see
+/// [`spawn_watch_helper`] and `register_managed_sync_bridge`).
 pub fn watch_enabled() -> bool {
     !matches!(
         std::env::var("CONTEXTSTREAM_WATCH")

@@ -474,6 +474,7 @@ async fn setup_keeps_git_working_tree_and_windsurf_rules_free_of_bak_files() {
                 &format!("--workspace-id={WORKSPACE_ID}"),
             ])
             .env_clear()
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &home_path)
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("CONTEXTSTREAM_API_KEY", SECRET)
@@ -566,7 +567,7 @@ async fn setup_keeps_machine_local_project_files_out_of_git_without_the_git_prog
                     .env("CONTEXTSTREAM_API_KEY", SECRET)
                     .env("CONTEXTSTREAM_API_URL", &url)
                     .env("CONTEXTSTREAM_NO_BROWSER", "1")
-                    .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
+                    .env("CONTEXTSTREAM_WATCH", "0")
                     .env("NO_COLOR", "1")
                     .current_dir(&project_path)
                     .stdin(Stdio::null())

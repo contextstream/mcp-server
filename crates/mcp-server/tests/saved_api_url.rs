@@ -287,6 +287,7 @@ fn run_cli(bin: &Path, home: &Path, cwd: &Path, args: &[&str]) -> Output {
     Command::new(bin)
         .args(args)
         .current_dir(cwd)
+        .env("CONTEXTSTREAM_WATCH", "0")
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env_remove("CONTEXTSTREAM_API_URL")

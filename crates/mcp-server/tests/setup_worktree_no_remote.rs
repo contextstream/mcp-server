@@ -390,7 +390,6 @@ fn run_cli(
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("CONTEXTSTREAM_API_URL", api_url)
         .env("CONTEXTSTREAM_NO_BROWSER", "1")
-        .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
         .env("CONTEXTSTREAM_WATCH", "0")
         .env("NO_COLOR", "1")
         .env_remove("CONTEXTSTREAM_API_KEY")

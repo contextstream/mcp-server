@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `CONTEXTSTREAM_WATCH=0`, the one opt-out for the sync bridge, now holds for every command: none starts a `contextstream-mcp watch` or registers or starts its service. `connect` registered and started the service anyway; under the opt-out it now stops before it uses the connection link, and says why. `update` run in a folder that belongs to another user than its home no longer starts the sync bridge: it says so and runs its refresh with the bridge off. The CLI tests use the real opt-out, and a test fails when one of them leaves a watcher running.
+
 ## 1.0.108
 
 - An agent connected through OAuth (claude.ai, ChatGPT and Claude Code on the web, all on the hosted server) can now be answered from the Agent Hub, as a run reported with a full API key already could. Every API request says this client carries back what a person sends a run (`X-ContextStream-Receives: deliveries`). On the hosted server, which has no key of its own, the caller's own OAuth token reads, claims and confirms the answers and messages sent to its runs, with each account's claims kept apart, and `progress` shows them as `[PERSON ANSWER]` and `[PERSON MESSAGE]` blocks. When nothing can come back, what `progress` says names the OAuth token too. A server that does not know the header ignores it.

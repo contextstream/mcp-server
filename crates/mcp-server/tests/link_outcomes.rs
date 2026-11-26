@@ -258,6 +258,7 @@ fn init_acme_remote_repo(path: &Path) {
 fn save_credentials(home: &Path, api_url: &str, key: &str) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
         .args(["configure", "--api-key-stdin"])
+        .env("CONTEXTSTREAM_WATCH", "0")
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("CONTEXTSTREAM_API_URL", api_url)

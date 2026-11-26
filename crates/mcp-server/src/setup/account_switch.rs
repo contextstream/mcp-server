@@ -18,14 +18,17 @@
 //! The same key, a new key for the same account and an entry with no key yet
 //! are written as before, without a word. A key `/auth/me` does not resolve
 //! (offline, refused, revoked) is "an unknown account", and a different key
-//! then still counts as a switch. So is a key held by reference
-//! (`${CONTEXTSTREAM_API_KEY}`, `{env:…}`): a deliberate key this check
-//! cannot resolve.
+//! then still counts as a switch. A key held by reference
+//! (`${CONTEXTSTREAM_API_KEY}`, `{env:…}`) resolves to whoever runs the
+//! editor, so it is the runner's own: it stays exactly as written, without a
+//! word or a lookup, unless `--switch-account` asks for a literal key there.
 //!
-//! Each key is resolved only against the API its own entry talks to, with no
-//! redirects followed: a key is never sent anywhere its entry does not send
-//! it. Two entries that talk to different APIs are different accounts here,
-//! without any lookup.
+//! Each key goes only to the API it belongs to, with no redirects followed:
+//! the key a write would put in is looked up only on this run's own API (its
+//! saved credentials' URL, `CONTEXTSTREAM_API_URL` or the default), never on
+//! anything an entry or a repository names, and an entry's key only on that
+//! entry's own API. When the two differ there is no lookup at all, and the
+//! keys count as different accounts.
 //!
 //! One exception: `configure` replacing the saved key passes that key to its
 //! rotation refresh, and an entry holding exactly it is the same credential
@@ -122,6 +125,9 @@ pub(crate) enum Account {
     /// A key whose entry talks to another API than the other key's (`None`
     /// when its entry does not say which): not looked up.
     OtherApi(Option<String>),
+    /// The key this run would write, when `/auth/me` did not name its
+    /// account or was not asked: this run's own account.
+    Yours,
 }
 
 impl Account {
@@ -129,10 +135,9 @@ impl Account {
         match self {
             Account::Email(email) => email.clone(),
             Account::Unknown | Account::OtherApi(None) => "an unknown account".to_string(),
-            Account::Reference(reference) => {
-                format!("an unknown account (the key {reference})")
-            }
+            Account::Reference(reference) => format!("the key held as {reference}"),
             Account::OtherApi(Some(api_url)) => format!("an unknown account on {api_url}"),
+            Account::Yours => "your account".to_string(),
         }
     }
 
@@ -181,6 +186,10 @@ pub(crate) enum KeyWrite {
     /// The switch was not agreed: the entry keeps this key it holds, and the
     /// rest of what ties it to its own account and home.
     Keep(String),
+    /// The write would put a literal key where the entry holds one by
+    /// reference, which is the runner's own: the reference stays exactly as
+    /// written and the rest of the write applies, without a word.
+    KeepReferences,
 }
 
 /// What a write may do with the keys of the entry at `path`, which holds
@@ -189,18 +198,40 @@ pub(crate) enum KeyWrite {
 pub(crate) fn settle_key_write(path: &Path, current: &[HeldKey], proposed: &[HeldKey]) -> KeyWrite {
     let Some(new_key) = proposed
         .iter()
-        .find(|key| !current.iter().any(|held| held.value == key.value))
+        .find(|key| !key.is_reference() && !current.iter().any(|held| held.value == key.value))
     else {
         return KeyWrite::NoSwitch;
     };
-    let Some(held) = current.iter().find(|held| held.value != new_key.value) else {
+    if let Some(held) = current
+        .iter()
+        .find(|held| !held.is_reference() && held.value != new_key.value)
+    {
+        return match settle(path, held, new_key, None) {
+            Settled::SameAccount => KeyWrite::NoSwitch,
+            Settled::Switched => KeyWrite::Switched,
+            Settled::Kept => KeyWrite::Keep(held.value.clone()),
+        };
+    }
+    let Some(reference) = current.iter().find(|held| held.is_reference()) else {
         return KeyWrite::NoSwitch;
     };
-    match settle(path, held, new_key, None) {
-        Settled::SameAccount => KeyWrite::NoSwitch,
-        Settled::Switched => KeyWrite::Switched,
-        Settled::Kept => KeyWrite::Keep(held.value.clone()),
+    if mode() == Mode::Switch {
+        let ui = ui::ui();
+        eprintln!(
+            "{}",
+            ui.line(
+                Mark::Info,
+                &format!(
+                    "Switching {} from the key held as {} to your account's key",
+                    ui.path(&path.display().to_string()),
+                    reference.value.trim()
+                ),
+                Some(SWITCH_ACCOUNT_FLAG),
+            )
+        );
+        return KeyWrite::Switched;
     }
+    KeyWrite::KeepReferences
 }
 
 /// The key a write must keep in the entry at `path` (see [`settle_key_write`]):
@@ -213,14 +244,15 @@ pub(crate) fn key_to_keep(
 ) -> Option<String> {
     match settle_key_write(path, current, proposed) {
         KeyWrite::Keep(key) => Some(key),
-        KeyWrite::NoSwitch | KeyWrite::Switched => None,
+        KeyWrite::NoSwitch | KeyWrite::Switched | KeyWrite::KeepReferences => None,
     }
 }
 
 /// Whether a write may create the project config `new_path`, signed in with
 /// `proposed`, in a project that already signs in as `evidence` (see
 /// [`ProjectEvidence`]). A project with no ContextStream config has no
-/// evidence and is created as before.
+/// evidence and is created as before, and a key held by reference (the
+/// runner's own) is no evidence.
 pub(crate) fn settle_new_entry(
     new_path: &Path,
     evidence: &[ProjectEvidence],
@@ -228,6 +260,7 @@ pub(crate) fn settle_new_entry(
 ) -> Settled {
     for item in evidence {
         let settled = match &item.held {
+            Held::Key(held) if held.is_reference() => Settled::SameAccount,
             Held::Key(held) => settle(&item.path, held, proposed, Some(new_path)),
             Held::Email(email) => {
                 let from = Account::Email(email.clone());
@@ -313,7 +346,7 @@ fn accounts_of(held: &HeldKey, proposed: &HeldKey) -> (Account, Account) {
     };
     let api_url = match (&held.api_url, &proposed.api_url) {
         (Some(a), Some(b)) if same_api_url(a, b) => a.clone(),
-        _ => return (unlooked(held), unlooked(proposed)),
+        _ => return (unlooked(held), Account::Yours),
     };
     let lookups: Vec<String> = [held, proposed]
         .into_iter()
@@ -331,20 +364,28 @@ fn accounts_of(held: &HeldKey, proposed: &HeldKey) -> (Account, Account) {
             .and_then(|index| found.get(index).cloned())
             .unwrap_or(Account::Unknown)
     };
-    (account(held), account(proposed))
+    (account(held), yours(account(proposed)))
 }
 
-/// The account one key signs in as, asked of its own entry's API.
-fn account_of(key: &HeldKey) -> Account {
-    if key.is_reference() {
-        return Account::Reference(key.value.trim().to_string());
+/// The key this run would write is this run's own account, named by email
+/// when `/auth/me` did.
+fn yours(account: Account) -> Account {
+    match account {
+        Account::Email(email) => Account::Email(email),
+        _ => Account::Yours,
     }
-    let Some(api_url) = key.api_url.as_deref() else {
-        return Account::OtherApi(None);
+}
+
+/// The account this run's key signs in as, asked of this run's own API.
+fn account_of(key: &HeldKey) -> Account {
+    let Some(api_url) = key.api_url.as_deref().filter(|_| !key.is_reference()) else {
+        return Account::Yours;
     };
-    lookup_accounts(api_url, std::slice::from_ref(&key.value))
-        .pop()
-        .unwrap_or(Account::Unknown)
+    yours(
+        lookup_accounts(api_url, std::slice::from_ref(&key.value))
+            .pop()
+            .unwrap_or(Account::Unknown),
+    )
 }
 
 pub(crate) fn same_api_url(a: &str, b: &str) -> bool {
@@ -756,6 +797,30 @@ mod tests {
         );
         assert_eq!(choice, Choice::Switch);
         assert_eq!(asked.as_deref(), Some("Create it for chase@example.test?"));
+
+        // Without a lookup, this run's own account is "your account".
+        let proposal = Proposal {
+            path: &path,
+            from: Account::OtherApi(Some("http://127.0.0.1:9".to_string())),
+            to: Account::Yours,
+            creating: Some(&creating),
+        };
+        let mut asked = None;
+        let mut lines = Vec::new();
+        decide(
+            &proposal,
+            Mode::Ask,
+            |question| {
+                asked = Some(question.to_string());
+                Ok(false)
+            },
+            &mut |line| lines.push(line),
+        );
+        assert_eq!(asked.as_deref(), Some("Create it for your account?"));
+        assert!(
+            lines[0].contains("would sign this project in as your account."),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -765,7 +830,7 @@ mod tests {
             (Account::Unknown, "signs in as an unknown account;"),
             (
                 Account::Reference("${CONTEXTSTREAM_API_KEY}".to_string()),
-                "signs in as an unknown account (the key ${CONTEXTSTREAM_API_KEY});",
+                "signs in as the key held as ${CONTEXTSTREAM_API_KEY};",
             ),
             (
                 Account::OtherApi(Some("http://127.0.0.1:9".to_string())),
@@ -832,14 +897,16 @@ mod tests {
             ),
             Settled::Kept
         );
+        // This run's key is never named from another API: it is "your
+        // account".
         assert_eq!(
             accounts_of(
                 &HeldKey::new("cs_key_a", Some("https://api.one.test".to_string())),
-                &HeldKey::new("cs_key_b", None),
+                &HeldKey::new("cs_key_b", Some("https://api.two.test".to_string())),
             ),
             (
                 Account::OtherApi(Some("https://api.one.test".to_string())),
-                Account::OtherApi(None)
+                Account::Yours
             )
         );
         // Trailing slashes and case do not make two APIs.
@@ -851,25 +918,6 @@ mod tests {
                 None
             ),
             Settled::SameAccount
-        );
-        // A key held by reference is a deliberate key this cannot resolve.
-        assert_eq!(
-            settle(
-                path,
-                &key("${CONTEXTSTREAM_API_KEY}"),
-                &key("cs_key_b"),
-                None
-            ),
-            Settled::Kept
-        );
-        assert_eq!(
-            settle(
-                path,
-                &key("{env:CONTEXTSTREAM_API_KEY}"),
-                &key("cs_key_b"),
-                None
-            ),
-            Settled::Kept
         );
     }
 
@@ -894,22 +942,40 @@ mod tests {
             settle_key_write(path, &keys(&["cs_erik"]), &keys(&["cs_chase"])),
             KeyWrite::Keep("cs_erik".to_string())
         );
-        // A reference the write leaves in place is no switch; a literal key
-        // in its place is.
-        let reference = keys(&["${CONTEXTSTREAM_API_KEY}"]);
-        assert_eq!(
-            settle_key_write(path, &reference, &reference),
-            KeyWrite::NoSwitch
-        );
-        assert_eq!(
-            settle_key_write(path, &reference, &keys(&["cs_chase"])),
-            KeyWrite::Keep("${CONTEXTSTREAM_API_KEY}".to_string())
-        );
         let _policy = test_policy(Mode::Switch, false);
         assert_eq!(
             settle_key_write(path, &keys(&["cs_erik"]), &keys(&["cs_chase"])),
             KeyWrite::Switched
         );
+    }
+
+    #[test]
+    fn a_key_held_by_reference_is_the_runners_own_and_stays_unless_switched() {
+        let path = Path::new("/work/repo/.mcp.json");
+        let _accounts = test_accounts(&[("cs_chase", "chase@example.test")]);
+        for reference in ["${CONTEXTSTREAM_API_KEY}", "{env:CONTEXTSTREAM_API_KEY}"] {
+            let held = keys(&[reference]);
+            // Left in place: nothing to settle.
+            let _policy = test_policy(Mode::Keep, false);
+            assert_eq!(settle_key_write(path, &held, &held), KeyWrite::NoSwitch);
+            // A literal key in its place: kept silently, with or without a
+            // terminal (no question is put)...
+            assert_eq!(
+                settle_key_write(path, &held, &keys(&["cs_chase"])),
+                KeyWrite::KeepReferences
+            );
+            let _policy = test_policy(Mode::Ask, true);
+            assert_eq!(
+                settle_key_write(path, &held, &keys(&["cs_chase"])),
+                KeyWrite::KeepReferences
+            );
+            // ...unless --switch-account asks for it.
+            let _policy = test_policy(Mode::Switch, false);
+            assert_eq!(
+                settle_key_write(path, &held, &keys(&["cs_chase"])),
+                KeyWrite::Switched
+            );
+        }
     }
 
     #[test]
@@ -928,6 +994,15 @@ mod tests {
         };
         assert_eq!(
             settle_new_entry(new_path, &[], &key("cs_chase")),
+            Settled::SameAccount
+        );
+        // A key held by reference is the runner's own: no evidence.
+        assert_eq!(
+            settle_new_entry(
+                new_path,
+                &evidence(Held::Key(key("${CONTEXTSTREAM_API_KEY}"))),
+                &key("cs_chase")
+            ),
             Settled::SameAccount
         );
         assert_eq!(

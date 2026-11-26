@@ -8,13 +8,18 @@
 //! `update` itself downloads its release manifest first, so these tests run
 //! the config refresh it hands to the installed binary: `migrate-remote
 //! --scope=all --only-configured` (with `--switch-account` handed on when
-//! given). The world is all temporary:
-//! - B's HOME holds B's key in its saved credentials (no key in the
-//!   environment), names B's API (stub B), has set up Claude Code and Cursor,
-//!   and runs the CLI from its own managed binary;
-//! - A's repository holds A's hosted entry, which talks to A's API (stub A)
-//!   and runs A's binary as its `headersHelper`;
-//! - both stubs answer `/api/v1/auth/me` and record which key reached them.
+//! given). The world is all temporary: B's HOME holds B's key in its saved
+//! credentials (no key in the environment), names B's API, has set up Claude
+//! Code and Cursor, and runs the CLI from its own managed binary; A's
+//! repository holds A's hosted entry, which runs A's binary as its
+//! `headersHelper`. Recording `/auth/me` stubs stand in for the APIs and for
+//! a gateway a repository names.
+//!
+//! A key goes only to the API it belongs to: B's key only to B's configured
+//! API, A's key only to the API A's entry names, and when those differ to
+//! neither. So the cases that name both accounts by email give A's entry and
+//! B's credentials the same API, as production does; a repository that
+//! names any other gateway gets no request at all.
 #![cfg(unix)]
 
 use axum::{
@@ -29,6 +34,8 @@ use std::sync::{Arc, Mutex};
 const KEY_A: &str = "cs_test_owner_a_key_aaaa1111";
 const KEY_B: &str = "cs_test_demo_b_key_bbbb2222";
 const KEY_B_OLD: &str = "cs_test_demo_b_oldkey_cccc3333";
+/// B's rotated key, for `configure --api-key-stdin`.
+const KEY_B2: &str = "cs_test_demo_b_newkey_dddd4444";
 const A_INSTALLATION: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const B_INSTALLATION: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const A_WORKSPACE: &str = "11111111-1111-4111-8111-111111111111";
@@ -41,6 +48,7 @@ fn key_label(key: Option<&str>) -> &'static str {
         Some(KEY_A) => "A",
         Some(KEY_B) => "B",
         Some(KEY_B_OLD) => "B_OLD",
+        Some(KEY_B2) => "B2",
         Some(_) => "other",
         None => "none",
     }
@@ -80,9 +88,11 @@ impl Stub {
                 if uri.path() != "/api/v1/auth/me" {
                     return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})));
                 }
-                let email = match label {
-                    "A" => "owner@example.test",
-                    "B" | "B_OLD" => "demo@example.test",
+                let (id, email) = match label {
+                    "A" => ("33333333-3333-4333-8333-333333333333", "owner@example.test"),
+                    "B" | "B_OLD" | "B2" => {
+                        ("22222222-2222-4222-8222-222222222222", "demo@example.test")
+                    }
                     _ => {
                         return (
                             StatusCode::UNAUTHORIZED,
@@ -90,7 +100,14 @@ impl Stub {
                         )
                     }
                 };
-                (StatusCode::OK, Json(json!({"data": {"email": email}})))
+                (
+                    StatusCode::OK,
+                    Json(json!({"data": {
+                        "id": id,
+                        "email": email,
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }})),
+                )
             }
         });
         let handle = tokio::spawn(async move {
@@ -120,6 +137,11 @@ impl Stub {
 
     fn clear(&self) {
         self.seen.lock().unwrap().clear();
+    }
+
+    /// Every request that reached this server, by path and key label.
+    fn requests(&self) -> Vec<(String, &'static str)> {
+        self.seen.lock().unwrap().clone()
     }
 }
 
@@ -229,12 +251,12 @@ impl World {
         self.repo.join(".cursor").join("mcp.json")
     }
 
-    /// A's hosted entry in the repository: it talks to A's gateway (stub
-    /// A), holds `key`, names A's installation and runs `helper`.
-    fn seed_owner_entry(&self, a_api: &str, key: &str, helper: &str) -> Value {
+    /// A's hosted entry in the repository: it talks to the gateway at
+    /// `gateway`, holds `key`, names A's installation and runs `helper`.
+    fn seed_owner_entry(&self, gateway: &str, key: &str, helper: &str) -> Value {
         let entry = json!({"mcpServers": {"contextstream": {
             "type": "http",
-            "url": format!("{a_api}/mcp?default_context_mode=fast"),
+            "url": format!("{gateway}/mcp?default_context_mode=fast"),
             "headers": {
                 "X-ContextStream-Managed-Config-Version": "2",
                 API_KEY_HEADER: key,
@@ -258,6 +280,16 @@ impl World {
     }
 
     async fn run_in(&self, cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        self.run_with_input(cwd, args, extra_env, None).await
+    }
+
+    async fn run_with_input(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+        input: Option<&str>,
+    ) -> Output {
         let mut command = Command::new(&self.b_binary);
         command
             .args(args)
@@ -269,13 +301,32 @@ impl World {
             .env("CONTEXTSTREAM_NO_BROWSER", "1")
             .env("NO_COLOR", "1")
             .current_dir(cwd)
-            .stdin(Stdio::null());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
         for (name, value) in extra_env {
             command.env(name, value);
         }
-        tokio::task::spawn_blocking(move || command.output().unwrap())
-            .await
-            .unwrap()
+        let input = input.map(String::from);
+        tokio::task::spawn_blocking(move || {
+            let mut child = command.spawn().unwrap();
+            if let Some(input) = input {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(input.as_bytes())
+                    .unwrap();
+            }
+            child.wait_with_output().unwrap()
+        })
+        .await
+        .unwrap()
     }
 
     /// The refresh `update` runs.
@@ -297,7 +348,7 @@ fn said(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    for key in [KEY_A, KEY_B, KEY_B_OLD] {
+    for key in [KEY_A, KEY_B, KEY_B_OLD, KEY_B2] {
         assert!(!text.contains(key), "a key was printed:\n{text}");
     }
     text
@@ -305,9 +356,10 @@ fn said(output: &Output) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_update_from_another_accounts_home_leaves_the_project_as_it_is() {
-    let (a_api, b_api) = (Stub::spawn().await, Stub::spawn().await);
-    let world = World::new(&b_api.url);
-    let before = world.seed_owner_entry(&a_api.url, KEY_A, &world.a_helper());
+    // A's entry and B's credentials name the same API, as in production.
+    let api = Stub::spawn().await;
+    let world = World::new(&api.url);
+    let before = world.seed_owner_entry(&api.url, KEY_A, &world.a_helper());
 
     let output = world.refresh(&[]).await;
     let text = said(&output);
@@ -352,7 +404,7 @@ async fn an_update_from_another_accounts_home_leaves_the_project_as_it_is() {
     assert!(!world.cursor_project_config().exists(), "{text}");
     assert!(
         text.contains(&format!(
-            "creating {} would sign this project in as",
+            "creating {} would sign this project in as demo@example.test.",
             world.cursor_project_config().display()
         )) && text.contains(&format!(
             "Did not create {}.",
@@ -360,18 +412,104 @@ async fn an_update_from_another_accounts_home_leaves_the_project_as_it_is() {
         )),
         "{text}"
     );
+    assert!(api.keys_on("/api/v1/auth/me").contains(&"A"), "{text}");
+}
 
-    // A's key went only to A's API; B's API never saw it.
-    assert!(a_api.keys_on("/api/v1/auth/me").contains(&"A"), "{text}");
+/// A repository that names its own gateway: whatever key it holds, the
+/// gateway hears nothing, and B's API never sees A's key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateway_a_repository_names_never_receives_the_runners_key() {
+    let (b_api, evil) = (Stub::spawn().await, Stub::spawn().await);
+    let world = World::new(&b_api.url);
+
+    // A literal key: kept, the runner's account named as "your account",
+    // and no lookup anywhere (the two APIs differ).
+    world.seed_owner_entry(&evil.url, KEY_A, &world.a_helper());
+    let output = world.refresh(&[]).await;
+    let text = said(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        entry_of(&world.project_config())["headers"][API_KEY_HEADER],
+        json!(KEY_A),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "signs in as an unknown account on {}; this would switch it to your account.",
+            evil.url
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("would sign this project in as your account."),
+        "{text}"
+    );
+    assert!(!world.cursor_project_config().exists(), "{text}");
+
+    // A key held by reference: kept as written without a word; it is no
+    // reason to hold back the Cursor entry.
+    world.seed_owner_entry(&evil.url, "${CONTEXTSTREAM_API_KEY}", &world.a_helper());
+    let output = world.refresh(&[]).await;
+    let text = said(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        entry_of(&world.project_config())["headers"][API_KEY_HEADER],
+        json!("${CONTEXTSTREAM_API_KEY}"),
+        "{text}"
+    );
+    assert!(!text.contains("signs in as"), "{text}");
+    assert_eq!(
+        entry_of(&world.cursor_project_config())["headers"][API_KEY_HEADER],
+        json!(KEY_B),
+        "{text}"
+    );
+
+    assert_eq!(
+        evil.requests(),
+        vec![],
+        "the repository's gateway was asked"
+    );
     assert!(!b_api.any_key("A"), "A's key reached B's API");
     assert!(b_api.keys_on("/api/v1/auth/me").is_empty());
 }
 
+/// The rotation path (`configure --api-key-stdin`) sends the new key only to
+/// this run's own API, whatever the repository's entry names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_never_sends_the_new_key_to_a_repository_gateway() {
+    let (b_api, evil) = (Stub::spawn().await, Stub::spawn().await);
+    let world = World::new(&b_api.url);
+    for key in [KEY_A, "${CONTEXTSTREAM_API_KEY}"] {
+        let before = world.seed_owner_entry(&evil.url, key, &world.a_helper());
+        let output = world
+            .run_with_input(
+                &world.repo,
+                &["configure", "--api-key-stdin"],
+                &[],
+                Some(&format!("{KEY_B2}\n")),
+            )
+            .await;
+        let text = said(&output);
+        assert!(output.status.success(), "{text}");
+        assert_eq!(
+            entry_of(&world.project_config()),
+            before["mcpServers"]["contextstream"],
+            "{text}"
+        );
+    }
+    assert_eq!(
+        evil.requests(),
+        vec![],
+        "the repository's gateway was asked"
+    );
+    assert!(!b_api.any_key("A"), "A's key reached B's API");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_agreed_switch_changes_the_key_and_installation_but_keeps_the_binary() {
-    let (a_api, b_api) = (Stub::spawn().await, Stub::spawn().await);
-    let world = World::new(&b_api.url);
-    world.seed_owner_entry(&a_api.url, KEY_A, &world.a_helper());
+    let api = Stub::spawn().await;
+    let world = World::new(&api.url);
+    world.seed_owner_entry(&api.url, KEY_A, &world.a_helper());
 
     let output = world.refresh(&["--switch-account"]).await;
     let text = said(&output);
@@ -407,14 +545,13 @@ async fn an_agreed_switch_changes_the_key_and_installation_but_keeps_the_binary(
         entry_of(&world.cursor_project_config())["headers"][API_KEY_HEADER],
         json!(KEY_B)
     );
-    assert!(!b_api.any_key("A"), "A's key reached B's API");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_entry_holding_a_key_reference_keeps_it() {
-    let (a_api, b_api) = (Stub::spawn().await, Stub::spawn().await);
-    let world = World::new(&b_api.url);
-    world.seed_owner_entry(&a_api.url, "${CONTEXTSTREAM_API_KEY}", &world.a_helper());
+async fn a_key_reference_is_the_runners_own_and_stays_as_written() {
+    let api = Stub::spawn().await;
+    let world = World::new(&api.url);
+    world.seed_owner_entry(&api.url, "${CONTEXTSTREAM_API_KEY}", &world.a_helper());
 
     let output = world.refresh(&[]).await;
     let text = said(&output);
@@ -425,31 +562,39 @@ async fn an_entry_holding_a_key_reference_keeps_it() {
         json!("${CONTEXTSTREAM_API_KEY}"),
         "{text}"
     );
+    // The rest of the refresh applies, as to any entry of the runner's own.
     assert_eq!(
         entry["headers"][INSTALLATION_HEADER],
-        json!(A_INSTALLATION),
+        json!(B_INSTALLATION),
         "{text}"
     );
-    assert_eq!(entry["headersHelper"], json!(world.a_helper()), "{text}");
     assert!(
         !std::fs::read_to_string(world.project_config())
             .unwrap()
             .contains(KEY_B),
         "a literal key was written over the reference"
     );
-    assert!(
-        text.contains("signs in as an unknown account (the key ${CONTEXTSTREAM_API_KEY})"),
+    assert!(!text.contains("signs in as"), "{text}");
+    assert!(world.cursor_project_config().exists(), "{text}");
+    assert!(api.keys_on("/api/v1/auth/me").is_empty(), "{text}");
+
+    // Only --switch-account puts a literal key in its place.
+    let output = world.refresh(&["--switch-account"]).await;
+    let text = said(&output);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        entry_of(&world.project_config())["headers"][API_KEY_HEADER],
+        json!(KEY_B),
         "{text}"
     );
-    assert!(!world.cursor_project_config().exists(), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn doctor_repair_without_the_flag_keeps_the_entry() {
-    let (a_api, b_api) = (Stub::spawn().await, Stub::spawn().await);
-    let world = World::new(&b_api.url);
+    let api = Stub::spawn().await;
+    let world = World::new(&api.url);
     // A's entry in B's own Claude Code config (B's HOME once signed in as A).
-    let before = world.seed_owner_entry(&a_api.url, KEY_A, &world.a_helper());
+    let before = world.seed_owner_entry(&api.url, KEY_A, &world.a_helper());
     let claude = world.b_home.join(".claude.json");
     std::fs::rename(world.project_config(), &claude).unwrap();
 
@@ -476,15 +621,13 @@ async fn doctor_repair_without_the_flag_keeps_the_entry() {
         "{text}"
     );
     assert!(text.contains("--switch-account"), "{text}");
-    assert!(a_api.keys_on("/api/v1/auth/me").contains(&"A"), "{text}");
-    assert!(!b_api.any_key("A"), "A's key reached B's API");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_same_account_refresh_keeps_a_bare_helper() {
-    let (a_api, b_api) = (Stub::spawn().await, Stub::spawn().await);
-    let world = World::new(&b_api.url);
-    world.seed_owner_entry(&a_api.url, KEY_B_OLD, "contextstream-mcp hook mcp-headers");
+    let api = Stub::spawn().await;
+    let world = World::new(&api.url);
+    world.seed_owner_entry(&api.url, KEY_B_OLD, "contextstream-mcp hook mcp-headers");
 
     let output = world.refresh(&[]).await;
     let text = said(&output);
@@ -516,8 +659,7 @@ async fn a_kept_stdio_entry_keeps_its_api_url_command_and_transport() {
     }}});
 
     // The project's stdio entry is not turned into a hosted one: it stays
-    // byte for byte, and its key reaches no API (its entry and the hosted
-    // one it would become talk to different APIs).
+    // byte for byte, and no key reaches any API (the APIs differ).
     let cursor = world.cursor_project_config();
     std::fs::create_dir_all(cursor.parent().unwrap()).unwrap();
     std::fs::write(&cursor, serde_json::to_string_pretty(&stdio).unwrap()).unwrap();
@@ -532,7 +674,10 @@ async fn a_kept_stdio_entry_keeps_its_api_url_command_and_transport() {
     );
     assert!(!a_api.any_key("A") && !b_api.any_key("A"), "{text}");
     assert!(
-        text.contains(&format!("signs in as an unknown account on {}", a_api.url)),
+        text.contains(&format!(
+            "signs in as an unknown account on {}; this would switch it to your account.",
+            a_api.url
+        )),
         "{text}"
     );
 
@@ -571,7 +716,7 @@ async fn a_kept_stdio_entry_keeps_its_api_url_command_and_transport() {
         json!("false"),
         "{text}"
     );
-    assert!(!b_api.any_key("A"), "A's key reached B's API");
+    assert!(!a_api.any_key("A") && !b_api.any_key("A"), "{text}");
 }
 
 /// Run `args` in a pseudo-terminal, answer the first question that contains
@@ -674,12 +819,12 @@ fn run_in_terminal(world: &World, args: &[&str], question: &str, answer: &[u8]) 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_terminal_is_asked_and_the_default_keeps_the_entry() {
-    let (a_api, b_api) = (Stub::spawn().await, Stub::spawn().await);
-    let world = World::new(&b_api.url);
+    let api = Stub::spawn().await;
+    let world = World::new(&api.url);
     let args = ["migrate-remote", "--scope=project", "--editors=claude"];
 
     // Enter takes the default, No.
-    world.seed_owner_entry(&a_api.url, KEY_A, &world.a_helper());
+    world.seed_owner_entry(&api.url, KEY_A, &world.a_helper());
     let world = Arc::new(world);
     let run = {
         let world = Arc::clone(&world);
@@ -720,5 +865,4 @@ async fn a_terminal_is_asked_and_the_default_keeps_the_entry() {
     );
     assert_eq!(entry["headersHelper"], json!(world.a_helper()), "{shown}");
     assert_ne!(entry["headersHelper"], json!(world.b_helper()));
-    assert!(!b_api.any_key("A"), "A's key reached B's API");
 }

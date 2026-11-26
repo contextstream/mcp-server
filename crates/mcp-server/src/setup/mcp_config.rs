@@ -1030,15 +1030,30 @@ fn settle_json_entry_account(path: &Path, existing: Option<&Value>, server: &mut
     match account_switch::settle_key_write(
         path,
         &json_entry_held_keys(existing),
-        &json_entry_held_keys(server),
+        &running_keys(json_entry_held_keys(server)),
     ) {
         account_switch::KeyWrite::Keep(_) => keep_entry_as_it_is(existing, server),
         account_switch::KeyWrite::Switched => keep_binary_across_homes(path, existing, server),
+        account_switch::KeyWrite::KeepReferences => {
+            keep_key_references(existing, server, true);
+            keep_binary_across_homes(path, existing, server);
+        }
         account_switch::KeyWrite::NoSwitch => {
-            keep_key_references(existing, server);
+            keep_key_references(existing, server, false);
             keep_binary_across_homes(path, existing, server);
         }
     }
+}
+
+/// The keys a write would put in, as this run's own: whatever URL the entry
+/// being written inherits from the existing one or a repository, this run's
+/// key belongs to this run's API (see [`super::credentials::configured_api_url`])
+/// and is looked up nowhere else.
+fn running_keys(keys: Vec<account_switch::HeldKey>) -> Vec<account_switch::HeldKey> {
+    let api_url = super::credentials::configured_api_url();
+    keys.into_iter()
+        .map(|key| account_switch::HeldKey::new(key.value, Some(api_url.clone())))
+        .collect()
 }
 
 /// The API a JSON-like entry sends its key to: a local entry's
@@ -1196,33 +1211,33 @@ fn keep_entry_as_it_is(existing: &Value, server: &mut Value) {
     }
 }
 
-/// A write that leaves the account alone keeps a key the entry holds by
-/// reference where the write would drop it (a project entry refreshed
-/// without its key).
-fn keep_key_references(existing: &Value, server: &mut Value) {
-    let reference = |value: &Value| {
-        value.as_str().is_some_and(|raw| {
-            account_switch::is_key_reference(raw)
-                || bearer_key_or_reference(raw)
-                    .is_some_and(|token| account_switch::is_key_reference(&token))
-        })
-    };
-    for (field, matches) in [
-        ("headers", is_key_header as fn(&str) -> bool),
-        ("env", |name: &str| name == "CONTEXTSTREAM_API_KEY"),
-        ("environment", |name: &str| name == "CONTEXTSTREAM_API_KEY"),
-    ] {
-        let Some(source) = existing.get(field).and_then(Value::as_object) else {
-            continue;
-        };
-        let Some(target) = server.get_mut(field).and_then(Value::as_object_mut) else {
-            continue;
-        };
-        for (name, value) in source {
-            if matches(name) && reference(value) && !target.contains_key(name) {
-                target.insert(name.clone(), value.clone());
-            }
+/// A key held by reference (`${CONTEXTSTREAM_API_KEY}`, `{env:…}`) resolves
+/// to whoever runs the editor, so it is the runner's own: a write that is no
+/// agreed switch keeps it exactly as written, putting the entry's key fields
+/// back to its own (no literal key in their place, none dropped). When the
+/// write would also change the entry's transport, a write that puts a
+/// literal key in keeps the whole entry; one that writes no key goes ahead
+/// (a legacy local entry turned hosted).
+fn keep_key_references(existing: &Value, server: &mut Value, literal_written: bool) {
+    if !json_entry_held_keys(existing)
+        .iter()
+        .any(|key| account_switch::is_key_reference(&key.value))
+    {
+        return;
+    }
+    if existing_json_like_server_is_remote(Some(existing))
+        != existing_json_like_server_is_remote(Some(server))
+    {
+        if literal_written {
+            *server = existing.clone();
         }
+        return;
+    }
+    restore_entry_values(existing, server, "headers", is_key_header);
+    for field in ["env", "environment"] {
+        restore_entry_values(existing, server, field, |name| {
+            name == "CONTEXTSTREAM_API_KEY"
+        });
     }
 }
 
@@ -1487,10 +1502,12 @@ fn refresh_json_entry_key_settled(
     api_key: &str,
     replaced_key: Option<&str>,
 ) -> bool {
-    let api_url = json_entry_api_url(entry);
-    let held =
-        keys_to_settle_on_rotation(embedded_json_api_keys(entry), replaced_key, api_url.clone());
-    let proposed = [account_switch::HeldKey::new(api_key, api_url)];
+    let held = keys_to_settle_on_rotation(
+        embedded_json_api_keys(entry),
+        replaced_key,
+        json_entry_api_url(entry),
+    );
+    let proposed = running_keys(vec![account_switch::HeldKey::new(api_key, None)]);
     if account_switch::key_to_keep(path, &held, &proposed).is_some() {
         return false;
     }
@@ -1700,7 +1717,12 @@ fn settle_codex_block_account(
     let mut document = parse_codex_toml(&new_block, path)
         .context("Internal error: generated Codex configuration is invalid")?;
     let (proposed, new_program) = contextstream_toml_item(&document)
-        .map(|entry| (codex_entry_held_keys(entry), codex_entry_program(entry)))
+        .map(|entry| {
+            (
+                running_keys(codex_entry_held_keys(entry)),
+                codex_entry_program(entry),
+            )
+        })
         .unwrap_or_default();
     let settled =
         account_switch::settle_key_write(path, &codex_entry_held_keys(existing_entry), &proposed);
@@ -1712,33 +1734,88 @@ fn settle_codex_block_account(
     else {
         return Ok(Some(new_block));
     };
-    if let account_switch::KeyWrite::Keep(_) = settled {
-        if !keep_codex_entry_as_it_is(existing_entry, entry) {
-            return Ok(None);
+    let mut changed = false;
+    match settled {
+        account_switch::KeyWrite::Keep(_) => {
+            if !keep_codex_entry_as_it_is(existing_entry, entry) {
+                return Ok(None);
+            }
+            return Ok(Some(document.to_string()));
         }
-        return Ok(Some(document.to_string()));
+        account_switch::KeyWrite::Switched => {}
+        account_switch::KeyWrite::KeepReferences => {
+            match keep_codex_key_references(existing_entry, entry, true) {
+                None => return Ok(None),
+                Some(restored) => changed |= restored,
+            }
+        }
+        account_switch::KeyWrite::NoSwitch => {
+            if let Some(restored) = keep_codex_key_references(existing_entry, entry, false) {
+                changed |= restored;
+            }
+        }
     }
-    // Any other write keeps a program from another home, or a bare one (see
-    // [`keep_binary_across_homes`]); only a local entry runs one.
+    let finish = |changed: bool, document: &DocumentMut| {
+        if changed {
+            document.to_string()
+        } else {
+            new_block.clone()
+        }
+    };
+    // Any write but a refused switch keeps a program from another home, or a
+    // bare one (see [`keep_binary_across_homes`]); only a local entry runs one.
     let (Some(home), Some(held_program), Some(new_program)) = (
         dirs::home_dir(),
         codex_entry_program(existing_entry),
         new_program,
     ) else {
-        return Ok(Some(new_block));
+        return Ok(Some(finish(changed, &document)));
     };
     let pinned =
         is_bare_contextstream_program(&held_program) || path_in_another_home(&held_program, &home);
-    if !pinned || held_program == new_program {
-        return Ok(Some(new_block));
-    }
-    if !keep_codex_entry_binary(existing_entry, entry) {
-        return Ok(Some(new_block));
+    if !pinned || held_program == new_program || !keep_codex_entry_binary(existing_entry, entry) {
+        return Ok(Some(finish(changed, &document)));
     }
     if !is_bare_contextstream_program(&held_program) {
         account_switch::say_binary_from_another_home(path, &held_program, &new_program);
     }
     Ok(Some(document.to_string()))
+}
+
+/// [`keep_key_references`] for a Codex entry: `Some(true)` when it put the
+/// entry's references back, `Some(false)` when there was nothing to put back,
+/// and `None` when a write putting a literal key in would also change the
+/// entry's transport, so the whole entry stays.
+fn keep_codex_key_references(
+    existing: &Item,
+    entry: &mut dyn toml_edit::TableLike,
+    literal_written: bool,
+) -> Option<bool> {
+    if !codex_entry_held_keys(existing)
+        .iter()
+        .any(|key| account_switch::is_key_reference(&key.value))
+    {
+        return Some(false);
+    }
+    if toml_item_string(existing, "url").is_some() != entry.contains_key("url") {
+        return (!literal_written).then_some(false);
+    }
+    for field in ["bearer_token_env_var", "env_http_headers"] {
+        if entry.contains_key(field)
+            || existing
+                .as_table_like()
+                .is_some_and(|table| table.contains_key(field))
+        {
+            restore_codex_field(existing, entry, field);
+        }
+    }
+    restore_codex_values(existing, entry, "env", |name| {
+        name == "CONTEXTSTREAM_API_KEY"
+    });
+    for table_key in ["http_headers", "headers"] {
+        restore_codex_values(existing, entry, table_key, is_key_header);
+    }
+    Some(true)
 }
 
 fn build_remote_http_server_json(
@@ -5087,7 +5164,7 @@ fn write_project_mcp_config_with_transport_mode(
 /// config; otherwise as [`account_switch::settle_new_entry`] settles it
 /// against what the project already uses (see [`project_account_evidence`]).
 fn new_project_entry_settled(project_path: &Path, new_path: &Path, server: &Value) -> bool {
-    let Some(proposed) = json_entry_held_keys(server)
+    let Some(proposed) = running_keys(json_entry_held_keys(server))
         .into_iter()
         .find(|key| !account_switch::is_key_reference(&key.value))
     else {
@@ -5309,8 +5386,8 @@ fn refresh_codex_toml_file_embedded_api_key(
             )
         })
         .unwrap_or_default();
-    let held = keys_to_settle_on_rotation(held, replaced_key, api_url.clone());
-    let proposed = [account_switch::HeldKey::new(api_key, api_url)];
+    let held = keys_to_settle_on_rotation(held, replaced_key, api_url);
+    let proposed = running_keys(vec![account_switch::HeldKey::new(api_key, None)]);
     if account_switch::key_to_keep(path, &held, &proposed).is_some() {
         return Ok(false);
     }
@@ -12003,7 +12080,7 @@ CONTEXTSTREAM_API_KEY = "test-key"
     }
 
     #[test]
-    fn an_entry_holding_a_key_by_reference_never_gets_a_literal_key_unasked() {
+    fn a_key_reference_is_the_runners_own_and_gets_a_literal_key_only_when_switched() {
         let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let _home = isolated_home(temp.path());
@@ -12025,17 +12102,38 @@ CONTEXTSTREAM_API_KEY = "test-key"
         };
         let _accounts = erik_and_chase();
 
-        // No terminal: the reference and the installation stay; no literal
-        // key reaches the file.
-        seed();
-        let server = refresh_project_with(&project, CHASE_KEY);
-        assert_eq!(server["headers"][HEADER_API_KEY], json!(reference));
-        assert_eq!(
-            server["headers"][HEADER_INSTALLATION_ID],
-            json!(ERIK_INSTALLATION)
-        );
-        let raw = std::fs::read_to_string(project.join(".mcp.json")).expect("read");
-        assert!(!raw.contains(CHASE_KEY), "{raw}");
+        // The reference resolves to whoever runs the editor: it is the
+        // runner's own, so it stays exactly as written and the rest of the
+        // refresh applies, this installation included. No literal key reaches
+        // the file, with or without a terminal.
+        for mode in [None, Some(account_switch::Mode::Ask)] {
+            let _policy = mode.map(|mode| account_switch::test_policy(mode, true));
+            let _accounts = erik_and_chase();
+            seed();
+            let server = refresh_project_with(&project, CHASE_KEY);
+            assert_eq!(server["headers"][HEADER_API_KEY], json!(reference));
+            assert_eq!(
+                server["headers"][HEADER_INSTALLATION_ID],
+                json!(TEST_MANAGED_INSTALLATION_ID)
+            );
+            let raw = std::fs::read_to_string(project.join(".mcp.json")).expect("read");
+            assert!(!raw.contains(CHASE_KEY), "{raw}");
+        }
+
+        // A reference is no evidence against creating another editor's entry.
+        let cursor = project.join(".cursor").join("mcp.json");
+        assert!(write_project_mcp_config_force_remote_with_auth(
+            &Editor::Cursor,
+            &project,
+            CHASE_KEY,
+            Some("ws-1"),
+            Some("proj-1"),
+            None,
+            None,
+            Some(CHASE_KEY),
+        )
+        .expect("project write"));
+        assert!(cursor.is_file());
 
         // Agreed: the literal key replaces it.
         let _switch = account_switch::test_policy(account_switch::Mode::Switch, false);

@@ -109,7 +109,14 @@ const WORKSPACE_KEY_PREFIX: &str = "cbiq_ws_";
 /// What every delivery call answers when the credential it would be sent
 /// under is not one anything can come back to ([`is_no_way_back`]).
 const NO_WAY_BACK: &str =
-    "deliveries go only to a run reported under a person's full API key; this credential is not one";
+    "deliveries go only to a run reported under a person's full API key or an app's OAuth token; this credential is neither";
+
+/// The credential a delivery call goes out under, as far as the way back
+/// cares: a key, or the subject of a caller's app token.
+enum Receiving {
+    Key(String),
+    AppToken(String),
+}
 
 /// Only personal ContextStream keys receive deliveries.
 pub fn is_full_api_key(key: &str) -> bool {
@@ -120,9 +127,10 @@ pub fn is_full_api_key(key: &str) -> bool {
 }
 
 /// Whether a delivery call was not made because this client's credential is
-/// not a person's full API key: a sign-in, an app's token, or a key limited
-/// to one workspace. ContextStream sends nothing to a run such a credential
-/// reported, so nothing is asked under it.
+/// neither a person's full API key nor the caller's own OAuth app token: a
+/// sign-in, a key limited to one workspace, or a caller's token that a key of
+/// the process's own goes out in place of. ContextStream sends nothing to a
+/// run such a credential reported, so nothing is asked under it.
 pub fn is_no_way_back(error: &Error) -> bool {
     matches!(error, Error::Validation(message) if message == NO_WAY_BACK)
 }
@@ -587,32 +595,56 @@ impl ContextStreamClient {
     }
 
     /// Whether anything can come back to the credential this client's
-    /// requests carry: it is a person's full API key, the caller's own (on
-    /// the hosted gateway) or else the one this process was given. This is
-    /// the one rule every delivery operation follows: each call below makes
-    /// no request when it does not hold ([`is_no_way_back`]).
+    /// requests carry: a person's full API key, the caller's own (on the
+    /// hosted gateway) or else the one this process was given; or, on the
+    /// hosted gateway, the caller's own OAuth app token (an MCP client that
+    /// connected through OAuth: claude.ai, ChatGPT, Claude Code on the web),
+    /// which the API names by its app's connection because every request of
+    /// this client says it carries deliveries (`client::RECEIVES_HEADER`).
+    /// This is the one rule every delivery operation follows: each call below
+    /// makes no request when it does not hold ([`is_no_way_back`]).
     pub async fn receives_deliveries(&self) -> bool {
         self.delivery_namespace().await.is_some()
     }
 
-    /// Opaque namespace for local claim evidence, scoped to this API and
-    /// the full key actually used on this request.
+    /// Opaque namespace for local claim evidence, scoped to this API and the
+    /// credential actually used on this request: the full key, or the subject
+    /// of the caller's app token. A token is renewed every hour or so, and its
+    /// connection is the same: its person names the evidence while its
+    /// renewals come and go (each request is still verified by the API).
     pub async fn delivery_namespace(&self) -> Option<String> {
         use sha2::{Digest, Sha256};
         let config = self.config().await;
         // An explicit caller credential determines eligibility, even when
         // the gateway also has a process key. Scope-only overrides do not
         // select a different credential.
-        let key = match crate::get_task_auth_override() {
-            Some(auth) if auth.api_key.is_some() || auth.jwt.is_some() => auth.api_key,
+        let credential = match crate::get_task_auth_override() {
+            Some(auth) if auth.api_key.is_some() || auth.jwt.is_some() => match auth.api_key {
+                Some(key) => Some(Receiving::Key(key)),
+                // The caller's token goes out only where the process has no key
+                // of its own, which would be sent in its place and never reads
+                // for a caller (`run_progress::sent_credential`).
+                None if config.api_key.is_none() => auth
+                    .jwt
+                    .as_deref()
+                    .and_then(crate::run_progress::bearer_subject)
+                    .map(Receiving::AppToken),
+                None => None,
+            },
             _ if config.is_http_transport => None,
-            _ => config.api_key,
-        }
-        .filter(|k| is_full_api_key(k))?;
+            _ => config.api_key.map(Receiving::Key),
+        }?;
         let mut hash = Sha256::new();
         hash.update(config.api_url.as_bytes());
         hash.update([0]);
-        hash.update(key.as_bytes());
+        match credential {
+            Receiving::Key(key) if is_full_api_key(&key) => hash.update(key.as_bytes()),
+            Receiving::Key(_) => return None,
+            Receiving::AppToken(subject) => {
+                hash.update(b"oauth-app-subject\0");
+                hash.update(subject.as_bytes());
+            }
+        }
         Some(hex::encode(hash.finalize()))
     }
 
@@ -1215,6 +1247,74 @@ mod tests {
             assert!(!client.receives_deliveries().await);
         })
         .await;
+    }
+
+    /// On the hosted gateway, an MCP client that connected through OAuth reads what its person sent its runs
+    /// under its own token: the gateway has no key of its own to send in its place, and the API names the token
+    /// by its app's connection. The evidence of its claims is kept under its person, so a renewed token keeps
+    /// it; another person, and a key, are other namespaces. A token that names nobody reads nothing.
+    #[tokio::test]
+    async fn a_callers_oauth_token_on_the_gateway_reads_its_runs_deliveries() {
+        use base64::Engine;
+        let token = |sub: &str, jti: &str| {
+            let encode =
+                |text: String| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+            format!(
+                "{}.{}.signature",
+                encode(r#"{"alg":"HS256"}"#.to_string()),
+                encode(format!(r#"{{"sub":"{sub}","jti":"{jti}"}}"#))
+            )
+        };
+        let gateway = ContextStreamClient::new(Config {
+            api_key: None,
+            is_http_transport: true,
+            ..Config::default()
+        });
+        let namespace_of = |jwt: Option<String>, api_key: Option<&str>| {
+            let gateway = &gateway;
+            let auth = mcp_types::AuthOverride {
+                jwt,
+                api_key: api_key.map(str::to_string),
+                ..Default::default()
+            };
+            async move {
+                crate::run_with_auth_override(auth, || async { gateway.delivery_namespace().await })
+                    .await
+            }
+        };
+        let person = Uuid::new_v4().to_string();
+        let first = namespace_of(Some(token(&person, "first")), None)
+            .await
+            .expect("a caller's app token receives");
+        let renewed = namespace_of(Some(token(&person, "renewed")), None).await;
+        assert_eq!(
+            renewed.as_deref(),
+            Some(first.as_str()),
+            "a renewal keeps its evidence"
+        );
+        let another = namespace_of(Some(token(&Uuid::new_v4().to_string(), "x")), None).await;
+        assert!(another.is_some() && another.as_deref() != Some(first.as_str()));
+        let keyed = namespace_of(None, Some("cbiq_0123456789abcdef")).await;
+        assert!(keyed.is_some() && keyed.as_deref() != Some(first.as_str()));
+        // A token that names nobody, a workspace-limited key and nothing at all read nothing.
+        assert_eq!(
+            namespace_of(Some("not-a-jwt".to_string()), None).await,
+            None
+        );
+        assert_eq!(
+            namespace_of(None, Some("cbiq_ws_0123456789abcdef")).await,
+            None
+        );
+        assert_eq!(namespace_of(None, None).await, None);
+        // The caller's key goes first, as it is what goes out.
+        assert_eq!(
+            namespace_of(
+                Some(token(&person, "first")),
+                Some("cbiq_ws_0123456789abcdef")
+            )
+            .await,
+            None
+        );
     }
 
     #[tokio::test]

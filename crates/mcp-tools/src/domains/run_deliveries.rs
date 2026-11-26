@@ -42,11 +42,14 @@
 //!   attempt, and whichever response clears the record shows it: once.
 //! - Only the credential that reported the run claims what is sent to it.
 //!   ContextStream raises a question for a waiting run, and takes a message
-//!   for it, only where the run was reported under an API key: an answer
-//!   cannot come back to a sign-in or an app's token, which change with every
-//!   refresh, nor to a key limited to one workspace. So a session that
-//!   reports under anything but a person's full API key reads nothing and is
-//!   never told to wait for an answer ([`ContextStreamClient::receives_deliveries`]).
+//!   for it, only where the run was reported under a person's full API key,
+//!   or under an app's OAuth token from a client that says it carries
+//!   deliveries (every request of this one says so: `client::RECEIVES_HEADER`),
+//!   which ContextStream then names by the app's connection, the same through
+//!   every renewal of the token. An answer cannot come back to a sign-in,
+//!   which changes with every refresh, nor to a key limited to one workspace.
+//!   So a session that reports under anything else reads nothing and is never
+//!   told to wait for an answer ([`ContextStreamClient::receives_deliveries`]).
 //! - A read is a side note to the agent's own call. An API without the
 //!   routes (they answer an unknown path's 404 where the feature is off), one
 //!   whose database cannot hold deliveries yet (503 `deliveries_not_ready`),
@@ -1449,7 +1452,7 @@ fn not_taken(headline: &str, done: &str, id: Uuid, refused: &Refused) -> ToolRes
         error if is_no_way_back(error) => (
             "no_way_back",
             None,
-            "this session's credential cannot receive or confirm what a person sends a run (only a person's full API key can)"
+            "this session's credential cannot receive or confirm what a person sends a run (only a person's full API key, or an app's own OAuth token on the hosted gateway, can)"
                 .to_string(),
         ),
         // The server ended it after a week with nobody taking it.

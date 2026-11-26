@@ -397,8 +397,9 @@ impl ProgressTool {
                 drop(sending_guard);
                 // What a person answered or wrote to this run comes back with
                 // the report's answer. It can add to the answer, never fail it.
-                // Only under an API key: nothing is ever sent to a run reported
-                // under a sign-in or an app's token.
+                // Only under a person's full API key, or the caller's own app
+                // token on the hosted gateway: nothing is ever sent to a run
+                // reported under a sign-in.
                 let owner = self.delivery_owner(workspace_id, is_http).await;
                 let tool =
                     run_deliveries::tool_for(context.agent.get("client").and_then(Value::as_str));

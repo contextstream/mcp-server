@@ -2207,6 +2207,14 @@ pub struct ContextStreamClient {
 
 /// Harness id of the client a hosted connection was configured for.
 const CLIENT_HEADER: &str = "X-ContextStream-Client";
+/// What this client carries back to the agent it serves, said on every
+/// authenticated request: a person's answers and messages (the deliveries it
+/// reads, claims and confirms for the runs it reports, `deliveries.rs`). The
+/// API names an app's OAuth token by its app's connection, and lets its runs
+/// be answered and messaged, only where the request says this.
+pub const RECEIVES_HEADER: &str = "X-ContextStream-Receives";
+/// The value of [`RECEIVES_HEADER`].
+pub const RECEIVES_DELIVERIES: &str = "deliveries";
 const MEMORY_SEARCH_CACHE_TTL: Duration = Duration::from_secs(10);
 // Memory search is an interactive agent-start path. The API owns the scoped
 // Postgres fallback when vector retrieval degrades, so replaying a terminal
@@ -4832,6 +4840,7 @@ impl ContextStreamClient {
                 }
             }
             req = with_edge_geography_headers(req);
+            req = req.header(RECEIVES_HEADER, RECEIVES_DELIVERIES);
             req = with_api_forwarder_header(req);
 
             // Forward the agent's model so server-side compliance events attribute
@@ -5185,6 +5194,7 @@ impl ContextStreamClient {
                 }
             }
             req = with_edge_geography_headers(req);
+            req = req.header(RECEIVES_HEADER, RECEIVES_DELIVERIES);
             req = with_api_forwarder_header(req);
 
             // Forward the agent's model so server-side compliance events attribute
@@ -5378,6 +5388,7 @@ impl ContextStreamClient {
                 req = req.header(CLIENT_HEADER, client.as_str());
             }
             req = with_edge_geography_headers(req);
+            req = req.header(RECEIVES_HEADER, RECEIVES_DELIVERIES);
             req = with_api_forwarder_header(req);
             if let Some(model_id) = get_task_model_id() {
                 req = req.header("X-ContextStream-Model", model_id);
@@ -27627,6 +27638,77 @@ mod tests {
         assert_eq!(requests[1].matches("x-contextstream-client:").count(), 1);
         assert!(requests[1].contains("x-contextstream-client: codex\r\n"));
         assert!(!requests[2].contains("x-contextstream-client:"));
+    }
+
+    /// Every authenticated request says what this client carries back to the agent: a person's answers and
+    /// messages. The API names an app's OAuth token by its app's connection only where a request says it.
+    #[tokio::test]
+    async fn every_request_says_it_carries_deliveries() {
+        let (client, server) = client_with_http_sequence(vec![
+            ("200 OK", "{}".to_string()),
+            ("200 OK", "ok".to_string()),
+            ("200 OK", "{}".to_string()),
+        ])
+        .await;
+        let options = || {
+            Some(RequestOptions {
+                retries: Some(0),
+                ..Default::default()
+            })
+        };
+        run_with_auth_override(
+            AuthOverride {
+                jwt: Some("a.caller.token".to_string()),
+                ..Default::default()
+            },
+            || async {
+                let _: serde_json::Value = client
+                    .request::<serde_json::Value, serde_json::Value>(
+                        "GET",
+                        "/as-a-caller",
+                        None,
+                        options(),
+                    )
+                    .await
+                    .expect("JSON request");
+                client
+                    .request_text::<serde_json::Value>(
+                        "GET",
+                        "/as-text",
+                        None,
+                        options(),
+                        Some("text/plain"),
+                    )
+                    .await
+                    .expect("text request");
+            },
+        )
+        .await;
+        let _: serde_json::Value = client
+            .request::<serde_json::Value, serde_json::Value>(
+                "GET",
+                "/as-the-process",
+                None,
+                options(),
+            )
+            .await
+            .expect("request without an override");
+        let requests: Vec<String> = server
+            .await
+            .expect("server task")
+            .iter()
+            .map(|request| request.to_ascii_lowercase())
+            .collect();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert_eq!(
+                request
+                    .matches("x-contextstream-receives: deliveries\r\n")
+                    .count(),
+                1,
+                "{request}"
+            );
+        }
     }
 
     fn assert_release_metadata_contract(metadata: &serde_json::Value) {

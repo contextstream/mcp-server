@@ -167,7 +167,9 @@ pub async fn run(wait: Wait) -> i32 {
     config.default_workspace_id = Some(workspace_id);
     let client = ContextStreamClient::new(config);
     // The one rule of every delivery operation: only a person's full API key
-    // receives. Under anything else the wait could only end with nothing.
+    // receives here (an app's OAuth token receives on the hosted gateway, where
+    // this command does not run). Under anything else the wait could only end
+    // with nothing.
     if !client.receives_deliveries().await {
         say("contextstream: only a person's full API key receives what a person sends a run, and the credentials found here are not one, so there is nothing to wait on.");
         return EXIT_NOT_STARTED;

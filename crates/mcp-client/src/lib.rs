@@ -245,7 +245,9 @@ pub use plan_loops::{
     GateResolution, LoopTicketAttachment, NewLoopTicket, PlanLoopConfig, PlanLoopConflict,
     PlanLoopGate,
 };
-pub use questions::{LabeledRow, ListRow, ListSource, NewQuestion, OneRow, QuestionSpec, RowsPage};
+pub use questions::{
+    LabeledRow, ListRow, ListSource, NewQuestion, OneRow, QuestionSpec, RowsPage, WriteBack,
+};
 pub use retry::IngestFailure;
 pub use run_progress::{
     observe_api_answers, sent_credential, ApiAnswer, RunFilter, SentCredential,

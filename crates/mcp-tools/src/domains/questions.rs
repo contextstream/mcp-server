@@ -4,8 +4,9 @@
 //! every row of a list. Each row gets an answer and is either sure or left
 //! for the person to check. With this tool an agent finds a saved question,
 //! makes one ready (labels rows with the person's answers, tries it, lets it
-//! answer on its own), runs it on a list, answers one row and reads the
-//! results.
+//! answer on its own), runs it on a list, answers one row, reads the results
+//! (page by page, or the whole run as a CSV) and writes them back where the
+//! list lives (a Google Sheet, an Excel workbook or an audience's contacts).
 //!
 //! A thin client of the ContextStream API ([`mcp_client::questions`]): each
 //! action is one call made with the caller's own credential, and this process
@@ -21,7 +22,7 @@ use mcp_client::questions::{
 };
 use mcp_client::{
     ContextStreamClient, LabeledRow, ListRow, ListSource, NewQuestion, OneRow, QuestionSpec,
-    RowsPage,
+    RowsPage, WriteBack,
 };
 use mcp_session::SessionManager;
 use mcp_types::{
@@ -55,6 +56,7 @@ pub(crate) const VALID_ACTIONS: &[&str] = &[
     "run",
     "status",
     "results",
+    "export",
     "answer",
     "cancel",
     "resume",
@@ -71,12 +73,19 @@ const MOST_LINES: usize = 30;
 /// The most characters of a row's fields a line shows.
 const PREVIEW_CHARS: usize = 120;
 
+/// The most rows of an export its text shows; the structured result has the
+/// whole CSV.
+const EXPORT_ROWS_SHOWN: usize = 50;
+
+/// The most characters of an export its text shows, whatever the rows.
+const EXPORT_CHARS_SHOWN: usize = 16_000;
+
 /// Routing summary advertised as the tool description (<= 1024 chars).
-pub(crate) const TOOL_DESCRIPTION: &str = "Saved questions: a question with fixed answers, asked about every row of a list (leads, tickets, contracts). Each row gets an answer and Sure or Check; a person settles the Check rows.\n\nFind one (list, get) or save one (create; version for a change). Make it ready: label rows with the answers the person gives (label; sample picks rows worth asking about), try it on them (try says in plain words whether it may answer on its own), then activate that version. Only an active question runs on a list (run; describe shows the list's columns first) or answers one row (answer). Follow a run with status, read its rows with results (which=check for the rows a person settles), and cancel, resume or write_back (a Google Sheet run, beside its list).\n\nworkspace_id defaults to the session's. Saved questions are switched on per workspace: when a call says they are not switched on here, stop and tell the person. Full reference: the `action` parameter.";
+pub(crate) const TOOL_DESCRIPTION: &str = "Saved questions: a question with fixed answers, asked about every row of a list (leads, tickets, contracts). Each row gets an answer and Sure or Check; a person settles the Check rows.\n\nFind one (list, get) or save one (create; version for a change). Make it ready: label rows with the answers the person gives (label; sample picks rows worth asking about), try it on them (try says whether it may answer on its own), then activate that version. Only an active question runs on a list (run; describe shows the list's columns first) or answers one row (answer). Follow a run with status, read its rows with results (which=check for the rows a person settles) or as a CSV (export), cancel or resume it, and write_back its answers where the list lives (a Google Sheet, an Excel workbook or an audience).\n\nworkspace_id defaults to the session's. Saved questions are switched on per workspace: when a call says they are not switched on here, stop and tell the person. Full reference: the `action` parameter.";
 
 /// Complete tool reference, advertised on the `action` parameter; see
 /// [`crate::schema::with_full_reference`].
-const TOOL_REFERENCE: &str = "Saved questions: a question with fixed answers asked about every row of a list. Each row gets an answer and Sure (it stands) or Check (a person settles it). Every call names the workspace: workspace_id, else the session's.\n\nActions:\n- list: the saved questions you can see; archived=true for the ones put away; limit.\n- get: question_id, version (else the one that answers, else the newest): the question with its revision, that version's spec and what trying it came to, its versions, and how many rows are labeled.\n- create: name, spec, shared (default true), template (a starter template's key). It is a draft: it answers nothing until a version is tried and activated.\n- version: question_id, spec, expected_revision (the revision get shows). A change is a new version; the shape stays.\n- label: question_id, rows=[{key, fields: {<field>: <value>}, want: {<question key, or \"answer\" for the row's answer>: <answer>}}]. The answers are the person's own, never your guesses. A row labeled before takes the new label. Without rows: the labeled rows.\n- sample: question_id, rows=[{key, fields}] from the list (up to 200), pick (how many, default 25), version: the rows worth asking the person to label, spread over every kind of answer, unclear ones first.\n- try: question_id, version (else the newest): tries it on the labeled rows and says in plain words what it came to and whether it may answer on its own.\n- activate: question_id, version, expected_revision: lets a version its trial calls ready answer on its own.\n- describe: question_id, source (or rows): the list's columns with a few values each, the fields the question looks at, and the ones the list lacks (name their columns with mapping).\n- run: question_id, source (or rows), mapping: asks an active question about every row, in the background; answers with the run and an estimate (rows, credits at most, minutes at least).\n- status: question_id, run_id: how far a run is (answered, sure, to check) and its spot checks; without run_id, the question's runs.\n- results: question_id, run_id, which=all|check|sure, after (the next a page gave), limit (default 25): rows with their answer, Sure or Check and why, and the person's call.\n- answer: question_id, fields={<field>: <value>}, key, mapping: one row now, by an active question; an answer kept for the same row is read, not asked again.\n- cancel, resume: question_id, run_id: stop a run; go on with a paused or stalled one.\n- write_back: question_id, run_id, mapping, session_id (default: the session's): writes a finished Google Sheet run's answers as two columns right of its range.\n\nA spec, sent without lines (trying chooses them): {spec: 1, shape: screen|sort|rate|checklist|match, about: \"what a row is\", show: [the fields it looks at], questions: [{key, ask, type: noul (yes or no) or choice, options: [{key, means}] with one keyed \"none\"}], pair: {first: [fields], second: [fields]} (match only, without show), rollup: {rule: all|any|at_least, k} (checklist only)}.\nA source: {kind: \"rows\", rows: [{key, fields}]}, {kind: \"csv\", text, key_column}, {kind: \"audience\", audience_id}, {kind: \"sheet\", connection_id, spreadsheet_id, range, key_column}, {kind: \"excel\", connection_id, drive_id, item_id, worksheet_id, range, key_column}.\nA mapping: {<field the question looks at>: <column of the list>}.\n\nA refusal says what to do next; one that ends with a code in brackets ([NOT_ACTIVE], [NOT_READY], [NO_TEST_ROWS], ...) names why. When saved questions are not switched on for the workspace, they are not offered there yet: stop and tell the person.";
+const TOOL_REFERENCE: &str = "Saved questions: a question with fixed answers asked about every row of a list. Each row gets an answer and Sure (it stands) or Check (a person settles it). Every call names the workspace: workspace_id, else the session's.\n\nActions:\n- list: the saved questions you can see; archived=true for the ones put away; limit.\n- get: question_id, version (else the one that answers, else the newest): the question with its revision, that version's spec and what trying it came to, its versions, and how many rows are labeled.\n- create: name, spec, shared (default true), template (a starter template's key). It is a draft: it answers nothing until a version is tried and activated.\n- version: question_id, spec, expected_revision (the revision get shows). A change is a new version; the shape stays.\n- label: question_id, rows=[{key, fields: {<field>: <value>}, want: {<question key, or \"answer\" for the row's answer>: <answer>}}]. The answers are the person's own, never your guesses. A row labeled before takes the new label. Without rows: the labeled rows.\n- sample: question_id, rows=[{key, fields}] from the list (up to 200), pick (how many, default 25), version: the rows worth asking the person to label, spread over every kind of answer, unclear ones first.\n- try: question_id, version (else the newest): tries it on the labeled rows and says in plain words what it came to and whether it may answer on its own.\n- activate: question_id, version, expected_revision: lets a version its trial calls ready answer on its own.\n- describe: question_id, source (or rows): the list's columns with a few values each, the fields the question looks at, and the ones the list lacks (name their columns with mapping).\n- run: question_id, source (or rows), mapping: asks an active question about every row, in the background; answers with the run and an estimate (rows, credits at most, minutes at least).\n- status: question_id, run_id: how far a run is (answered, sure, to check) and its spot checks; without run_id, the question's runs.\n- results: question_id, run_id, which=all|check|sure, after (the next a page gave), limit (default 25): rows with their answer, Sure or Check and why, and the person's call.\n- export: question_id, run_id: the run's rows as a CSV, done or not: row, the fields the question looks at, its answer (the person's call first), Sure or check, Why, and each question's answer when it asks more than one. The text shows the first rows; the structured result has the whole file (csv).\n- answer: question_id, fields={<field>: <value>}, key, mapping: one row now, by an active question; an answer kept for the same row is read, not asked again.\n- cancel, resume: question_id, run_id: stop a run; go on with a paused or stalled one.\n- write_back: question_id, run_id, mapping: writes a finished run's answers where its list lives. A Google Sheet or an Excel workbook gets two columns right of the list's range (the answer, and Sure, Check or Your call), recorded under session_id (default: the session's). An audience gets two properties on each contact: the answer under attribute (default: the question's name; at most 26 letters, digits or _) and Sure, Check or Your call under the same name with _sure_or_check. Any other list: export it.\n\nA spec, sent without lines (trying chooses them): {spec: 1, shape: screen|sort|rate|checklist|match, about: \"what a row is\", show: [the fields it looks at], questions: [{key, ask, type: noul (yes or no) or choice, options: [{key, means}] with one keyed \"none\"}], pair: {first: [fields], second: [fields]} (match only, without show), rollup: {rule: all|any|at_least, k} (checklist only)}.\nA source: {kind: \"rows\", rows: [{key, fields}]}, {kind: \"csv\", text, key_column}, {kind: \"audience\", audience_id}, {kind: \"sheet\", connection_id, spreadsheet_id, range, key_column}, {kind: \"excel\", connection_id, drive_id, item_id, worksheet_id, range, key_column}.\nA mapping: {<field the question looks at>: <column of the list>}.\n\nA refusal says what to do next; one that ends with a code in brackets ([NOT_ACTIVE], [NOT_READY], [NO_TEST_ROWS], [NOT_WRITABLE], [NOT_EMPTY], ...) names why. When saved questions are not switched on for the workspace, they are not offered there yet: stop and tell the person.";
 
 /// The form of a spec, said with a refusal of one.
 const SPEC_FORM: &str = "A spec is {spec: 1, shape: screen|sort|rate|checklist|match, about, show: [fields], questions: [{key, ask, type: noul|choice, options: [{key, means}]}], pair: {first, second} (match only), rollup: {rule: all|any|at_least, k} (checklist only)}, without lines.";
@@ -87,6 +96,10 @@ const SOURCE_FORM: &str = "A source is {kind: \"rows\", rows: [{key, fields}]}, 
 /// What a 404 from these routes means when it names no record: the routes
 /// are not there for this workspace.
 const NOT_SWITCHED_ON: &str = "Saved questions are not switched on for this workspace yet (or this is not a workspace you are a member of). Nothing was changed. Tell the person; there is nothing to retry until they are switched on.";
+
+/// The same for an export, which an API may not have yet where saved
+/// questions are switched on.
+const NO_EXPORT_HERE: &str = "This API exports no runs here: saved questions are not switched on for this workspace yet, or this ContextStream API does not export runs yet. Nothing was changed. If status still reads the run, read its rows with results instead; otherwise tell the person.";
 
 /// The `questions` tool's arguments.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -119,6 +132,7 @@ pub struct QuestionsInput {
     pub after: Option<i64>,
     // write_back
     pub session_id: Option<String>,
+    pub attribute: Option<String>,
 }
 
 /// The live `questions` tool.
@@ -151,9 +165,9 @@ impl QuestionsTool {
         }
     }
 
-    /// The session a write-back is recorded under: `session_id`, else the id
-    /// the API assigned at init, else this server's own, as the integration
-    /// tool's edits are.
+    /// The session a write-back to a sheet or a workbook is recorded under:
+    /// `session_id`, else the id the API assigned at init, else this server's
+    /// own, as the integration tool's edits are. None when none is known.
     async fn host_session(&self, explicit: Option<&str>) -> Option<String> {
         let state = self.session.state().await;
         let found = [
@@ -177,7 +191,7 @@ impl QuestionsTool {
                 let result = client
                     .list_questions(workspace, input.archived.unwrap_or(false), input.limit)
                     .await
-                    .map_err(|error| explain(error, None))?;
+                    .map_err(|error| explain(error, action, None, None))?;
                 Ok(ToolResult::with_structured(list_text(&result), result))
             }
             "get" => {
@@ -186,7 +200,7 @@ impl QuestionsTool {
                 let result = client
                     .get_question(workspace, question, version)
                     .await
-                    .map_err(|error| explain(error, Some(question)))?;
+                    .map_err(|error| explain(error, action, Some(question), None))?;
                 Ok(ToolResult::with_structured(
                     question_text(&result, question),
                     result,
@@ -208,7 +222,7 @@ impl QuestionsTool {
                 let result = client
                     .create_question(workspace, &new)
                     .await
-                    .map_err(|error| explain(error, None))?;
+                    .map_err(|error| explain(error, action, None, None))?;
                 Ok(ToolResult::with_structured(
                     saved_text(&result, true),
                     result,
@@ -221,7 +235,7 @@ impl QuestionsTool {
                 let result = client
                     .add_question_version(workspace, question, &spec, revision)
                     .await
-                    .map_err(|error| explain(error, Some(question)))?;
+                    .map_err(|error| explain(error, action, Some(question), None))?;
                 Ok(ToolResult::with_structured(
                     saved_text(&result, false),
                     result,
@@ -234,7 +248,7 @@ impl QuestionsTool {
                         let result = client
                             .question_test_rows(workspace, question)
                             .await
-                            .map_err(|error| explain(error, Some(question)))?;
+                            .map_err(|error| explain(error, action, Some(question), None))?;
                         Ok(ToolResult::with_structured(
                             test_rows_text(&result, question),
                             result,
@@ -245,7 +259,7 @@ impl QuestionsTool {
                         let result = client
                             .label_question_rows(workspace, question, &rows)
                             .await
-                            .map_err(|error| explain(error, Some(question)))?;
+                            .map_err(|error| explain(error, action, Some(question), None))?;
                         Ok(ToolResult::with_structured(
                             labeled_text(&result, question),
                             result,
@@ -276,7 +290,7 @@ impl QuestionsTool {
                 let result = client
                     .sample_question_rows(workspace, question, &rows, version, pick)
                     .await
-                    .map_err(|error| explain(error, Some(question)))?;
+                    .map_err(|error| explain(error, action, Some(question), None))?;
                 Ok(ToolResult::with_structured(
                     sample_text(&result, question),
                     result,
@@ -288,7 +302,7 @@ impl QuestionsTool {
                 let result = client
                     .try_question(workspace, question, version)
                     .await
-                    .map_err(|error| explain(error, Some(question)))?;
+                    .map_err(|error| explain(error, action, Some(question), None))?;
                 Ok(ToolResult::with_structured(
                     trial_text(&result, question),
                     result,
@@ -305,7 +319,7 @@ impl QuestionsTool {
                 let result = client
                     .activate_question(workspace, question, version, revision)
                     .await
-                    .map_err(|error| explain(error, Some(question)))?;
+                    .map_err(|error| explain(error, action, Some(question), None))?;
                 Ok(ToolResult::with_structured(
                     activated_text(&result, question, version),
                     result,
@@ -317,7 +331,7 @@ impl QuestionsTool {
                 let result = client
                     .describe_question_list(workspace, question, &source)
                     .await
-                    .map_err(|error| explain(error, Some(question)))?;
+                    .map_err(|error| explain(error, action, Some(question), None))?;
                 Ok(ToolResult::with_structured(
                     described_text(&result, question),
                     result,
@@ -330,7 +344,7 @@ impl QuestionsTool {
                 let result = client
                     .start_question_run(workspace, question, &source, mapping.as_ref())
                     .await
-                    .map_err(|error| explain(error, Some(question)))?;
+                    .map_err(|error| explain(error, action, Some(question), None))?;
                 Ok(ToolResult::with_structured(
                     started_text(&result, question),
                     result,
@@ -343,7 +357,7 @@ impl QuestionsTool {
                         let result = client
                             .question_run(workspace, question, run)
                             .await
-                            .map_err(|error| explain(error, Some(question)))?;
+                            .map_err(|error| explain(error, action, Some(question), Some(run)))?;
                         Ok(ToolResult::with_structured(
                             run_status_text(&result, question),
                             result,
@@ -353,7 +367,7 @@ impl QuestionsTool {
                         let result = client
                             .question_runs(workspace, question)
                             .await
-                            .map_err(|error| explain(error, Some(question)))?;
+                            .map_err(|error| explain(error, action, Some(question), None))?;
                         Ok(ToolResult::with_structured(
                             runs_text(&result, question),
                             result,
@@ -384,7 +398,7 @@ impl QuestionsTool {
                 let result = client
                     .question_run_rows(workspace, question, run, &page)
                     .await
-                    .map_err(|error| explain(error, Some(question)))?;
+                    .map_err(|error| explain(error, action, Some(question), Some(run)))?;
                 Ok(ToolResult::with_structured(
                     rows_text(&result, question, run, &page),
                     result,
@@ -409,7 +423,7 @@ impl QuestionsTool {
                 let result = client
                     .answer_question_row(workspace, question, &row)
                     .await
-                    .map_err(|error| explain(error, Some(question)))?;
+                    .map_err(|error| explain(error, action, Some(question), None))?;
                 Ok(ToolResult::with_structured(answer_text(&result), result))
             }
             "cancel" | "resume" => {
@@ -420,35 +434,36 @@ impl QuestionsTool {
                 } else {
                     client.resume_question_run(workspace, question, run).await
                 }
-                .map_err(|error| explain(error, Some(question)))?;
+                .map_err(|error| explain(error, action, Some(question), Some(run)))?;
                 Ok(ToolResult::with_structured(
                     run_changed_text(action, &result, question, run),
                     result,
                 ))
             }
+            "export" => {
+                let question = question_id(input.question_id.as_deref(), action)?;
+                let run = run_id(input.run_id.as_deref(), action)?;
+                let csv = client
+                    .export_question_run(workspace, question, run)
+                    .await
+                    .map_err(|error| explain(error, action, Some(question), Some(run)))?;
+                let (text, structured) = exported(&csv, question, run);
+                Ok(ToolResult::with_structured(text, structured))
+            }
             "write_back" => {
                 let question = question_id(input.question_id.as_deref(), action)?;
                 let run = run_id(input.run_id.as_deref(), action)?;
-                let mapping = checked_mapping(input.mapping.as_ref())?;
-                let session_id = self
-                    .host_session(input.session_id.as_deref())
-                    .await
-                    .ok_or_else(|| {
-                        Error::Validation(
-                            "write_back needs the session id init returned, so the change to the sheet is recorded under it: pass it as session_id, or run init first."
-                                .to_string(),
-                        )
-                    })?;
+                // A sheet or a workbook records the change under a session;
+                // an audience needs none, so none known is no refusal here.
+                let write = WriteBack {
+                    session_id: self.host_session(input.session_id.as_deref()).await,
+                    mapping: checked_mapping(input.mapping.as_ref())?,
+                    attribute: non_empty(input.attribute.as_deref()).map(str::to_string),
+                };
                 let result = client
-                    .write_back_question_run(
-                        workspace,
-                        question,
-                        run,
-                        &session_id,
-                        mapping.as_ref(),
-                    )
+                    .write_back_question_run(workspace, question, run, &write)
                     .await
-                    .map_err(|error| explain(error, Some(question)))?;
+                    .map_err(|error| explain(error, action, Some(question), Some(run)))?;
                 Ok(ToolResult::with_structured(
                     written_back_text(&result),
                     result,
@@ -500,7 +515,7 @@ impl ToolHandler for QuestionsTool {
             .string_enum(
                 "action",
                 &crate::schema::with_full_reference(
-                    "What to do: list, get, create, version, label, sample, try, activate, describe, run, status, results, answer, cancel, resume or write_back",
+                    "What to do: list, get, create, version, label, sample, try, activate, describe, run, status, results, export, answer, cancel, resume or write_back",
                     TOOL_REFERENCE,
                 ),
                 VALID_ACTIONS,
@@ -513,7 +528,7 @@ impl ToolHandler for QuestionsTool {
             )
             .uuid(
                 "run_id",
-                "A run of it (run and status show ids): status, results, cancel, resume, write_back",
+                "A run of it (run and status show ids): status, results, export, cancel, resume, write_back",
                 false,
             )
             .string("name", "create: the question's name", false)
@@ -591,7 +606,12 @@ impl ToolHandler for QuestionsTool {
             )
             .string(
                 "session_id",
-                "write_back: the session the change is recorded under (default: the one init returned)",
+                "write_back to a Google Sheet or an Excel workbook: the session the change is recorded under (default: the one init returned)",
+                false,
+            )
+            .string(
+                "attribute",
+                "write_back to an audience: the contact property the answer goes under (default: the question's name; at most 26 letters, digits or _); Sure, Check or Your call goes under the same name with _sure_or_check",
                 false,
             )
             .uuid("workspace_id", "Workspace ID. Defaults to the session's.", false)
@@ -809,8 +829,9 @@ fn checked_mapping(mapping: Option<&Value>) -> Result<Option<Mapping>> {
 // ============================================================================
 
 /// What an API refusal means and what to do next, after the API's own
-/// message. Every error that is not the API's answer is passed on unchanged.
-fn explain(error: Error, question: Option<Uuid>) -> Error {
+/// message. Every error that is not the API's answer is passed on unchanged,
+/// so are the answers this adds nothing to (402, 403 and 429 among them).
+fn explain(error: Error, action: &str, question: Option<Uuid>, run: Option<Uuid>) -> Error {
     match error {
         Error::Http {
             status,
@@ -818,7 +839,7 @@ fn explain(error: Error, question: Option<Uuid>) -> Error {
             code,
             source,
         } => {
-            let message = match advice(status, &message, question) {
+            let message = match advice(status, &message, action, question, run) {
                 Some(advice) => format!("{message}\n[QUESTIONS] {advice}"),
                 None => message,
             };
@@ -833,18 +854,46 @@ fn explain(error: Error, question: Option<Uuid>) -> Error {
     }
 }
 
-fn question_ref(question: Option<Uuid>) -> String {
-    question
-        .map(|question| format!("question_id=\"{question}\""))
-        .unwrap_or_else(|| "question_id=\"<id>\"".to_string())
+/// `field="<id>"` for a call to make next, with the id the refused call
+/// named.
+fn id_ref(field: &str, id: Option<Uuid>) -> String {
+    match id {
+        Some(id) => format!("{field}=\"{id}\""),
+        None => format!("{field}=\"<id>\""),
+    }
 }
 
-fn advice(status: u16, message: &str, question: Option<Uuid>) -> Option<String> {
+/// Whether a 404 is about the routes, not a record: the API's answer for a
+/// path it does not have (saved questions switched off), for a workspace
+/// they are not offered in, or one that names nothing at all.
+fn routes_not_there(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    lower.contains("endpoint not found")
+        || lower.contains("no such workspace")
+        || lower == "not found"
+        || lower == "http 404 error"
+}
+
+fn advice(
+    status: u16,
+    message: &str,
+    action: &str,
+    question: Option<Uuid>,
+    run: Option<Uuid>,
+) -> Option<String> {
     let lower = message.to_ascii_lowercase();
-    let target = question_ref(question);
+    let target = id_ref("question_id", question);
+    let run_ref = id_ref("run_id", run);
+    let export = format!("questions(action=\"export\", {target}, {run_ref})");
     match status {
-        // A record that is not there is named; anything else that is not
-        // found is the routes not being there for this workspace.
+        404 if routes_not_there(message) => Some(
+            if action == "export" {
+                NO_EXPORT_HERE
+            } else {
+                NOT_SWITCHED_ON
+            }
+            .to_string(),
+        ),
         404 if lower.contains("no such question") => Some(
             "No saved question with that id is here for you: questions(action=\"list\") shows the ones you can see."
                 .to_string(),
@@ -855,10 +904,25 @@ fn advice(status: u16, message: &str, question: Option<Uuid>) -> Option<String> 
         404 if lower.contains("no such run") => Some(format!(
             "No run with that id for this question: questions(action=\"status\", {target}) lists its runs."
         )),
-        404 if lower.contains("no such") && !lower.contains("no such workspace") => None,
-        404 => Some(NOT_SWITCHED_ON.to_string()),
+        // An audience is read and written as Create Email reads it.
+        404 if lower.contains("email isn't offered") || lower.contains("email is not offered") => {
+            Some(if action == "write_back" {
+                format!(
+                    "Answers go onto an audience's contacts only where Create Email is offered to the account, and it is not offered to this one yet. Nothing was written. Get the answers as a CSV instead: {export}."
+                )
+            } else {
+                "An audience is read only where Create Email is offered to the account, and it is not offered to this one yet. Send the list another way: rows, a CSV, a Google Sheet or an Excel workbook."
+                    .to_string()
+            })
+        }
+        // Any other record the API names in its own words.
+        404 => None,
         503 if message.contains(mcp_client::questions::NOT_ASKING) => Some(
-            "Questions are not being answered here right now, so nothing was asked. Try again later; list, get, status and results still read."
+            "Questions are not being answered here right now, so nothing was asked. Try again later; list, get, status, results and export still read."
+                .to_string(),
+        ),
+        400 if refusal_code(message) == Some("SESSION") => Some(
+            "Writing to a Google Sheet or an Excel workbook is recorded under a session, and none is known here: pass session_id (the one init returned), or run init first, then write back again."
                 .to_string(),
         ),
         400 if lower.contains("not in the form") => Some(SPEC_FORM.to_string()),
@@ -879,8 +943,32 @@ fn advice(status: u16, message: &str, question: Option<Uuid>) -> Option<String> 
                 "A question keeps its shape: save another question for another shape (action=\"create\")."
                     .to_string(),
             ),
+            // NOT_A_SHEET is what an API said before write-back took
+            // workbooks and audiences.
+            Some("NOT_WRITABLE" | "NOT_A_SHEET") => Some(format!(
+                "Only a run over a Google Sheet, an Excel workbook or an audience goes back where its list lives. Nothing was written. Get this run's answers as a CSV instead: {export}."
+            )),
+            Some("ATTRIBUTE") => Some(format!(
+                "Name the contact property for the answers with attribute=\"...\": at most 26 letters, digits or _ (a space or - counts as _). Left out, it is the question's name, which must fit the same rule. Then questions(action=\"write_back\", {target}, {run_ref}, attribute=\"...\")."
+            )),
+            Some("NOT_EMPTY") if lower.contains("contact") => Some(format!(
+                "Nothing was written. Write the answers under another property: questions(action=\"write_back\", {target}, {run_ref}, attribute=\"...\")."
+            )),
+            Some("NOT_EMPTY") => Some(
+                "Nothing was written. Ask the person to clear or move what is in the two columns right of the list's range, then write back again."
+                    .to_string(),
+            ),
+            Some("RANGE") => Some(format!(
+                "This run read its list from a range that names no columns. Run the question again on a range such as Sheet1!A1:D500 and write that run back; {export} gives this run's answers as a CSV meanwhile."
+            )),
+            Some("SOURCE") => Some(format!(
+                "The list could not be read as it is (the message says why): check the list, its range and the connected app, and try again. questions(action=\"describe\", {target}, source={{...}}) reads a list and shows its columns."
+            )),
             None if lower.contains("changed since") => Some(format!(
                 "Read it again with questions(action=\"get\", {target}): its revision is the expected_revision to send."
+            )),
+            None if lower.contains("once it is over") => Some(format!(
+                "The run is still going: follow it with questions(action=\"status\", {target}, {run_ref}) and write it back once it is done. {export} gives its answers so far as a CSV."
             )),
             _ => None,
         },
@@ -1450,7 +1538,13 @@ fn run_status_text(result: &Value, question: Uuid) -> String {
             int_field(checks, "disagreed").unwrap_or(0)
         ));
     }
-    let sheet = run.pointer("/source/kind").and_then(Value::as_str) == Some("sheet");
+    // Where a finished run's answers can go back to, by where its list lives.
+    let back = match run.pointer("/source/kind").and_then(Value::as_str) {
+        Some("sheet") => Some("beside the list in the Google Sheet"),
+        Some("excel") => Some("beside the list in the Excel workbook"),
+        Some("audience") => Some("onto the audience's contacts"),
+        _ => None,
+    };
     lines.push(match text_field(run, &["status"]) {
         Some("queued" | "running") => format!(
             "Next: it goes on in the background; ask again with questions(action=\"status\", question_id=\"{question}\", {run_ref}). Rows answered so far are in results."
@@ -1458,12 +1552,18 @@ fn run_status_text(result: &Value, question: Uuid) -> String {
         Some("paused") => format!(
             "Next: it is paused because the credits ran out. Once there are credits again, questions(action=\"resume\", question_id=\"{question}\", {run_ref}) goes on."
         ),
-        Some("done") if sheet => format!(
-            "Next: questions(action=\"results\", question_id=\"{question}\", {run_ref}, which=\"check\") lists the rows a person settles; questions(action=\"write_back\", question_id=\"{question}\", {run_ref}) writes the answers beside the list in the sheet."
-        ),
-        Some("done") => format!(
-            "Next: questions(action=\"results\", question_id=\"{question}\", {run_ref}, which=\"check\") lists the rows a person settles."
-        ),
+        Some("done") => {
+            let mut next = format!(
+                "Next: questions(action=\"results\", question_id=\"{question}\", {run_ref}, which=\"check\") lists the rows a person settles; questions(action=\"export\", question_id=\"{question}\", {run_ref}) gives every row as a CSV"
+            );
+            if let Some(back) = back {
+                next.push_str(&format!(
+                    "; questions(action=\"write_back\", question_id=\"{question}\", {run_ref}) writes the answers {back}"
+                ));
+            }
+            next.push('.');
+            next
+        }
         Some("failed") => "It failed. Start a new run if the list is still to be asked.".to_string(),
         Some("cancelled") => "It was cancelled; the rows answered before stay.".to_string(),
         _ => format!(
@@ -1611,7 +1711,12 @@ fn run_changed_text(action: &str, result: &Value, question: Uuid, run: Uuid) -> 
     }
 }
 
+/// What became of a write-back: the two columns of a sheet or a workbook,
+/// or the two properties of an audience's contacts.
 fn written_back_text(result: &Value) -> String {
+    if let Some(property) = text_field(result, &["property"]) {
+        return contacts_written_text(result, property);
+    }
     let range = text_field(result, &["range"])
         .map(one_line)
         .unwrap_or_else(|| "the two columns right of the list".to_string());
@@ -1622,13 +1727,13 @@ fn written_back_text(result: &Value) -> String {
     let words = match text_field(write, &["status"]) {
         Some("succeeded") => format!("Written: the answers are in {range}."),
         Some("reconciling" | "running") => format!(
-            "Sent to the sheet for {range}; it has not confirmed it yet. Read the sheet before writing again."
+            "Sent to the app for {range}; it has not confirmed it yet. Read the list before writing again."
         ),
         Some("awaiting_approval") => format!(
             "Waiting for approval: the answers go into {range} once the person approves the change in ContextStream."
         ),
         Some("failed") => format!(
-            "Not written: the sheet refused it: {}.",
+            "Not written: the app refused it: {}.",
             write
                 .pointer("/error/message")
                 .and_then(Value::as_str)
@@ -1639,6 +1744,145 @@ fn written_back_text(result: &Value) -> String {
         None => format!("Written back to {range}."),
     };
     format!("[QUESTIONS] {words}{operation}")
+}
+
+/// What writing a run's answers onto its audience's contacts came to.
+fn contacts_written_text(result: &Value, property: &str) -> String {
+    let contacts = result.get("contacts").unwrap_or(&Value::Null);
+    let count = |key: &str| int_field(contacts, key).unwrap_or(0);
+    let property = one_line(property);
+    let status = text_field(result, &["sure_or_check_property"])
+        .map(one_line)
+        .unwrap_or_else(|| format!("{property}_sure_or_check"));
+    let mut line = format!(
+        "[QUESTIONS] Written onto the audience's contacts: {} contact(s) hold their answer under the property {property}, and Sure, Check or Your call under {status}.",
+        count("written")
+    );
+    let mut rest = Vec::new();
+    if count("unchanged") > 0 {
+        rest.push(format!("{} held it already", count("unchanged")));
+    }
+    if count("cleared") > 0 {
+        rest.push(format!(
+            "{} with no answer now had their earlier one taken away",
+            count("cleared")
+        ));
+    }
+    if count("full") > 0 {
+        rest.push(format!(
+            "{} had no room for two more properties and were left as they were",
+            count("full")
+        ));
+    }
+    if count("gone") > 0 {
+        rest.push(format!("{} are no longer in the workspace", count("gone")));
+    }
+    if !rest.is_empty() {
+        line.push_str(&format!(" Of the others, {}.", rest.join(", ")));
+    }
+    line
+}
+
+/// A run's CSV for the text and the structured result: the text shows its
+/// header and the first rows, at most [`EXPORT_ROWS_SHOWN`] of them and
+/// [`EXPORT_CHARS_SHOWN`] characters, so an agent's context is not filled by
+/// a long list; the structured result has the whole file.
+fn exported(csv: &str, question: Uuid, run: Uuid) -> (String, Value) {
+    let records = csv_records(csv.strip_prefix('\u{feff}').unwrap_or(csv));
+    let (header, rows) = match records.split_first() {
+        Some((header, rows)) => (Some(*header), rows),
+        None => (None, &[][..]),
+    };
+    let mut block = header.map(str::to_string).unwrap_or_default();
+    let mut used = block.chars().count();
+    let mut shown = 0;
+    for row in rows.iter().take(EXPORT_ROWS_SHOWN) {
+        let size = row.chars().count() + 1;
+        if used + size > EXPORT_CHARS_SHOWN {
+            break;
+        }
+        block.push('\n');
+        block.push_str(row);
+        used += size;
+        shown += 1;
+    }
+    let total = rows.len();
+    let headline = match (total, shown) {
+        (0, _) => format!("[QUESTIONS] Run {run} as a CSV: no rows."),
+        (total, shown) if shown == total => {
+            format!("[QUESTIONS] Run {run} as a CSV: {total} row(s).")
+        }
+        (total, 0) => format!(
+            "[QUESTIONS] Run {run} as a CSV: {total} row(s), too long to show here. The structured result has the whole file (csv)."
+        ),
+        (total, shown) => format!(
+            "[QUESTIONS] Run {run} as a CSV: {total} row(s), the first {shown} below. The structured result has the whole file (csv)."
+        ),
+    };
+    let mut lines = vec![headline];
+    if !block.is_empty() {
+        // Stored words on a line of their own cannot pass for a notice.
+        lines.push(quoted_body(&block));
+    }
+    if shown < total && shown > 0 {
+        lines.push(format!(
+            "… and {} more row(s) in the structured result (csv). questions(action=\"results\", question_id=\"{question}\", run_id=\"{run}\") reads them page by page.",
+            total - shown
+        ));
+    }
+    let structured = json!({
+        "question_id": question,
+        "run_id": run,
+        "rows": total,
+        "shown": shown,
+        "columns": header.map(csv_cells).unwrap_or_default(),
+        "csv": csv,
+    });
+    (lines.join("\n"), structured)
+}
+
+/// A CSV's records, each without its line break: a line break inside a
+/// quoted cell stays in its record.
+fn csv_records(csv: &str) -> Vec<&str> {
+    let mut records = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    for (at, c) in csv.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '\n' if !quoted => {
+                let record = &csv[start..at];
+                records.push(record.strip_suffix('\r').unwrap_or(record));
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < csv.len() {
+        records.push(&csv[start..]);
+    }
+    records
+}
+
+/// The cells of one CSV record, unquoted.
+fn csv_cells(record: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut quoted = false;
+    let mut chars = record.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                cell.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => cells.push(std::mem::take(&mut cell)),
+            other => cell.push(other),
+        }
+    }
+    cells.push(cell);
+    cells
 }
 
 #[cfg(test)]

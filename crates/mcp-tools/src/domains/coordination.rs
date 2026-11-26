@@ -1741,7 +1741,7 @@ mod item_id_notice_tests {
 
     const ITEM: &str = "550e8400-e29b-41d4-a716-446655440000";
     const NOTICE: &str = "660e8400-e29b-41d4-a716-446655440000";
-    const OTHER_NOTICE: &str = "770e8400-e29b-41d4-a716-446655440000";
+    const OTHER_NOTICE: &str = "22222222-2222-4222-8222-222222222222";
 
     /// A notice action on the item's id is 404, the item reads, the inbox
     /// lists `notices`, and a notice action on any other id succeeds. Returns
@@ -1822,7 +1822,7 @@ mod item_id_notice_tests {
             listener,
             serde_json::json!([
                 {"id": NOTICE, "item_id": ITEM, "reason": "Deploy coflow-web 85afa2a"},
-                {"id": OTHER_NOTICE, "item_id": "880e8400-e29b-41d4-a716-446655440000"}
+                {"id": OTHER_NOTICE, "item_id": "20202020-2020-4020-8020-202020202020"}
             ]),
         );
         let result = tool.execute(call("ack")).await.expect("acked");

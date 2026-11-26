@@ -2985,11 +2985,17 @@ async fn run_configure(
             3 => {
                 let (api_key, email) = setup::authenticate().await?;
                 let api_url = setup::get_api_url();
+                // Read before it is overwritten: entries holding it are this
+                // same credential being rotated.
+                let replaced_key = setup::saved_api_key_before_rotation();
                 setup::persist_setup_credentials(&api_key, &api_url)?;
                 if !setup::ui::is_quiet() {
                     eprintln!("Credentials saved. Authenticated as {}.", email);
                 }
-                let refreshed = setup::refresh_existing_mcp_config_credentials(&api_key);
+                let refreshed = setup::refresh_existing_mcp_config_credentials(
+                    &api_key,
+                    replaced_key.as_deref(),
+                );
                 if refreshed > 0 && !setup::ui::is_quiet() {
                     if mcp_server::setup::safe_edit::is_dry_run() {
                         eprintln!("Would refresh API key in {refreshed} editor MCP config(s).");
@@ -3137,6 +3143,10 @@ async fn run_configure_api_key_from_stdin() -> Result<()> {
             }
         })?;
 
+    // Read before it is overwritten: entries holding exactly this key are the
+    // same credential being rotated and take the new key without a question,
+    // even when the API now refuses the old one.
+    let replaced_key = setup::saved_api_key_before_rotation();
     setup::persist_setup_credentials(api_key, &api_url)?;
     if !setup::ui::is_quiet() {
         eprintln!(
@@ -3145,7 +3155,8 @@ async fn run_configure_api_key_from_stdin() -> Result<()> {
             user.email
         );
     }
-    let refreshed = setup::refresh_existing_mcp_config_credentials(api_key);
+    let refreshed =
+        setup::refresh_existing_mcp_config_credentials(api_key, replaced_key.as_deref());
     if refreshed > 0 && !setup::ui::is_quiet() {
         if mcp_server::setup::safe_edit::is_dry_run() {
             eprintln!("Would refresh API key in {refreshed} editor MCP config(s).");

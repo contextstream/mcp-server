@@ -16,6 +16,11 @@
 //! are written as before, without a word. A key `/auth/me` does not resolve
 //! (offline, refused, revoked) is "an unknown account", and a different key
 //! then still counts as a switch.
+//!
+//! One exception: `configure` replacing the saved key passes that key to its
+//! rotation refresh, and an entry holding exactly it is the same credential
+//! being rotated. It takes the new key with no question, even when the API
+//! now refuses the old one (`mcp_config::keys_to_settle_on_rotation`).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};

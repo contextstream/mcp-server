@@ -8,9 +8,10 @@
 //!    and `doctor --repair` rewrites the config to match current credentials and
 //!    reports the modified paths rather than `No managed changes were needed`.
 //!
-//! A revoked key names no account, so replacing it is an account switch (ticket
-//! e69fbc52): without a terminal both commands keep it and warn unless given
-//! `--switch-account`.
+//! Ticket e69fbc52: the rotation treats every entry holding exactly the previously saved key as the same credential,
+//! so the revoked KEY_A is replaced with no question and no flag, while an entry holding another account's key is
+//! kept with a warning in that same run. `doctor --repair` has no previous key to go by: a dead key names no account,
+//! so replacing it there takes `--switch-account`.
 #![cfg(unix)]
 
 use axum::{
@@ -33,6 +34,8 @@ const USER_ID: &str = "22222222-2222-4222-8222-222222222222";
 const KEY_A: &str = "cs_mock_initial_key_a_1111";
 const KEY_B: &str = "cs_mock_rotated_key_b_2222";
 const REVOKED_DEAD_KEY: &str = "cs_revoked_dead_key_000";
+/// A key for another account, held by a project entry the rotation must not take over.
+const OTHER_ACCOUNT_KEY: &str = "cs_mock_other_account_key_3333";
 
 async fn spawn_mock_api_server() -> (String, Arc<Mutex<String>>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -63,6 +66,21 @@ async fn spawn_mock_api_server() -> (String, Arc<Mutex<String>>, tokio::task::Jo
             get(move |headers: HeaderMap| {
                 let auth = auth_me.clone();
                 async move {
+                    let caller = headers
+                        .get("x-api-key")
+                        .and_then(|value| value.to_str().ok());
+                    if caller == Some(OTHER_ACCOUNT_KEY) {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "data": {
+                                    "id": "33333333-3333-4333-8333-333333333333",
+                                    "email": "other-account@example.test",
+                                    "created_at": "2026-01-01T00:00:00Z"
+                                }
+                            })),
+                        );
+                    }
                     if !auth(&headers) {
                         return (
                             StatusCode::UNAUTHORIZED,
@@ -352,50 +370,34 @@ async fn configure_api_key_stdin_rotates_editor_configs_and_doctor_repairs_stale
         );
     }
 
-    // 3. Revoke KEY_A on server, switch active valid key to KEY_B, and rotate via `configure --api-key-stdin`.
-    *valid_key.lock().unwrap() = KEY_B.to_string();
-    // The revoked KEY_A no longer names an account, so without a terminal the
-    // rotation keeps it in every config and says how to switch on purpose
-    // (ticket e69fbc52), never printing either key.
-    let unagreed_out = run_cli_with_stdin(
-        &bin,
-        &home,
-        &home,
-        &api_url,
-        &["configure", "--api-key-stdin"],
-        Some(&format!(
-            "{KEY_B}
-"
-        )),
-    );
-    let unagreed_stderr = String::from_utf8_lossy(&unagreed_out.stderr);
-    assert!(
-        unagreed_out.status.success(),
-        "configure without --switch-account failed: {unagreed_stderr}"
-    );
-    assert!(
-        unagreed_stderr.contains("signs in as an unknown account")
-            && unagreed_stderr.contains("keyrot@example.test")
-            && unagreed_stderr.contains("--switch-account"),
-        "expected the account-switch warning: {unagreed_stderr}"
-    );
-    assert!(!unagreed_stderr.contains(KEY_A) && !unagreed_stderr.contains(KEY_B));
-    for path in [&claude_path, &cursor_path, &codex_path] {
-        let raw = std::fs::read_to_string(path).expect("read config after unagreed rotation");
-        assert!(
-            raw.contains(KEY_A) && !raw.contains(KEY_B),
-            "{} switched without --switch-account:
-{raw}",
-            path.display()
-        );
-    }
+    // A project whose `.mcp.json` signs in as another account. The rotation below runs inside it, so its refresh
+    // reaches that entry too.
+    let project = temp.path().join("other-account-project");
+    std::fs::create_dir_all(&project).expect("mkdir project");
+    let project = project.canonicalize().expect("canonical project");
+    let project_config = project.join(".mcp.json");
+    let other_entry = serde_json::to_string_pretty(&json!({"mcpServers": {"contextstream": {
+        "type": "http",
+        "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast",
+        "headers": {
+            "X-ContextStream-Managed-Config-Version": "2",
+            "X-ContextStream-API-Key": OTHER_ACCOUNT_KEY
+        }
+    }}}))
+    .unwrap();
+    std::fs::write(&project_config, &other_entry).expect("seed project entry");
 
+    // 3. Revoke KEY_A on server, switch active valid key to KEY_B, and rotate via `configure --api-key-stdin`.
+    //    No terminal and no --switch-account: the entries holding KEY_A (the saved key being replaced) take KEY_B
+    //    without a word although the API now refuses KEY_A; the project entry holding another account's key is
+    //    kept, with a warning that names both accounts and no key.
+    *valid_key.lock().unwrap() = KEY_B.to_string();
     let rotate_out = run_cli_with_stdin(
         &bin,
         &home,
-        &home,
+        &project,
         &api_url,
-        &["configure", "--api-key-stdin", "--switch-account"],
+        &["configure", "--api-key-stdin"],
         Some(&format!(
             "{KEY_B}
 "
@@ -426,6 +428,40 @@ async fn configure_api_key_stdin_rotates_editor_configs_and_doctor_repairs_stale
             "NEW KEY_B missing in {}:
 {raw}",
             path.display()
+        );
+        assert!(
+            !rotate_stderr.contains(&format!("{} signs in as", path.display())),
+            "the rotation warned about its own credential in {}: {rotate_stderr}",
+            path.display()
+        );
+    }
+
+    // The entry holding another account's key was kept, with one warning naming both accounts, and no key printed.
+    assert_eq!(
+        std::fs::read_to_string(&project_config).expect("read project entry"),
+        other_entry,
+        "the rotation switched another account's project entry"
+    );
+    assert_eq!(
+        rotate_stderr.matches("signs in as").count(),
+        1,
+        "expected exactly one account-switch warning: {rotate_stderr}"
+    );
+    assert!(
+        rotate_stderr.contains(&format!(
+            "{} signs in as other-account@example.test; this would switch it to keyrot@example.test.",
+            project_config.display()
+        )) && rotate_stderr.contains("--switch-account"),
+        "expected the account-switch warning for the project entry: {rotate_stderr}"
+    );
+    let rotate_said = format!(
+        "{}{rotate_stderr}",
+        String::from_utf8_lossy(&rotate_out.stdout)
+    );
+    for key in [KEY_A, KEY_B, OTHER_ACCOUNT_KEY] {
+        assert!(
+            !rotate_said.contains(key),
+            "a key was printed: {rotate_said}"
         );
     }
 
@@ -485,7 +521,8 @@ async fn configure_api_key_stdin_rotates_editor_configs_and_doctor_repairs_stale
     assert!(!stale_combined.contains(KEY_B));
 
     // 5. `doctor --repair --switch-account` must replace the dead keys with KEY_B, report the modified files, and
-    //    pass. The dead keys name no account, so the repair switches them only when told to (ticket e69fbc52).
+    //    pass. The dead keys name no account and doctor has no previous key to go by, so the repair switches them
+    //    only when told to (ticket e69fbc52).
     let repair_out = run_cli_with_stdin(
         &bin,
         &home,

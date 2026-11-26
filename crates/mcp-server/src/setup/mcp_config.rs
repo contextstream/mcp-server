@@ -1031,12 +1031,28 @@ fn settle_json_entry_account(path: &Path, existing: Option<&Value>, server: &mut
     restore_json_entry_installation_id(server, json_entry_installation_id(existing).as_deref());
 }
 
+/// The keys an entry holds that a rotation to a new key must settle with
+/// [`account_switch`]: all of them except `replaced_key`, the saved key
+/// `configure` is replacing. An entry holding exactly that key holds the same
+/// credential being rotated, so it takes the new key without a question, even
+/// when the API now refuses the old one (a revoked key).
+fn keys_to_settle_on_rotation(held: Vec<String>, replaced_key: Option<&str>) -> Vec<String> {
+    let replaced_key = replaced_key.map(str::trim).filter(|key| !key.is_empty());
+    held.into_iter()
+        .filter(|key| Some(key.as_str()) != replaced_key)
+        .collect()
+}
+
 /// [`refresh_json_entry_embedded_api_key`], unless that would switch the
 /// entry at `path` to another account without agreement.
-fn refresh_json_entry_key_settled(path: &Path, entry: &mut Value, api_key: &str) -> bool {
-    if account_switch::key_to_keep(path, &embedded_json_api_keys(entry), &[api_key.to_string()])
-        .is_some()
-    {
+fn refresh_json_entry_key_settled(
+    path: &Path,
+    entry: &mut Value,
+    api_key: &str,
+    replaced_key: Option<&str>,
+) -> bool {
+    let held = keys_to_settle_on_rotation(embedded_json_api_keys(entry), replaced_key);
+    if account_switch::key_to_keep(path, &held, &[api_key.to_string()]).is_some() {
         return false;
     }
     refresh_json_entry_embedded_api_key(entry, api_key)
@@ -4570,16 +4586,23 @@ fn refresh_json_entry_embedded_api_key(entry: &mut Value, api_key: &str) -> bool
     changed
 }
 
-fn refresh_codex_toml_file_embedded_api_key(path: &Path, api_key: &str) -> Result<bool> {
+fn refresh_codex_toml_file_embedded_api_key(
+    path: &Path,
+    api_key: &str,
+    replaced_key: Option<&str>,
+) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
     let raw_existing = std::fs::read_to_string(path)
         .with_context(|| format!("Could not read Codex config {}", path.display()))?;
     let mut document = parse_codex_toml(&raw_existing, path)?;
-    let held = contextstream_toml_item(&document)
-        .map(embedded_codex_toml_api_keys)
-        .unwrap_or_default();
+    let held = keys_to_settle_on_rotation(
+        contextstream_toml_item(&document)
+            .map(embedded_codex_toml_api_keys)
+            .unwrap_or_default(),
+        replaced_key,
+    );
     if account_switch::key_to_keep(path, &held, &[api_key.to_string()]).is_some() {
         return Ok(false);
     }
@@ -4687,8 +4710,13 @@ fn refresh_codex_toml_entry_embedded_api_key(
 /// Surgically refresh embedded ContextStream API keys in existing global and
 /// project MCP config files without creating missing files or adding keys to
 /// configs that do not embed one.
+///
+/// `replaced_key` is the saved key this rotation replaces: entries holding
+/// exactly it take `api_key` without a question. Any other key that differs
+/// from `api_key` goes through the [`account_switch`] check first.
 pub fn refresh_embedded_api_key_in_existing_configs(
     api_key: &str,
+    replaced_key: Option<&str>,
     project_roots: &[PathBuf],
 ) -> Vec<(PathBuf, Result<bool>)> {
     let api_key = api_key.trim();
@@ -4706,7 +4734,8 @@ pub fn refresh_embedded_api_key_in_existing_configs(
             ConfigDialect::CodexToml => {
                 if let Some(path) = dirs::home_dir().map(|h| h.join(".codex").join("config.toml")) {
                     if path.exists() {
-                        let result = refresh_codex_toml_file_embedded_api_key(&path, api_key);
+                        let result =
+                            refresh_codex_toml_file_embedded_api_key(&path, api_key, replaced_key);
                         outcomes.push((path, result));
                     }
                 }
@@ -4728,7 +4757,7 @@ pub fn refresh_embedded_api_key_in_existing_configs(
                     else {
                         return Ok(false);
                     };
-                    if !refresh_json_entry_key_settled(&path, entry, api_key) {
+                    if !refresh_json_entry_key_settled(&path, entry, api_key, replaced_key) {
                         return Ok(false);
                     }
                     safe_edit::commit(&path, &loaded, &config)
@@ -4760,7 +4789,7 @@ pub fn refresh_embedded_api_key_in_existing_configs(
                     else {
                         return Ok(false);
                     };
-                    if !refresh_json_entry_key_settled(&path, entry, api_key) {
+                    if !refresh_json_entry_key_settled(&path, entry, api_key, replaced_key) {
                         return Ok(false);
                     }
                     commit_mcp_config(editor, &path, &loaded, &config, &[])
@@ -4774,7 +4803,11 @@ pub fn refresh_embedded_api_key_in_existing_configs(
     for project_root in project_roots {
         let codex_project_path = project_root.join(".codex").join("config.toml");
         if codex_project_path.exists() {
-            let result = refresh_codex_toml_file_embedded_api_key(&codex_project_path, api_key);
+            let result = refresh_codex_toml_file_embedded_api_key(
+                &codex_project_path,
+                api_key,
+                replaced_key,
+            );
             outcomes.push((codex_project_path, result));
         }
 
@@ -4796,7 +4829,7 @@ pub fn refresh_embedded_api_key_in_existing_configs(
                 else {
                     return Ok(false);
                 };
-                if !refresh_json_entry_key_settled(&path, entry, api_key) {
+                if !refresh_json_entry_key_settled(&path, entry, api_key, replaced_key) {
                     return Ok(false);
                 }
                 let changed = safe_edit::commit(&path, &loaded, &config)?;
@@ -10637,6 +10670,7 @@ CONTEXTSTREAM_API_KEY = "test-key"
         // Fresh HOME before setup: `.claude/` exists, `.claude.json` does not.
         let initial = refresh_embedded_api_key_in_existing_configs(
             "cs_key_a",
+            None,
             std::slice::from_ref(&project),
         );
         assert!(initial.is_empty());
@@ -10675,16 +10709,18 @@ CONTEXTSTREAM_API_KEY = "test-key"
         )
         .expect("write project .mcp.json");
 
-        // A rotation: both keys sign in as the same account, so nothing asks
-        // and every embedded key is refreshed as before. A key for another
-        // account is not written without a terminal.
+        // `configure` rotates the saved key cs_key_a, which the API now
+        // refuses (no account for it), to cs_key_b. Every entry holding
+        // exactly cs_key_a is that same credential: refreshed with no
+        // terminal, no question and no --switch-account.
         let _accounts = account_switch::test_accounts(&[
-            ("cs_key_a", "keyrot@example.test"),
-            ("cs_key_b", "KeyRot@example.test"),
+            ("cs_key_b", "keyrot@example.test"),
+            ("cs_key_c", "keyrot@example.test"),
             ("cs_key_other", "someone-else@example.test"),
         ]);
         let outcomes = refresh_embedded_api_key_in_existing_configs(
             "cs_key_b",
+            Some("cs_key_a"),
             std::slice::from_ref(&project),
         );
         let changed_count = outcomes
@@ -10693,12 +10729,10 @@ CONTEXTSTREAM_API_KEY = "test-key"
             .count();
         assert_eq!(changed_count, 3, "{outcomes:?}");
 
-        let rotated = [
-            home.join(".claude.json"),
-            home.join(".codex").join("config.toml"),
-            project.join(".mcp.json"),
-        ];
-        for path in &rotated {
+        let claude = home.join(".claude.json");
+        let codex = home.join(".codex").join("config.toml");
+        let project_config = project.join(".mcp.json");
+        for path in [&claude, &codex, &project_config] {
             let content = std::fs::read_to_string(path).expect("read rotated config");
             assert!(
                 !content.contains("cs_key_a"),
@@ -10718,26 +10752,39 @@ CONTEXTSTREAM_API_KEY = "test-key"
             "must never create unconfigured editor files"
         );
 
-        let before: Vec<String> = rotated
-            .iter()
-            .map(|path| std::fs::read_to_string(path).expect("read"))
-            .collect();
+        // The project entry now holds another account's key. The next
+        // rotation (cs_key_b to cs_key_c) still refreshes the entries holding
+        // cs_key_b, and keeps the other account's key without a terminal.
+        let other = std::fs::read_to_string(&project_config)
+            .expect("read")
+            .replace("cs_key_b", "cs_key_other");
+        std::fs::write(&project_config, &other).expect("plant another account's key");
         let outcomes = refresh_embedded_api_key_in_existing_configs(
-            "cs_key_other",
+            "cs_key_c",
+            Some("cs_key_b"),
             std::slice::from_ref(&project),
         );
-        assert!(
-            outcomes.iter().all(|(_, res)| matches!(res, Ok(false))),
-            "{outcomes:?}"
-        );
-        for (path, before) in rotated.iter().zip(before) {
-            assert_eq!(
-                std::fs::read_to_string(path).expect("read"),
-                before,
-                "{} switched to another account without a terminal",
+        for (path, outcome) in &outcomes {
+            let expected = path != &project_config;
+            assert!(
+                matches!(outcome, Ok(changed) if *changed == expected),
+                "{}: {outcome:?}",
                 path.display()
             );
         }
+        for path in [&claude, &codex] {
+            let content = std::fs::read_to_string(path).expect("read");
+            assert!(
+                content.contains("cs_key_c") && !content.contains("cs_key_b"),
+                "{}: {content}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&project_config).expect("read"),
+            other,
+            "the project entry switched to another account without a terminal"
+        );
     }
 
     const ERIK_KEY: &str = "cs_erik_key";
@@ -11000,6 +11047,12 @@ mod session_headers_helper_tests {
 
     #[test]
     fn claude_codes_hosted_entry_runs_the_command_that_names_the_connection() {
+        // Both builds read HOME for the helper's path, and the tests that set
+        // HOME hold this lock: without it, one of them can change HOME between
+        // the two builds and the second line names another path.
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let hosted = entry(&Editor::ClaudeCode, None, TransportMode::ForceRemote);
         let line = hosted[HEADERS_HELPER_FIELD].as_str().expect("the line");
         assert!(line.ends_with(LINE_END), "{line}");

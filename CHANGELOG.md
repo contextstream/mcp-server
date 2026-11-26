@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.105
+
+- `coordination` `ack` and `dismiss` handed a coordination item's id (the `item=<id>` that opens a `[COORDINATION]` line, or an id from the inbox's items) now act on your open notice about that item, where they used to answer "not one of this session's notices". With no open notice they say there was nothing to do; with notices in several of your sessions and no session named, they list them and touch none.
+
 ## 1.0.104
 
 - `memory` `get_node`, `get_event`, `get_task`, `get_todo` and `get_doc` handed an id that belongs to another kind, or to a coordination item or notice, now answer with that record, after "`<id>` is not a <kind>: it is <what>, which <call> reads." The structured result names the asked kind, the record's kind and the call that reads it. An id that matches nothing is refused as before. Only the read getters do this; updates, deletes and completions still act only on their own kind.

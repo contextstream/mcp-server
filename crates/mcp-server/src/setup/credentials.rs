@@ -121,7 +121,19 @@ fn write_saved_credentials_changed(api_key: &str, api_url: Option<&str>) -> Resu
 /// saved `api_url` override in `credentials.json`, then
 /// [`mcp_types::config::DEFAULT_API_URL`].
 pub fn setup_client_config(api_key: &str) -> mcp_types::Config {
-    let api_url = std::env::var("CONTEXTSTREAM_API_URL")
+    mcp_types::Config {
+        api_url: configured_api_url(),
+        api_key: Some(api_key.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The API this run's own credentials belong to: `CONTEXTSTREAM_API_URL`,
+/// then the saved `api_url` in `credentials.json`, then
+/// [`mcp_types::config::DEFAULT_API_URL`]. Never anything an editor config
+/// or a repository names.
+pub fn configured_api_url() -> String {
+    std::env::var("CONTEXTSTREAM_API_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| {
@@ -131,12 +143,7 @@ pub fn setup_client_config(api_key: &str) -> mcp_types::Config {
                 .filter(|url| !url.trim().is_empty())
         })
         .map(|url| normalize_api_url(&url))
-        .unwrap_or_else(|| mcp_types::config::DEFAULT_API_URL.to_string());
-    mcp_types::Config {
-        api_url,
-        api_key: Some(api_key.to_string()),
-        ..Default::default()
-    }
+        .unwrap_or_else(|| mcp_types::config::DEFAULT_API_URL.to_string())
 }
 
 /// Persist validated setup/configure credentials to `~/.contextstream/credentials.json`

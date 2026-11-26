@@ -246,10 +246,10 @@ fn editor_contract(editor: &Editor) -> Value {
         }),
         "project_remote": run(&|sandbox| write_project_mcp_config_force_remote_with_auth(
             editor, &sandbox.project, "test-key", Some("ws-1"), Some("proj-1"), None, None, Some("test-key"),
-        )),
+        ).map(|_| ())),
         "project_local": run(&|sandbox| write_project_mcp_config_force_local(
             editor, &sandbox.project, "test-key", Some("ws-1"), Some("proj-1"), None, None,
-        )),
+        ).map(|_| ())),
     });
 
     let generated = {

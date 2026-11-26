@@ -409,12 +409,17 @@ async fn setup_profile_file_uses_payload_api_url_for_all_requests() {
 
     // 1. Fresh HOME with CONTEXTSTREAM_API_URL unset: all workspace, project, and
     // device-completion calls must hit `payload.api_url`.
+    // Hosted entries talk to the mock's gateway, so the account check on the
+    // re-run asks the mock, never the real API.
+    let gateway = format!("{api_url}/mcp?default_context_mode=fast");
+    let run_gateway = gateway.clone();
     let run_home = home.clone();
     let run_proj = proj.clone();
     let run_pf = profile_path.clone();
     let out = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
             .args(["setup", "--profile-file", run_pf.to_str().unwrap()])
+            .env("CONTEXTSTREAM_MCP_HTTP_URL", &run_gateway)
             .env("HOME", &run_home)
             .env("USERPROFILE", &run_home)
             .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
@@ -447,6 +452,7 @@ async fn setup_profile_file_uses_payload_api_url_for_all_requests() {
         .unwrap(),
     )
     .unwrap();
+    let rerun_gateway = gateway.clone();
     let rerun_home = home.clone();
     let rerun_proj = proj.clone();
     let rerun_pf = profile_path.clone();
@@ -458,6 +464,7 @@ async fn setup_profile_file_uses_payload_api_url_for_all_requests() {
                 rerun_pf.to_str().unwrap(),
                 "--account-only",
             ])
+            .env("CONTEXTSTREAM_MCP_HTTP_URL", &rerun_gateway)
             .env("HOME", &rerun_home)
             .env("USERPROFILE", &rerun_home)
             .env("CONTEXTSTREAM_WATCH_DISABLED", "1")

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.106
+
+- A read that names a `project_id` from another workspace now uses that project's workspace when the session's workspace is only the connection's default (the `X-ContextStream-Workspace-Id` header, with no workspace passed, no `init`, no task sign-in and no folder mapping). Before, hosted graph reads such as impact and call paths answered "Choose a project for code graph queries" until `init` had run.
+
 ## 1.0.105
 
 - `coordination` `ack` and `dismiss` handed a coordination item's id (the `item=<id>` that opens a `[COORDINATION]` line, or an id from the inbox's items) now act on your open notice about that item, where they used to answer "not one of this session's notices". With no open notice they say there was nothing to do; with notices in several of your sessions and no session named, they list them and touch none.

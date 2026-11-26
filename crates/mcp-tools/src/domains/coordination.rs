@@ -186,6 +186,113 @@ impl CoordinationTool {
         }
     }
 
+    /// ack and dismiss take a notice's id, but agents also pass the id of the
+    /// coordination item the notice is about: the `item=<id>` that opens each
+    /// [COORDINATION] line, or an id from the inbox's items. Five of the 26
+    /// failed tool calls of 2026-11-25/26 were that, each answered "not one of
+    /// this session's notices". After the API's 404, an id that names an item
+    /// the caller can see stands for the caller's open notices about it.
+    #[allow(clippy::too_many_arguments)]
+    async fn notices_about_item(
+        &self,
+        verb: NoticeVerb,
+        raw: &str,
+        id: Uuid,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        session_id: Option<&str>,
+        error: Error,
+    ) -> Result<ToolResult> {
+        if !matches!(error, Error::Http { status: 404, .. }) {
+            return Err(error);
+        }
+        let Ok(item) = self.client.get_coordination_item(id).await else {
+            return Err(not_this_sessions_notice(raw, error));
+        };
+        let state_session = match self.session.as_deref() {
+            Some(session) => session.state().await.api_session_id.clone(),
+            None => None,
+        };
+        let session_id = state_session.or_else(|| {
+            session_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        });
+        let Ok(inbox) = self
+            .client
+            .coordination_inbox(workspace_id, project_id, session_id.as_deref(), Some(100))
+            .await
+        else {
+            return Err(not_this_sessions_notice(raw, error));
+        };
+        let uuid_of = |value: &Value, key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(|text| Uuid::parse_str(text).ok())
+        };
+        let notices: Vec<Uuid> = inbox_notices(&inbox)
+            .iter()
+            .filter(|notice| uuid_of(notice, "item_id") == Some(id))
+            .filter_map(|notice| uuid_of(notice, "id"))
+            .collect();
+        let payload = item.get("data").unwrap_or(&item);
+        let title = payload
+            .get("title")
+            .and_then(Value::as_str)
+            .map(|title| one_line(title, 120))
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| "untitled".to_string());
+        let name = verb.name();
+        if notices.is_empty() {
+            return Ok(ToolResult::with_structured(
+                format!(
+                    "`{raw}` is the coordination item \"{title}\", not a notice, and no open notice in your inbox is about it, so there was nothing to {name}. {name} takes the notice_id at the end of a [COORDINATION] line; coordination(action=\"inbox\") lists your open notices."
+                ),
+                serde_json::json!({"item_id": id, "notices": []}),
+            ));
+        }
+        let listed = notices
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if notices.len() > 1 && session_id.is_none() {
+            // Each notice is a session's; without the caller's session, acking
+            // them all would take the item from the user's other live agents.
+            return Err(Error::refused(
+                mcp_types::ValidationReason::InvalidValue,
+                format!(
+                    "`notice_id` {raw} is the coordination item \"{title}\", not a notice, and {} of your sessions have a notice about it: {listed}. Pass the notice_id your session was given (at the end of its [COORDINATION] line), or your session_id.",
+                    notices.len()
+                ),
+            ));
+        }
+        let mut done = Vec::with_capacity(notices.len());
+        for notice in &notices {
+            done.push(match verb {
+                NoticeVerb::Ack => {
+                    self.client
+                        .ack_coordination_notice(*notice, workspace_id)
+                        .await?
+                }
+                NoticeVerb::Dismiss => {
+                    self.client
+                        .dismiss_coordination_notice(*notice, workspace_id)
+                        .await?
+                }
+            });
+        }
+        Ok(ToolResult::with_structured(
+            format!(
+                "{} coordination notice {listed}: `{raw}` is the coordination item \"{title}\" it is about, not the notice itself.",
+                verb.past()
+            ),
+            serde_json::json!({"item_id": id, "notices": done}),
+        ))
+    }
+
     fn parse_uuid_list(values: &Option<Vec<String>>) -> Result<Vec<Uuid>> {
         let Some(values) = values else {
             return Ok(Vec::new());
@@ -374,11 +481,26 @@ impl ToolHandler for CoordinationTool {
                 let uuid = self
                     .coordination_id(&notice_id, "notice_id", workspace_id, project_id)
                     .await?;
-                let result = self
+                let result = match self
                     .client
                     .ack_coordination_notice(uuid, workspace_id)
                     .await
-                    .map_err(|e| not_this_sessions_notice(&notice_id, e))?;
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return self
+                            .notices_about_item(
+                                NoticeVerb::Ack,
+                                &notice_id,
+                                uuid,
+                                workspace_id,
+                                project_id,
+                                input.session_id.as_deref(),
+                                error,
+                            )
+                            .await
+                    }
+                };
                 Ok(ToolResult::with_structured(
                     format!("Acked coordination notice {notice_id}"),
                     result,
@@ -438,11 +560,26 @@ impl ToolHandler for CoordinationTool {
                 let uuid = self
                     .coordination_id(&notice_id, "notice_id", workspace_id, project_id)
                     .await?;
-                let result = self
+                let result = match self
                     .client
                     .dismiss_coordination_notice(uuid, workspace_id)
                     .await
-                    .map_err(|e| not_this_sessions_notice(&notice_id, e))?;
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return self
+                            .notices_about_item(
+                                NoticeVerb::Dismiss,
+                                &notice_id,
+                                uuid,
+                                workspace_id,
+                                project_id,
+                                input.session_id.as_deref(),
+                                error,
+                            )
+                            .await
+                    }
+                };
                 Ok(ToolResult::with_structured(
                     format!("Dismissed coordination notice {notice_id}"),
                     result,
@@ -823,6 +960,29 @@ pub(crate) fn format_item(result: &Value, id: &str) -> String {
         out.push_str(&linked.join(", "));
     }
     out
+}
+
+/// What ack or dismiss does to a notice.
+#[derive(Debug, Clone, Copy)]
+enum NoticeVerb {
+    Ack,
+    Dismiss,
+}
+
+impl NoticeVerb {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ack => "ack",
+            Self::Dismiss => "dismiss",
+        }
+    }
+
+    fn past(self) -> &'static str {
+        match self {
+            Self::Ack => "Acked",
+            Self::Dismiss => "Dismissed",
+        }
+    }
 }
 
 /// The longest reply the API takes (`ReplyNoticeRequest`).
@@ -1566,5 +1726,194 @@ mod notice_refusal_tests {
             .as_str()
             .expect("project_id is described");
         assert!(description.contains("share"), "{description}");
+    }
+}
+
+#[cfg(test)]
+mod item_id_notice_tests {
+    //! ack and dismiss handed the id of a coordination item rather than of a
+    //! notice (5 of 26 failed tool calls, 2026-11-25/26): the caller's open
+    //! notice about the item is acked or dismissed, and an item with none
+    //! says there was nothing to do.
+    use super::*;
+    use crate::testing::{TestFixtures, ToolResultAssert};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const ITEM: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const NOTICE: &str = "660e8400-e29b-41d4-a716-446655440000";
+    const OTHER_NOTICE: &str = "770e8400-e29b-41d4-a716-446655440000";
+
+    /// A notice action on the item's id is 404, the item reads, the inbox
+    /// lists `notices`, and a notice action on any other id succeeds. Returns
+    /// the request lines it saw.
+    fn serve(
+        listener: tokio::net::TcpListener,
+        notices: Value,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await
+            {
+                let mut buffer = vec![0u8; 16 * 1024];
+                let read = socket.read(&mut buffer).await.expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let line = request.lines().next().unwrap_or_default().to_string();
+                let (status, body) = if line.contains(&format!("/coordination/notices/{ITEM}/")) {
+                    (
+                        404,
+                        serde_json::json!({"error": {"code": "not_found", "message": "Coordination notice not found"}}),
+                    )
+                } else if line.contains(&format!("/coordinations/{ITEM}")) {
+                    (
+                        200,
+                        serde_json::json!({"data": {"id": ITEM, "kind": "status", "title": "Deploy coflow-web 85afa2a"}}),
+                    )
+                } else if line.contains("/coordination/inbox") {
+                    (
+                        200,
+                        serde_json::json!({"data": {"notices": notices.clone(), "items": []}}),
+                    )
+                } else if line.contains("/coordination/notices/") {
+                    (200, serde_json::json!({"data": {"status": "acked"}}))
+                } else {
+                    (
+                        404,
+                        serde_json::json!({"error": {"code": "not_found", "message": "not found"}}),
+                    )
+                };
+                let body = body.to_string();
+                lines.push(line);
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            lines
+        })
+    }
+
+    async fn tool() -> (CoordinationTool, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{}", listener.local_addr().expect("addr"));
+        config.api_key = Some("test-key".to_string());
+        (
+            CoordinationTool::new(ContextStreamClient::new(config)),
+            listener,
+        )
+    }
+
+    fn call(action: &str) -> Value {
+        serde_json::json!({"action": action, "notice_id": ITEM,
+                           "workspace_id": TestFixtures::workspace_id()})
+    }
+
+    #[tokio::test]
+    async fn an_item_id_acks_the_callers_notice_about_it() {
+        let (tool, listener) = tool().await;
+        let seen = serve(
+            listener,
+            serde_json::json!([
+                {"id": NOTICE, "item_id": ITEM, "reason": "Deploy coflow-web 85afa2a"},
+                {"id": OTHER_NOTICE, "item_id": "880e8400-e29b-41d4-a716-446655440000"}
+            ]),
+        );
+        let result = tool.execute(call("ack")).await.expect("acked");
+        assert!(!result.is_error, "{result:?}");
+        let text = result.text();
+        assert!(
+            text.contains(&format!("Acked coordination notice {NOTICE}")),
+            "{text}"
+        );
+        assert!(text.contains("Deploy coflow-web 85afa2a"), "{text}");
+        let lines = seen.await.unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(&format!("/coordination/notices/{NOTICE}/ack"))),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains(OTHER_NOTICE)),
+            "only the notice about the item is acked: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_item_id_with_no_open_notice_says_there_was_nothing_to_dismiss() {
+        let (tool, listener) = tool().await;
+        let seen = serve(listener, serde_json::json!([]));
+        let result = tool.execute(call("dismiss")).await.expect("answered");
+        assert!(!result.is_error, "{result:?}");
+        let text = result.text();
+        assert!(text.contains("not a notice"), "{text}");
+        assert!(text.contains("nothing to dismiss"), "{text}");
+        let lines = seen.await.unwrap();
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("/dismiss")).count(),
+            1,
+            "only the first dismiss was sent: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_item_id_with_notices_in_several_sessions_names_them_and_acks_none() {
+        let (tool, listener) = tool().await;
+        let seen = serve(
+            listener,
+            serde_json::json!([
+                {"id": NOTICE, "item_id": ITEM},
+                {"id": OTHER_NOTICE, "item_id": ITEM}
+            ]),
+        );
+        let error = tool.execute(call("ack")).await.expect_err("refused");
+        assert!(
+            matches!(
+                error,
+                Error::Refused {
+                    reason: mcp_types::ValidationReason::InvalidValue,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains(NOTICE) && text.contains(OTHER_NOTICE),
+            "{text}"
+        );
+        let lines = seen.await.unwrap();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains(NOTICE) || l.contains(OTHER_NOTICE)),
+            "nothing is acked: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_the_callers_session_its_notice_about_the_item_is_acked() {
+        let (tool, listener) = tool().await;
+        let seen = serve(
+            listener,
+            serde_json::json!([{"id": NOTICE, "item_id": ITEM}]),
+        );
+        let mut input = call("ack");
+        input["session_id"] = serde_json::json!("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+        let result = tool.execute(input).await.expect("acked");
+        assert!(!result.is_error, "{result:?}");
+        let lines = seen.await.unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("/coordination/inbox")
+                && l.contains("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
+            "the inbox is read for the caller's session: {lines:?}"
+        );
     }
 }

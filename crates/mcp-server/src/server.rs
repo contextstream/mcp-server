@@ -427,7 +427,10 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "answer": "Answering one row",
             "cancel": "Cancelling a run of a question",
             "resume": "Resuming a run of a question",
-            "write_back": "Writing answers back where the list lives"
+            "write_back": "Writing answers back where the list lives",
+            "watch": "Reading the nightly watch of saved questions",
+            "checks": "Listing a question's checks",
+            "take_check": "Taking a check of a question"
         });
     } else if name == "memory" {
         metadata["actions"] = serde_json::json!({
@@ -3714,10 +3717,11 @@ mod tests {
         (
             // New row for saved questions: the `questions` tool; `action` is
             // required. Advanced for `export`, write-back's `attribute`,
-            // `templates` and a trial's `model`; additive only
-            // (later_inputs_only_add_to_the_questions_schema).
+            // `templates`, a trial's `model`, a run's `document` and the
+            // nightly watch (`watch`, `checks`, `take_check` with `check_id`);
+            // additive only (later_inputs_only_add_to_the_questions_schema).
             "questions",
-            "5d4054bfac98df03374acfb39d8287c38b32505c0ec9ce054346bb0023868fc2",
+            "add77908c899136a94180de8bccbfc7f5261bb48caf0fb0f392dbb3455742069",
         ),
         (
             "reminder",
@@ -4359,17 +4363,19 @@ mod tests {
     #[test]
     fn later_inputs_only_add_to_the_questions_schema() {
         // A run as a CSV (`export`), the contact property an audience's
-        // answers go under (`attribute`), the starter templates (`templates`)
-        // and who answers a trial (`model`) came after the tool's first
-        // contract. Without them the schema is exactly that contract, so
-        // every other action and parameter is unchanged.
+        // answers go under (`attribute`), the starter templates (`templates`),
+        // who answers a trial (`model`), a requirement check's `document` and
+        // the nightly watch (`watch`, `checks`, `take_check` and its
+        // `check_id`) came after the tool's first contract. Without them the
+        // schema is exactly that contract, so every other action and
+        // parameter is unchanged.
         let tools = tools_with_questions(&test_registry(Config::default()));
         assert_eq!(
             schema_contract_without(
                 &tools,
                 "questions",
-                &["export", "templates"],
-                &["attribute", "model"]
+                &["export", "templates", "watch", "checks", "take_check"],
+                &["attribute", "model", "document", "check_id"]
             ),
             "ce91789331c82c91d5f63f43295062ed24121d308c7b19a68f3f1ad72feaa2b5"
         );
@@ -4412,7 +4418,10 @@ mod tests {
                 "answer",
                 "cancel",
                 "resume",
-                "write_back"
+                "write_back",
+                "watch",
+                "checks",
+                "take_check"
             ])
         );
         assert_eq!(questions["annotations"]["readOnlyHint"], false);
@@ -4468,6 +4477,25 @@ mod tests {
         assert_eq!(
             questions["inputSchema"]["properties"]["attribute"]["type"],
             "string"
+        );
+        // A run's `document` (a requirement check), and the check of the
+        // nightly watch a person takes, which is a write.
+        assert_eq!(
+            questions["inputSchema"]["properties"]["document"]["type"],
+            "object"
+        );
+        assert_eq!(
+            questions["inputSchema"]["properties"]["check_id"]["type"],
+            "string"
+        );
+        assert_eq!(
+            contextstream_call_title(
+                "questions",
+                "Saved Questions",
+                false,
+                &serde_json::json!({"action": "take_check"})
+            ),
+            "Taking a check of a question"
         );
     }
 

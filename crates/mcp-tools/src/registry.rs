@@ -505,8 +505,8 @@ fn write_observation_labels(name: &str, input: &Value) -> Option<(&'static str, 
             None | Some("report") => Some(("progress", "report")),
             _ => None,
         },
-        // `label` without rows reads the labeled rows; list, get, describe,
-        // status and results are reads.
+        // `label` without rows reads the labeled rows; list, templates, get,
+        // describe, status, results, export, watch and checks are reads.
         "questions" => Some((
             "questions",
             match input_action(input)? {
@@ -521,6 +521,7 @@ fn write_observation_labels(name: &str, input: &Value) -> Option<(&'static str, 
                 "cancel" => "cancel",
                 "resume" => "resume",
                 "write_back" => "write_back",
+                "take_check" => "take_check",
                 _ => return None,
             },
         )),
@@ -2040,6 +2041,17 @@ mod acceleration_observation_tests {
             write_observation_labels("questions", &json!({"action": "results"})),
             None
         );
+        assert_eq!(
+            write_observation_labels("questions", &json!({"action": "take_check"})),
+            Some(("questions", "take_check"))
+        );
+        for read in ["watch", "checks"] {
+            assert_eq!(
+                write_observation_labels("questions", &json!({"action": read})),
+                None,
+                "{read}"
+            );
+        }
         // Reads keep their hot-read label; unknown calls fold to `other`.
         assert_eq!(
             tool_call_action_label("search", &json!({"mode": "keyword"})),
@@ -2835,9 +2847,12 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
                 "export answers as csv",
                 "write answers back to the sheet",
                 "starter templates",
+                "requirement check",
+                "check requirements against a document",
+                "nightly watch",
             ],
             tags: &["questions", "lists", "rows", "answers", "review", "runs"],
-            when_to_use: "Ask a saved question with fixed answers about every row of a list (leads, tickets, contracts): find or save one, label rows with the person's answers, try it, activate it, run it on a list or answer one row, read which rows are Sure and which a person checks, export a run as a CSV, and write its answers back to a Google Sheet, an Excel workbook or an audience.",
+            when_to_use: "Ask a saved question with fixed answers about every row of a list (leads, tickets, Jira issues, contracts): find or save one, label rows with the person's answers, try it, activate it, run it on a list or answer one row, check a list of requirements against a document, read which rows are Sure and which a person checks, export a run as a CSV, write its answers back to a Google Sheet, an Excel workbook or an audience, and read the nightly watch's checks of its answers.",
             avoid_when: "Do not use for questions about the codebase or memory (search, answer, memory), or to label rows with your own guesses: labels are the person's answers.",
             examples: &[
                 "which saved questions does this workspace have",
@@ -2846,6 +2861,9 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
                 "answer the triage question for this one ticket",
                 "export that run's answers as a CSV",
                 "copy the lead fit starter template",
+                "check these requirements against the vendor's response",
+                "run the triage question on our Jira issues",
+                "did the nightly watch hold any of our questions",
             ],
             latency_class: "variable",
             parallel_safe: false,
@@ -3072,9 +3090,10 @@ const CONSOLIDATED_TOOLS: &[&str] = &[
     "coordination",
     // Live run progress (report, get, list).
     "progress",
-    // Saved questions (list, get, create, version, label, sample, try,
-    // activate, describe, run, status, results, answer, cancel, resume,
-    // write_back): the hosted gateway serves it as stdio does.
+    // Saved questions (list, templates, get, create, version, label, sample,
+    // try, activate, describe, run, status, results, export, answer, cancel,
+    // resume, write_back, watch, checks, take_check): the hosted gateway
+    // serves it as stdio does.
     "questions",
     // Graph-driven smart verification checks (`ms_verify` alias).
     "verify",

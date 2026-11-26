@@ -280,12 +280,16 @@ async fn each_read_calls_its_route_with_the_sessions_workspace() {
                  "shape": "screen", "spec": f.spec()},
                 {"key": "request-urgency", "name": "Request urgency", "about": "A request a customer sent",
                  "shape": "rate", "spec": {}},
+                {"key": "requirement-match", "name": "Requirement check",
+                 "about": "A requirement from a bid request, and a passage from a vendor's response to it.",
+                 "shape": "match", "spec": {}},
             ]}),
             says: vec![
-                "2 starter template(s)",
+                "3 starter template(s)",
                 "template=\"<key>\"",
                 "- Lead fit (template=\"lead-fit\"): screen, A sales lead from the contact form",
                 "- Request urgency (template=\"request-urgency\"): rate,",
+                "- Requirement check (template=\"requirement-match\"): match, A requirement from a bid request, and a passage from a vendor's response to it.",
             ],
         },
         Case {
@@ -423,6 +427,124 @@ async fn each_read_calls_its_route_with_the_sessions_workspace() {
                 "after=12",
             ],
         },
+        Case {
+            // A requirement check's rows: the passage each answer rests on
+            // and where it is, a requirement no passage answers, and a row
+            // of a version a check holds.
+            arguments: json!({
+                "action": "results", "question_id": q.to_string(), "run_id": r.to_string(),
+            }),
+            method: "GET",
+            target: format!("/api/v1/questions/{q}/runs/{r}/rows?workspace_id={w}&limit=25"),
+            body: Value::Null,
+            status: 200,
+            answer: json!({
+                "rows": [
+                    {"place": 0, "key": "sso", "state": "answered", "label": "yes", "trust": "sure",
+                     "reason": null, "answers": [], "called": null, "spot_check": false,
+                     "fields": {"requirement": "Single sign-on through SAML",
+                                "passage": "We support single sign-on through SAML 2.0 and OIDC.",
+                                "where": "Page 3, under \u{201c}Security\u{201d}, passage 12"}},
+                    {"place": 1, "key": "soc2", "state": "answered", "label": "no", "trust": "check",
+                     "reason": "not_found", "answers": [], "called": null, "spot_check": false,
+                     "fields": {"requirement": "A SOC 2 Type II report",
+                                "passage": "We are audited every year.", "where": "Page 1, passage 2"}},
+                    {"place": 2, "key": "row-0a1b2c3d4e5f", "state": "answered", "label": "yes",
+                     "trust": "check", "reason": "held", "answers": [], "called": null, "spot_check": false,
+                     "fields": {"requirement": "Data kept in the EU",
+                                "passage": "Customer data stays in Frankfurt.", "where": "Page 4, passage 20"}},
+                ],
+                "next": null,
+            }),
+            says: vec![
+                "- #0 sso: yes (Sure); quoted from Page 3, under \u{201c}Security\u{201d}, passage 12: \"We support single sign-on through SAML 2.0 and OIDC.\"",
+                "- #1 soc2: no (Check: not found in the document); closest Page 1, passage 2: \"We are audited every year.\"",
+                "- #2 row-0a1b2c3d4e5f: yes (Check: being checked again, a person's call for now) [Data kept in the EU]; quoted from Page 4, passage 20: \"Customer data stays in Frankfurt.\"",
+            ],
+        },
+        Case {
+            // A version a check of the nightly watch holds.
+            arguments: json!({"action": "get", "question_id": q.to_string()}),
+            method: "GET",
+            target: format!("/api/v1/questions/{q}?workspace_id={w}"),
+            body: Value::Null,
+            status: 200,
+            answer: json!({
+                "question": f.question("active", Some(2)),
+                "version": {"version": 2, "spec": f.spec(), "trial": {"bison": {
+                    "ready": true, "needs": [], "model": "bison", "disagreed": [],
+                    "summary": "12 of 12 labeled rows answered as labeled.",
+                    "held": {"since": "2026-11-26T04:05:00Z", "retest": Uuid::nil(), "sure_and_wrong": 2},
+                }}},
+                "versions": [{"version": 2, "tried": true}],
+                "test_rows": 12,
+            }),
+            says: vec![
+                "Trial: ready to answer on its own.",
+                "Held: a check found it sure and wrong on 2 labeled answer(s), so it still answers, but no row of it is Sure until a person takes that check (check_id=00000000-0000-0000-0000-000000000000) or it is tried again.",
+            ],
+        },
+        Case {
+            // The nightly watch: each answerer's last night, and this
+            // workspace's checks by outcome.
+            arguments: json!({"action": "watch"}),
+            method: "GET",
+            target: format!("/api/v1/questions/watch?workspace_id={w}"),
+            body: Value::Null,
+            status: 200,
+            answer: json!({
+                "canaries": [
+                    {"model": "bison", "ran_at": "2026-11-26T03:10:00Z", "verdict": "steady", "cases": 60,
+                     "answered": 59, "as_labeled": 52, "sure": 48, "sure_and_wrong": 0, "guard_missed": 0,
+                     "flipped": 0, "far": 0, "shift": 0.004},
+                    {"model": "mammoth", "ran_at": "2026-11-26T03:20:00Z", "verdict": "moved", "cases": 60,
+                     "answered": 60, "as_labeled": 50, "sure": 45, "sure_and_wrong": 1, "guard_missed": 0,
+                     "flipped": 4, "far": 2, "shift": 0.031},
+                ],
+                "checks": {"steady": 3, "moved": 1, "held": 1},
+            }),
+            says: vec![
+                "[QUESTIONS] The nightly watch: each night every answerer is asked the starter templates' made-up rows again",
+                "- bison: steady: it answers as it did (59 of 60 made-up row(s) answered, 52 as labeled, 48 sure, 0 sure and wrong); ran 2026-11-26T03:10:00Z",
+                "- mammoth: moved: what answers changed, so the questions it answers are checked again (60 of 60 made-up row(s) answered, 50 as labeled, 45 sure, 1 sure and wrong); 4 answer(s) changed since its reference",
+                "This workspace's checks in the last 30 days: 3 steady, 1 moved, 1 held their version.",
+                "A held question still answers",
+            ],
+        },
+        Case {
+            // A question's checks, under the API's own name for the list.
+            arguments: json!({"action": "checks", "question_id": q.to_string()}),
+            method: "GET",
+            target: format!("/api/v1/questions/{q}/retests?workspace_id={w}"),
+            body: Value::Null,
+            status: 200,
+            answer: json!({"retests": [
+                {"id": Uuid::new_v4(), "version": 2, "model": "bison", "reason": "model_moved",
+                 "status": "done", "moved": true, "held": true,
+                 "result": {"then": {"labeled": 12, "as_labeled": 11, "sure": 9, "sure_and_wrong": 0, "not_answered": 0},
+                            "proposal": {"ready": true, "summary": "12 of 12 labeled rows answered as labeled."},
+                            "moved": ["sure_and_wrong", "fewer_as_labeled"]},
+                 "reviewed_by": null, "reviewed_at": null,
+                 "created_at": "2026-11-26T04:00:00Z", "finished_at": "2026-11-26T04:05:00Z"},
+                {"id": Uuid::new_v4(), "version": 1, "model": "bison", "reason": "corrections",
+                 "status": "done", "moved": false, "held": false,
+                 "result": {"proposal": {"ready": true}, "moved": []},
+                 "reviewed_by": Uuid::new_v4(), "reviewed_at": "2026-11-20T09:00:00Z",
+                 "created_at": "2026-11-20T08:00:00Z", "finished_at": "2026-11-20T08:04:00Z"},
+                {"id": Uuid::new_v4(), "version": 2, "model": "mammoth", "reason": "model_moved",
+                 "status": "queued", "moved": null, "held": false, "result": null,
+                 "reviewed_by": null, "reviewed_at": null,
+                 "created_at": "2026-11-26T04:01:00Z", "finished_at": null},
+            ]}),
+            says: vec![
+                "[QUESTIONS] 3 check(s), newest first:",
+                " done: version 2 on bison, after the nightly watch saw its answerer change; its numbers moved (sure and wrong on a labeled row, fewer rows answered as labeled); it put the version on hold (no row Sure until a person takes this check or tries the version again); a person may take it; started 2026-11-26T04:00:00Z",
+                " done: version 1 on bison, after a person corrected enough of its rows; its numbers held; taken 2026-11-20T09:00:00Z",
+                " queued: version 2 on mammoth, after the nightly watch saw its answerer change; started 2026-11-26T04:01:00Z",
+                "questions(action=\"take_check\", question_id=",
+                "Only when the person says so.",
+            ],
+        },
     ];
     for case in cases {
         check(&f, case).await;
@@ -443,6 +565,7 @@ async fn each_write_posts_its_body_to_its_route() {
     });
     let connection = Uuid::new_v4();
     let repository = Uuid::new_v4();
+    let taken = Uuid::new_v4();
     let cases = vec![
         Case {
             // A copy of a starter template: no spec is sent.
@@ -782,6 +905,122 @@ async fn each_write_posts_its_body_to_its_route() {
                 "2 are no longer in the workspace",
             ],
         },
+        Case {
+            // The Jira issues the workspace keeps in sync: one project's of
+            // one status, as Jira names them.
+            arguments: json!({
+                "action": "run", "question_id": q.to_string(),
+                "source": {"kind": "Jira", "project_key": "OPS", "status": "In Progress"},
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/runs"),
+            body: json!({
+                "workspace_id": w,
+                "source": {"kind": "jira", "project_key": "OPS", "status": "In Progress"},
+                "surface": "mcp",
+            }),
+            status: 202,
+            answer: json!({"run": f.run_view("queued", "jira"), "estimate": {"rows": 31}}),
+            says: vec!["started on 31 row(s)"],
+        },
+        Case {
+            // Every project's, of any status.
+            arguments: json!({
+                "action": "describe", "question_id": q.to_string(), "source": {"kind": "jira"},
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/describe"),
+            body: json!({"workspace_id": w, "source": {"kind": "jira"}}),
+            status: 200,
+            answer: json!({"rows": 2, "columns": [{"name": "summary", "samples": ["Customs hold in Laredo"]}],
+                           "looks_at": ["summary"], "missing": []}),
+            says: vec!["2 row(s) and 1 column(s)", "- summary: Customs hold in Laredo"],
+        },
+        Case {
+            // A requirement check: the document goes as it was given.
+            arguments: json!({
+                "action": "run", "question_id": q.to_string(),
+                "rows": [{"key": "sso", "fields": {"requirement": "Single sign-on through SAML"}}],
+                "document": {
+                    "kind": "text", "title": "Vendor response",
+                    "text": "Security\n\nWe support single sign-on through SAML 2.0.\u{c}Support\n\nAround the clock.",
+                },
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/runs"),
+            body: json!({
+                "workspace_id": w,
+                "source": {"kind": "rows", "rows": [{"key": "sso", "fields": {"requirement": "Single sign-on through SAML"}}]},
+                "surface": "mcp",
+                "document": {
+                    "kind": "text", "title": "Vendor response",
+                    "text": "Security\n\nWe support single sign-on through SAML 2.0.\u{c}Support\n\nAround the clock.",
+                },
+            }),
+            status: 202,
+            answer: json!({"run": f.run_view("queued", "rows"), "estimate": {"rows": 1, "minutes_at_least": 1}}),
+            says: vec!["started on 1 row(s)"],
+        },
+        Case {
+            // A Google Doc through a connected app, with the column that
+            // holds each requirement named.
+            arguments: json!({
+                "action": "run", "question_id": q.to_string(),
+                "source": {"kind": "csv", "text": "need\nSSO\n"},
+                "mapping": {"requirement": "need"},
+                "document": {"kind": "google_doc", "connection_id": connection.to_string(), "document_id": "1AbC"},
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/runs"),
+            body: json!({
+                "workspace_id": w,
+                "source": {"kind": "csv", "text": "need\nSSO\n"},
+                "mapping": {"requirement": "need"},
+                "surface": "mcp",
+                "document": {"kind": "google_doc", "connection_id": connection, "document_id": "1AbC"},
+            }),
+            status: 202,
+            answer: json!({"run": f.run_view("queued", "csv"), "estimate": {"rows": 1}}),
+            says: vec!["started on 1 row(s)"],
+        },
+        Case {
+            // A Word document in OneDrive or SharePoint; its kind is read as
+            // written.
+            arguments: json!({
+                "action": "run", "question_id": q.to_string(),
+                "source": {"kind": "csv", "text": "requirement\nSSO\n"},
+                "document": {"kind": "Word", "connection_id": connection.to_string(),
+                             "drive_id": "b!x7", "item_id": "01ABC"},
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/runs"),
+            body: json!({
+                "workspace_id": w,
+                "source": {"kind": "csv", "text": "requirement\nSSO\n"},
+                "surface": "mcp",
+                "document": {"kind": "word", "connection_id": connection, "drive_id": "b!x7", "item_id": "01ABC"},
+            }),
+            status: 202,
+            answer: json!({"run": f.run_view("queued", "csv"), "estimate": {"rows": 1}}),
+            says: vec!["started on 1 row(s)"],
+        },
+        Case {
+            // A person takes what a done check chose: its trial is the
+            // version's on that answerer now.
+            arguments: json!({
+                "action": "take_check", "question_id": q.to_string(), "check_id": taken.to_string(),
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/retests/{taken}/accept"),
+            body: json!({"workspace_id": w}),
+            status: 200,
+            answer: json!({"trial": f.trial(true)}),
+            says: vec![
+                "taken: what it chose is the version's trial on bison now, and a hold it put on the version is over.",
+                "Trial: ready to answer on its own.",
+                "shows the version as it answers now.",
+            ],
+        },
     ];
     for case in cases {
         check(&f, case).await;
@@ -972,6 +1211,55 @@ async fn what_cannot_be_right_is_refused_before_anything_is_sent() {
             json!({"action": "export", "question_id": q, "run_id": "latest"}),
             "run_id must be",
         ),
+        // Lists of Jira issues: an unknown kind is still refused, with the
+        // one meant, and so is a field Jira lists do not take.
+        (
+            json!({"action": "run", "question_id": q, "source": {"kind": "Jira-Cloud"}}),
+            "source.kind \"Jira-Cloud\" is not one of: rows, csv, audience, sheet, excel, notion, linear, issues, jira. Did you mean \"jira\"?",
+        ),
+        (
+            json!({"action": "describe", "question_id": q, "source": {"kind": "jira", "project": "OPS"}}),
+            "unknown field `project`",
+        ),
+        // A requirement check's document.
+        (
+            json!({"action": "run", "question_id": q, "source": {"kind": "csv", "text": "a"},
+                   "document": {"kind": "pdf", "text": "a"}}),
+            "document.kind \"pdf\" is not one of: text, google_doc, word",
+        ),
+        (
+            json!({"action": "run", "question_id": q, "source": {"kind": "csv", "text": "a"},
+                   "document": {"text": "We do SSO."}}),
+            "document.kind is required",
+        ),
+        (
+            json!({"action": "run", "question_id": q, "source": {"kind": "csv", "text": "a"},
+                   "document": {"kind": "google_doc", "connection_id": Uuid::new_v4().to_string()}}),
+            "missing field `document_id`",
+        ),
+        (
+            json!({"action": "run", "question_id": q, "source": {"kind": "csv", "text": "a"},
+                   "document": {"kind": "text", "text": "a", "url": "https://example.com/rfp.pdf"}}),
+            "unknown field `url`",
+        ),
+        (
+            json!({"action": "run", "question_id": q, "source": {"kind": "csv", "text": "a"},
+                   "document": "the vendor's response"}),
+            "document must be an object",
+        ),
+        // The nightly watch's checks.
+        (
+            json!({"action": "checks"}),
+            "question_id is required for checks",
+        ),
+        (
+            json!({"action": "take_check", "question_id": q}),
+            "check_id is required for take_check",
+        ),
+        (
+            json!({"action": "Take-Check", "question_id": q, "check_id": "newest"}),
+            "check_id must be the check's id",
+        ),
     ];
     for (arguments, says) in cases {
         let api = Api::start(vec![]).await;
@@ -1019,6 +1307,8 @@ async fn a_404_says_saved_questions_are_not_switched_on_for_the_workspace() {
             json!({"action": "list"}),
             json!({"action": "run", "question_id": Uuid::new_v4().to_string(),
                    "source": {"kind": "csv", "text": "company\nAcme\n"}}),
+            // The nightly watch is a route of its own beside them.
+            json!({"action": "watch"}),
         ] {
             let (error, requests) = refused_with(404, answer.clone(), arguments.clone()).await;
             assert!(
@@ -1621,6 +1911,163 @@ async fn template_answerer_and_repository_refusals_say_what_to_do_next() {
     }
 }
 
+// ============================================================================
+// A requirement check, and the nightly watch's checks
+// ============================================================================
+
+#[tokio::test]
+async fn requirement_check_and_watch_refusals_say_what_to_do_next() {
+    let (q, c) = (Uuid::new_v4(), Uuid::new_v4());
+    let take =
+        json!({"action": "take_check", "question_id": q.to_string(), "check_id": c.to_string()});
+    let check_run = json!({
+        "action": "run", "question_id": q.to_string(),
+        "source": {"kind": "csv", "text": "need\nSSO\n"},
+        "document": {"kind": "text", "text": "We support single sign-on."},
+    });
+    let cases: Vec<(u16, Value, Value, Vec<String>)> = vec![
+        (
+            404,
+            refusal("NOT_FOUND", "This question has no such check. [NO_SUCH_CHECK]"),
+            take.clone(),
+            vec![
+                "[NO_SUCH_CHECK]".into(),
+                format!("questions(action=\"checks\", question_id=\"{q}\") lists its checks."),
+            ],
+        ),
+        (
+            409,
+            refusal("CONFLICT", "This check is not done yet, or was taken already. [CHECK_NOT_DONE]"),
+            take.clone(),
+            vec![
+                "[CHECK_NOT_DONE]".into(),
+                format!("questions(action=\"checks\", question_id=\"{q}\") shows whether it is still running or was taken already."),
+            ],
+        ),
+        (
+            409,
+            refusal(
+                "CONFLICT",
+                "What this check found would not let the question answer on its own. Look at the rows it got wrong, or reword the question. [CHECK_NOT_READY]",
+            ),
+            take.clone(),
+            vec![
+                "[CHECK_NOT_READY]".into(),
+                format!("questions(action=\"try\", question_id=\"{q}\"): a new trial ends a hold too."),
+            ],
+        ),
+        (
+            409,
+            refusal(
+                "CONFLICT",
+                "The question was tried again after this check, so its newer trial stands. [CHECK_STALE]",
+            ),
+            take.clone(),
+            vec![
+                "[CHECK_STALE]".into(),
+                format!("questions(action=\"get\", question_id=\"{q}\") shows it."),
+            ],
+        ),
+        (
+            422,
+            refusal(
+                "VALIDATION_ERROR",
+                "A document is checked only by a question that matches a requirement with a passage, as the requirement check template does. [NOT_A_MATCH]",
+            ),
+            check_run.clone(),
+            vec![
+                "[NOT_A_MATCH]".into(),
+                "Copy the \"requirement-match\" starter template (\"Requirement check\") to get a question a document can be checked against".into(),
+                "questions(action=\"create\", name=\"...\", template=\"requirement-match\")".into(),
+                "Or run this question without document.".into(),
+            ],
+        ),
+        (
+            422,
+            refusal(
+                "VALIDATION_ERROR",
+                "Each row needs its requirement in the field \"requirement\": map your list's column to it. [NO_REQUIREMENT]",
+            ),
+            check_run.clone(),
+            vec![
+                "[NO_REQUIREMENT]".into(),
+                "mapping={\"<requirement field>\": \"<column>\"}".into(),
+            ],
+        ),
+        // An API before the nightly watch: a question's checks are not
+        // there, and the watch is read as a question's id.
+        (
+            404,
+            router_404(),
+            json!({"action": "checks", "question_id": q.to_string()}),
+            vec!["does not check questions again yet".into()],
+        ),
+        (
+            404,
+            router_404(),
+            take.clone(),
+            vec!["does not check questions again yet".into()],
+        ),
+        (
+            400,
+            refusal("BAD_REQUEST", "Invalid URL: Cannot parse `watch` to a `UUID`"),
+            json!({"action": "watch"}),
+            vec!["keeps no nightly watch yet".into()],
+        ),
+    ];
+    for (status, answer, arguments, says) in cases {
+        let (error, requests) = refused_with(status, answer, arguments.clone()).await;
+        for words in &says {
+            assert!(
+                error.contains(words.as_str()),
+                "{arguments}: {words:?} not in {error}"
+            );
+        }
+        assert!(!error.contains(NOT_SWITCHED_ON), "{arguments}: {error}");
+        assert_eq!(requests.len(), 1, "{arguments} is not asked again");
+    }
+}
+
+#[test]
+fn the_watch_and_a_questions_checks_are_read_in_either_shape() {
+    let question = Uuid::new_v4();
+    // A check listed one by one, as the watch may list them and as a
+    // question's checks are listed under `checks`.
+    let check = json!({
+        "id": "c-1", "version": 3, "model": "mammoth", "reason": "corrections", "status": "done",
+        "moved": false, "held": true, "result": {"moved": [], "proposal": {"ready": false}},
+        "reviewed_at": null, "created_at": "2026-11-26T05:00:00Z",
+    });
+    let watch = watch_text(&json!({"canaries": [], "checks": [check]}));
+    assert!(
+        watch.contains("The nightly watch has not asked any answerer yet."),
+        "{watch}"
+    );
+    assert!(
+        watch.contains("This workspace's recent checks: 1."),
+        "{watch}"
+    );
+    assert!(
+        watch.contains("- check_id=c-1 done: version 3 on mammoth, after a person corrected enough of its rows; its numbers held; it put the version on hold"),
+        "{watch}"
+    );
+    assert!(watch.contains("A held question still answers"), "{watch}");
+    let listed = checks_text(&json!({"checks": [check]}), question);
+    assert!(listed.contains("1 check(s), newest first"), "{listed}");
+    // What it chose would not let the version answer: nothing to take.
+    assert!(!listed.contains("take_check"), "{listed}");
+    assert!(!listed.contains("a person may take it"), "{listed}");
+
+    let none = checks_text(&json!({"retests": []}), question);
+    assert!(none.contains("has not been checked again"), "{none}");
+    let quiet = watch_text(&json!({"canaries": [], "checks": {}}));
+    assert!(
+        quiet.contains("No question of this workspace was checked again in the last 30 days."),
+        "{quiet}"
+    );
+    assert!(!quiet.contains("A held question"), "{quiet}");
+}
+
 #[test]
 fn a_versions_trials_are_read_by_who_answered_them() {
     let first = json!({"ready": true, "model": "bison"});
@@ -1872,6 +2319,12 @@ async fn only_not_switched_on_takes_the_tool_out() {
             404,
             router_404(),
             json!({"action": "export", "question_id": q, "run_id": r}),
+        ),
+        // Nor do a question's checks an API does not keep.
+        (
+            404,
+            router_404(),
+            json!({"action": "checks", "question_id": q}),
         ),
         (
             403,

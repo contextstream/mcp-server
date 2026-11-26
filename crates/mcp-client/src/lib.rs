@@ -246,7 +246,8 @@ pub use plan_loops::{
     PlanLoopGate,
 };
 pub use questions::{
-    LabeledRow, ListRow, ListSource, NewQuestion, OneRow, QuestionSpec, RowsPage, WriteBack,
+    LabeledRow, ListRow, ListSource, NewQuestion, OneRow, QuestionSpec, RowsPage, RunDocument,
+    WriteBack,
 };
 pub use retry::IngestFailure;
 pub use run_progress::{

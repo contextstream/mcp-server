@@ -8,6 +8,11 @@
 //! answer on its own), runs it on a list, answers one row, reads the results
 //! (page by page, or the whole run as a CSV) and writes them back where the
 //! list lives (a Google Sheet, an Excel workbook or an audience's contacts).
+//! A run with a document is a requirement check: each row's requirement is
+//! asked about the passages that speak to it. The nightly watch asks each
+//! answerer made-up rows again and checks a question whose answerer changed;
+//! the agent reads it and its checks, and takes a check when the person says
+//! so.
 //!
 //! A thin client of the ContextStream API ([`mcp_client::questions`]): each
 //! action is one call made with the caller's own credential, and this process
@@ -26,12 +31,12 @@ pub(crate) mod gate;
 
 use async_trait::async_trait;
 use mcp_client::questions::{
-    refusal_code, Mapping, ISSUE_STATES, QUESTION_TYPES, ROLLUP_RULES, ROW_FILTERS, SHAPES,
-    SOURCE_KINDS, TRIAL_MODELS,
+    refusal_code, Mapping, DOCUMENT_KINDS, ISSUE_STATES, QUESTION_TYPES, ROLLUP_RULES, ROW_FILTERS,
+    SHAPES, SOURCE_KINDS, TRIAL_MODELS,
 };
 use mcp_client::{
     ContextStreamClient, LabeledRow, ListRow, ListSource, NewQuestion, OneRow, QuestionSpec,
-    RowsPage, WriteBack,
+    RowsPage, RunDocument, WriteBack,
 };
 use mcp_session::SessionManager;
 use mcp_types::{
@@ -79,6 +84,9 @@ pub(crate) const VALID_ACTIONS: &[&str] = &[
     "cancel",
     "resume",
     "write_back",
+    "watch",
+    "checks",
+    "take_check",
 ];
 
 /// Rows a page of results shows when the call does not say: a run's rows
@@ -99,17 +107,20 @@ const EXPORT_ROWS_SHOWN: usize = 50;
 const EXPORT_CHARS_SHOWN: usize = 16_000;
 
 /// Routing summary advertised as the tool description (<= 1024 chars).
-pub(crate) const TOOL_DESCRIPTION: &str = "Saved questions: a question with fixed answers, asked about every row of a list (leads, tickets, contracts). Each row gets an answer and Sure or Check; a person settles the Check rows.\n\nFind one (list, get) or save one (create, from a spec or a starter template: templates; version for a change). Make it ready: label rows with the person's answers (sample picks rows worth asking about), try it (it says whether it may answer on its own), then activate that version. Only an active question runs on a list (run; describe shows its columns first) or answers one row (answer). Follow a run with status, read its rows with results (which=check: the rows a person settles) or as a CSV (export), cancel or resume it, and write_back its answers where the list lives (a Google Sheet, an Excel workbook or an audience).\n\nworkspace_id defaults to the session's. Saved questions are switched on per workspace: when a call says they are not switched on here, stop and tell the person. Full reference: the `action` parameter.";
+pub(crate) const TOOL_DESCRIPTION: &str = "Saved questions: a question with fixed answers, asked about every row of a list (leads, tickets, contracts). Each row gets an answer, Sure or Check; a person settles Check rows.\n\nFind one (list, get) or save one (create, from a spec or a starter template: templates; version for a change). Make it ready: label rows with the person's answers (sample picks rows to ask about), try it, then activate the version its trial calls ready. Only an active question runs on a list (run, with document for a requirement check; describe shows columns) or answers one row (answer). Follow a run with status, read its rows with results (which=check: those a person settles) or as a CSV (export), cancel or resume it, and write_back its answers to the Google Sheet, Excel workbook or audience it read. Nightly watch: watch, checks, take_check (when the person says so).\n\nworkspace_id defaults to the session's. When a call says saved questions are not switched on here, stop and tell the person. Full reference: the `action` parameter.";
 
 /// Complete tool reference, advertised on the `action` parameter; see
 /// [`crate::schema::with_full_reference`].
-const TOOL_REFERENCE: &str = "Saved questions: a question with fixed answers asked about every row of a list. Each row gets an answer and Sure (it stands) or Check (a person settles it). Every call names the workspace: workspace_id, else the session's.\n\nActions:\n- list: the saved questions you can see; archived=true for the ones put away; limit.\n- templates: the starter templates to copy (key, name, what a row is, the question). An unchanged copy needs fewer labeled rows before it may answer on its own.\n- get: question_id, version (else the one that answers, else the newest): the question with its revision, that version's spec and what trying it came to, its versions, and how many rows are labeled.\n- create: name, then spec, or template (a starter template's key, which templates lists) to save a copy of it; shared (default true). It is a draft: it answers nothing until a version is tried and activated.\n- version: question_id, spec, expected_revision (the revision get shows). A change is a new version; the shape stays.\n- label: question_id, rows=[{key, fields: {<field>: <value>}, want: {<question key, or \"answer\" for the row's answer>: <answer>}}]. The answers are the person's own, never your guesses. A row labeled before takes the new label. Without rows: the labeled rows.\n- sample: question_id, rows=[{key, fields}] from the list (up to 200), pick (how many, default 25), version: the rows worth asking the person to label, spread over every kind of answer, unclear ones first.\n- try: question_id, version (else the newest), and who answers: bison (the default; its trial decides whether the version may answer on its own) or mammoth, the second answerer (a version tried on it too has it answer the rows of a run bison gives no answer to). Tries it on the labeled rows and says in plain words what it came to. A question that decides about people (a job, credit, a place to live or insurance) is kept for a person: none of its rows is Sure, and each comes back as Check, about a person.\n- activate: question_id, version, expected_revision: lets a version its trial calls ready answer on its own.\n- describe: question_id, source (or rows): the list's columns with a few values each, the fields the question looks at, and the ones the list lacks (name their columns with mapping).\n- run: question_id, source (or rows), mapping: asks an active question about every row, in the background; answers with the run and an estimate (rows, credits at most, minutes at least).\n- status: question_id, run_id: how far a run is (answered, sure, to check) and its spot checks; without run_id, the question's runs.\n- results: question_id, run_id, which=all|check|sure, after (the next a page gave), limit (default 25): rows with their answer, Sure or Check and why, and the person's call.\n- export: question_id, run_id: the run's rows as a CSV, done or not: row, the fields the question looks at, its answer (the person's call first), Sure or check, Why, and each question's answer when it asks more than one. The text shows the first rows; the structured result has the whole file (csv).\n- answer: question_id, fields={<field>: <value>}, key, mapping: one row now, by an active question; an answer kept for the same row is read, not asked again.\n- cancel, resume: question_id, run_id: stop a run; go on with a paused or stalled one.\n- write_back: question_id, run_id, mapping: writes a finished run's answers where its list lives. A Google Sheet or an Excel workbook gets two columns right of the list's range (the answer, and Sure, Check or Your call), recorded under session_id (default: the session's). An audience gets two properties on each contact: the answer under attribute (default: the question's name; at most 26 letters, digits or _) and Sure, Check or Your call under the same name with _sure_or_check. Any other list (rows, a CSV, Notion, Linear, a repository's issues): export it.\n\nA spec, sent without lines (trying chooses them): {spec: 1, shape: screen|sort|rate|checklist|match, about: \"what a row is\", show: [the fields it looks at], questions: [{key, ask, type: noul (yes or no) or choice, options: [{key, means}] with one keyed \"none\"}], pair: {first: [fields], second: [fields]} (match only, without show), rollup: {rule: all|any|at_least, k} (checklist only)}.\nA source: {kind: \"rows\", rows: [{key, fields}]}, {kind: \"csv\", text, key_column}, {kind: \"audience\", audience_id}, {kind: \"sheet\", connection_id, spreadsheet_id, range, key_column}, {kind: \"excel\", connection_id, drive_id, item_id, worksheet_id, range, key_column}, {kind: \"notion\", connection_id, data_source_id} (one row a page, each property a field), {kind: \"linear\", connection_id, project_id} (a project's issues: identifier, title, state, url), {kind: \"issues\", repository_id, state: open|closed|all} (a repository's issues as ContextStream keeps them in sync; open when left out).\nA mapping: {<field the question looks at>: <column of the list>}.\n\nA refusal says what to do next; one that ends with a code in brackets ([NOT_ACTIVE], [NOT_READY], [NO_TEST_ROWS], [NOT_WRITABLE], [NOT_EMPTY], ...) names why. When saved questions are not switched on for the workspace, they are not offered there yet: stop and tell the person.";
+const TOOL_REFERENCE: &str = "Saved questions: a question with fixed answers asked about every row of a list. Each row gets an answer and Sure (it stands) or Check (a person settles it). Every call names the workspace: workspace_id, else the session's.\n\nActions:\n- list: the saved questions you can see; archived=true for the ones put away; limit.\n- templates: the starter templates to copy (key, name, what a row is, the question). An unchanged copy needs fewer labeled rows before it may answer on its own.\n- get: question_id, version (else the one that answers, else the newest): the question with its revision, that version's spec and what trying it came to, its versions, and how many rows are labeled.\n- create: name, then spec, or template (a starter template's key, which templates lists) to save a copy of it; shared (default true). It is a draft: it answers nothing until a version is tried and activated.\n- version: question_id, spec, expected_revision (the revision get shows). A change is a new version; the shape stays.\n- label: question_id, rows=[{key, fields: {<field>: <value>}, want: {<question key, or \"answer\" for the row's answer>: <answer>}}]. The answers are the person's own, never your guesses. A row labeled before takes the new label. Without rows: the labeled rows.\n- sample: question_id, rows=[{key, fields}] from the list (up to 200), pick (how many, default 25), version: the rows worth asking the person to label, spread over every kind of answer, unclear ones first.\n- try: question_id, version (else the newest), and who answers: bison (the default; its trial decides whether the version may answer on its own) or mammoth, the second answerer (a version tried on it too has it answer the rows of a run bison gives no answer to). Tries it on the labeled rows and says in plain words what it came to. A question that decides about people (a job, credit, a place to live or insurance) is kept for a person: none of its rows is Sure, and each comes back as Check, about a person.\n- activate: question_id, version, expected_revision: lets a version its trial calls ready answer on its own.\n- describe: question_id, source (or rows): the list's columns with a few values each, the fields the question looks at, and the ones the list lacks (name their columns with mapping).\n- run: question_id, source (or rows), mapping, document: asks an active question about every row, in the background; answers with the run and an estimate (rows, credits at most, minutes at least). With document it is a requirement check, for a match question of one requirement field and one passage field asked as one yes-or-no question, such as a copy of the requirement-match starter template (Requirement check): each row's requirement is asked about the 3 passages of the document that speak to it best. A sure yes quotes its passage; a requirement no passage says yes to comes back as Check, not found in the document.\n- status: question_id, run_id: how far a run is (answered, sure, to check) and its spot checks; without run_id, the question's runs.\n- results: question_id, run_id, which=all|check|sure, after (the next a page gave), limit (default 25): rows with their answer, Sure or Check and why, and the person's call. A requirement check's row has its requirement, the passage its answer rests on and where that is (requirement, passage, where).\n- export: question_id, run_id: the run's rows as a CSV, done or not: row, the fields the question looks at, its answer (the person's call first), Sure or check, Why, and each question's answer when it asks more than one. The text shows the first rows; the structured result has the whole file (csv).\n- answer: question_id, fields={<field>: <value>}, key, mapping: one row now, by an active question; an answer kept for the same row is read, not asked again.\n- cancel, resume: question_id, run_id: stop a run; go on with a paused or stalled one.\n- write_back: question_id, run_id, mapping: writes a finished run's answers where its list lives. A Google Sheet or an Excel workbook gets two columns right of the list's range (the answer, and Sure, Check or Your call), recorded under session_id (default: the session's). An audience gets two properties on each contact: the answer under attribute (default: the question's name; at most 26 letters, digits or _) and Sure, Check or Your call under the same name with _sure_or_check. Any other list (rows, a CSV, Notion, Linear, a repository's issues, Jira): export it.\n- watch: the nightly watch. Each night every answerer is asked the starter templates' made-up rows again and compared with its last reference: steady, moved (what answers changed, so the active questions it answers are checked again) or a new reference, with its counts; and this workspace's checks of the last 30 days by outcome.\n- checks: question_id: the question's checks, newest first. A check asks the labeled rows again after the answerer changed, or after a person corrected enough rows, and says whether the numbers moved and why. One that finds the version sure and wrong on a labeled row holds it: it still answers, but every row is Check (held) until a person takes the check or tries the version again.\n- take_check: question_id, check_id: what a done check chose becomes the version's trial on its answerer, which ends a hold. Only when the person says so.\n\nA spec, sent without lines (trying chooses them): {spec: 1, shape: screen|sort|rate|checklist|match, about: \"what a row is\", show: [the fields it looks at], questions: [{key, ask, type: noul (yes or no) or choice, options: [{key, means}] with one keyed \"none\"}], pair: {first: [fields], second: [fields]} (match only, without show), rollup: {rule: all|any|at_least, k} (checklist only)}.\nA source: {kind: \"rows\", rows: [{key, fields}]}, {kind: \"csv\", text, key_column}, {kind: \"audience\", audience_id}, {kind: \"sheet\", connection_id, spreadsheet_id, range, key_column}, {kind: \"excel\", connection_id, drive_id, item_id, worksheet_id, range, key_column}, {kind: \"notion\", connection_id, data_source_id} (one row a page, each property a field), {kind: \"linear\", connection_id, project_id} (a project's issues: identifier, title, state, url), {kind: \"issues\", repository_id, state: open|closed|all} (a repository's issues as ContextStream keeps them in sync; open when left out), {kind: \"jira\", project_key, status} (the Jira issues ContextStream keeps in sync that you may see, newest first: key, summary, description, status, priority, type, assignee, reporter, project, labels, updated; every project's and any status when left out).\nA document: {kind: \"text\", text, title} (at most 2 MiB; a form feed marks a page, a blank line a paragraph), {kind: \"google_doc\", connection_id, document_id} or {kind: \"word\", connection_id, drive_id, item_id} (a Word document in OneDrive or SharePoint).\nA mapping: {<field the question looks at>: <column of the list>}.\n\nA refusal says what to do next; one that ends with a code in brackets ([NOT_ACTIVE], [NOT_READY], [NO_TEST_ROWS], [NOT_WRITABLE], [NOT_EMPTY], ...) names why. When saved questions are not switched on for the workspace, they are not offered there yet: stop and tell the person.";
 
 /// The form of a spec, said with a refusal of one.
 const SPEC_FORM: &str = "A spec is {spec: 1, shape: screen|sort|rate|checklist|match, about, show: [fields], questions: [{key, ask, type: noul|choice, options: [{key, means}]}], pair: {first, second} (match only), rollup: {rule: all|any|at_least, k} (checklist only)}, without lines.";
 
 /// The form of a list, said with a refusal of one.
-const SOURCE_FORM: &str = "A source is {kind: \"rows\", rows: [{key, fields}]}, {kind: \"csv\", text, key_column}, {kind: \"audience\", audience_id}, {kind: \"sheet\", connection_id, spreadsheet_id, range, key_column}, {kind: \"excel\", connection_id, drive_id, item_id, worksheet_id, range, key_column}, {kind: \"notion\", connection_id, data_source_id}, {kind: \"linear\", connection_id, project_id} or {kind: \"issues\", repository_id, state: open|closed|all}.";
+const SOURCE_FORM: &str = "A source is {kind: \"rows\", rows: [{key, fields}]}, {kind: \"csv\", text, key_column}, {kind: \"audience\", audience_id}, {kind: \"sheet\", connection_id, spreadsheet_id, range, key_column}, {kind: \"excel\", connection_id, drive_id, item_id, worksheet_id, range, key_column}, {kind: \"notion\", connection_id, data_source_id}, {kind: \"linear\", connection_id, project_id}, {kind: \"issues\", repository_id, state: open|closed|all} or {kind: \"jira\", project_key, status}.";
+
+/// The form of a requirement check's document, said with a refusal of one.
+const DOCUMENT_FORM: &str = "A document is {kind: \"text\", text, title}, {kind: \"google_doc\", connection_id, document_id} or {kind: \"word\", connection_id, drive_id, item_id}.";
 
 /// What a 404 from these routes means when it names no record: the routes
 /// are not there for this workspace.
@@ -119,6 +130,10 @@ const NOT_SWITCHED_ON: &str = "Saved questions are not switched on for this work
 /// questions are switched on.
 const NO_EXPORT_HERE: &str = "This API exports no runs here: saved questions are not switched on for this workspace yet, or this ContextStream API does not export runs yet. Nothing was changed. If status still reads the run, read its rows with results instead; otherwise tell the person.";
 
+/// The same for a question's checks, which an API may not keep yet where
+/// saved questions are switched on.
+const NO_CHECKS_HERE: &str = "This API keeps no checks of questions here: saved questions are not switched on for this workspace yet, or this ContextStream API does not check questions again yet. Nothing was changed. questions(action=\"get\") still shows a question's trials; otherwise tell the person.";
+
 /// The `questions` tool's arguments.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -127,6 +142,8 @@ pub struct QuestionsInput {
     pub workspace_id: Option<String>,
     pub question_id: Option<String>,
     pub run_id: Option<String>,
+    // take_check
+    pub check_id: Option<String>,
     // list
     pub archived: Option<bool>,
     pub limit: Option<i64>,
@@ -147,6 +164,8 @@ pub struct QuestionsInput {
     pub mapping: Option<Value>,
     pub fields: Option<Value>,
     pub key: Option<String>,
+    // run: a requirement check's document
+    pub document: Option<Value>,
     // results
     pub which: Option<String>,
     pub after: Option<i64>,
@@ -426,8 +445,15 @@ impl QuestionsTool {
                 let question = question_id(input.question_id.as_deref(), action)?;
                 let source = list_source(input.source.as_ref(), input.rows.as_ref(), action)?;
                 let mapping = checked_mapping(input.mapping.as_ref())?;
+                let document = checked_document(input.document.as_ref())?;
                 let result = client
-                    .start_question_run(workspace, question, &source, mapping.as_ref())
+                    .start_question_run(
+                        workspace,
+                        question,
+                        &source,
+                        mapping.as_ref(),
+                        document.as_ref(),
+                    )
                     .await
                     .map_err(|error| explain(error, action, Some(question), None))?;
                 Ok(ToolResult::with_structured(
@@ -554,6 +580,36 @@ impl QuestionsTool {
                     result,
                 ))
             }
+            "watch" => {
+                let result = client
+                    .question_watch(workspace)
+                    .await
+                    .map_err(|error| explain(error, action, None, None))?;
+                Ok(ToolResult::with_structured(watch_text(&result), result))
+            }
+            "checks" => {
+                let question = question_id(input.question_id.as_deref(), action)?;
+                let result = client
+                    .question_checks(workspace, question)
+                    .await
+                    .map_err(|error| explain(error, action, Some(question), None))?;
+                Ok(ToolResult::with_structured(
+                    checks_text(&result, question),
+                    result,
+                ))
+            }
+            "take_check" => {
+                let question = question_id(input.question_id.as_deref(), action)?;
+                let check = check_id(input.check_id.as_deref(), action)?;
+                let result = client
+                    .take_question_check(workspace, question, check)
+                    .await
+                    .map_err(|error| explain(error, action, Some(question), None))?;
+                Ok(ToolResult::with_structured(
+                    taken_text(&result, question, check),
+                    result,
+                ))
+            }
             other => Err(Error::Validation(format!(
                 "Unknown action: {}. Use one of: {}.",
                 one_line(other),
@@ -603,7 +659,7 @@ impl ToolHandler for QuestionsTool {
             .string_enum(
                 "action",
                 &crate::schema::with_full_reference(
-                    "What to do: list, get, create, version, label, sample, try, activate, describe, run, status, results, export, answer, cancel, resume or write_back",
+                    "What to do: list, templates, get, create, version, label, sample, try, activate, describe, run, status, results, export, answer, cancel, resume, write_back, watch, checks or take_check",
                     TOOL_REFERENCE,
                 ),
                 VALID_ACTIONS,
@@ -611,12 +667,17 @@ impl ToolHandler for QuestionsTool {
             )
             .uuid(
                 "question_id",
-                "The saved question (list shows ids); every action but list and create",
+                "The saved question (list shows ids); every action but list, templates, create and watch",
                 false,
             )
             .uuid(
                 "run_id",
                 "A run of it (run and status show ids): status, results, export, cancel, resume, write_back",
+                false,
+            )
+            .uuid(
+                "check_id",
+                "take_check: a check of the question (checks shows ids)",
                 false,
             )
             .string("name", "create: the question's name", false)
@@ -663,12 +724,17 @@ impl ToolHandler for QuestionsTool {
             .integer("pick", "sample: how many rows to offer (default 25)", false)
             .object(
                 "source",
-                "describe, run: the list, {kind: rows|csv|audience|sheet|excel|notion|linear|issues, ...} (see action)",
+                "describe, run: the list, {kind: rows|csv|audience|sheet|excel|notion|linear|issues|jira, ...} (see action)",
                 false,
             )
             .object(
                 "mapping",
                 "run, answer, write_back: {<field the question looks at>: <column of the list>}",
+                false,
+            )
+            .object(
+                "document",
+                "run, a requirement check (a copy of the requirement-match starter template, or a question like it): the document each row's requirement is checked against, {kind: text|google_doc|word, ...} (see action)",
                 false,
             )
             .object(
@@ -779,6 +845,7 @@ pub fn prefetch(
 
 const QUESTION_ID_IS: &str = "the saved question's id (questions(action=\"list\") shows it)";
 const RUN_ID_IS: &str = "the run's id (run and status show it)";
+const CHECK_ID_IS: &str = "the check's id (checks shows it)";
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
@@ -807,6 +874,12 @@ fn question_id(raw: Option<&str>, action: &str) -> Result<Uuid> {
 fn run_id(raw: Option<&str>, action: &str) -> Result<Uuid> {
     optional_uuid(raw, "run_id", RUN_ID_IS)?
         .ok_or_else(|| Error::Validation(format!("run_id is required for {action}: {RUN_ID_IS}.")))
+}
+
+fn check_id(raw: Option<&str>, action: &str) -> Result<Uuid> {
+    optional_uuid(raw, "check_id", CHECK_ID_IS)?.ok_or_else(|| {
+        Error::Validation(format!("check_id is required for {action}: {CHECK_ID_IS}."))
+    })
 }
 
 fn checked_version(version: Option<i64>) -> Result<Option<i64>> {
@@ -957,6 +1030,30 @@ fn list_source(source: Option<&Value>, rows: Option<&Value>, action: &str) -> Re
     }
 }
 
+/// The document a run checks each requirement against, when the call names
+/// one, in the form the API reads.
+fn checked_document(document: Option<&Value>) -> Result<Option<RunDocument>> {
+    match document {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(given)) => {
+            let mut document = given.clone();
+            if !document.get("kind").is_some_and(Value::is_string) {
+                return Err(Error::Validation(format!(
+                    "document.kind is required: one of {}. {DOCUMENT_FORM}",
+                    DOCUMENT_KINDS.join(", ")
+                )));
+            }
+            canonical_enum(&mut document, "kind", "document.kind", DOCUMENT_KINDS)?;
+            serde_json::from_value(Value::Object(document))
+                .map(Some)
+                .map_err(|error| Error::Validation(format!("document: {error}. {DOCUMENT_FORM}")))
+        }
+        Some(_) => Err(Error::Validation(format!(
+            "document must be an object. {DOCUMENT_FORM}"
+        ))),
+    }
+}
+
 /// Which column of the list is which field, when the call names any.
 fn checked_mapping(mapping: Option<&Value>) -> Result<Option<Mapping>> {
     match mapping {
@@ -1035,13 +1132,16 @@ fn advice(
     let export = format!("questions(action=\"export\", {target}, {run_ref})");
     match status {
         404 if routes_not_there(message) => Some(
-            if action == "export" {
-                NO_EXPORT_HERE
-            } else {
-                NOT_SWITCHED_ON
+            match action {
+                "export" => NO_EXPORT_HERE,
+                "checks" | "take_check" => NO_CHECKS_HERE,
+                _ => NOT_SWITCHED_ON,
             }
             .to_string(),
         ),
+        404 if refusal_code(message) == Some("NO_SUCH_CHECK") => Some(format!(
+            "No check with that id for this question: questions(action=\"checks\", {target}) lists its checks."
+        )),
         404 if lower.contains("no such question") => Some(
             "No saved question with that id is here for you: questions(action=\"list\") shows the ones you can see."
                 .to_string(),
@@ -1081,6 +1181,11 @@ fn advice(
         // An API before starter templates reads `templates` as a question's id.
         400 if action == "templates" => Some(
             "This ContextStream API has no starter templates yet: save a question with its own spec instead (questions(action=\"create\", name=\"...\", spec={...}))."
+                .to_string(),
+        ),
+        // The same for the nightly watch, read as a question's id.
+        400 if action == "watch" => Some(
+            "This ContextStream API keeps no nightly watch yet: there is nothing to read. Nothing was changed."
                 .to_string(),
         ),
         409 | 422 => match refusal_code(message) {
@@ -1131,6 +1236,24 @@ fn advice(
             )),
             Some("SOURCE") => Some(format!(
                 "The list could not be read as it is (the message says why): check the list, its range and the connected app, and try again. questions(action=\"describe\", {target}, source={{...}}) reads a list and shows its columns."
+            )),
+            // A requirement check.
+            Some("NOT_A_MATCH") => Some(
+                "Nothing was started. Only a match question that pairs one requirement field with one passage field and asks one yes-or-no question checks a document. Copy the \"requirement-match\" starter template (\"Requirement check\") to get a question a document can be checked against: questions(action=\"create\", name=\"...\", template=\"requirement-match\"), make it ready and run it with the document. Or run this question without document."
+                    .to_string(),
+            ),
+            Some("NO_REQUIREMENT") => Some(format!(
+                "Name the column of the list that holds each requirement with mapping={{\"<requirement field>\": \"<column>\"}}, then run again; questions(action=\"describe\", {target}, source={{...}}) shows the list's columns."
+            )),
+            // Taking a check of the nightly watch.
+            Some("CHECK_NOT_DONE") => Some(format!(
+                "A check is taken once, when it is done: questions(action=\"checks\", {target}) shows whether it is still running or was taken already."
+            )),
+            Some("CHECK_NOT_READY") => Some(format!(
+                "Nothing was changed. Label more rows with the person's answers or write a reworded version (action=\"version\"), then try it again with questions(action=\"try\", {target}): a new trial ends a hold too."
+            )),
+            Some("CHECK_STALE") => Some(format!(
+                "Nothing was changed: the version's newer trial stands. questions(action=\"get\", {target}) shows it."
             )),
             None if lower.contains("changed since") => Some(format!(
                 "Read it again with questions(action=\"get\", {target}): its revision is the expected_revision to send."
@@ -1337,6 +1460,18 @@ fn trial_lines(trial: &Value, answerer: &str) -> Vec<String> {
             "It decides about people (a job, credit, a place to live or insurance), so a person makes every call: no row of it is Sure, and each comes back as Check, about a person."
                 .to_string(),
         );
+    }
+    // A check of the nightly watch found it sure and wrong on labeled rows.
+    if let Some(held) = trial.get("held").filter(|held| held.is_object()) {
+        let mut line = format!(
+            "Held: a check found it sure and wrong on {} labeled answer(s), so it still answers, but no row of it is Sure until a person takes that check",
+            int_field(held, "sure_and_wrong").map_or_else(unknown, |n| n.to_string())
+        );
+        if let Some(check) = text_field(held, &["retest"]) {
+            line.push_str(&format!(" (check_id={})", one_line(check)));
+        }
+        line.push_str(" or it is tried again.");
+        lines.push(line);
     }
     if let Some(summary) = text_field(trial, &["summary"]) {
         for line in quoted_body(summary).lines() {
@@ -1878,6 +2013,12 @@ fn answer_words(answer: &Value) -> String {
         (Some(_), Some("about_a_person")) => {
             words.push_str(" (Check: about a person, a person's call)")
         }
+        // Its version is held after a check of the nightly watch.
+        (Some(_), Some("held")) => {
+            words.push_str(" (Check: being checked again, a person's call for now)")
+        }
+        // A requirement check found no passage that answers it.
+        (Some(_), Some("not_found")) => words.push_str(" (Check: not found in the document)"),
         (Some(_), Some(reason)) => {
             words.push_str(&format!(" (Check: {})", one_line(reason).replace('_', " ")))
         }
@@ -1916,12 +2057,36 @@ fn rows_text(result: &Value, question: Uuid, run: Uuid, page: &RowsPage) -> Stri
         if row.get("spot_check").and_then(Value::as_bool) == Some(true) {
             line.push_str("; spot check");
         }
-        // A key made from the row's hash says nothing; its fields do.
-        if key.starts_with("row-") {
-            let fields = preview(row.get("fields"));
-            if !fields.is_empty() {
-                line.push_str(&format!(" [{fields}]"));
+        let fields = row.get("fields").unwrap_or(&Value::Null);
+        // A requirement check's row: the passage its answer rests on (for a
+        // requirement not found, the closest one), and where it is.
+        let quoted = text_field(fields, &["where"]).zip(text_field(fields, &["passage"]));
+        match quoted {
+            Some((place, passage)) => {
+                if key.starts_with("row-") {
+                    if let Some(requirement) = text_field(fields, &["requirement"]) {
+                        line.push_str(&format!(" [{}]", cut(requirement, PREVIEW_CHARS)));
+                    }
+                }
+                let from = if text_field(row, &["reason"]) == Some("not_found") {
+                    "closest"
+                } else {
+                    "quoted from"
+                };
+                line.push_str(&format!(
+                    "; {from} {}: \"{}\"",
+                    one_line(place),
+                    cut(passage, PREVIEW_CHARS)
+                ));
             }
+            // A key made from the row's hash says nothing; its fields do.
+            None if key.starts_with("row-") => {
+                let fields = preview(Some(fields));
+                if !fields.is_empty() {
+                    line.push_str(&format!(" [{fields}]"));
+                }
+            }
+            None => {}
         }
         line
     }));
@@ -2053,6 +2218,247 @@ fn contacts_written_text(result: &Value, property: &str) -> String {
         line.push_str(&format!(" Of the others, {}.", rest.join(", ")));
     }
     line
+}
+
+/// What the nightly watch says of an answerer, in words.
+fn verdict_words(verdict: Option<&str>) -> String {
+    match verdict {
+        Some("steady") => "steady: it answers as it did".to_string(),
+        Some("moved") => {
+            "moved: what answers changed, so the questions it answers are checked again".to_string()
+        }
+        Some("baseline") => "a new reference for the nights after".to_string(),
+        Some("unread") => "too few rows got an answer to say".to_string(),
+        Some(other) => one_line(other),
+        None => unknown(),
+    }
+}
+
+/// One answerer's last night of the watch, on one line.
+fn canary_line(canary: &Value) -> String {
+    let count = |key: &str| int_field(canary, key).map_or_else(unknown, |n| n.to_string());
+    let mut line = format!(
+        "{}: {} ({} of {} made-up row(s) answered, {} as labeled, {} sure, {} sure and wrong)",
+        text_field(canary, &["model"])
+            .map(one_line)
+            .unwrap_or_else(unknown),
+        verdict_words(text_field(canary, &["verdict"])),
+        count("answered"),
+        count("cases"),
+        count("as_labeled"),
+        count("sure"),
+        count("sure_and_wrong"),
+    );
+    if let Some(flipped) = int_field(canary, "flipped").filter(|flipped| *flipped > 0) {
+        line.push_str(&format!(
+            "; {flipped} answer(s) changed since its reference"
+        ));
+    }
+    if let Some(missed) = int_field(canary, "guard_missed").filter(|missed| *missed > 0) {
+        line.push_str(&format!(
+            "; {missed} question(s) about a person taken for not about one"
+        ));
+    }
+    if let Some(at) = text_field(canary, &["ran_at"]) {
+        line.push_str(&format!("; ran {}", one_line(at)));
+    }
+    line
+}
+
+/// How a question whose check holds it goes on.
+const HELD_NEXT: &str = "A held question still answers, but no row of it is Sure until a person takes its check or tries it again: questions(action=\"checks\", question_id=\"<id>\") shows a question's checks.";
+
+fn watch_text(result: &Value) -> String {
+    let canaries = items(result, "canaries");
+    let mut lines = vec![if canaries.is_empty() {
+        "[QUESTIONS] The nightly watch has not asked any answerer yet.".to_string()
+    } else {
+        "[QUESTIONS] The nightly watch: each night every answerer is asked the starter templates' made-up rows again and compared with its last reference.".to_string()
+    }];
+    lines.extend(
+        canaries
+            .iter()
+            .take(MOST_LINES)
+            .map(|canary| format!("- {}", canary_line(canary))),
+    );
+    lines.extend(more_line(MOST_LINES, canaries.len()));
+    let held = match result.get("checks") {
+        // The workspace's checks by outcome.
+        Some(Value::Object(counts)) => {
+            let count = |key: &str| counts.get(key).and_then(Value::as_i64).unwrap_or(0);
+            let counted: Vec<String> = [
+                ("waiting", "waiting"),
+                ("steady", "steady"),
+                ("moved", "moved"),
+                ("held", "held their version"),
+                ("failed", "failed"),
+            ]
+            .into_iter()
+            .filter(|&(key, _)| count(key) > 0)
+            .map(|(key, words)| format!("{} {words}", count(key)))
+            .collect();
+            lines.push(if counted.is_empty() {
+                "No question of this workspace was checked again in the last 30 days.".to_string()
+            } else {
+                format!(
+                    "This workspace's checks in the last 30 days: {}.",
+                    counted.join(", ")
+                )
+            });
+            count("held") > 0
+        }
+        // Or one by one.
+        Some(Value::Array(checks)) => {
+            lines.push(format!("This workspace's recent checks: {}.", checks.len()));
+            lines.extend(
+                checks
+                    .iter()
+                    .take(MOST_LINES)
+                    .map(|check| format!("- {}", check_line(check))),
+            );
+            lines.extend(more_line(MOST_LINES, checks.len()));
+            checks
+                .iter()
+                .any(|check| check.get("held").and_then(Value::as_bool) == Some(true))
+        }
+        _ => false,
+    };
+    if held {
+        lines.push(HELD_NEXT.to_string());
+    }
+    lines.join("\n")
+}
+
+/// Why a check ran, in words.
+fn check_reason_words(reason: Option<&str>) -> String {
+    match reason {
+        Some("model_moved") => "the nightly watch saw its answerer change".to_string(),
+        Some("corrections") => "a person corrected enough of its rows".to_string(),
+        Some(other) => one_line(other).replace('_', " "),
+        None => unknown(),
+    }
+}
+
+/// Why a check's numbers moved, in words.
+fn moved_words(check: &Value) -> Vec<String> {
+    check
+        .pointer("/result/moved")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|why| match why {
+            "sure_and_wrong" => "sure and wrong on a labeled row".to_string(),
+            "fewer_as_labeled" => "fewer rows answered as labeled".to_string(),
+            "more_to_look_at" => "more rows for a person to look at".to_string(),
+            "less_to_look_at" => "fewer rows for a person to look at".to_string(),
+            other => one_line(other).replace('_', " "),
+        })
+        .collect()
+}
+
+/// Whether a person may take a check: it is done, not taken, and what it
+/// chose would let the version answer on its own.
+fn takeable(check: &Value) -> bool {
+    text_field(check, &["status"]) == Some("done")
+        && text_field(check, &["reviewed_at"]).is_none()
+        && check
+            .pointer("/result/proposal/ready")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+/// One check on one line: what it checked, why, and what it came to.
+fn check_line(check: &Value) -> String {
+    let status = text_field(check, &["status"]);
+    let mut line = format!(
+        "check_id={} {}: version {} on {}, after {}",
+        text_field(check, &["id"])
+            .map(one_line)
+            .unwrap_or_else(unknown),
+        status.map(one_line).unwrap_or_else(unknown),
+        int_field(check, "version").map_or_else(unknown, |n| n.to_string()),
+        text_field(check, &["model"])
+            .map(one_line)
+            .unwrap_or_else(unknown),
+        check_reason_words(text_field(check, &["reason"])),
+    );
+    if status == Some("done") {
+        let why = moved_words(check);
+        if check.get("moved").and_then(Value::as_bool) == Some(true) || !why.is_empty() {
+            line.push_str("; its numbers moved");
+            if !why.is_empty() {
+                line.push_str(&format!(" ({})", why.join(", ")));
+            }
+        } else {
+            line.push_str("; its numbers held");
+        }
+        if check.get("held").and_then(Value::as_bool) == Some(true) {
+            line.push_str(
+                "; it put the version on hold (no row Sure until a person takes this check or tries the version again)",
+            );
+        }
+        match text_field(check, &["reviewed_at"]) {
+            Some(at) => line.push_str(&format!("; taken {}", one_line(at))),
+            None if takeable(check) => line.push_str("; a person may take it"),
+            None => {}
+        }
+    }
+    if let Some(at) = text_field(check, &["created_at"]) {
+        line.push_str(&format!("; started {}", one_line(at)));
+    }
+    line
+}
+
+fn checks_text(result: &Value, question: Uuid) -> String {
+    // The API names the list `retests`; `checks` is read first.
+    let checks = if result.get("checks").is_some() {
+        items(result, "checks")
+    } else {
+        items(result, "retests")
+    };
+    if checks.is_empty() {
+        return "[QUESTIONS] This question has not been checked again. A check runs when the nightly watch sees its answerer change, or once a person has corrected enough of its rows.".to_string();
+    }
+    let mut lines = vec![format!(
+        "[QUESTIONS] {} check(s), newest first:",
+        checks.len()
+    )];
+    lines.extend(
+        checks
+            .iter()
+            .take(MOST_LINES)
+            .map(|check| format!("- {}", check_line(check))),
+    );
+    lines.extend(more_line(MOST_LINES, checks.len()));
+    if let Some(check) = checks.iter().find(|check| takeable(check)) {
+        let id = text_field(check, &["id"])
+            .map(one_line)
+            .unwrap_or_else(|| "<id>".into());
+        lines.push(format!(
+            "A person may take check {id}: questions(action=\"take_check\", question_id=\"{question}\", check_id=\"{id}\") makes what it chose the version's trial on {}, which ends a hold. Only when the person says so.",
+            text_field(check, &["model"])
+                .map(one_line)
+                .unwrap_or_else(|| "its answerer".into())
+        ));
+    }
+    lines.join("\n")
+}
+
+fn taken_text(result: &Value, question: Uuid, check: Uuid) -> String {
+    let taken = trials_of(result.get("trial")).into_iter().next();
+    let answerer = taken.map_or(FIRST_ANSWERER, |(answerer, _)| answerer);
+    let mut lines = vec![format!(
+        "[QUESTIONS] Check {check} taken: what it chose is the version's trial on {} now, and a hold it put on the version is over.",
+        one_line(answerer)
+    )];
+    if let Some((answerer, trial)) = taken {
+        lines.extend(trial_lines(trial, answerer));
+    }
+    lines.push(format!(
+        "Next: questions(action=\"get\", question_id=\"{question}\") shows the version as it answers now."
+    ));
+    lines.join("\n")
 }
 
 /// A run's CSV for the text and the structured result: the text shows its

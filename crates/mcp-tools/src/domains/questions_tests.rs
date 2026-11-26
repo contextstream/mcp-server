@@ -70,6 +70,14 @@ impl Fixture {
         })
     }
 
+    /// A trial kept under `answerer`, as the API answers one.
+    fn trial_on(&self, answerer: &str, ready: bool) -> Value {
+        let mut trial = self.trial(ready);
+        trial["model"] = json!(answerer);
+        trial["asked_of"] = json!(answerer);
+        trial
+    }
+
     /// A run as the API answers one.
     fn run_view(&self, status: &str, kind: &str) -> Value {
         json!({
@@ -149,10 +157,43 @@ fn the_tool_is_listed_with_its_actions_and_a_portable_description() {
         &crate::portable_schema::portable_input_schema(&schema)
     )
     .is_empty());
-    // What it tells people is in plain words.
-    let told = format!("{} {}", metadata.description, schema).to_lowercase();
-    for word in ["model", "probabilit", "threshold", "token", "question set"] {
-        assert!(!told.contains(word), "the tool's words mention {word:?}");
+    // Who answers a trial is the API's `model`, by its two names.
+    assert_eq!(
+        schema["properties"]["model"]["enum"],
+        json!(["bison", "mammoth"])
+    );
+    // What it tells people is in plain words: the description and every
+    // description in the schema (an argument's name is the API's).
+    let mut told = vec![metadata.description.to_lowercase()];
+    descriptions(&schema, &mut told);
+    assert!(told.len() > 20, "{told:?}");
+    for text in &told {
+        for word in ["model", "probabilit", "threshold", "token", "question set"] {
+            assert!(
+                !text.contains(word),
+                "the tool's words mention {word:?}: {text}"
+            );
+        }
+    }
+}
+
+/// Every description in a schema, lower case.
+fn descriptions(schema: &Value, out: &mut Vec<String>) {
+    match schema {
+        Value::Object(object) => {
+            for (key, value) in object {
+                match value {
+                    Value::String(text) if key == "description" => out.push(text.to_lowercase()),
+                    other => descriptions(other, out),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                descriptions(item, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -228,6 +269,64 @@ async fn each_read_calls_its_route_with_the_sessions_workspace() {
     let f = Fixture::new();
     let (w, q, r) = (f.workspace, f.question, f.run);
     let cases = vec![
+        Case {
+            arguments: json!({"action": "templates"}),
+            method: "GET",
+            target: format!("/api/v1/questions/templates?workspace_id={w}"),
+            body: Value::Null,
+            status: 200,
+            answer: json!({"templates": [
+                {"key": "lead-fit", "name": "Lead fit", "about": "A sales lead from the contact form",
+                 "shape": "screen", "spec": f.spec()},
+                {"key": "request-urgency", "name": "Request urgency", "about": "A request a customer sent",
+                 "shape": "rate", "spec": {}},
+            ]}),
+            says: vec![
+                "2 starter template(s)",
+                "template=\"<key>\"",
+                "- Lead fit (template=\"lead-fit\"): screen, A sales lead from the contact form",
+                "- Request urgency (template=\"request-urgency\"): rate,",
+            ],
+        },
+        Case {
+            // A version tried on both answerers: the first's trial decides,
+            // the second's says what it takes.
+            arguments: json!({"action": "get", "question_id": q.to_string()}),
+            method: "GET",
+            target: format!("/api/v1/questions/{q}?workspace_id={w}"),
+            body: Value::Null,
+            status: 200,
+            answer: json!({
+                "question": f.question("draft", None),
+                "version": {"version": 2, "spec": f.spec(), "trial": {
+                    "mammoth": f.trial_on("mammoth", false),
+                    "bison": f.trial(true),
+                }},
+                "versions": [{"version": 2, "tried": true}],
+                "test_rows": 30,
+            }),
+            says: vec![
+                "Trial: ready to answer on its own.",
+                "Trial on mammoth: not ready; it needs more labeled rows (at least 20).",
+                "version=2, expected_revision=4",
+            ],
+        },
+        Case {
+            arguments: json!({
+                "action": "results", "question_id": q.to_string(), "run_id": r.to_string(),
+            }),
+            method: "GET",
+            target: format!("/api/v1/questions/{q}/runs/{r}/rows?workspace_id={w}&limit=25"),
+            body: Value::Null,
+            status: 200,
+            answer: json!({
+                "rows": [{"place": 0, "key": "cand-1", "state": "answered", "label": "yes", "trust": "check",
+                          "reason": "about_a_person", "answers": [], "fields": {}, "called": null,
+                          "spot_check": false}],
+                "next": null,
+            }),
+            says: vec!["- #0 cand-1: yes (Check: about a person, a person's call)"],
+        },
         Case {
             arguments: json!({"action": "list", "archived": true, "limit": 5}),
             method: "GET",
@@ -342,7 +441,106 @@ async fn each_write_posts_its_body_to_its_route() {
         "show": ["company", "notes"],
         "questions": [{"key": "fit", "ask": "Is this lead a fit for us?", "type": "noul"}],
     });
+    let connection = Uuid::new_v4();
+    let repository = Uuid::new_v4();
     let cases = vec![
+        Case {
+            // A copy of a starter template: no spec is sent.
+            arguments: json!({"action": "create", "name": "Our lead fit", "template": "lead-fit"}),
+            method: "POST",
+            target: "/api/v1/questions".to_string(),
+            body: json!({"workspace_id": w, "name": "Our lead fit", "template": "lead-fit"}),
+            status: 201,
+            answer: json!({
+                "question": {"id": q, "name": "Our lead fit", "shape": "screen", "status": "draft",
+                             "template": "lead-fit", "latest_version": 1, "revision": 1},
+                "version": {"version": 1, "spec": canonical_spec, "trial": null},
+            }),
+            says: vec![
+                "Saved as a draft (version 1)",
+                "It started from the starter template lead-fit; unchanged, it needs fewer labeled rows.",
+            ],
+        },
+        Case {
+            // The second answerer, tried too: no step toward activating.
+            arguments: json!({"action": "try", "question_id": q.to_string(), "model": "Mammoth"}),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/trial"),
+            body: json!({"workspace_id": w, "model": "mammoth"}),
+            status: 200,
+            answer: json!({"question": f.question("active", Some(2)), "version": 2,
+                           "trial": f.trial_on("mammoth", true)}),
+            says: vec![
+                "Tried version 2 of \"Lead fit\" on its labeled rows, answered by mammoth.",
+                "Trial on mammoth: ready: it answers the rows of a run that bison gives no answer to.",
+                "Next: nothing more for it.",
+            ],
+        },
+        Case {
+            // A question about people: a person makes every call.
+            arguments: json!({"action": "try", "question_id": q.to_string(), "version": 2}),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/trial"),
+            body: json!({"workspace_id": w, "version": 2}),
+            status: 200,
+            answer: json!({"question": f.question("draft", None), "version": 2, "trial": {
+                "ready": true, "needs": [], "model": "bison", "review_only": true, "disagreed": [],
+                "summary": "12 of 12 labeled rows answered as labeled. It decides about people, so a person makes every call: no row is answered on its own.",
+            }}),
+            says: vec![
+                "Trial: ready to answer on its own.",
+                "It decides about people (a job, credit, a place to live or insurance), so a person makes every call: no row of it is Sure, and each comes back as Check, about a person.",
+                "action=\"activate\"",
+            ],
+        },
+        Case {
+            arguments: json!({
+                "action": "describe", "question_id": q.to_string(),
+                "source": {"kind": "Linear", "connection_id": connection.to_string(), "project_id": "proj-7"},
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/describe"),
+            body: json!({
+                "workspace_id": w,
+                "source": {"kind": "linear", "connection_id": connection, "project_id": "proj-7"},
+            }),
+            status: 200,
+            answer: json!({"rows": 3, "columns": [{"name": "title", "samples": ["Crash on save"]}],
+                           "looks_at": ["title"], "missing": []}),
+            says: vec!["3 row(s) and 1 column(s)", "- title: Crash on save"],
+        },
+        Case {
+            arguments: json!({
+                "action": "run", "question_id": q.to_string(),
+                "source": {"kind": "issues", "repository_id": repository.to_string(), "state": " Closed "},
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/runs"),
+            body: json!({
+                "workspace_id": w,
+                "source": {"kind": "issues", "repository_id": repository, "state": "closed"},
+                "surface": "mcp",
+            }),
+            status: 202,
+            answer: json!({"run": f.run_view("queued", "issues"), "estimate": {"rows": 40}}),
+            says: vec!["started on 40 row(s)"],
+        },
+        Case {
+            arguments: json!({
+                "action": "run", "question_id": q.to_string(),
+                "source": {"kind": "notion", "connection_id": connection.to_string(), "data_source_id": "ds-9"},
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/runs"),
+            body: json!({
+                "workspace_id": w,
+                "source": {"kind": "notion", "connection_id": connection, "data_source_id": "ds-9"},
+                "surface": "mcp",
+            }),
+            status: 202,
+            answer: json!({"run": f.run_view("queued", "notion"), "estimate": {"rows": 12}}),
+            says: vec!["started on 12 row(s)"],
+        },
         Case {
             arguments: json!({
                 "action": "create", "name": "Lead fit", "spec": f.spec(),
@@ -659,7 +857,21 @@ async fn what_cannot_be_right_is_refused_before_anything_is_sent() {
         ),
         (
             json!({"action": "create", "name": "Lead fit"}),
-            "spec is required for create",
+            "create needs spec, or template",
+        ),
+        (
+            json!({"action": "try", "question_id": q, "model": "gpt"}),
+            "model \"gpt\" is not one of: bison, mammoth",
+        ),
+        (
+            json!({"action": "run", "question_id": q,
+                   "source": {"kind": "issues", "repository_id": Uuid::new_v4().to_string(), "state": "pending"}}),
+            "source.state \"pending\" is not one of: open, closed, all",
+        ),
+        (
+            json!({"action": "describe", "question_id": q,
+                   "source": {"kind": "notion", "connection_id": Uuid::new_v4().to_string()}}),
+            "missing field `data_source_id`",
         ),
         (
             json!({"action": "create", "name": "Lead fit", "spec": {
@@ -1349,4 +1561,83 @@ async fn an_export_an_api_does_not_have_says_so() {
     assert!(error.contains("does not export runs yet"), "{error}");
     assert!(error.contains("read its rows with results"), "{error}");
     assert_eq!(requests.len(), 1);
+}
+
+// ============================================================================
+// Starter templates, who answers a trial, and the lists read for a run
+// ============================================================================
+
+#[tokio::test]
+async fn template_answerer_and_repository_refusals_say_what_to_do_next() {
+    let q = Uuid::new_v4().to_string();
+    let cases: Vec<(u16, Value, Value, &str)> = vec![
+        (
+            422,
+            refusal(
+                "VALIDATION_ERROR",
+                "No starter template has that key. Send the question's spec, or a template's key. [TEMPLATE]",
+            ),
+            json!({"action": "create", "name": "Fit", "template": "lead-fitness"}),
+            "questions(action=\"templates\") lists the starter templates",
+        ),
+        (
+            422,
+            refusal(
+                "VALIDATION_ERROR",
+                "Send the question's spec, or the key of a starter template to copy. [SPEC]",
+            ),
+            json!({"action": "create", "name": "Fit", "template": "lead-fit"}),
+            "A spec is {spec: 1",
+        ),
+        (
+            422,
+            refusal(
+                "VALIDATION_ERROR",
+                "A question is tried on bison, or on mammoth so that it answers what bison does not. [MODEL]",
+            ),
+            json!({"action": "try", "question_id": q, "model": "mammoth"}),
+            "answered by bison (the default) or mammoth",
+        ),
+        (
+            404,
+            refusal("NOT_FOUND", "No such repository."),
+            json!({"action": "run", "question_id": q,
+                   "source": {"kind": "issues", "repository_id": Uuid::new_v4().to_string()}}),
+            "vcs(action=\"list_repos\")",
+        ),
+        (
+            // An API before starter templates reads `templates` as an id.
+            400,
+            refusal("BAD_REQUEST", "Invalid URL: Cannot parse `templates` to a `UUID`"),
+            json!({"action": "templates"}),
+            "has no starter templates yet",
+        ),
+    ];
+    for (status, answer, arguments, says) in cases {
+        let (error, requests) = refused_with(status, answer, arguments.clone()).await;
+        assert!(error.contains(says), "{arguments}: {says:?} not in {error}");
+        assert!(!error.contains("not switched on"), "{error}");
+        assert_eq!(requests.len(), 1);
+    }
+}
+
+#[test]
+fn a_versions_trials_are_read_by_who_answered_them() {
+    let first = json!({"ready": true, "model": "bison"});
+    let second = json!({"ready": false, "model": "mammoth"});
+    // Kept under each answerer's key: the first answerer's first.
+    let kept = json!({"mammoth": second, "bison": first});
+    let trials = trials_of(Some(&kept));
+    assert_eq!(
+        trials
+            .iter()
+            .map(|(answerer, _)| *answerer)
+            .collect::<Vec<_>>(),
+        vec!["bison", "mammoth"]
+    );
+    // A trial sent as it is says who answered it; without, it is the first's.
+    assert_eq!(trials_of(Some(&second))[0].0, "mammoth");
+    assert_eq!(trials_of(Some(&json!({"ready": true})))[0].0, "bison");
+    assert!(trials_of(Some(&Value::Null)).is_empty());
+    assert!(trials_of(None).is_empty());
 }

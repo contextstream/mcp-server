@@ -1239,10 +1239,14 @@ async fn a_refused_transition_is_explained_in_plain_words() {
 
 #[tokio::test]
 async fn with_the_api_down_every_action_fails_with_the_clients_typed_error() {
-    // A port nothing listens on.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let address = closed.local_addr().expect("address");
-    drop(closed);
+    // A bound socket that never listens: connections to it are refused, and
+    // no parallel test can take its port. A dropped listener's port went to
+    // another test's mock API, which answered detach_ticket (release gate,
+    // 2026-11-26).
+    let held = tokio::net::TcpSocket::new_v4().expect("socket");
+    held.bind("127.0.0.1:0".parse().expect("loopback"))
+        .expect("bind");
+    let address = held.local_addr().expect("address");
     let scope = Scope::new();
     let (client, session) = client_and_session(
         &format!("http://{address}"),
@@ -1268,6 +1272,7 @@ async fn with_the_api_down_every_action_fails_with_the_clients_typed_error() {
             .expect_err("no local answer without the API");
         assert!(error.is_connection_failure(), "{input}: {error:?}");
     }
+    drop(held);
 }
 
 #[tokio::test]

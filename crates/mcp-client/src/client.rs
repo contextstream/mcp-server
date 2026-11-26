@@ -1875,6 +1875,11 @@ const UNKEYED_CREATE_ROUTES: &[&str] = &[
     "docs/roadmap",
     "flash/push",
     "analytics/compliance/events",
+    // Saved questions: a question, a new version of one (a resend after the
+    // first was saved is refused as changed since), and a run over a list.
+    "questions",
+    "questions/*/versions",
+    "questions/*/runs",
 ];
 
 fn route_matches_pattern(path: &str, pattern: &str) -> bool {
@@ -2033,12 +2038,15 @@ fn retry_permitted(is_write: bool, failure: AttemptFailure, idempotency_supporte
 
 /// A 503 that says what is missing (an integration that "is not connected")
 /// is an answer, not an outage: it cannot change in the seconds a retry
-/// waits, and retrying it took 7 s per call (#458).
+/// waits, and retrying it took 7 s per call (#458). So is a saved question's
+/// [`crate::questions::NOT_ASKING`]: answering is switched off where the API
+/// runs.
 fn error_reports_a_lasting_state(error: &Error) -> bool {
     matches!(
         error,
         Error::Http { status: 503, message, .. }
             if message.to_ascii_lowercase().contains("is not connected")
+                || message.contains(crate::questions::NOT_ASKING)
     )
 }
 
@@ -36394,6 +36402,11 @@ mod caller_bound_response_cache_tests {
         assert!(!error_reports_a_lasting_state(&http(
             500,
             "is not connected"
+        )));
+        // A saved question asked while answering is switched off.
+        assert!(error_reports_a_lasting_state(&http(
+            503,
+            "Questions are not asked of a model here yet. [NOT_ASKING]"
         )));
     }
 

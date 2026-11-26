@@ -1321,6 +1321,12 @@ fn is_contextstream_read_only_operation(tool_name: &str, tool_input: &Value) -> 
         // A progress report (or a read of runs) changes nothing a grounded
         // read depends on: it is a note for the people watching.
         "progress" => true,
+        // Saved questions: the reads. A save, a label, a trial, a run or an
+        // answer changes something.
+        "questions" => matches!(
+            action.as_str(),
+            "list" | "templates" | "get" | "status" | "results" | "export" | "describe"
+        ),
         _ => false,
     }
 }
@@ -4792,6 +4798,49 @@ mod tests {
             true,
             "session"
         ));
+    }
+
+    #[test]
+    fn a_saved_question_read_is_not_a_change_and_its_writes_are() {
+        for action in [
+            "list",
+            "templates",
+            "get",
+            "status",
+            "results",
+            "export",
+            "describe",
+        ] {
+            assert!(
+                !is_likely_state_changing_tool(
+                    "questions",
+                    &serde_json::json!({"action": action}),
+                    true,
+                    "questions"
+                ),
+                "{action}"
+            );
+        }
+        for action in [
+            "create",
+            "version",
+            "label",
+            "try",
+            "activate",
+            "run",
+            "answer",
+            "write_back",
+        ] {
+            assert!(
+                is_likely_state_changing_tool(
+                    "questions",
+                    &serde_json::json!({"action": action}),
+                    true,
+                    "questions"
+                ),
+                "{action}"
+            );
+        }
     }
 
     #[test]

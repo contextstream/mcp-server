@@ -570,6 +570,10 @@ fn json_identity_value<'a>(entry: &'a Value, env_name: &str, header_name: &str) 
         })
 }
 
+/// `key_by_reference`: the entry holds its key by reference
+/// (`${CONTEXTSTREAM_API_KEY}`), so it signs in as whoever runs the editor
+/// and a refresh never changes the installation id it names (the one that
+/// wrote it, or none). Nothing holds that id to this installation then.
 fn validate_managed_identity_values(
     editor: &Editor,
     client: Option<&str>,
@@ -577,6 +581,7 @@ fn validate_managed_identity_values(
     teaching_version: Option<&str>,
     installation_id: Option<&str>,
     expected_installation_id: Option<Uuid>,
+    key_by_reference: bool,
 ) -> std::result::Result<(), String> {
     if client != Some(editor.harness_id().as_str()) {
         return Err(format!(
@@ -595,6 +600,9 @@ fn validate_managed_identity_values(
             "teaching version is missing or stale (expected {})",
             HARNESS_TEACHING_VERSION
         ));
+    }
+    if key_by_reference {
+        return Ok(());
     }
     let installation_id = installation_id
         .and_then(|value| Uuid::parse_str(value).ok())
@@ -630,6 +638,7 @@ fn validate_json_managed_identity(
             "X-ContextStream-Installation-Id",
         ),
         expected_installation_id,
+        super::mcp_config::json_entry_holds_key_reference(entry),
     )
 }
 
@@ -710,6 +719,7 @@ fn check_codex_mcp_config_with_api_key(
             "X-ContextStream-Installation-Id",
         ),
         expected_installation_id,
+        super::mcp_config::codex_entry_holds_key_reference(entry),
     ) {
         Ok(()) => {
             if let Some(expected_key) = expected_api_key.map(str::trim).filter(|k| !k.is_empty()) {
@@ -4273,6 +4283,59 @@ mod tests {
         assert!(wrong_identity
             .detail
             .contains("does not match this installation"));
+    }
+
+    #[test]
+    fn a_key_held_by_reference_keeps_the_installation_id_its_entry_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(".mcp.json");
+        const FIX: &str = "contextstream-mcp update-configs --scope project";
+        let this_installation = Uuid::from_u128(0x1234);
+        let entry = |key: &str, installation: Option<Uuid>| {
+            let mut headers = json!({
+                "X-ContextStream-Client": "claude",
+                "X-ContextStream-Managed-Config-Version": MANAGED_CONFIG_VERSION,
+                "X-ContextStream-Teaching-Version": HARNESS_TEACHING_VERSION,
+                "X-ContextStream-API-Key": key,
+            });
+            if let Some(id) = installation {
+                headers["X-ContextStream-Installation-Id"] = json!(id.to_string());
+            }
+            json!({"mcpServers": {"contextstream": {
+                "type": "http",
+                "url": "https://mcp.contextstream.io/mcp",
+                "headers": headers,
+            }}})
+            .to_string()
+        };
+        let check = |content: String| {
+            std::fs::write(&path, content).unwrap();
+            check_mcp_config_file(
+                &Editor::ClaudeCode,
+                "mcp_project",
+                &path,
+                CheckStatus::Warn,
+                Some(this_installation),
+                FIX,
+            )
+        };
+
+        // A refresh never changes the installation id of an entry whose key
+        // is held by reference, so the doctor does not hold it to this one.
+        for installation in [None, Some(Uuid::from_u128(0x5678))] {
+            let result = check(entry("${CONTEXTSTREAM_API_KEY}", installation));
+            assert_eq!(result.status, CheckStatus::Pass, "{}", result.detail);
+        }
+        // A literal key still has to name this installation.
+        for installation in [None, Some(Uuid::from_u128(0x5678))] {
+            let result = check(entry("cs_literal_key_for_the_doctor", installation));
+            assert_eq!(result.status, CheckStatus::Fail, "{}", result.detail);
+            assert!(
+                result.detail.contains("installation identity"),
+                "{}",
+                result.detail
+            );
+        }
     }
 
     #[test]

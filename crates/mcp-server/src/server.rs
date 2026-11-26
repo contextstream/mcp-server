@@ -113,6 +113,11 @@ pub fn build_registry(
     // A local server keeps a reported run alive on a timer; the hosted
     // gateway runs none (the tool reads the transport from the client config).
     domains::progress::register_progress_tools(&mut registry, client.clone(), session.clone());
+    // Saved questions: a thin client of the API's `/questions` routes, for
+    // stdio and the hosted gateway alike. Registered on its surfaces, listed
+    // per caller (only for a workspace with saved questions switched on) by
+    // `with_slipstream_listing`.
+    domains::questions::register_questions_tools(&mut registry, client.clone(), session.clone());
     domains::feed::register_feed_tools(&mut registry, client.clone(), session.clone());
     // Phase 1-3 taxonomy expansion: unified entity CRUD across tickets,
     // handoffs, backlog_views, incidents, releases, experiments, goals,
@@ -270,6 +275,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "entity" => "Updating ContextStream entity".to_string(),
         "reminder" => "Setting reminder in ContextStream".to_string(),
         "progress" => "Reporting progress to ContextStream".to_string(),
+        "questions" => "Working on saved questions in ContextStream".to_string(),
         "integration" => "Updating ContextStream integration".to_string(),
         "vcs" => "Linking VCS with ContextStream".to_string(),
         "feed" => "Updating ContextStream feed".to_string(),
@@ -310,6 +316,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "entity" => "ContextStream entity updated".to_string(),
         "reminder" => "Reminder saved to ContextStream".to_string(),
         "progress" => "Progress reported to ContextStream".to_string(),
+        "questions" => "ContextStream saved questions complete".to_string(),
         "integration" => "ContextStream integration updated".to_string(),
         "vcs" => "VCS linked with ContextStream".to_string(),
         "feed" => "ContextStream feed updated".to_string(),
@@ -400,6 +407,27 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "report": "Reporting progress to ContextStream",
             "get": "Loading a run from ContextStream",
             "list": "Listing ContextStream runs"
+        });
+    } else if name == domains::questions::TOOL_NAME {
+        metadata["actions"] = serde_json::json!({
+            "list": "Listing saved questions",
+            "templates": "Listing starter questions",
+            "get": "Loading a saved question",
+            "create": "Saving a question to ContextStream",
+            "version": "Saving a new version of a question",
+            "label": "Saving labeled rows for a question",
+            "sample": "Picking rows to label",
+            "try": "Trying a question on labeled rows",
+            "activate": "Letting a question answer on its own",
+            "describe": "Reading a list's columns",
+            "run": "Asking a question about a list",
+            "status": "Checking a run of a question",
+            "results": "Reading a run's answers",
+            "export": "Exporting a run's answers as CSV",
+            "answer": "Answering one row",
+            "cancel": "Cancelling a run of a question",
+            "resume": "Resuming a run of a question",
+            "write_back": "Writing answers back where the list lives"
         });
     } else if name == "memory" {
         metadata["actions"] = serde_json::json!({
@@ -873,7 +901,9 @@ pub(crate) const TOOLS_LIST_CHANGED_NOTIFICATION: &str =
 /// out (`ToolRegistry::list`), so a workspace without agents, or a caller whose workspace
 /// is not known yet, pays no prompt for it. Waits at most
 /// `slipstream::LISTING_BUDGET` for the catalog, and records what was shown so a later
-/// change can be announced (`slipstream_list_changed_notice`).
+/// change can be announced (`slipstream_list_changed_notice`). The other tools listed
+/// per caller are added here too: `studio` (`studio_listing_entry`) and `questions`
+/// (`questions_listing_entry`).
 pub(crate) async fn with_slipstream_listing(
     registry: &ToolRegistry,
     client: &ContextStreamClient,
@@ -881,12 +911,13 @@ pub(crate) async fn with_slipstream_listing(
     category: Option<&str>,
     tools: &mut Vec<serde_json::Value>,
 ) {
-    // Both catalogs are read at once: a listing waits for the slower, not the sum.
-    let (slipstream, studio) = tokio::join!(
+    // Every answer is read at once: a listing waits for the slowest, not the sum.
+    let (slipstream, studio, questions) = tokio::join!(
         slipstream_listing_entry(registry, client, session, category),
         studio_listing_entry(registry, client, category),
+        questions_listing_entry(registry, client, session, category),
     );
-    for entry in [slipstream, studio].into_iter().flatten() {
+    for entry in [slipstream, studio, questions].into_iter().flatten() {
         insert_sorted(tools, entry);
     }
 }
@@ -941,6 +972,36 @@ async fn studio_listing_entry(
             studio::LISTING_BUDGET,
         )
         .await
+    {
+        return None;
+    }
+    Some(contextstream_tool_list_entry(tool))
+}
+
+/// `questions` for a caller whose workspace has saved questions switched on
+/// (`domains::questions::gate`), waiting at most `questions::LISTING_BUDGET` for the
+/// answer. The API serves its saved-question routes only to the pilot's workspaces, so
+/// everyone else pays no prompt for a tool that could only say it is not switched on.
+async fn questions_listing_entry(
+    registry: &ToolRegistry,
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    category: Option<&str>,
+) -> Option<serde_json::Value> {
+    use domains::questions;
+    // Not on this surface (router, OpenAI agentic, coach, studio, a light toolset):
+    // nothing to add, and nothing is asked.
+    let tool = registry.get(questions::TOOL_NAME)?;
+    if !requested_category_matches(category, tool.metadata.category.as_str()) {
+        return None;
+    }
+    if !questions::listed(
+        &questions::QuestionsGate::global(),
+        client,
+        session,
+        questions::LISTING_BUDGET,
+    )
+    .await
     {
         return None;
     }
@@ -2157,11 +2218,19 @@ async fn handle_request_dispatch(
         }
         "server/discover" => {
             // A stateless client lists tools right after this, with no initialize: read
-            // the studio offer now so that listing finds it ready.
+            // the studio offer and the saved-questions switch now so that listing finds
+            // them ready.
             if registry.get(domains::studio::TOOL_NAME).is_some() {
                 domains::studio::prefetch(
                     domains::studio::StudioGate::global(),
                     (**client).clone(),
+                );
+            }
+            if registry.get(domains::questions::TOOL_NAME).is_some() {
+                domains::questions::prefetch(
+                    domains::questions::QuestionsGate::global(),
+                    (**client).clone(),
+                    session.clone(),
                 );
             }
             json_rpc_result(id, build_contextstream_stateless_discover_result())
@@ -2209,6 +2278,13 @@ async fn handle_request_dispatch(
                 domains::studio::prefetch(
                     domains::studio::StudioGate::global(),
                     (**client).clone(),
+                );
+            }
+            if !review_cred_only && registry.get(domains::questions::TOOL_NAME).is_some() {
+                domains::questions::prefetch(
+                    domains::questions::QuestionsGate::global(),
+                    (**client).clone(),
+                    session.clone(),
                 );
             }
             if !review_cred_only && lists_hosted_tools(registry) {
@@ -3411,6 +3487,9 @@ mod tests {
         "project",
         "project_read",
         "qa",
+        // `questions` is listed per caller (questions_listing_entry: only where
+        // saved questions are switched on for the caller's workspace), so it is
+        // not in the registry's own listing.
         "reminder",
         "search",
         "session",
@@ -3633,6 +3712,14 @@ mod tests {
             "e4716ffb4e7f26147df700a3d38cd799139bfccc36958a7825e115c60bf18098",
         ),
         (
+            // New row for saved questions: the `questions` tool; `action` is
+            // required. Advanced for `export`, write-back's `attribute`,
+            // `templates` and a trial's `model`; additive only
+            // (later_inputs_only_add_to_the_questions_schema).
+            "questions",
+            "5d4054bfac98df03374acfb39d8287c38b32505c0ec9ce054346bb0023868fc2",
+        ),
+        (
             "reminder",
             "fd547c393406f274c9b25aab9c626f569904febf4d1e5cb3902372d30764df94",
         ),
@@ -3709,6 +3796,17 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("tool name"))
             .collect()
+    }
+
+    /// The registry's listing with `questions` as `questions_listing_entry` adds it for
+    /// a caller whose workspace has saved questions switched on, on the surfaces that
+    /// serve it.
+    fn tools_with_questions(registry: &ToolRegistry) -> Vec<serde_json::Value> {
+        let mut tools = contextstream_tools_list(registry, None);
+        if let Some(tool) = registry.get(domains::questions::TOOL_NAME) {
+            insert_sorted(&mut tools, contextstream_tool_list_entry(tool));
+        }
+        tools
     }
 
     fn canonical_schema_contract(value: &serde_json::Value) -> serde_json::Value {
@@ -3940,7 +4038,9 @@ mod tests {
 
     #[test]
     fn broad_input_schemas_match_the_expected_structural_contract() {
-        let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        // `questions` is listed per caller; its contract is that of the entry a
+        // caller whose workspace has saved questions switched on gets.
+        let tools = tools_with_questions(&test_registry(Config::default()));
         let actual: Vec<_> = tools
             .iter()
             .map(|tool| {
@@ -4256,6 +4356,121 @@ mod tests {
         );
     }
 
+    #[test]
+    fn later_inputs_only_add_to_the_questions_schema() {
+        // A run as a CSV (`export`), the contact property an audience's
+        // answers go under (`attribute`), the starter templates (`templates`)
+        // and who answers a trial (`model`) came after the tool's first
+        // contract. Without them the schema is exactly that contract, so
+        // every other action and parameter is unchanged.
+        let tools = tools_with_questions(&test_registry(Config::default()));
+        assert_eq!(
+            schema_contract_without(
+                &tools,
+                "questions",
+                &["export", "templates"],
+                &["attribute", "model"]
+            ),
+            "ce91789331c82c91d5f63f43295062ed24121d308c7b19a68f3f1ad72feaa2b5"
+        );
+    }
+
+    #[test]
+    fn the_questions_tool_is_in_the_standard_toolset_only() {
+        // Saved questions: on the default (standard) surface and the hosted
+        // gateway's complete one, not on the light toolset or the compact
+        // OpenAI surface, where it is reached through tool_search. Where it is
+        // served it is listed per caller (questions_listing_entry): only for a
+        // workspace with saved questions switched on, never in the registry's
+        // own listing. A write that destroys nothing and asks for a person's
+        // confirmation (a run spends credits).
+        let registry = test_registry(Config::default());
+        assert!(!listed_names(&contextstream_tools_list(&registry, None)).contains(&"questions"));
+        let tools = tools_with_questions(&registry);
+        let questions = tool_by_name(&tools, "questions");
+        assert_eq!(
+            questions["inputSchema"]["required"],
+            serde_json::json!(["action"])
+        );
+        assert_eq!(
+            questions["inputSchema"]["properties"]["action"]["enum"],
+            serde_json::json!([
+                "list",
+                "templates",
+                "get",
+                "create",
+                "version",
+                "label",
+                "sample",
+                "try",
+                "activate",
+                "describe",
+                "run",
+                "status",
+                "results",
+                "export",
+                "answer",
+                "cancel",
+                "resume",
+                "write_back"
+            ])
+        );
+        assert_eq!(questions["annotations"]["readOnlyHint"], false);
+        assert_eq!(questions["annotations"]["destructiveHint"], false);
+        assert_eq!(
+            questions["_meta"]["contextstream"]["safety"]["requiresConfirmation"],
+            true
+        );
+        let description = questions["description"].as_str().expect("description");
+        assert!(description.chars().count() <= PORTABLE_DESCRIPTION_LIMIT);
+        let hosted = test_registry(Config {
+            toolset: mcp_types::config::Toolset::Complete,
+            ..Config::default()
+        });
+        assert!(!listed_names(&contextstream_tools_list(&hosted, None)).contains(&"questions"));
+        assert!(listed_names(&tools_with_questions(&hosted)).contains(&"questions"));
+        for config in [
+            Config {
+                toolset: mcp_types::config::Toolset::Light,
+                ..Config::default()
+            },
+            Config {
+                tool_surface_profile: ToolSurfaceProfile::OpenaiAgentic,
+                ..Config::default()
+            },
+        ] {
+            // Not served there: the per-caller listing has nothing to add.
+            let registry = test_registry(config);
+            assert!(registry.get(domains::questions::TOOL_NAME).is_none());
+            assert!(!listed_names(&tools_with_questions(&registry)).contains(&"questions"));
+        }
+        // A call's title follows its action.
+        assert_eq!(
+            contextstream_call_title(
+                "questions",
+                "Saved Questions",
+                false,
+                &serde_json::json!({"action": "run"})
+            ),
+            "Asking a question about a list"
+        );
+        assert_eq!(
+            contextstream_call_title(
+                "questions",
+                "Saved Questions",
+                false,
+                &serde_json::json!({"action": "export"})
+            ),
+            "Exporting a run's answers as CSV"
+        );
+        // `attribute` names the contact property an audience's answers go
+        // under.
+        assert_eq!(
+            questions["inputSchema"]["properties"]["attribute"]["type"],
+            "string"
+        );
+    }
+
     /// Every surface a client can be configured into, including the hosted
     /// gateway's `complete` toolset and the worst case with integration tools
     /// forced visible.
@@ -4314,7 +4529,9 @@ mod tests {
 
         let mut failures = Vec::new();
         for (label, config) in every_tool_surface_config() {
-            let tools = contextstream_tools_list(&test_registry(config), None);
+            // With `questions`, as a caller whose workspace has saved questions
+            // switched on gets it.
+            let tools = tools_with_questions(&test_registry(config));
             if tools.len() > MAX_TOOLS {
                 failures.push(format!(
                     "{label}: {} tools exceeds {MAX_TOOLS}",
@@ -4403,7 +4620,9 @@ mod tests {
         let Some(path) = std::env::var_os("CONTEXTSTREAM_DUMP_TOOLS_TO") else {
             return;
         };
-        let surface = |config: Config| contextstream_tools_list(&test_registry(config), None);
+        // With `questions`, as a caller whose workspace has saved questions switched on
+        // gets it.
+        let surface = |config: Config| tools_with_questions(&test_registry(config));
         let surfaces = serde_json::json!({
             // What the hosted gateway serves (complete toolset, consolidated).
             "hosted": surface(Config {
@@ -4648,7 +4867,9 @@ mod tests {
             ),
         ] {
             let registry = test_registry(config);
-            let mut tools = contextstream_tools_list(&registry, None);
+            // `questions` is listed per caller (`questions_listing_entry`), as this
+            // entry, where saved questions are switched on.
+            let mut tools = tools_with_questions(&registry);
             // `studio` is listed per caller (`studio_listing_entry`), as this
             // entry, wherever it is served.
             tools.extend(
@@ -5897,6 +6118,10 @@ mod tests {
     fn auto_init_disables_auto_index_for_cwd_derived_home_root() {
         // A cwd-derived root (explicitly_supplied == false) must never enable
         // auto-indexing — even when the cwd is a $HOME-like / broad root.
+        // The guard reads HOME again: hold the env lock so no test moves it.
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = dirs::home_dir().expect("home dir");
         assert!(!should_auto_init_index(
             Some(home.to_string_lossy().as_ref()),
@@ -5920,6 +6145,10 @@ mod tests {
     fn auto_init_disables_auto_index_for_explicit_sensitive_root() {
         // Defense-in-depth: an explicit folder is still rejected when it fails
         // the ingest-containment guard ($HOME here).
+        // The guard reads HOME again: hold the env lock so no test moves it.
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = dirs::home_dir().expect("home dir");
         assert!(!should_auto_init_index(
             Some(home.to_string_lossy().as_ref()),
@@ -6162,6 +6391,101 @@ mod tests {
             slipstream_list_changed_notice(&registry, &client, &session).await,
             None
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Saved questions: listed per caller, only where they are switched on
+    // ------------------------------------------------------------------
+
+    /// A ContextStream API with saved questions switched on for `pilot` only: the starter
+    /// templates answer there, and everything else gets the 404 of a route that is not
+    /// served.
+    async fn questions_api(pilot: Uuid) -> String {
+        let not_served = || {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"success": false, "error": {
+                    "code": "NOT_FOUND",
+                    "message": "Endpoint not found. Verify the API path and workspace_id."}})),
+            )
+        };
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/questions/templates",
+                axum::routing::get(
+                    move |axum::extract::Query(query): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        if query.get("workspace_id") == Some(&pilot.to_string()) {
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({"success": true,
+                                    "data": {"templates": []}})),
+                            )
+                        } else {
+                            not_served()
+                        }
+                    },
+                ),
+            )
+            .fallback(move || async move { not_served() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind questions API");
+        let address = listener.local_addr().expect("questions API address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn questions_is_listed_only_where_saved_questions_are_switched_on() {
+        let pilot = Uuid::new_v4();
+        let api = questions_api(pilot).await;
+
+        // Switched on for the workspace: listed as the registry describes it, among the
+        // rest in order.
+        let (registry, client, session, telemetry) =
+            slipstream_runtime(api.clone(), "stdio-questions-on", Some(pilot));
+        let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
+        let names = listed_names(&tools);
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+        let entry = registry
+            .get(domains::questions::TOOL_NAME)
+            .map(contextstream_tool_list_entry)
+            .expect("served on the default surface");
+        assert_eq!(tool_by_name(&tools, "questions"), &entry);
+        assert_eq!(
+            tools.len(),
+            contextstream_tools_list(&registry, None).len() + 1
+        );
+
+        // Another workspace: its routes answer 404, so the tool is not listed.
+        let (registry, client, session, telemetry) =
+            slipstream_runtime(api, "stdio-questions-off", Some(Uuid::new_v4()));
+        let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
+        assert!(!listed_names(&tools).contains(&"questions"));
+        assert_eq!(tools.len(), contextstream_tools_list(&registry, None).len());
+        // Still callable: the API answers why.
+        let refused = registry
+            .execute("questions", serde_json::json!({"action": "list"}))
+            .await
+            .expect_err("not switched on")
+            .to_string();
+        assert!(
+            refused.contains("Saved questions are not switched on for this workspace yet"),
+            "{refused}"
+        );
+
+        // The API cannot be reached: not listed.
+        let (registry, client, session, telemetry) = slipstream_runtime(
+            "http://127.0.0.1:9".to_string(),
+            "stdio-questions-down",
+            Some(pilot),
+        );
+        let tools = stdio_tools(&registry, &client, &session, &telemetry).await;
+        assert!(!listed_names(&tools).contains(&"questions"));
     }
 }
 
@@ -6425,8 +6749,14 @@ mod review_go_ahead {
         assert_eq!(deletes(&seen).len(), 1, "{:?}", seen.lock().unwrap());
     }
 
+    // The checks run `cargo` here, which finds its toolchain through HOME:
+    // hold the env lock so no test moves HOME meanwhile.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn stdio_tools_call_preserves_structured_content_for_verify_and_ms_verify() {
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             temp.path().join("Cargo.toml"),

@@ -85,6 +85,18 @@ impl Stub {
                     });
                 let label = key_label(key.as_deref());
                 record.lock().unwrap().push((uri.path().to_string(), label));
+                // A's workspace and project: only A's key sees them.
+                for (prefix, id) in [
+                    ("/api/v1/workspaces/", A_WORKSPACE),
+                    ("/api/v1/projects/", A_PROJECT),
+                ] {
+                    if let Some(asked) = uri.path().strip_prefix(prefix) {
+                        if asked == id && label == "A" {
+                            return (StatusCode::OK, Json(json!({"data": {"id": id}})));
+                        }
+                        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})));
+                    }
+                }
                 if uri.path() != "/api/v1/auth/me" {
                     return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})));
                 }
@@ -162,6 +174,12 @@ struct World {
 
 impl World {
     fn new(b_api: &str) -> Self {
+        Self::for_runner(b_api, KEY_B, B_INSTALLATION)
+    }
+
+    /// The runner's HOME (`b_home`) signed in with `key` on `api`, its
+    /// installation `installation`.
+    fn for_runner(b_api: &str, key: &str, installation: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let b_home = root.join("b-home");
@@ -192,14 +210,14 @@ impl World {
         // B's key lives in B's saved credentials, with B's API.
         std::fs::write(
             b_dir.join("credentials.json"),
-            json!({"api_key": KEY_B, "api_url": b_api}).to_string(),
+            json!({"api_key": key, "api_url": b_api}).to_string(),
         )
         .unwrap();
         std::fs::write(
             b_dir.join("installation.json"),
             json!({
                 "schema_version": 1,
-                "installation_id": B_INSTALLATION,
+                "installation_id": installation,
                 "created_at": "2026-11-01T00:00:00Z",
                 "configured_clients": ["claude", "cursor"],
                 "last_install_completed_at": "2026-11-01T00:00:00Z",
@@ -446,22 +464,57 @@ async fn a_gateway_a_repository_names_never_receives_the_runners_key() {
     );
     assert!(!world.cursor_project_config().exists(), "{text}");
 
-    // A key held by reference: kept as written without a word; it is no
-    // reason to hold back the Cursor entry.
-    world.seed_owner_entry(&evil.url, "${CONTEXTSTREAM_API_KEY}", &world.a_helper());
-    let output = world.refresh(&[]).await;
-    let text = said(&output);
-    assert!(output.status.success(), "{text}");
-    assert_eq!(
-        entry_of(&world.project_config())["headers"][API_KEY_HEADER],
-        json!("${CONTEXTSTREAM_API_KEY}"),
-        "{text}"
-    );
-    assert!(!text.contains("signs in as"), "{text}");
-    assert_eq!(
-        entry_of(&world.cursor_project_config())["headers"][API_KEY_HEADER],
-        json!(KEY_B),
-        "{text}"
+    // A key held by reference: kept as written. B's key cannot see the
+    // workspace the project names (asked of B's own API), or nothing says
+    // which workspace it is (no link): either way B's Cursor entry is not
+    // created.
+    for linked in [true, false] {
+        world.seed_owner_entry(&evil.url, "${CONTEXTSTREAM_API_KEY}", &world.a_helper());
+        if !linked {
+            // A hostile repository: no link, and an entry that names no
+            // workspace, only its gateway and the reference.
+            std::fs::remove_dir_all(world.repo.join(".contextstream")).unwrap();
+            let bare = json!({"mcpServers": {"contextstream": {
+                "type": "http",
+                "url": format!("{}/mcp?default_context_mode=fast", evil.url),
+                "headers": {
+                    "X-ContextStream-Managed-Config-Version": "2",
+                    API_KEY_HEADER: "${CONTEXTSTREAM_API_KEY}",
+                },
+            }}});
+            std::fs::write(
+                world.project_config(),
+                serde_json::to_string_pretty(&bare).unwrap(),
+            )
+            .unwrap();
+        }
+        let output = world.refresh(&[]).await;
+        let text = said(&output);
+        assert!(output.status.success(), "{text}");
+        assert_eq!(
+            entry_of(&world.project_config())["headers"][API_KEY_HEADER],
+            json!("${CONTEXTSTREAM_API_KEY}"),
+            "{text}"
+        );
+        assert!(!world.cursor_project_config().exists(), "{text}");
+        // Nor does this home's binary go in: A's stays, and an entry that
+        // ran none still runs none.
+        let helper = entry_of(&world.project_config())["headersHelper"].clone();
+        if linked {
+            assert_eq!(helper, json!(world.a_helper()), "{text}");
+        } else {
+            assert!(helper.is_null(), "{text}");
+        }
+        let why = if linked {
+            "Your account cannot see the workspace or project it names."
+        } else {
+            "Could not tell whether your account can see the workspace or project it names."
+        };
+        assert!(text.contains(why), "{text}");
+    }
+    assert!(
+        b_api.keys_on(&format!("/api/v1/workspaces/{A_WORKSPACE}")) == vec!["B"],
+        "B's own API is asked, with B's key, once"
     );
 
     assert_eq!(
@@ -547,11 +600,17 @@ async fn an_agreed_switch_changes_the_key_and_installation_but_keeps_the_binary(
     );
 }
 
+/// A's repository whose entry holds its key by reference (it resolves to
+/// whoever runs the editor) and runs a system-installed helper. B's refresh
+/// keeps the reference, A's installation id and the helper, and writes no
+/// entry with B's key into the project, because B's key cannot see the
+/// workspace the project names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_key_reference_is_the_runners_own_and_stays_as_written() {
+async fn a_placeholder_repo_of_another_account_gets_nothing_of_the_runners() {
     let api = Stub::spawn().await;
     let world = World::new(&api.url);
-    world.seed_owner_entry(&api.url, "${CONTEXTSTREAM_API_KEY}", &world.a_helper());
+    let system_helper = "/usr/local/bin/contextstream-mcp hook mcp-headers";
+    world.seed_owner_entry(&api.url, "${CONTEXTSTREAM_API_KEY}", system_helper);
 
     let output = world.refresh(&[]).await;
     let text = said(&output);
@@ -562,29 +621,86 @@ async fn a_key_reference_is_the_runners_own_and_stays_as_written() {
         json!("${CONTEXTSTREAM_API_KEY}"),
         "{text}"
     );
-    // The rest of the refresh applies, as to any entry of the runner's own.
     assert_eq!(
         entry["headers"][INSTALLATION_HEADER],
-        json!(B_INSTALLATION),
+        json!(A_INSTALLATION),
+        "{text}"
+    );
+    assert_eq!(entry["headersHelper"], json!(system_helper), "{text}");
+    let raw = std::fs::read_to_string(world.project_config()).unwrap();
+    assert!(
+        !raw.contains(KEY_B) && !raw.contains(B_INSTALLATION),
+        "{raw}"
+    );
+    assert!(!world.cursor_project_config().exists(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "{} signs in as the key held as ${{CONTEXTSTREAM_API_KEY}}; creating {} would sign this project in as your account.",
+            world.project_config().display(),
+            world.cursor_project_config().display()
+        )),
         "{text}"
     );
     assert!(
-        !std::fs::read_to_string(world.project_config())
-            .unwrap()
-            .contains(KEY_B),
-        "a literal key was written over the reference"
+        text.contains("Your account cannot see the workspace or project it names."),
+        "{text}"
     );
-    assert!(!text.contains("signs in as"), "{text}");
-    assert!(world.cursor_project_config().exists(), "{text}");
-    assert!(api.keys_on("/api/v1/auth/me").is_empty(), "{text}");
+    assert!(text.contains("To create it on purpose"), "{text}");
+    assert!(!api.any_key("A"), "{text}");
 
-    // Only --switch-account puts a literal key in its place.
+    // Only --switch-account puts B's key in, the reference's place included.
     let output = world.refresh(&["--switch-account"]).await;
     let text = said(&output);
     assert!(output.status.success(), "{text}");
     assert_eq!(
         entry_of(&world.project_config())["headers"][API_KEY_HEADER],
         json!(KEY_B),
+        "{text}"
+    );
+    assert_eq!(
+        entry_of(&world.cursor_project_config())["headers"][API_KEY_HEADER],
+        json!(KEY_B),
+        "{text}"
+    );
+}
+
+/// The owner's own refresh of the same repository: A's key sees A's
+/// workspace, so everything is written without a word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owners_own_placeholder_repo_stays_silent() {
+    let api = Stub::spawn().await;
+    let world = World::for_runner(&api.url, KEY_A, A_INSTALLATION);
+    world.seed_owner_entry(&api.url, "${CONTEXTSTREAM_API_KEY}", &world.b_helper());
+
+    let output = world.refresh(&[]).await;
+    let text = said(&output);
+    assert!(output.status.success(), "{text}");
+    for quiet in [
+        "signs in as",
+        "Did not create",
+        "another home",
+        "Could not tell",
+    ] {
+        assert!(!text.contains(quiet), "{quiet}: {text}");
+    }
+    let entry = entry_of(&world.project_config());
+    assert_eq!(
+        entry["headers"][API_KEY_HEADER],
+        json!("${CONTEXTSTREAM_API_KEY}"),
+        "{text}"
+    );
+    assert_eq!(entry["headersHelper"], json!(world.b_helper()), "{text}");
+    assert_eq!(
+        entry_of(&world.cursor_project_config())["headers"][API_KEY_HEADER],
+        json!(KEY_A),
+        "{text}"
+    );
+    assert_eq!(
+        api.keys_on(&format!("/api/v1/workspaces/{A_WORKSPACE}"))
+            .into_iter()
+            .chain(api.keys_on(&format!("/api/v1/projects/{A_PROJECT}")))
+            .collect::<Vec<_>>(),
+        vec!["A"],
         "{text}"
     );
 }

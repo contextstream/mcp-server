@@ -42,16 +42,16 @@ pub(super) fn print_step(step: usize, title: &str, detail: &str) {
 
 /// Shorten paths under HOME to `~/…` for display.
 pub(super) fn display_path(path: &Path) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(relative) = path.strip_prefix(&home) {
-            return if relative.as_os_str().is_empty() {
-                "~".to_string()
-            } else {
-                format!("~/{}", relative.display())
-            };
-        }
+    display_path_under(path, dirs::home_dir().as_deref())
+}
+
+/// [`display_path`] against `home`, read once by the caller.
+fn display_path_under(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(relative) if relative.as_os_str().is_empty() => "~".to_string(),
+        Some(relative) => format!("~/{}", relative.display()),
+        None => path.display().to_string(),
     }
-    path.display().to_string()
 }
 
 /// What setup will link this folder to once the user saves.
@@ -1700,9 +1700,32 @@ mod tests {
 
     #[test]
     fn display_path_abbreviates_home() {
+        // Against a home given outright, which no other test can change.
+        let home = Path::new("/home/someone");
+        assert_eq!(display_path_under(home, Some(home)), "~");
+        assert_eq!(
+            display_path_under(&home.join("code").join("app"), Some(home)),
+            "~/code/app"
+        );
+        assert_eq!(
+            display_path_under(Path::new("/opt/app"), Some(home)),
+            "/opt/app"
+        );
+        assert_eq!(
+            display_path_under(Path::new("/home/someone-else/app"), Some(home)),
+            "/home/someone-else/app"
+        );
+        assert_eq!(
+            display_path_under(&home.join("app"), None),
+            home.join("app").display().to_string()
+        );
+
+        // `display_path` reads this process's HOME, which a test changes
+        // only while it holds the env lock.
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = dirs::home_dir().expect("home");
-        assert_eq!(display_path(&home), "~");
         assert_eq!(display_path(&home.join("code").join("app")), "~/code/app");
-        assert_eq!(display_path(Path::new("/opt/app")), "/opt/app");
     }
 }

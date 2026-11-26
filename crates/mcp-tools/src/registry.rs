@@ -505,6 +505,25 @@ fn write_observation_labels(name: &str, input: &Value) -> Option<(&'static str, 
             None | Some("report") => Some(("progress", "report")),
             _ => None,
         },
+        // `label` without rows reads the labeled rows; list, get, describe,
+        // status and results are reads.
+        "questions" => Some((
+            "questions",
+            match input_action(input)? {
+                "create" => "create",
+                "version" => "version",
+                "label" if input.get("rows").is_some_and(|rows| !rows.is_null()) => "label",
+                "sample" => "sample",
+                "try" => "try",
+                "activate" => "activate",
+                "run" => "run",
+                "answer" => "answer",
+                "cancel" => "cancel",
+                "resume" => "resume",
+                "write_back" => "write_back",
+                _ => return None,
+            },
+        )),
         "capture_plan" => Some(("capture_plan", "capture_plan")),
         "session_capture" => Some(("session_capture", capture_action_label(input))),
         "session_capture_lesson" => Some(("session_capture_lesson", "capture_lesson")),
@@ -2004,6 +2023,23 @@ mod acceleration_observation_tests {
             write_observation_labels("memory", &json!({"action": "attacker-label"})),
             None
         );
+        // Saved questions: writes are timed, reads are not.
+        assert_eq!(
+            write_observation_labels("questions", &json!({"action": "run"})),
+            Some(("questions", "run"))
+        );
+        assert_eq!(
+            write_observation_labels("questions", &json!({"action": "label", "rows": []})),
+            Some(("questions", "label"))
+        );
+        assert_eq!(
+            write_observation_labels("questions", &json!({"action": "label"})),
+            None
+        );
+        assert_eq!(
+            write_observation_labels("questions", &json!({"action": "results"})),
+            None
+        );
         // Reads keep their hot-read label; unknown calls fold to `other`.
         assert_eq!(
             tool_call_action_label("search", &json!({"mode": "keyword"})),
@@ -2300,12 +2336,16 @@ impl ToolsetConfig {
 
 /// Tools whose `tools/list` entry depends on who asks: `agents` is listed
 /// only for a caller whose workspace has agents turned on, with a
-/// description written from them. The registry's own listing leaves them out
-/// and the transports add them per caller (`slipstream::listing`).
+/// description written from them; `studio` only for a person Create offers
+/// one-prompt making to; `questions` only for a caller whose workspace has
+/// saved questions switched on. The registry's own listing leaves them out
+/// and the transports add them per caller (`slipstream::listing`,
+/// `studio::listed`, `questions::listed`).
 const LISTED_PER_CALLER: &[&str] = &[
     crate::domains::slipstream::TOOL_NAME,
     crate::domains::slipstream::LEGACY_TOOL_NAME,
     crate::domains::studio::TOOL_NAME,
+    crate::domains::questions::TOOL_NAME,
 ];
 
 /// Whether `name` is listed per caller rather than from the registry.
@@ -2782,6 +2822,35 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
             parallel_safe: false,
             batch_safe: false,
         },
+        "questions" => DiscoveryHints {
+            aliases: &[
+                "saved questions",
+                "saved question",
+                "ask about every row",
+                "screen a list",
+                "sort a list",
+                "rate tickets",
+                "qualify leads",
+                "sure or check",
+                "export answers as csv",
+                "write answers back to the sheet",
+                "starter templates",
+            ],
+            tags: &["questions", "lists", "rows", "answers", "review", "runs"],
+            when_to_use: "Ask a saved question with fixed answers about every row of a list (leads, tickets, contracts): find or save one, label rows with the person's answers, try it, activate it, run it on a list or answer one row, read which rows are Sure and which a person checks, export a run as a CSV, and write its answers back to a Google Sheet, an Excel workbook or an audience.",
+            avoid_when: "Do not use for questions about the codebase or memory (search, answer, memory), or to label rows with your own guesses: labels are the person's answers.",
+            examples: &[
+                "which saved questions does this workspace have",
+                "run the lead fit question on this CSV",
+                "show the rows of that run a person needs to check",
+                "answer the triage question for this one ticket",
+                "export that run's answers as a CSV",
+                "copy the lead fit starter template",
+            ],
+            latency_class: "variable",
+            parallel_safe: false,
+            batch_safe: false,
+        },
         "verify" => DiscoveryHints {
             aliases: &[
                 "ms_verify",
@@ -2886,6 +2955,9 @@ const STANDARD_TOOLS: &[&str] = &[
     "coordination",
     // Live run progress: what an agent is doing now, for people watching.
     "progress",
+    // Saved questions: a question with fixed answers asked about every row of
+    // a list. Not in the light toolset.
+    "questions",
     // Graph-driven smart verification checks (`ms_verify` alias).
     "verify",
     // Context Feeds
@@ -3000,6 +3072,10 @@ const CONSOLIDATED_TOOLS: &[&str] = &[
     "coordination",
     // Live run progress (report, get, list).
     "progress",
+    // Saved questions (list, get, create, version, label, sample, try,
+    // activate, describe, run, status, results, answer, cancel, resume,
+    // write_back): the hosted gateway serves it as stdio does.
+    "questions",
     // Graph-driven smart verification checks (`ms_verify` alias).
     "verify",
     "feed",

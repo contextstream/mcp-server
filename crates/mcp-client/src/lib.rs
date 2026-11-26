@@ -34,6 +34,7 @@ pub mod ingest_guard;
 pub mod json;
 pub mod parity;
 pub mod plan_loops;
+pub mod questions;
 pub mod remote_checks;
 pub mod retry;
 pub mod run_progress;
@@ -243,6 +244,9 @@ pub use parity::{
 pub use plan_loops::{
     GateResolution, LoopTicketAttachment, NewLoopTicket, PlanLoopConfig, PlanLoopConflict,
     PlanLoopGate,
+};
+pub use questions::{
+    LabeledRow, ListRow, ListSource, NewQuestion, OneRow, QuestionSpec, RowsPage, WriteBack,
 };
 pub use retry::IngestFailure;
 pub use run_progress::{

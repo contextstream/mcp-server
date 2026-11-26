@@ -75,7 +75,6 @@ fn run_cli(home: &Path, cwd: &Path, args: &[&str]) -> Output {
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("CONTEXTSTREAM_API_URL", "http://127.0.0.1:9")
         .env("CONTEXTSTREAM_WATCH", "0")
-        .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
         .env("NO_COLOR", "1")
         .output()
         .expect("execute contextstream-mcp")
@@ -343,7 +342,6 @@ fn real_binary_in_space_and_apostrophe_path_forwards_stdin_and_emits_empty_and_p
         ("HOME", home.as_os_str()),
         ("USERPROFILE", home.as_os_str()),
         ("CONTEXTSTREAM_WATCH", OsStr::new("0")),
-        ("CONTEXTSTREAM_WATCH_DISABLED", OsStr::new("1")),
     ];
 
     for (shell, command_str) in &shells {

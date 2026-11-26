@@ -406,6 +406,9 @@ async fn pre_compact_and_session_end_honor_hosted_remote_transcript_opt_outs_and
         let out = Command::new(&bin)
             .args(args)
             .current_dir(&repo)
+            // configure would register and start the sync bridge with this
+            // host's real service manager.
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env_remove("CONTEXTSTREAM_API_KEY")

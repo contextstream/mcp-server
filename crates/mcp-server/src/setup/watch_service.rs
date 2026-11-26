@@ -402,6 +402,11 @@ fn reload_after_removal() {
 fn reload_after_removal() {}
 
 pub fn register_managed_sync_bridge() -> Result<SyncBridgeServiceRegistration> {
+    // `CONTEXTSTREAM_WATCH=0` turns the sync bridge off: nothing is written
+    // or started, whoever asks; the registration is reported as it stands.
+    if !crate::watch::watch_enabled() {
+        return sync_bridge_registration_status();
+    }
     let Some(spec) = registration_spec()? else {
         return Ok(SyncBridgeServiceRegistration {
             state: SyncBridgeRegistrationState::Unsupported,
@@ -508,6 +513,38 @@ mod tests {
             path,
             content,
         }
+    }
+
+    /// `CONTEXTSTREAM_WATCH=0`: registering writes no service file and runs
+    /// no service manager, whoever asks (`connect` included).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_opt_out_registers_and_starts_nothing() {
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let saved: Vec<_> = ["CONTEXTSTREAM_WATCH", "XDG_CONFIG_HOME"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        std::env::set_var("CONTEXTSTREAM_WATCH", "0");
+        std::env::set_var("XDG_CONFIG_HOME", temp.path());
+        let registration = register_managed_sync_bridge();
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let registration = registration.expect("the registration as it stands");
+        assert_eq!(registration.state, SyncBridgeRegistrationState::Missing);
+        assert_eq!(registration.activation, SyncBridgeActivationState::Deferred);
+        assert!(!registration.changed);
+        assert!(!temp
+            .path()
+            .join("systemd/user/contextstream-watch.service")
+            .exists());
     }
 
     #[test]

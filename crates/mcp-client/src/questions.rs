@@ -21,7 +21,9 @@
 //!   `POST /questions/:id/activate` lets a version answer on its own;
 //! - `POST /questions/:id/describe` `{workspace_id, source}` reads a list's
 //!   columns; `POST /questions/:id/runs` `{workspace_id, source, mapping?,
-//!   surface}` (202) asks the question about every row of a list, and
+//!   surface, document?}` (202) asks the question about every row of a list
+//!   (with `document`, a requirement check: each row's requirement against
+//!   the document's passages), and
 //!   `GET .../runs`, `GET .../runs/:run_id`, `POST .../cancel`,
 //!   `POST .../resume` and `GET .../rows?which&after&limit` follow a run;
 //!   `GET .../runs/:run_id/export?workspace_id` reads a run's rows as a CSV
@@ -31,7 +33,12 @@
 //!   Excel workbook's range (`session_id` required), or onto an audience's
 //!   contacts (`attribute`);
 //! - `POST /questions/:id/answer` `{workspace_id, key?, fields, mapping?}`
-//!   answers one row.
+//!   answers one row;
+//! - the nightly watch: `GET /questions/watch?workspace_id` reads each
+//!   answerer's last canary and the workspace's recent checks;
+//!   `GET /questions/:id/retests?workspace_id` a question's checks, newest
+//!   first; `POST /questions/:id/retests/:retest_id/accept` `{workspace_id}`
+//!   takes what a done check chose as the version's trial on its answerer.
 //!
 //! Every run this client starts says it came from an agent's tools
 //! ([`RUN_SURFACE`]). A person's own call on a row is not offered here.
@@ -59,8 +66,11 @@ pub const QUESTION_TYPES: &[&str] = &["noul", "choice"];
 pub const ROLLUP_RULES: &[&str] = &["all", "any", "at_least"];
 /// Where a list comes from: `kind` of a [`ListSource`].
 pub const SOURCE_KINDS: &[&str] = &[
-    "rows", "csv", "audience", "sheet", "excel", "notion", "linear", "issues",
+    "rows", "csv", "audience", "sheet", "excel", "notion", "linear", "issues", "jira",
 ];
+/// Where a requirement check's document comes from: `kind` of a
+/// [`RunDocument`].
+pub const DOCUMENT_KINDS: &[&str] = &["text", "google_doc", "word"];
 /// Which of a repository's issues an `issues` list takes: open ones unless
 /// it says otherwise.
 pub const ISSUE_STATES: &[&str] = &["open", "closed", "all"];
@@ -226,6 +236,43 @@ pub enum ListSource {
         repository_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<String>,
+    },
+    /// The Jira issues the workspace's Jira connection keeps in sync that the
+    /// caller may see, newest first, keyed by issue key: one project's
+    /// (`project_key`, `OPS`) or every project's, of one `status` as Jira
+    /// names it (`In Progress`) or of any.
+    Jira {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+}
+
+/// The document a requirement check reads each requirement of a list
+/// against, as the API reads it: only a question that matches one
+/// requirement field with one passage field checks one. Unknown fields are
+/// refused, as the API refuses them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunDocument {
+    /// Text pasted or read out of a file, at most 2 MiB: a form feed marks a
+    /// page, a blank line a paragraph.
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// A Google Doc through a connected app.
+    GoogleDoc {
+        connection_id: Uuid,
+        document_id: String,
+    },
+    /// A Word document in OneDrive or SharePoint through a connected app.
+    Word {
+        connection_id: Uuid,
+        drive_id: String,
+        item_id: String,
     },
 }
 
@@ -521,7 +568,9 @@ impl ContextStreamClient {
     }
 
     /// Ask the question, as it answers now, about every row of a list, as a
-    /// run started from an agent's tools ([`RUN_SURFACE`]).
+    /// run started from an agent's tools ([`RUN_SURFACE`]). With `document`,
+    /// a requirement check: each row's requirement is asked about the
+    /// document's passages that speak to it.
     /// Endpoint: `POST /questions/:id/runs` (202), answered `{run, estimate}`.
     pub async fn start_question_run(
         &self,
@@ -529,6 +578,7 @@ impl ContextStreamClient {
         question_id: Uuid,
         source: &ListSource,
         mapping: Option<&Mapping>,
+        document: Option<&RunDocument>,
     ) -> Result<Value> {
         let workspace_id = self.question_workspace(workspace_id).await?;
         let body = strip_nulls(serde_json::json!({
@@ -536,6 +586,7 @@ impl ContextStreamClient {
             "source": source,
             "mapping": mapping,
             "surface": RUN_SURFACE,
+            "document": document,
         }));
         self.post(&question_path(question_id, "/runs"), body).await
     }
@@ -691,6 +742,49 @@ impl ContextStreamClient {
         )
         .await
     }
+
+    /// The nightly watch: each answerer's last canary (the starter templates'
+    /// made-up rows asked again, as counts and a verdict) and the workspace's
+    /// checks of the last 30 days. Endpoint: `GET /questions/watch?workspace_id`,
+    /// answered `{canaries, checks}`.
+    pub async fn question_watch(&self, workspace_id: Option<Uuid>) -> Result<Value> {
+        let workspace_id = self.question_workspace(workspace_id).await?;
+        self.get(&format!("/questions/watch?workspace_id={workspace_id}"))
+            .await
+    }
+
+    /// The question's checks, newest first: why each ran, what it came to and
+    /// whether it held the version. Endpoint:
+    /// `GET /questions/:id/retests?workspace_id`.
+    pub async fn question_checks(
+        &self,
+        workspace_id: Option<Uuid>,
+        question_id: Uuid,
+    ) -> Result<Value> {
+        let workspace_id = self.question_workspace(workspace_id).await?;
+        self.get(&question_path(
+            question_id,
+            &format!("/retests?workspace_id={workspace_id}"),
+        ))
+        .await
+    }
+
+    /// Take what a done check chose as the version's trial on its answerer,
+    /// which ends a hold the check put on the version. Endpoint:
+    /// `POST /questions/:id/retests/:retest_id/accept`, answered `{trial}`.
+    pub async fn take_question_check(
+        &self,
+        workspace_id: Option<Uuid>,
+        question_id: Uuid,
+        check_id: Uuid,
+    ) -> Result<Value> {
+        let workspace_id = self.question_workspace(workspace_id).await?;
+        self.post(
+            &question_path(question_id, &format!("/retests/{check_id}/accept")),
+            serde_json::json!({ "workspace_id": workspace_id }),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -784,6 +878,13 @@ mod tests {
                 json!({"kind": "issues", "repository_id": repository}),
                 "issues",
             ),
+            // The Jira issues kept in sync: one project's of one status, or
+            // every one.
+            (
+                json!({"kind": "jira", "project_key": "OPS", "status": "In Progress"}),
+                "jira",
+            ),
+            (json!({"kind": "jira"}), "jira"),
         ] {
             let source: ListSource = serde_json::from_value(sent.clone()).unwrap();
             assert_eq!(serde_json::to_value(&source).unwrap(), sent, "{kind}");
@@ -793,6 +894,50 @@ mod tests {
             json!({"kind": "notion", "connection_id": connection}),
         );
         assert!(missing.unwrap_err().to_string().contains("data_source_id"));
+        let stray = serde_json::from_value::<ListSource>(json!({"kind": "jira", "project": "OPS"}));
+        assert!(stray
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field `project`"));
+        let unknown = serde_json::from_value::<ListSource>(json!({"kind": "asana"}));
+        assert!(unknown.unwrap_err().to_string().contains("asana"));
+    }
+
+    #[test]
+    fn a_document_is_tagged_by_its_kind_and_sent_as_it_was_given() {
+        let connection = Uuid::new_v4();
+        for (sent, kind) in [
+            (
+                json!({"kind": "text", "text": "Security\n\nWe encrypt at rest.\u{c}Support\n\n24/7.", "title": "Reply"}),
+                "text",
+            ),
+            (json!({"kind": "text", "text": "One page."}), "text"),
+            (
+                json!({"kind": "google_doc", "connection_id": connection, "document_id": "doc-1"}),
+                "google_doc",
+            ),
+            (
+                json!({"kind": "word", "connection_id": connection, "drive_id": "b!x", "item_id": "01AB"}),
+                "word",
+            ),
+        ] {
+            let document: RunDocument = serde_json::from_value(sent.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&document).unwrap(), sent, "{kind}");
+            assert!(DOCUMENT_KINDS.contains(&kind));
+        }
+        let missing = serde_json::from_value::<RunDocument>(
+            json!({"kind": "word", "connection_id": connection, "item_id": "01AB"}),
+        );
+        assert!(missing.unwrap_err().to_string().contains("drive_id"));
+        let stray = serde_json::from_value::<RunDocument>(
+            json!({"kind": "text", "text": "a", "url": "https://example.com"}),
+        );
+        assert!(stray
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field `url`"));
+        let unknown = serde_json::from_value::<RunDocument>(json!({"kind": "pdf", "text": "a"}));
+        assert!(unknown.unwrap_err().to_string().contains("pdf"));
     }
 
     #[test]
@@ -842,13 +987,15 @@ mod tests {
             );
         }
         // The rest change nothing twice: a label replaces the label, an
-        // answer kept before is read, a trial or a pick is asked again.
+        // answer kept before is read, a trial or a pick is asked again, and a
+        // check is taken once (a resend after it was taken is refused).
         for path in [
             format!("/api/v1/questions/{id}/test-rows"),
             format!("/api/v1/questions/{id}/answer"),
             format!("/api/v1/questions/{id}/trial"),
             format!("/api/v1/questions/{id}/sample"),
             format!("/api/v1/questions/{id}/runs/{id}/cancel"),
+            format!("/api/v1/questions/{id}/retests/{id}/accept"),
         ] {
             assert!(
                 !crate::client::is_unkeyed_create_request("POST", &path),

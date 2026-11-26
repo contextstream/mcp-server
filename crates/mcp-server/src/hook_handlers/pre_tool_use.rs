@@ -1321,11 +1321,20 @@ fn is_contextstream_read_only_operation(tool_name: &str, tool_input: &Value) -> 
         // A progress report (or a read of runs) changes nothing a grounded
         // read depends on: it is a note for the people watching.
         "progress" => true,
-        // Saved questions: the reads. A save, a label, a trial, a run or an
-        // answer changes something.
+        // Saved questions: the reads, the nightly watch's among them. A save,
+        // a label, a trial, a run, an answer or a check taken changes
+        // something.
         "questions" => matches!(
             action.as_str(),
-            "list" | "templates" | "get" | "status" | "results" | "export" | "describe"
+            "list"
+                | "templates"
+                | "get"
+                | "status"
+                | "results"
+                | "export"
+                | "describe"
+                | "watch"
+                | "checks"
         ),
         _ => false,
     }
@@ -4810,6 +4819,8 @@ mod tests {
             "results",
             "export",
             "describe",
+            "watch",
+            "checks",
         ] {
             assert!(
                 !is_likely_state_changing_tool(
@@ -4830,6 +4841,7 @@ mod tests {
             "run",
             "answer",
             "write_back",
+            "take_check",
         ] {
             assert!(
                 is_likely_state_changing_tool(

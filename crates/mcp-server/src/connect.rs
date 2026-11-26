@@ -10,6 +10,7 @@ use uuid::Uuid;
 const TOKEN_ENV: &str = "CONTEXTSTREAM_BRIDGE_TOKEN";
 const READY_WAIT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const WATCH_OFF: &str = "The sync bridge is turned off on this machine (CONTEXTSTREAM_WATCH=0), and connecting a checkout starts it. Nothing was changed and the connection link is still unused. Unset CONTEXTSTREAM_WATCH and run the command again.";
 
 fn resolve_token(explicit: Option<String>) -> Result<String> {
     let token = explicit
@@ -43,6 +44,11 @@ fn resolve_project_path(path: Option<String>) -> Result<PathBuf> {
 /// Connect the exact local checkout selected by `path` to the project-scoped
 /// enrollment minted in the dashboard.
 pub async fn run_connect(token: Option<String>, path: Option<String>) -> Result<()> {
+    // Connecting starts the sync bridge and waits for its first sync, so with
+    // the bridge turned off it would only spend the link and time out.
+    if !crate::watch::watch_enabled() {
+        anyhow::bail!(WATCH_OFF);
+    }
     let token = resolve_token(token)?;
     let project_path = resolve_project_path(path)?;
     let config = crate::config::load_config().map_err(|_| {

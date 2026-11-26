@@ -539,9 +539,12 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let closed_port = listener.local_addr().unwrap();
-        drop(listener);
+        // A bound socket that never listens: connections to it are refused,
+        // and no parallel test can take its port, as a dropped listener's
+        // port can be given to another test's server.
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let closed_port = held.local_addr().unwrap();
         let offline = ContextStreamClient::new(Config {
             api_url: format!("http://{closed_port}"),
             api_key: Some("k".into()),
@@ -564,6 +567,7 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        drop(held);
     }
 
     #[test]

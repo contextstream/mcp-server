@@ -1374,6 +1374,10 @@ mod tests {
 
     #[test]
     fn catalog_lists_every_client_without_local_paths() {
+        // HOME is compared against below; no test moves it while this holds.
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let catalog = catalog_json();
         let clients = catalog["clients"].as_array().expect("clients");
         assert_eq!(clients.len(), Editor::all().len());
@@ -1449,6 +1453,9 @@ mod tests {
     /// `CONTEXTSTREAM_BLESS_CLIENT_CONTRACT=1 cargo test -p mcp-server --lib client_contract`.
     #[test]
     fn client_contract_docs_table_is_current() {
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         const DOC_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/clients.md");
         const BEGIN: &str =
             "<!-- BEGIN GENERATED: contextstream-mcp clients --format markdown -->\n";

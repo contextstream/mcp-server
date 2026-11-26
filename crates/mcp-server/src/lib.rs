@@ -91,10 +91,14 @@ pub(crate) fn managed_hook_invocation() -> bool {
     std::env::var("CONTEXTSTREAM_MANAGED_HOOK_INVOCATION").as_deref() == Ok("1")
 }
 
-/// Shared mutex for tests that modify environment variables.
+/// The one lock for tests that touch the process environment.
 ///
-/// Since `std::env::set_var` / `remove_var` affect the whole process,
-/// all tests that touch env vars must hold this lock to avoid races.
+/// `std::env::set_var` / `remove_var` change the whole process, so a test
+/// holds this lock for as long as it sets or removes a variable (HOME above
+/// all), and for as long as it depends on one: reading it, calling code that
+/// reads it (`dirs::home_dir()`), or running a program that does (`cargo`
+/// finds its toolchain through HOME). A test that reads HOME without it can
+/// see another test's temporary home between two reads.
 #[cfg(test)]
 pub fn env_test_mutex() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();

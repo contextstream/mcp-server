@@ -775,6 +775,33 @@ pub async fn enrich_frame_diagnostics(
     repo_key: Option<&str>,
     frame: &mut Value,
 ) {
+    enrich_frame_diagnostics_within(
+        DIAGNOSE_TIMEOUT,
+        client,
+        call_id,
+        workspace_id,
+        project_id,
+        repo_key,
+        frame,
+    )
+    .await;
+}
+
+/// [`enrich_frame_diagnostics`] waiting up to `timeout` instead of
+/// `DIAGNOSE_TIMEOUT`. For a test of what is asked and how the answer lands:
+/// a loaded host cannot promise a round trip within 95 ms, so with the real
+/// bound such a test passes or fails by the host's load. The bound itself
+/// is tested on a frozen clock (`run_fails_open_when_diagnose_endpoint_fails_or_times_out`).
+#[doc(hidden)]
+pub async fn enrich_frame_diagnostics_within(
+    timeout: Duration,
+    client: &ContextStreamClient,
+    call_id: Option<&str>,
+    workspace_id: Option<&str>,
+    project_id: Option<&str>,
+    repo_key: Option<&str>,
+    frame: &mut Value,
+) {
     if !frame_needs_diagnose(frame) {
         return;
     }
@@ -800,8 +827,8 @@ pub async fn enrich_frame_diagnostics(
     }
     let req_body = Value::Object(body);
     let Ok(Ok(answer)) = tokio::time::timeout(
-        DIAGNOSE_TIMEOUT,
-        client.hosted_tool_diagnose(call_id, &req_body, DIAGNOSE_TIMEOUT),
+        timeout,
+        client.hosted_tool_diagnose(call_id, &req_body, timeout),
     )
     .await
     else {

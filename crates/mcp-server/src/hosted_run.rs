@@ -1193,7 +1193,13 @@ mod tests {
         });
         assert!(frame.get("diagnostics").is_none());
 
-        mcp_tools::domains::hosted_tools::enrich_frame_diagnostics(
+        // The production bound is 95 ms, round trip included; on a loaded host
+        // that ran out before the request left (no request seen, no
+        // diagnostics). What is checked here is the request and the
+        // enrichment, so this waits for the stub's answer; the bound is
+        // tested on a frozen clock in mcp-tools.
+        mcp_tools::domains::hosted_tools::enrich_frame_diagnostics_within(
+            std::time::Duration::from_secs(30),
             &client,
             mcp_tools::domains::hosted_tools::call_id_of(&call_data),
             Some("550e8400-e29b-41d4-a716-446655440000"),

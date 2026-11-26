@@ -6118,6 +6118,10 @@ mod tests {
     fn auto_init_disables_auto_index_for_cwd_derived_home_root() {
         // A cwd-derived root (explicitly_supplied == false) must never enable
         // auto-indexing — even when the cwd is a $HOME-like / broad root.
+        // The guard reads HOME again: hold the env lock so no test moves it.
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = dirs::home_dir().expect("home dir");
         assert!(!should_auto_init_index(
             Some(home.to_string_lossy().as_ref()),
@@ -6141,6 +6145,10 @@ mod tests {
     fn auto_init_disables_auto_index_for_explicit_sensitive_root() {
         // Defense-in-depth: an explicit folder is still rejected when it fails
         // the ingest-containment guard ($HOME here).
+        // The guard reads HOME again: hold the env lock so no test moves it.
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = dirs::home_dir().expect("home dir");
         assert!(!should_auto_init_index(
             Some(home.to_string_lossy().as_ref()),
@@ -6741,8 +6749,14 @@ mod review_go_ahead {
         assert_eq!(deletes(&seen).len(), 1, "{:?}", seen.lock().unwrap());
     }
 
+    // The checks run `cargo` here, which finds its toolchain through HOME:
+    // hold the env lock so no test moves HOME meanwhile.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn stdio_tools_call_preserves_structured_content_for_verify_and_ms_verify() {
+        let _env = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             temp.path().join("Cargo.toml"),

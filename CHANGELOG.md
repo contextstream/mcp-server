@@ -3,6 +3,7 @@
 ## 1.0.108
 
 - An agent connected through OAuth (claude.ai, ChatGPT and Claude Code on the web, all on the hosted server) can now be answered from the Agent Hub, as a run reported with a full API key already could. Every API request says this client carries back what a person sends a run (`X-ContextStream-Receives: deliveries`). On the hosted server, which has no key of its own, the caller's own OAuth token reads, claims and confirms the answers and messages sent to its runs, with each account's claims kept apart, and `progress` shows them as `[PERSON ANSWER]` and `[PERSON MESSAGE]` blocks. When nothing can come back, what `progress` says names the OAuth token too. A server that does not know the header ignores it.
+- A new `questions` tool runs saved questions over lists. An agent can find a saved question or copy a starter template, try a version on bison or on mammoth (the second answerer), make it ready and run it on a list: rows given inline, a CSV, a Google Sheet, an Excel workbook, an audience, a Notion data source, a Linear project or a repository's issues. It can then answer a row, read the results, export a run as a CSV, and write a finished run back to a sheet, a workbook or an audience's contacts. It is listed only for a caller whose workspace has saved questions switched on, a pilot for now: the MCP asks the API once per caller and workspace and keeps the answer for 5 minutes. Elsewhere it is not listed, and a call to it says saved questions are not switched on for the workspace yet.
 
 ## 1.0.107
 

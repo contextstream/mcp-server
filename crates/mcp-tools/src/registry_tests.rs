@@ -1484,6 +1484,27 @@ mod alias_tests {
         assert!(is_listed_per_caller("agents"));
         assert!(is_listed_per_caller("slipstream"));
     }
+
+    #[test]
+    fn saved_questions_are_listed_per_caller_and_stay_callable() {
+        // Only where saved questions are switched on for the caller's
+        // workspace: the registry's own listing leaves the tool out, and it
+        // stays on the surfaces that serve it.
+        assert!(is_listed_per_caller(crate::domains::questions::TOOL_NAME));
+        let mut registry = ToolRegistry::new(&create_complete_config());
+        registry.register(
+            crate::domains::questions::TOOL_NAME,
+            Arc::new(MockTool::new(crate::domains::questions::TOOL_NAME)),
+        );
+        assert!(registry.get(crate::domains::questions::TOOL_NAME).is_some());
+        assert!(!registry
+            .names()
+            .contains(&crate::domains::questions::TOOL_NAME));
+        assert!(registry
+            .list()
+            .iter()
+            .all(|tool| tool.metadata.name != crate::domains::questions::TOOL_NAME));
+    }
 }
 
 mod destructive_split_tests {

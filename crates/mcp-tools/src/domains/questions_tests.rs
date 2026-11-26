@@ -29,7 +29,7 @@ impl Fixture {
     /// The tool, in a session whose workspace is the fixture's.
     fn tool(&self, api: &Api) -> QuestionsTool {
         let (client, session) = client_and_session(&api.base_url, self.workspace, None);
-        QuestionsTool::new(client, session)
+        QuestionsTool::new(client, session, Arc::new(QuestionsGate::new()))
     }
 
     /// A saved question as the API answers one.
@@ -135,7 +135,7 @@ fn only(api: &Api) -> Seen {
 fn the_tool_is_listed_with_its_actions_and_a_portable_description() {
     let fixture = Fixture::new();
     let (client, session) = client_and_session("http://127.0.0.1:9", fixture.workspace, None);
-    let tool = QuestionsTool::new(client, session);
+    let tool = QuestionsTool::new(client, session, Arc::new(QuestionsGate::new()));
     let metadata = tool.metadata();
     assert_eq!(metadata.name, TOOL_NAME);
     assert!(!metadata.annotations.destructive);
@@ -1207,7 +1207,7 @@ async fn a_write_back_sends_the_sessions_own_id_unless_one_is_given() {
         if let Some(given) = given {
             arguments["session_id"] = json!(given);
         }
-        QuestionsTool::new(client, session)
+        QuestionsTool::new(client, session, Arc::new(QuestionsGate::new()))
             .execute(arguments)
             .await
             .unwrap();
@@ -1436,7 +1436,7 @@ async fn an_export_shows_the_first_rows_and_keeps_the_whole_csv() {
     let csv = run_csv(60);
     let api = CsvApi::start(200, "text/csv; charset=utf-8", csv.clone()).await;
     let (client, session) = client_and_session(&api.base_url, f.workspace, None);
-    let result = QuestionsTool::new(client, session)
+    let result = QuestionsTool::new(client, session, Arc::new(QuestionsGate::new()))
         .execute(json!({
             "action": "export", "question_id": f.question.to_string(), "run_id": f.run.to_string(),
         }))
@@ -1640,4 +1640,273 @@ fn a_versions_trials_are_read_by_who_answered_them() {
     assert_eq!(trials_of(Some(&json!({"ready": true})))[0].0, "bison");
     assert!(trials_of(Some(&Value::Null)).is_empty());
     assert!(trials_of(None).is_empty());
+}
+
+// ============================================================================
+// Listed only where saved questions are switched on
+// ============================================================================
+
+/// The probe: the workspace's starter templates, free and asking no model.
+const TEMPLATES: &str = "GET /api/v1/questions/templates";
+
+fn templates_answer() -> Value {
+    envelope(json!({"templates": []}))
+}
+
+/// The key the gate keeps this caller's answer for `workspace_id` under.
+async fn gate_key(client: &ContextStreamClient, workspace_id: Uuid) -> gate::GateKey {
+    gate::GateKey {
+        identity: crate::domains::slipstream::caller_identity(client)
+            .await
+            .expect("a caller with a key"),
+        workspace_id,
+    }
+}
+
+#[tokio::test]
+async fn the_tool_is_listed_where_saved_questions_are_switched_on() {
+    let f = Fixture::new();
+    let api = Api::start(vec![(TEMPLATES, 200, templates_answer())]).await;
+    let (client, session) = client_and_session(&api.base_url, f.workspace, None);
+    let gate = QuestionsGate::new();
+    assert!(listed(&gate, &client, &session, LISTING_BUDGET).await);
+    // One read of the workspace the listing is for.
+    let probe = only(&api);
+    assert_eq!(probe.method, "GET");
+    assert_eq!(
+        probe.target,
+        format!("/api/v1/questions/templates?workspace_id={}", f.workspace)
+    );
+    // Known for five minutes: the next listing asks nobody.
+    assert!(listed(&gate, &client, &session, LISTING_BUDGET).await);
+    assert_eq!(api.requests().len(), 1);
+    assert_eq!(
+        gate.fresh(&gate_key(&client, f.workspace).await),
+        Some(gate::Offer::Offered)
+    );
+}
+
+#[tokio::test]
+async fn the_tool_is_not_listed_where_saved_questions_are_not_switched_on() {
+    // Switched off, or a workspace outside the pilot: the routes are not
+    // there (404). A caller these routes refuse, such as an agent's key
+    // limited to another workspace (401, 403), is not offered the tool either.
+    for (status, answer) in [
+        (404, router_404()),
+        (404, refusal("NOT_FOUND", "No such workspace.")),
+        (
+            403,
+            refusal("FORBIDDEN", "This key is limited to another workspace."),
+        ),
+        (401, refusal("UNAUTHORIZED", "Invalid API key.")),
+    ] {
+        let f = Fixture::new();
+        let api = Api::start(vec![(TEMPLATES, status, answer)]).await;
+        let (client, session) = client_and_session(&api.base_url, f.workspace, None);
+        let gate = QuestionsGate::new();
+        assert!(
+            !listed(&gate, &client, &session, LISTING_BUDGET).await,
+            "{status}"
+        );
+        assert_eq!(
+            api.requests().len(),
+            1,
+            "{status}: one read, no retry or replay"
+        );
+        // Known for five minutes too.
+        assert!(
+            !listed(&gate, &client, &session, LISTING_BUDGET).await,
+            "{status}"
+        );
+        assert_eq!(api.requests().len(), 1, "{status}");
+        assert_eq!(
+            gate.fresh(&gate_key(&client, f.workspace).await),
+            Some(gate::Offer::NotOffered),
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unreachable_api_lists_nothing_unless_an_answer_was_known_before() {
+    // A 5xx is read again once while the listing waits, then left out, to be
+    // read again in 30 seconds.
+    let f = Fixture::new();
+    let api = Api::start(vec![(TEMPLATES, 500, json!({"error": "boom"}))]).await;
+    let (client, session) = client_and_session(&api.base_url, f.workspace, None);
+    let gate = QuestionsGate::new();
+    assert!(!listed(&gate, &client, &session, LISTING_BUDGET).await);
+    assert_eq!(api.requests().len(), 2);
+    let key = gate_key(&client, f.workspace).await;
+    assert_eq!(gate.fresh(&key), Some(gate::Offer::Unreachable));
+
+    // Switched on when last read, more than five minutes ago: a blip keeps
+    // the tool listed.
+    if let Some(earlier) =
+        std::time::Instant::now().checked_sub(gate::KNOWN_TTL + Duration::from_secs(1))
+    {
+        let gate = QuestionsGate::new();
+        gate.record_at(&key, gate::Offer::Offered, earlier);
+        assert!(listed(&gate, &client, &session, LISTING_BUDGET).await);
+        assert_eq!(gate.fresh(&key), Some(gate::Offer::Offered));
+    }
+
+    // Nobody answers at all.
+    let (client, session) = client_and_session("http://127.0.0.1:9", f.workspace, None);
+    assert!(!listed(&QuestionsGate::new(), &client, &session, LISTING_BUDGET).await);
+}
+
+#[tokio::test]
+async fn without_a_caller_or_a_workspace_nothing_is_asked() {
+    let api = Api::start(vec![(TEMPLATES, 200, templates_answer())]).await;
+    // No credential: there is no caller to ask for.
+    let mut config = TestFixtures::test_config();
+    config.api_url = api.base_url.clone();
+    config.api_key = None;
+    config.jwt = None;
+    let client = ContextStreamClient::new(config.clone());
+    let session = SessionManager::new(client.clone(), config);
+    assert!(!listed(&QuestionsGate::new(), &client, &session, LISTING_BUDGET).await);
+    assert!(api.requests().is_empty());
+
+    // No workspace known: nothing to ask about.
+    let mut config = TestFixtures::test_config();
+    config.api_url = api.base_url.clone();
+    config.default_workspace_id = None;
+    let client = ContextStreamClient::new(config.clone());
+    let session = SessionManager::new(client.clone(), config);
+    if !listed(&QuestionsGate::new(), &client, &session, LISTING_BUDGET).await {
+        // (A developer machine may map its working folder to a workspace.)
+        assert!(api.requests().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_call_the_api_answers_records_saved_questions_as_switched_on() {
+    let f = Fixture::new();
+    let api = Api::start(vec![(
+        "GET /api/v1/questions",
+        200,
+        envelope(json!({"questions": []})),
+    )])
+    .await;
+    let (client, session) = client_and_session(&api.base_url, f.workspace, None);
+    let gate = Arc::new(QuestionsGate::new());
+    let tool = QuestionsTool::new(client.clone(), session.clone(), gate.clone());
+    tool.execute(json!({"action": "list"})).await.expect("list");
+    assert_eq!(
+        gate.fresh(&gate_key(&client, f.workspace).await),
+        Some(gate::Offer::Offered)
+    );
+    // The listing needs no read of its own.
+    assert!(listed(&gate, &client, &session, LISTING_BUDGET).await);
+    assert_eq!(api.requests().len(), 1);
+
+    // A workspace the call names is the one recorded.
+    let other = Uuid::new_v4();
+    tool.execute(json!({"action": "list", "workspace_id": other.to_string()}))
+        .await
+        .expect("list");
+    assert_eq!(
+        gate.fresh(&gate_key(&client, other).await),
+        Some(gate::Offer::Offered)
+    );
+}
+
+#[tokio::test]
+async fn a_workspace_switched_on_is_noticed_on_its_next_call() {
+    // Outside the pilot when the tools were listed, switched on since.
+    let f = Fixture::new();
+    let api = Api::start_in_turn(vec![
+        ("GET /api/v1/questions", 404, router_404()),
+        (
+            "GET /api/v1/questions",
+            200,
+            envelope(json!({"questions": []})),
+        ),
+    ])
+    .await;
+    let (client, session) = client_and_session(&api.base_url, f.workspace, None);
+    let gate = Arc::new(QuestionsGate::new());
+    assert!(!listed(&gate, &client, &session, LISTING_BUDGET).await);
+    QuestionsTool::new(client.clone(), session.clone(), gate.clone())
+        .execute(json!({"action": "list"}))
+        .await
+        .expect("switched on since");
+    assert!(listed(&gate, &client, &session, LISTING_BUDGET).await);
+    assert_eq!(api.requests().len(), 2, "the listing read nothing more");
+}
+
+#[tokio::test]
+async fn only_not_switched_on_takes_the_tool_out() {
+    // Switched on when listed, switched off since: the next call's 404 says
+    // so, and the listing follows.
+    let f = Fixture::new();
+    let api = Api::start(vec![("GET /api/v1/questions", 404, router_404())]).await;
+    let (client, session) = client_and_session(&api.base_url, f.workspace, None);
+    let gate = Arc::new(QuestionsGate::new());
+    let key = gate_key(&client, f.workspace).await;
+    gate.record(&key, gate::Offer::Offered);
+    let error = QuestionsTool::new(client.clone(), session.clone(), gate.clone())
+        .execute(json!({"action": "list"}))
+        .await
+        .expect_err("switched off")
+        .to_string();
+    assert!(error.contains("not switched on"), "{error}");
+    assert_eq!(gate.fresh(&key), Some(gate::Offer::NotOffered));
+    assert!(!listed(&gate, &client, &session, LISTING_BUDGET).await);
+    assert_eq!(api.requests().len(), 1);
+
+    // A missing record, an export an API does not have, a refusal of the
+    // caller's role or of the call, and a refused input say nothing about
+    // the switch: a known answer stays as it was.
+    let q = Uuid::new_v4().to_string();
+    let r = Uuid::new_v4().to_string();
+    let cases = [
+        (
+            404,
+            refusal("NOT_FOUND", "No such question."),
+            json!({"action": "get", "question_id": q}),
+        ),
+        (
+            404,
+            router_404(),
+            json!({"action": "export", "question_id": q, "run_id": r}),
+        ),
+        (
+            403,
+            refusal("FORBIDDEN", "Only the question's owner can change it."),
+            json!({"action": "activate", "question_id": q, "version": 2, "expected_revision": 3}),
+        ),
+        (
+            409,
+            refusal(
+                "CONFLICT",
+                "This question does not answer on its own yet. [NOT_ACTIVE]",
+            ),
+            json!({"action": "answer", "question_id": q, "fields": {"company": "Acme"}}),
+        ),
+        (404, router_404(), json!({"action": "get"})),
+    ];
+    for (status, answer, arguments) in cases {
+        for known in [None, Some(gate::Offer::Offered)] {
+            let f = Fixture::new();
+            let api = Api::start(vec![
+                ("GET /api/v1/questions", status, answer.clone()),
+                ("POST /api/v1/questions", status, answer.clone()),
+            ])
+            .await;
+            let (client, session) = client_and_session(&api.base_url, f.workspace, None);
+            let gate = Arc::new(QuestionsGate::new());
+            let key = gate_key(&client, f.workspace).await;
+            if let Some(known) = known {
+                gate.record(&key, known);
+            }
+            let refused = QuestionsTool::new(client, session, gate.clone())
+                .execute(arguments.clone())
+                .await;
+            assert!(refused.is_err(), "{arguments}");
+            assert_eq!(gate.fresh(&key), known, "{arguments}");
+        }
+    }
 }

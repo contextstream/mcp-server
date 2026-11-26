@@ -2336,12 +2336,16 @@ impl ToolsetConfig {
 
 /// Tools whose `tools/list` entry depends on who asks: `agents` is listed
 /// only for a caller whose workspace has agents turned on, with a
-/// description written from them. The registry's own listing leaves them out
-/// and the transports add them per caller (`slipstream::listing`).
+/// description written from them; `studio` only for a person Create offers
+/// one-prompt making to; `questions` only for a caller whose workspace has
+/// saved questions switched on. The registry's own listing leaves them out
+/// and the transports add them per caller (`slipstream::listing`,
+/// `studio::listed`, `questions::listed`).
 const LISTED_PER_CALLER: &[&str] = &[
     crate::domains::slipstream::TOOL_NAME,
     crate::domains::slipstream::LEGACY_TOOL_NAME,
     crate::domains::studio::TOOL_NAME,
+    crate::domains::questions::TOOL_NAME,
 ];
 
 /// Whether `name` is listed per caller rather than from the registry.

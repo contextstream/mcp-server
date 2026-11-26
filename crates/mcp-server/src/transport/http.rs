@@ -8633,6 +8633,109 @@ mod tests {
             Some(900)
         );
     }
+
+    /// `questions` is added per caller too, for the workspace their connection names, and
+    /// only where that workspace has saved questions switched on (the API serves its
+    /// routes only to the pilot's workspaces, and answers 404 everywhere else).
+    #[tokio::test]
+    async fn hosted_tools_list_adds_questions_per_caller_workspace() {
+        let pilot = Uuid::new_v4();
+        let elsewhere = Uuid::new_v4();
+        let app = axum::Router::new().route(
+            "/api/v1/questions/templates",
+            get(move |Query(query): Query<HashMap<String, String>>| async move {
+                if query.get("workspace_id") == Some(&pilot.to_string()) {
+                    (
+                        StatusCode::OK,
+                        Json(json!({"success": true, "data": {"templates": []}})),
+                    )
+                } else {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"success": false, "error": {"code": "NOT_FOUND",
+                            "message": "Endpoint not found. Verify the API path and workspace_id."}})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind questions API");
+        let address = listener.local_addr().expect("questions API address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+
+        let config = Config {
+            api_url: format!("http://{address}"),
+            api_key: Some("gateway-process-key".to_string()),
+            is_http_transport: true,
+            ..Config::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config.clone()));
+        let registry = build_registry(&config, client.clone(), session.clone());
+        let state = HttpState {
+            registry: Arc::new(registry),
+            client: client.clone(),
+            session: session.clone(),
+            jwt_secret: None,
+            require_auth: false,
+            telemetry: AgenticTelemetry::new(client, session),
+            tools_list_cache: Arc::new(RwLock::new(HashMap::new())),
+            concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            metrics_handle: None,
+        };
+        let list_as = |caller: &'static str, workspace: Option<Uuid>| {
+            let state = state.clone();
+            async move {
+                let auth = AuthOverride {
+                    api_key: Some(format!("{caller}-key")),
+                    workspace_id: workspace,
+                    ..AuthOverride::default()
+                };
+                run_with_caller_cache_identity(caller.to_string(), || async {
+                    run_with_auth_override(auth, || async {
+                        handle_list_tools_method(&state, None).await
+                    })
+                    .await
+                })
+                .await
+                .expect("tools/list")
+            }
+        };
+        let has_questions = |list: &Value| {
+            list["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "questions")
+        };
+
+        let listed = list_as("questions-pilot", Some(pilot)).await;
+        assert!(has_questions(&listed));
+        // Another caller, another workspace: not listed, and nothing leaks across.
+        let other = list_as("questions-elsewhere", Some(elsewhere)).await;
+        assert!(!has_questions(&other));
+        assert_eq!(
+            other["tools"].as_array().unwrap().len() + 1,
+            listed["tools"].as_array().unwrap().len()
+        );
+        // The switch is per workspace: the same caller does not get it in another one.
+        assert!(!has_questions(
+            &list_as("questions-pilot", Some(elsewhere)).await
+        ));
+        // No workspace named: nothing to ask about.
+        assert!(!has_questions(&list_as("questions-nowhere", None).await));
+
+        // The shared cache holds only what every caller sees.
+        for cached in state
+            .tools_list_cache
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .values()
+        {
+            assert!(!has_questions(cached));
+        }
+    }
 }
 
 #[cfg(test)]

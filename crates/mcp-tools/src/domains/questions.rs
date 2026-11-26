@@ -16,6 +16,13 @@
 //! anything is sent; the rest is the API's to judge, and its message is
 //! passed on with what it means and the call to make next. A person's own
 //! call on a row is not offered here.
+//!
+//! Saved questions are switched on per workspace, for the pilot's workspaces
+//! only, so the tool is listed only for a caller whose workspace has them
+//! switched on (see [`gate`]). It stays callable everywhere it is registered.
+
+#[path = "questions_gate.rs"]
+pub(crate) mod gate;
 
 use async_trait::async_trait;
 use mcp_client::questions::{
@@ -34,15 +41,23 @@ use mcp_types::{
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use uuid::Uuid;
 
 use super::display_title::{one_line, quoted_body};
 use crate::input_shape::enum_argument;
 use crate::registry::ToolHandler;
 use crate::schema::SchemaBuilder;
+pub use gate::QuestionsGate;
 
 /// The tool's name.
 pub const TOOL_NAME: &str = "questions";
+
+/// How long a listing waits for the probe before leaving the tool out.
+pub const LISTING_BUDGET: Duration = Duration::from_millis(2500);
+
+/// How long the read after an initialize waits for the probe.
+const PREFETCH_BUDGET: Duration = Duration::from_secs(10);
 
 /// The tool's actions.
 pub(crate) const VALID_ACTIONS: &[&str] = &[
@@ -144,11 +159,21 @@ pub struct QuestionsInput {
 pub struct QuestionsTool {
     client: ContextStreamClient,
     session: Arc<SessionManager>,
+    gate: Arc<QuestionsGate>,
 }
 
 impl QuestionsTool {
-    pub fn new(client: ContextStreamClient, session: Arc<SessionManager>) -> Self {
-        Self { client, session }
+    /// The tool, recording what its answers say of the switch in `gate`.
+    pub fn new(
+        client: ContextStreamClient,
+        session: Arc<SessionManager>,
+        gate: Arc<QuestionsGate>,
+    ) -> Self {
+        Self {
+            client,
+            session,
+            gate,
+        }
     }
 
     /// The workspace a call names: `workspace_id`, else the session's. With
@@ -188,8 +213,42 @@ impl QuestionsTool {
         found
     }
 
-    async fn run_action(&self, action: &str, input: QuestionsInput) -> Result<ToolResult> {
-        let workspace = self.workspace(input.workspace_id.as_deref()).await?;
+    /// Record what a call's outcome says of saved questions for the workspace
+    /// it was made in, so the listing follows a switch on its next call: an
+    /// answer from the API means they are switched on there, a refusal the
+    /// tool reads as "not switched on" ([`NOT_SWITCHED_ON`]) means they are
+    /// not. Nothing else says either: a missing record, a refusal of the
+    /// caller's role, a refused input or an unreachable API change nothing.
+    async fn note_offer(&self, workspace: Option<Uuid>, outcome: &Result<ToolResult>) {
+        let Some(workspace_id) = workspace else {
+            return;
+        };
+        let offer = match outcome {
+            Ok(_) => gate::Offer::Offered,
+            Err(Error::Http {
+                status: 404,
+                message,
+                ..
+            }) if message.contains(NOT_SWITCHED_ON) => gate::Offer::NotOffered,
+            _ => return,
+        };
+        if let Some(identity) = super::slipstream::caller_identity(&self.client).await {
+            self.gate.record(
+                &gate::GateKey {
+                    identity,
+                    workspace_id,
+                },
+                offer,
+            );
+        }
+    }
+
+    async fn run_action(
+        &self,
+        action: &str,
+        workspace: Option<Uuid>,
+        input: QuestionsInput,
+    ) -> Result<ToolResult> {
         let client = &self.client;
         match action {
             "list" => {
@@ -517,7 +576,10 @@ impl ToolHandler for QuestionsTool {
                     VALID_ACTIONS.join(", ")
                 ))
             })?;
-        self.run_action(&action, input).await
+        let workspace = self.workspace(input.workspace_id.as_deref()).await?;
+        let outcome = self.run_action(&action, workspace, input).await;
+        self.note_offer(workspace, &outcome).await;
+        outcome
     }
 
     fn metadata(&self) -> &ToolMetadata {
@@ -651,13 +713,64 @@ impl ToolHandler for QuestionsTool {
     }
 }
 
-/// Register the `questions` tool.
+/// Register the `questions` tool. The registry's own listing leaves it out;
+/// the transports list it per caller ([`listed`]).
 pub fn register_questions_tools(
     registry: &mut crate::registry::ToolRegistry,
     client: ContextStreamClient,
     session: Arc<SessionManager>,
 ) {
-    registry.register(TOOL_NAME, Arc::new(QuestionsTool::new(client, session)));
+    registry.register(
+        TOOL_NAME,
+        Arc::new(QuestionsTool::new(client, session, QuestionsGate::global())),
+    );
+}
+
+// ============================================================================
+// Listing: shown only where saved questions are switched on
+// ============================================================================
+
+/// Who asks, about which workspace, for a listing: the caller's identity and
+/// the workspace the listing is for (the session's, the hosted connection's,
+/// and on stdio the configured default or the folder's mapping).
+async fn listing_key(
+    client: &ContextStreamClient,
+    session: &SessionManager,
+) -> Option<gate::GateKey> {
+    let identity = super::slipstream::caller_identity(client).await?;
+    let workspace_id = super::slipstream::listing_workspace(client, session).await?;
+    Some(gate::GateKey {
+        identity,
+        workspace_id,
+    })
+}
+
+/// Whether `questions` is listed for the current caller: only when saved
+/// questions are switched on for its workspace, read within `budget` unless
+/// a fresh answer is cached. Without a caller identity or a workspace it is
+/// not listed, and nothing is asked.
+pub async fn listed(
+    gate: &QuestionsGate,
+    client: &ContextStreamClient,
+    session: &SessionManager,
+    budget: Duration,
+) -> bool {
+    match listing_key(client, session).await {
+        Some(key) => gate.offered(client, &key, budget).await,
+        None => false,
+    }
+}
+
+/// Read whether saved questions are switched on for the current caller in
+/// the background, so the tools/list after an initialize finds it ready.
+pub fn prefetch(
+    gate: Arc<QuestionsGate>,
+    client: ContextStreamClient,
+    session: Arc<SessionManager>,
+) {
+    mcp_client::spawn_with_task_context(async move {
+        listed(&gate, &client, &session, PREFETCH_BUDGET).await;
+    });
 }
 
 // ============================================================================

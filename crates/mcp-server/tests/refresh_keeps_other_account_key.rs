@@ -1,20 +1,27 @@
 //! Regression test for ticket e69fbc52: `contextstream-mcp update`, run with
 //! another account's HOME inside a repository, rewrote that repository's
 //! project `.mcp.json` with the HOME account's API key and installation id,
-//! without a word, and every call from the repository then ran as the wrong
-//! account.
+//! and pointed its `headersHelper` at the HOME's own binary, without a word.
+//! Every call from the repository then ran as the wrong account, through
+//! another person's binary.
 //!
 //! `update` refreshes MCP configs by running `migrate-remote --scope=all
 //! --only-configured` (with `--switch-account` handed on when given). These
 //! tests run that refresh for the project entry from a HOME signed in as
 //! Chase, against an `/auth/me` stub, with no terminal:
-//! - an entry that signs in as Erik keeps Erik's key and installation id, the
-//!   rest of the refresh still applies, and stderr names both accounts by
-//!   email and says how to switch on purpose (never a key);
-//! - `--switch-account` switches it, and says so;
+//! - an entry that signs in as Erik keeps Erik's key, installation id and
+//!   `headersHelper` line byte for byte, the rest of the refresh still
+//!   applies, and stderr names both accounts by email and says how to switch
+//!   on purpose (never a key);
+//! - `--switch-account` switches it, helper line included, and says so;
 //! - a key `/auth/me` refuses is "an unknown account" and is kept too;
-//! - a new key for the same account, and an entry with no key, are written
-//!   without a word, as before.
+//! - a new key for the same account is written without an account question,
+//!   but a helper from another home than Chase's stays, with a warning naming
+//!   both binaries; an entry with no key is written as before.
+//!
+//! A local (stdio) entry is refreshed by `configure --transcripts`, which
+//! keeps it local: its command is kept byte for byte without
+//! `--switch-account` and repointed with it.
 #![cfg(unix)]
 
 use axum::{
@@ -66,9 +73,27 @@ async fn spawn_auth_me_stub() -> (String, tokio::task::JoinHandle<()>) {
     (api_url, handle)
 }
 
+/// Chase's managed binary (`<home>/.contextstream/bin/contextstream-mcp`):
+/// the CLI runs from there, as an installed one does, so a refresh names it
+/// and never needs to install it.
+fn install_managed_binary(home: &Path) -> PathBuf {
+    let bin_dir = home.join(".contextstream").join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let dest = bin_dir.join("contextstream-mcp");
+    let src = PathBuf::from(env!("CARGO_BIN_EXE_contextstream-mcp"));
+    if std::fs::hard_link(&src, &dest).is_err() {
+        // A copy made by a child process, so no descriptor writing the binary
+        // is open here when another test forks (ETXTBSY).
+        let status = Command::new("cp").arg(&src).arg(&dest).status().unwrap();
+        assert!(status.success(), "cp {} {}", src.display(), dest.display());
+    }
+    dest
+}
+
 /// A project `.mcp.json` whose hosted ContextStream entry holds `api_key`
-/// (none when `None`) and names Erik's installation.
-fn seed_project_entry(project: &Path, api_key: Option<&str>) -> PathBuf {
+/// (none when `None`), names Erik's installation and, when given, runs
+/// `helper` as its `headersHelper`.
+fn seed_project_entry(project: &Path, api_key: Option<&str>, helper: Option<&str>) -> PathBuf {
     let path = project.join(".mcp.json");
     let mut headers = json!({
         "X-ContextStream-Managed-Config-Version": "2",
@@ -78,36 +103,41 @@ fn seed_project_entry(project: &Path, api_key: Option<&str>) -> PathBuf {
     if let Some(api_key) = api_key {
         headers[API_KEY_HEADER] = json!(api_key);
     }
-    let config = json!({"mcpServers": {"contextstream": {
+    let mut entry = json!({
         "type": "http",
         "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast",
         "headers": headers,
-    }}});
+    });
+    if let Some(helper) = helper {
+        entry["headersHelper"] = json!(helper);
+    }
+    let config = json!({"mcpServers": {"contextstream": entry}});
     std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
     path
 }
 
-fn entry_headers(path: &Path) -> Value {
+fn entry_of(path: &Path) -> Value {
     let config: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    config["mcpServers"]["contextstream"]["headers"].clone()
+    config["mcpServers"]["contextstream"].clone()
 }
 
-/// The config refresh `update` runs, for the project entry only, from
-/// Chase's HOME, with no terminal.
-async fn refresh_project(home: &Path, project: &Path, api_url: &str, extra: &[&str]) -> Output {
-    let mut args = vec![
-        "migrate-remote".to_string(),
-        "--scope=project".to_string(),
-        "--editors=claude".to_string(),
-    ];
-    args.extend(extra.iter().map(|arg| arg.to_string()));
-    let (home, project, api_url) = (
+/// Run the CLI from Chase's managed binary, in Chase's HOME, in `cwd`, with no
+/// terminal.
+async fn run_cli(
+    binary: &Path,
+    home: &Path,
+    cwd: &Path,
+    api_url: &str,
+    args: Vec<String>,
+) -> Output {
+    let (binary, home, cwd, api_url) = (
+        binary.to_path_buf(),
         home.to_path_buf(),
-        project.to_path_buf(),
+        cwd.to_path_buf(),
         api_url.to_string(),
     );
     tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
+        Command::new(&binary)
             .args(&args)
             .env_clear()
             .env("HOME", &home)
@@ -118,13 +148,30 @@ async fn refresh_project(home: &Path, project: &Path, api_url: &str, extra: &[&s
             .env("CONTEXTSTREAM_WATCH_ENABLED", "false")
             .env("CONTEXTSTREAM_NO_BROWSER", "1")
             .env("NO_COLOR", "1")
-            .current_dir(&project)
+            .current_dir(&cwd)
             .stdin(Stdio::null())
             .output()
             .unwrap()
     })
     .await
     .unwrap()
+}
+
+/// The config refresh `update` runs, for the project entry only.
+async fn refresh_project(
+    binary: &Path,
+    home: &Path,
+    project: &Path,
+    api_url: &str,
+    extra: &[&str],
+) -> Output {
+    let mut args = vec![
+        "migrate-remote".to_string(),
+        "--scope=project".to_string(),
+        "--editors=claude".to_string(),
+    ];
+    args.extend(extra.iter().map(|arg| arg.to_string()));
+    run_cli(binary, home, project, api_url, args).await
 }
 
 fn said(output: &Output) -> String {
@@ -151,26 +198,42 @@ async fn a_refresh_from_another_accounts_home_asks_before_switching_a_project_en
     std::fs::create_dir_all(&project).unwrap();
     // The CLI names the folder it runs in as the OS reports it.
     let project = project.canonicalize().unwrap();
+    let chase_binary = install_managed_binary(&home);
+    let chase_helper = format!("{} hook mcp-headers", chase_binary.display());
+    let erik_binary = temp
+        .path()
+        .join("erik-home")
+        .join(".contextstream")
+        .join("bin")
+        .join("contextstream-mcp")
+        .display()
+        .to_string();
+    let erik_helper = format!("{erik_binary} hook mcp-headers");
 
-    // 1. No terminal, no flag: Erik's key and installation stay, the rest of
-    //    the refresh applies, and the warning names both accounts.
-    let path = seed_project_entry(&project, Some(ERIK_KEY));
-    let output = refresh_project(&home, &project, &api_url, &[]).await;
+    // 1. No terminal, no flag: Erik's key, installation and helper line stay
+    //    byte for byte, the rest of the refresh applies, and the warning
+    //    names both accounts.
+    let path = seed_project_entry(&project, Some(ERIK_KEY), Some(&erik_helper));
+    let output = refresh_project(&chase_binary, &home, &project, &api_url, &[]).await;
     let text = said(&output);
     assert!(output.status.success(), "{text}");
-    let headers = entry_headers(&path);
-    assert_eq!(headers[API_KEY_HEADER], json!(ERIK_KEY), "{text}");
+    let entry = entry_of(&path);
+    assert_eq!(entry["headers"][API_KEY_HEADER], json!(ERIK_KEY), "{text}");
     assert_eq!(
-        headers[INSTALLATION_HEADER],
+        entry["headers"][INSTALLATION_HEADER],
         json!(ERIK_INSTALLATION),
         "{text}"
     );
+    assert_eq!(entry["headersHelper"], json!(erik_helper), "{text}");
     assert!(
-        headers.get("X-ContextStream-Teaching-Version").is_some(),
-        "the rest of the refresh still applies: {headers}"
+        entry["headers"]
+            .get("X-ContextStream-Teaching-Version")
+            .is_some(),
+        "the rest of the refresh still applies: {entry}"
     );
     let raw = std::fs::read_to_string(&path).unwrap();
     assert!(!raw.contains(CHASE_KEY), "{raw}");
+    assert!(!raw.contains(&chase_binary.display().to_string()), "{raw}");
     assert!(
         text.contains(&format!(
             "{} signs in as erik@example.test; this would switch it to chase@example.test.",
@@ -185,17 +248,25 @@ async fn a_refresh_from_another_accounts_home_asks_before_switching_a_project_en
     assert!(text.contains("--switch-account"), "{text}");
     assert_no_key_printed(&text);
 
-    // 2. The explicit opt-in switches it, and says so.
-    let output = refresh_project(&home, &project, &api_url, &["--switch-account"]).await;
+    // 2. The explicit opt-in switches it, helper line included, and says so.
+    let output = refresh_project(
+        &chase_binary,
+        &home,
+        &project,
+        &api_url,
+        &["--switch-account"],
+    )
+    .await;
     let text = said(&output);
     assert!(output.status.success(), "{text}");
-    let headers = entry_headers(&path);
-    assert_eq!(headers[API_KEY_HEADER], json!(CHASE_KEY), "{text}");
+    let entry = entry_of(&path);
+    assert_eq!(entry["headers"][API_KEY_HEADER], json!(CHASE_KEY), "{text}");
     assert_ne!(
-        headers[INSTALLATION_HEADER],
+        entry["headers"][INSTALLATION_HEADER],
         json!(ERIK_INSTALLATION),
         "{text}"
     );
+    assert_eq!(entry["headersHelper"], json!(chase_helper), "{text}");
     assert!(
         text.contains("from erik@example.test to chase@example.test"),
         "{text}"
@@ -203,45 +274,140 @@ async fn a_refresh_from_another_accounts_home_asks_before_switching_a_project_en
     assert_no_key_printed(&text);
 
     // 3. A key `/auth/me` refuses is an unknown account: still a switch, so
-    //    it is kept.
-    let path = seed_project_entry(&project, Some(REVOKED_KEY));
-    let output = refresh_project(&home, &project, &api_url, &[]).await;
+    //    the key and the helper line are kept.
+    let path = seed_project_entry(&project, Some(REVOKED_KEY), Some(&erik_helper));
+    let output = refresh_project(&chase_binary, &home, &project, &api_url, &[]).await;
     let text = said(&output);
     assert!(output.status.success(), "{text}");
+    let entry = entry_of(&path);
     assert_eq!(
-        entry_headers(&path)[API_KEY_HEADER],
+        entry["headers"][API_KEY_HEADER],
         json!(REVOKED_KEY),
         "{text}"
     );
+    assert_eq!(entry["headersHelper"], json!(erik_helper), "{text}");
     assert!(
         text.contains("signs in as an unknown account; this would switch it to chase@example.test"),
         "{text}"
     );
     assert_no_key_printed(&text);
 
-    // 4. A new key for the same account is written without a word.
-    let path = seed_project_entry(&project, Some(CHASE_OLD_KEY));
-    let output = refresh_project(&home, &project, &api_url, &[]).await;
+    // 4. A new key for the same account is written without an account
+    //    question, but a helper from another home than Chase's stays, with
+    //    one warning naming both binaries.
+    let path = seed_project_entry(&project, Some(CHASE_OLD_KEY), Some(&erik_helper));
+    let output = refresh_project(&chase_binary, &home, &project, &api_url, &[]).await;
     let text = said(&output);
     assert!(output.status.success(), "{text}");
+    let entry = entry_of(&path);
+    assert_eq!(entry["headers"][API_KEY_HEADER], json!(CHASE_KEY), "{text}");
+    assert_eq!(entry["headersHelper"], json!(erik_helper), "{text}");
+    assert!(!text.contains("signs in as"), "{text}");
     assert_eq!(
-        entry_headers(&path)[API_KEY_HEADER],
-        json!(CHASE_KEY),
+        text.matches("from another home than this one").count(),
+        1,
         "{text}"
     );
-    assert!(!text.contains("signs in as"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "{} runs {erik_binary}, from another home than this one; it was not pointed at {}.",
+            path.display(),
+            chase_binary.display()
+        )),
+        "{text}"
+    );
+    assert_no_key_printed(&text);
 
-    // 5. So is an entry with no key yet.
-    let path = seed_project_entry(&project, None);
-    let output = refresh_project(&home, &project, &api_url, &[]).await;
+    // 5. An entry with no key (and no helper) is written as before.
+    let path = seed_project_entry(&project, None, None);
+    let output = refresh_project(&chase_binary, &home, &project, &api_url, &[]).await;
     let text = said(&output);
     assert!(output.status.success(), "{text}");
+    let entry = entry_of(&path);
+    assert_eq!(entry["headers"][API_KEY_HEADER], json!(CHASE_KEY), "{text}");
+    assert_eq!(entry["headersHelper"], json!(chase_helper), "{text}");
+    assert!(!text.contains("signs in as"), "{text}");
+    assert!(!text.contains("from another home"), "{text}");
+
+    // 6. A local (stdio) entry in Chase's Cursor config that runs Erik's binary
+    //    with Erik's key: `configure --transcripts` keeps it local. Without
+    //    the flag its command, arguments, key and installation stay byte for
+    //    byte; with it, they move to Chase.
+    let cursor = home.join(".cursor").join("mcp.json");
+    let stdio_entry = json!({
+        "command": erik_binary,
+        "args": [],
+        "env": {
+            "CONTEXTSTREAM_MANAGED_CONFIG_VERSION": "2",
+            "CONTEXTSTREAM_API_KEY": ERIK_KEY,
+            "CONTEXTSTREAM_INSTALLATION_ID": ERIK_INSTALLATION,
+        },
+    });
+    std::fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+    std::fs::write(
+        &cursor,
+        serde_json::to_string_pretty(&json!({"mcpServers": {"contextstream": stdio_entry}}))
+            .unwrap(),
+    )
+    .unwrap();
+    let configure = |extra: &[&str]| {
+        let mut args: Vec<String> = [
+            "configure",
+            "--transcripts=on",
+            "--scope=global",
+            "--editors=cursor",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        args.extend(extra.iter().map(|arg| arg.to_string()));
+        run_cli(&chase_binary, &home, &home, &api_url, args)
+    };
+    let output = configure(&[]).await;
+    let text = said(&output);
+    assert!(output.status.success(), "{text}");
+    let entry = entry_of(&cursor);
+    assert_eq!(entry["command"], stdio_entry["command"], "{text}");
+    assert_eq!(entry["args"], stdio_entry["args"], "{text}");
     assert_eq!(
-        entry_headers(&path)[API_KEY_HEADER],
+        entry["env"]["CONTEXTSTREAM_API_KEY"],
+        json!(ERIK_KEY),
+        "{text}"
+    );
+    assert_eq!(
+        entry["env"]["CONTEXTSTREAM_INSTALLATION_ID"],
+        json!(ERIK_INSTALLATION),
+        "{text}"
+    );
+    assert_eq!(
+        entry["env"]["CONTEXTSTREAM_TRANSCRIPTS_ENABLED"],
+        json!("true"),
+        "the rest of the refresh still applies: {entry}"
+    );
+    assert!(
+        text.contains(&format!(
+            "{} signs in as erik@example.test; this would switch it to chase@example.test.",
+            cursor.display()
+        )),
+        "{text}"
+    );
+    assert_no_key_printed(&text);
+
+    let output = configure(&["--switch-account"]).await;
+    let text = said(&output);
+    assert!(output.status.success(), "{text}");
+    let entry = entry_of(&cursor);
+    assert_eq!(
+        entry["command"],
+        json!(chase_binary.display().to_string()),
+        "{text}"
+    );
+    assert_eq!(
+        entry["env"]["CONTEXTSTREAM_API_KEY"],
         json!(CHASE_KEY),
         "{text}"
     );
-    assert!(!text.contains("signs in as"), "{text}");
+    assert_no_key_printed(&text);
 
     server.abort();
 }

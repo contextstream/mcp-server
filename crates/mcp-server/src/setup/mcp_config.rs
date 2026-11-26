@@ -1012,23 +1012,189 @@ fn restore_json_entry_installation_id(entry: &mut Value, installation_id: Option
     }
 }
 
-/// Before `server` replaces `existing` in the config at `path`: when it would
-/// sign the entry in as another account and that was not agreed to (see
-/// [`account_switch`]), put the entry's own key and installation id back;
-/// the rest of the refresh stays.
+/// Before `server` replaces `existing` in the config at `path`.
+///
+/// When it would sign the entry in as another account and that was not
+/// agreed to (see [`account_switch`]), the entry keeps its own key, its
+/// installation id and the binary it runs (its stdio command and Claude
+/// Code's `headersHelper`), exactly as they are; the rest of the refresh
+/// stays. An agreed switch takes all of the write.
+///
+/// A write that leaves the account alone still never moves the binary an
+/// entry runs from another home to this one (see
+/// [`keep_binary_from_another_home`]).
 fn settle_json_entry_account(path: &Path, existing: Option<&Value>, server: &mut Value) {
     let Some(existing) = existing else {
         return;
     };
-    let Some(kept) = account_switch::key_to_keep(
+    match account_switch::settle_key_write(
         path,
         &embedded_json_api_keys(existing),
         &embedded_json_api_keys(server),
-    ) else {
+    ) {
+        account_switch::KeyWrite::Switched => {}
+        account_switch::KeyWrite::Keep(kept) => {
+            if !keep_entry_binary(existing, server) {
+                *server = existing.clone();
+                return;
+            }
+            refresh_json_entry_embedded_api_key(server, &kept);
+            restore_json_entry_installation_id(
+                server,
+                json_entry_installation_id(existing).as_deref(),
+            );
+        }
+        account_switch::KeyWrite::NoSwitch => keep_binary_from_another_home(path, existing, server),
+    }
+}
+
+/// The entry fields a refresh points at this home's binary: a stdio entry's
+/// command and arguments, and Claude Code's `headersHelper` line. No env or
+/// header value a refresh writes holds a path.
+const BINARY_FIELDS: [&str; 3] = ["command", "args", HEADERS_HELPER_FIELD];
+
+/// Keep the binary `existing` runs in `server`, exactly as it is: each of
+/// [`BINARY_FIELDS`] the write sets goes back to the entry's own value, or
+/// out when the entry had none. False when that would break the entry
+/// because the write turns a hosted entry into a local one, which needs a
+/// command: the caller then keeps the whole entry as it is.
+fn keep_entry_binary(existing: &Value, server: &mut Value) -> bool {
+    if server.get("command").is_some() && existing.get("command").is_none() {
+        return false;
+    }
+    let Some(entry) = server.as_object_mut() else {
+        return true;
+    };
+    for field in BINARY_FIELDS {
+        if !entry.contains_key(field) {
+            continue;
+        }
+        match existing.get(field) {
+            Some(value) => {
+                entry.insert(field.to_string(), value.clone());
+            }
+            None => {
+                entry.remove(field);
+            }
+        }
+    }
+    true
+}
+
+/// The words an entry runs a binary with: the program of its `headersHelper`
+/// line, then its command and arguments.
+fn json_entry_binary_words(entry: &Value) -> Vec<String> {
+    let mut words: Vec<String> = entry
+        .get(HEADERS_HELPER_FIELD)
+        .and_then(Value::as_str)
+        .and_then(|line| line.split_whitespace().next())
+        .map(String::from)
+        .into_iter()
+        .collect();
+    for field in ["command", "args"] {
+        match entry.get(field) {
+            Some(Value::String(word)) => words.push(word.clone()),
+            Some(Value::Array(list)) => {
+                words.extend(list.iter().filter_map(Value::as_str).map(String::from))
+            }
+            _ => {}
+        }
+    }
+    words
+}
+
+/// Whether `path` lies in a home directory other than `home`: a managed
+/// install (`<home>/.contextstream/...`) of another home, or anything under
+/// another directory beside `home` (`/home/<someone else>/...`). A bare
+/// program name, found on PATH, lies in no home.
+fn path_in_another_home(path: &str, home: &Path) -> bool {
+    let normalize = |raw: &str| {
+        raw.trim()
+            .trim_end_matches(" (deleted)")
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_string()
+    };
+    let path = normalize(path);
+    let home = normalize(&home.to_string_lossy());
+    if home.is_empty() || !path.contains('/') {
+        return false;
+    }
+    let same = |a: &str, b: &str| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let under = |dir: &str| {
+        path.get(..dir.len()).is_some_and(|head| same(head, dir))
+            && path.as_bytes().get(dir.len()) == Some(&b'/')
+    };
+    if under(&home) {
+        return false;
+    }
+    if let Some(index) = path.find("/.contextstream/") {
+        return !same(&path[..index], &home);
+    }
+    // Homes share a parent (`/home`, `/Users`, `C:/Users`); a home right under
+    // a root (`/root`, `D:/me`) has none worth comparing.
+    let is_root = |dir: &str| {
+        let rest = match dir.split_once(':') {
+            Some((drive, rest)) if drive.len() == 1 => rest,
+            _ => dir,
+        };
+        rest.trim_matches('/').is_empty()
+    };
+    match home.rsplit_once('/') {
+        Some((parent, _)) if !is_root(parent) => under(parent),
+        _ => false,
+    }
+}
+
+/// On a write that leaves the account alone: when `existing` runs a binary
+/// from another home than this one and `server` would run another binary,
+/// keep the entry's own (see [`keep_entry_binary`]) and say so once, naming
+/// both. The same account in another person's home is still another
+/// identity's binary.
+fn keep_binary_from_another_home(path: &Path, existing: &Value, server: &mut Value) {
+    let Some(home) = dirs::home_dir() else {
         return;
     };
-    refresh_json_entry_embedded_api_key(server, &kept);
-    restore_json_entry_installation_id(server, json_entry_installation_id(existing).as_deref());
+    let Some((kept, instead)) = binary_moved_from_another_home(existing, server, &home) else {
+        return;
+    };
+    if !keep_entry_binary(existing, server) {
+        *server = existing.clone();
+    }
+    account_switch::say_binary_from_another_home(path, &kept, &instead);
+}
+
+/// The binary from another home than `home` that `existing` runs, and the
+/// one `server` would run instead, when the write changes what it runs.
+fn binary_moved_from_another_home(
+    existing: &Value,
+    server: &Value,
+    home: &Path,
+) -> Option<(String, String)> {
+    let held = json_entry_binary_words(existing);
+    let kept = held
+        .iter()
+        .find(|word| path_in_another_home(word, home))?
+        .clone();
+    let changes = BINARY_FIELDS.iter().any(|field| {
+        server
+            .get(*field)
+            .is_some_and(|value| existing.get(*field) != Some(value))
+    });
+    if !changes {
+        return None;
+    }
+    let instead = json_entry_binary_words(server)
+        .into_iter()
+        .find(|word| !held.contains(word))
+        .unwrap_or_default();
+    Some((kept, instead))
 }
 
 /// The keys an entry holds that a rotation to a new key must settle with
@@ -1109,36 +1275,124 @@ fn restore_codex_toml_installation_id(
     }
 }
 
+/// The words a Codex entry runs its binary with: its command and arguments.
+fn codex_entry_binary_words(entry: &Item) -> Vec<String> {
+    let Some(table) = entry.as_table_like() else {
+        return Vec::new();
+    };
+    let mut words: Vec<String> = table
+        .get("command")
+        .and_then(Item::as_value)
+        .and_then(toml_edit::Value::as_str)
+        .map(String::from)
+        .into_iter()
+        .collect();
+    if let Some(args) = table
+        .get("args")
+        .and_then(Item::as_value)
+        .and_then(toml_edit::Value::as_array)
+    {
+        words.extend(
+            args.iter()
+                .filter_map(toml_edit::Value::as_str)
+                .map(String::from),
+        );
+    }
+    words
+}
+
+/// [`keep_entry_binary`] for a Codex entry: its command and arguments.
+fn keep_codex_entry_binary(existing: &Item, entry: &mut dyn toml_edit::TableLike) -> bool {
+    let held = existing.as_table_like();
+    if entry.contains_key("command") && !held.is_some_and(|table| table.contains_key("command")) {
+        return false;
+    }
+    for field in ["command", "args"] {
+        if !entry.contains_key(field) {
+            continue;
+        }
+        match held.and_then(|table| table.get(field)) {
+            Some(item) => {
+                entry.insert(field, item.clone());
+            }
+            None => {
+                entry.remove(field);
+            }
+        }
+    }
+    true
+}
+
 /// [`settle_json_entry_account`] for the Codex block that replaces the
 /// `[mcp_servers.contextstream]` entry of `existing` in the config at `path`.
-fn settle_codex_block_account(path: &Path, existing: &str, new_block: String) -> Result<String> {
+/// `None` when the entry must stay exactly as it is.
+fn settle_codex_block_account(
+    path: &Path,
+    existing: &str,
+    new_block: String,
+) -> Result<Option<String>> {
     let existing_document = parse_codex_toml(existing, path)?;
     let Some(existing_entry) = contextstream_toml_item(&existing_document) else {
-        return Ok(new_block);
+        return Ok(Some(new_block));
     };
     let mut document = parse_codex_toml(&new_block, path)
         .context("Internal error: generated Codex configuration is invalid")?;
-    let proposed = contextstream_toml_item(&document)
-        .map(embedded_codex_toml_api_keys)
+    let (proposed, new_words) = contextstream_toml_item(&document)
+        .map(|entry| {
+            (
+                embedded_codex_toml_api_keys(entry),
+                codex_entry_binary_words(entry),
+            )
+        })
         .unwrap_or_default();
-    let Some(kept) = account_switch::key_to_keep(
+    let settled = account_switch::settle_key_write(
         path,
         &embedded_codex_toml_api_keys(existing_entry),
         &proposed,
-    ) else {
-        return Ok(new_block);
-    };
-    let installation_id = codex_toml_installation_id(existing_entry);
-    if let Some(entry) = document
+    );
+    let Some(entry) = document
         .get_mut("mcp_servers")
         .and_then(Item::as_table_like_mut)
         .and_then(|servers| servers.get_mut("contextstream"))
         .and_then(Item::as_table_like_mut)
-    {
-        refresh_codex_toml_entry_embedded_api_key(entry, &kept);
-        restore_codex_toml_installation_id(entry, installation_id.as_deref());
+    else {
+        return Ok(Some(new_block));
+    };
+    match settled {
+        account_switch::KeyWrite::Switched => return Ok(Some(new_block)),
+        account_switch::KeyWrite::Keep(kept) => {
+            if !keep_codex_entry_binary(existing_entry, entry) {
+                return Ok(None);
+            }
+            refresh_codex_toml_entry_embedded_api_key(entry, &kept);
+            restore_codex_toml_installation_id(
+                entry,
+                codex_toml_installation_id(existing_entry).as_deref(),
+            );
+        }
+        account_switch::KeyWrite::NoSwitch => {
+            let held = codex_entry_binary_words(existing_entry);
+            let Some(home) = dirs::home_dir() else {
+                return Ok(Some(new_block));
+            };
+            let Some(kept) = held.iter().find(|word| path_in_another_home(word, &home)) else {
+                return Ok(Some(new_block));
+            };
+            if new_words.is_empty() || new_words == held {
+                return Ok(Some(new_block));
+            }
+            let instead = new_words
+                .iter()
+                .find(|word| !held.contains(word))
+                .cloned()
+                .unwrap_or_default();
+            account_switch::say_binary_from_another_home(path, kept, &instead);
+            if !keep_codex_entry_binary(existing_entry, entry) {
+                return Ok(None);
+            }
+        }
     }
-    Ok(document.to_string())
+    Ok(Some(document.to_string()))
 }
 
 fn build_remote_http_server_json(
@@ -3488,7 +3742,10 @@ fn write_codex_config(
             identity,
         )
     };
-    let new_block = settle_codex_block_account(&path, existing, new_block)?;
+    let Some(new_block) = settle_codex_block_account(&path, existing, new_block)? else {
+        // The entry stays exactly as it is.
+        return Ok(());
+    };
 
     let result = upsert_contextstream_toml(existing, &new_block, &path)?;
     safe_edit::write_private_text(&path, &result, Some(&raw_existing), true)?;
@@ -11019,6 +11276,250 @@ CONTEXTSTREAM_API_KEY = "test-key"
                 raw.contains(TEST_MANAGED_INSTALLATION_ID),
                 "{}: {raw}",
                 path.display()
+            );
+        }
+    }
+
+    /// Entries that run a binary from Erik's home (`<temp>/erik-home`): a
+    /// hosted project entry with a `headersHelper`, and local Cursor and Codex
+    /// entries, each holding `api_key`. HOME is `<temp>/chase-home`, which has
+    /// its own managed binary.
+    struct ErikBinaryEntries {
+        project: PathBuf,
+        project_config: PathBuf,
+        cursor: PathBuf,
+        codex: PathBuf,
+        erik_binary: String,
+        erik_helper: String,
+        chase_binary: String,
+    }
+
+    impl ErikBinaryEntries {
+        fn new(temp: &Path, home: &Path) -> Self {
+            let chase_binary = super::super::hooks::managed_binary_path();
+            std::fs::create_dir_all(chase_binary.parent().expect("bin dir")).expect("mkdir bin");
+            std::fs::write(&chase_binary, b"").expect("this home's managed binary");
+            let erik_binary = temp
+                .join("erik-home")
+                .join(".contextstream")
+                .join("bin")
+                .join("contextstream-mcp")
+                .display()
+                .to_string();
+            let project = temp.join("repo");
+            Self {
+                project_config: project.join(".mcp.json"),
+                project,
+                cursor: home.join(".cursor").join("mcp.json"),
+                codex: home.join(".codex").join("config.toml"),
+                erik_helper: format!("{erik_binary} hook mcp-headers"),
+                erik_binary,
+                chase_binary: chase_binary.display().to_string(),
+            }
+        }
+
+        fn seed(&self, api_key: &str) {
+            seed_json(
+                &self.project_config,
+                &json!({"mcpServers": {"contextstream": {
+                    "type": "http",
+                    "url": default_remote_mcp_url(),
+                    HEADERS_HELPER_FIELD: self.erik_helper,
+                    "headers": {
+                        HEADER_MANAGED_CONFIG_VERSION: MANAGED_CONFIG_VERSION,
+                        HEADER_API_KEY: api_key,
+                    },
+                }}}),
+            );
+            seed_json(
+                &self.cursor,
+                &json!({"mcpServers": {"contextstream": {
+                    "command": self.erik_binary,
+                    "args": [],
+                    "env": {
+                        ENV_MANAGED_CONFIG_VERSION: MANAGED_CONFIG_VERSION,
+                        "CONTEXTSTREAM_API_KEY": api_key,
+                    },
+                }}}),
+            );
+            std::fs::create_dir_all(self.codex.parent().expect("codex dir")).expect("mkdir");
+            std::fs::write(
+                &self.codex,
+                format!(
+                    "{CODEX_MANAGED_COMMENT}\n[mcp_servers.contextstream]\ncommand = \"{}\"\n\
+                     args = []\n\n[mcp_servers.contextstream.env]\n\
+                     CONTEXTSTREAM_API_KEY = \"{api_key}\"\n\
+                     {ENV_MANAGED_CONFIG_VERSION} = \"{MANAGED_CONFIG_VERSION}\"\n",
+                    toml_escape(&self.erik_binary)
+                ),
+            )
+            .expect("seed codex");
+        }
+
+        /// What a refresh from Chase's HOME writes into all three.
+        fn refresh(&self, api_key: &str) {
+            write_project_mcp_config_force_remote_with_auth(
+                &Editor::ClaudeCode,
+                &self.project,
+                api_key,
+                Some("ws-1"),
+                Some("proj-1"),
+                None,
+                None,
+                Some(api_key),
+            )
+            .expect("project refresh");
+            for editor in [Editor::Cursor, Editor::Codex] {
+                write_mcp_config_force_local(&editor, api_key, Some("ws-1"), None, None, None)
+                    .expect("local refresh");
+            }
+        }
+
+        fn helper(&self) -> Value {
+            read_json(&self.project_config)["mcpServers"]["contextstream"][HEADERS_HELPER_FIELD]
+                .clone()
+        }
+
+        fn cursor_command(&self) -> (Value, Value) {
+            let entry = read_json(&self.cursor)["mcpServers"]["contextstream"].clone();
+            (entry["command"].clone(), entry["args"].clone())
+        }
+
+        fn codex_command(&self) -> Option<String> {
+            let raw = std::fs::read_to_string(&self.codex).expect("read codex");
+            let document = parse_codex_toml(&raw, &self.codex).expect("parse codex");
+            contextstream_toml_item(&document)
+                .and_then(|entry| toml_item_string(entry, "command"))
+                .map(String::from)
+        }
+    }
+
+    #[test]
+    fn a_kept_entry_keeps_the_binary_it_runs_and_an_agreed_switch_repoints_it() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("chase-home");
+        std::fs::create_dir_all(home.join(".claude")).expect("mkdir .claude");
+        let _home = HomeGuard::isolate_under(&home);
+        let _xdg = XdgConfigGuard::isolate_under(&home);
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+        let entries = ErikBinaryEntries::new(temp.path(), &home);
+        let _accounts = erik_and_chase();
+
+        // Refused (no terminal): every entry keeps Erik's key and the binary
+        // it runs, byte for byte; nothing names this home's binary.
+        entries.seed(ERIK_KEY);
+        entries.refresh(CHASE_KEY);
+        assert_eq!(entries.helper(), json!(entries.erik_helper));
+        assert_eq!(
+            entries.cursor_command(),
+            (json!(entries.erik_binary), json!([]))
+        );
+        assert_eq!(entries.codex_command(), Some(entries.erik_binary.clone()));
+        for path in [&entries.project_config, &entries.cursor, &entries.codex] {
+            let raw = std::fs::read_to_string(path).expect("read");
+            assert!(raw.contains(ERIK_KEY), "{}: {raw}", path.display());
+            assert!(!raw.contains(CHASE_KEY), "{}: {raw}", path.display());
+            assert!(
+                !raw.contains(&entries.chase_binary),
+                "{}: {raw}",
+                path.display()
+            );
+        }
+
+        // Agreed: each entry moves to Chase's key and this home's binary.
+        let _switch = account_switch::test_policy(account_switch::Mode::Switch, false);
+        let _accounts = erik_and_chase();
+        entries.seed(ERIK_KEY);
+        entries.refresh(CHASE_KEY);
+        assert_eq!(
+            entries.helper(),
+            json!(format!("{} hook mcp-headers", entries.chase_binary))
+        );
+        assert_eq!(entries.cursor_command().0, json!(entries.chase_binary));
+        assert_eq!(entries.codex_command(), Some(entries.chase_binary.clone()));
+    }
+
+    #[test]
+    fn a_same_account_refresh_never_moves_an_entry_to_this_homes_binary() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("chase-home");
+        std::fs::create_dir_all(home.join(".claude")).expect("mkdir .claude");
+        let _home = HomeGuard::isolate_under(&home);
+        let _xdg = XdgConfigGuard::isolate_under(&home);
+        let _api_url = EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL);
+        let entries = ErikBinaryEntries::new(temp.path(), &home);
+        let _accounts = erik_and_chase();
+
+        // The same account (a new key for Erik), so no account question: the
+        // key is refreshed, but each entry keeps running Erik's binary.
+        entries.seed(ERIK_KEY);
+        entries.refresh("cs_erik_rotated");
+        assert_eq!(entries.helper(), json!(entries.erik_helper));
+        assert_eq!(
+            entries.cursor_command(),
+            (json!(entries.erik_binary), json!([]))
+        );
+        assert_eq!(entries.codex_command(), Some(entries.erik_binary.clone()));
+        for path in [&entries.project_config, &entries.cursor, &entries.codex] {
+            let raw = std::fs::read_to_string(path).expect("read");
+            assert!(raw.contains("cs_erik_rotated"), "{}: {raw}", path.display());
+            assert!(!raw.contains(ERIK_KEY), "{}: {raw}", path.display());
+        }
+
+        // A binary in no home (a system install) is repointed as before.
+        let system_helper = "/opt/tools/contextstream-mcp hook mcp-headers";
+        let mut entry = read_json(&entries.project_config);
+        entry["mcpServers"]["contextstream"][HEADERS_HELPER_FIELD] = json!(system_helper);
+        seed_json(&entries.project_config, &entry);
+        entries.refresh("cs_erik_rotated");
+        assert_eq!(
+            entries.helper(),
+            json!(format!("{} hook mcp-headers", entries.chase_binary))
+        );
+    }
+
+    #[test]
+    fn another_home_is_a_managed_install_elsewhere_or_a_sibling_home() {
+        let chase = Path::new("/home/chase");
+        for (path, home, other) in [
+            (
+                "/home/erik/.contextstream/bin/contextstream-mcp",
+                chase,
+                true,
+            ),
+            ("/home/erik/bin/contextstream-mcp", chase, true),
+            ("/home/chase-old/bin/contextstream-mcp", chase, true),
+            (
+                "/home/chase/.contextstream/bin/contextstream-mcp",
+                chase,
+                false,
+            ),
+            ("/home/chase/bin/contextstream-mcp", chase, false),
+            ("/usr/local/bin/contextstream-mcp", chase, false),
+            ("contextstream-mcp", chase, false),
+            (
+                "/srv/me/.contextstream/bin/contextstream-mcp",
+                Path::new("/root"),
+                true,
+            ),
+            ("/usr/bin/contextstream-mcp", Path::new("/root"), false),
+            (
+                "C:\\Users\\erik\\.contextstream\\bin\\contextstream-mcp.exe",
+                Path::new("C:\\Users\\chase"),
+                true,
+            ),
+            (
+                "C:/Program Files/ContextStream/contextstream-mcp.exe",
+                Path::new("C:\\Users\\chase"),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                path_in_another_home(path, home),
+                other,
+                "{path} from {home:?}"
             );
         }
     }

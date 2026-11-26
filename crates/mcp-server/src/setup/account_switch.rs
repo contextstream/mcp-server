@@ -10,7 +10,9 @@
 //! entry holds, this module says which file, the account it signs in as now
 //! and the account it would switch to, by email, and asks (default No). With
 //! no terminal, or under `setup --yes`, it keeps the key and says how to switch
-//! on purpose: `--switch-account`, or setup in a terminal.
+//! on purpose: `--switch-account`, or setup in a terminal. A kept entry also
+//! keeps its installation id and the binary it runs
+//! (`mcp_config::settle_json_entry_account`).
 //!
 //! The same key, a new key for the same account and an entry with no key yet
 //! are written as before, without a word. A key `/auth/me` does not resolve
@@ -99,29 +101,95 @@ pub(crate) struct Proposal<'a> {
     pub to: Account,
 }
 
-/// The key a write must keep in the entry at `path`, which holds `current`
-/// keys now and would hold `proposed` ones: `Some` when the write would put a
-/// key for another account in place of one it holds and that was not agreed
-/// to, `None` when the write may go ahead as it is.
+/// How a write that holds `proposed` keys may replace an entry that holds
+/// `current` ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KeyWrite {
+    /// No key for another account goes in place of a held one: the same key,
+    /// a new key for the same account, or an entry with no key yet.
+    NoSwitch,
+    /// The entry switches to another account, as agreed (`--switch-account`,
+    /// or a yes on a terminal).
+    Switched,
+    /// The switch was not agreed: the entry keeps this key it holds, and the
+    /// rest of what ties it to its own account and home.
+    Keep(String),
+}
+
+/// What a write may do with the keys of the entry at `path`, which holds
+/// `current` keys now and would hold `proposed` ones. Asks or warns first
+/// when it would put a key for another account in place of one it holds.
+pub(crate) fn settle_key_write(path: &Path, current: &[String], proposed: &[String]) -> KeyWrite {
+    let Some(new_key) = proposed.iter().find(|key| !current.contains(key)) else {
+        return KeyWrite::NoSwitch;
+    };
+    let Some(held) = current.iter().find(|key| *key != new_key) else {
+        return KeyWrite::NoSwitch;
+    };
+    match settle(path, held, new_key) {
+        Settled::SameAccount => KeyWrite::NoSwitch,
+        Settled::Switched => KeyWrite::Switched,
+        Settled::Kept => KeyWrite::Keep(held.clone()),
+    }
+}
+
+/// The key a write must keep in the entry at `path` (see [`settle_key_write`]):
+/// `Some` when the write would switch it to another account without
+/// agreement, `None` when it may go ahead.
 pub(crate) fn key_to_keep(path: &Path, current: &[String], proposed: &[String]) -> Option<String> {
-    let new_key = proposed.iter().find(|key| !current.contains(key))?;
-    let held = current.iter().find(|key| *key != new_key)?;
-    (settle(path, held, new_key) == Choice::Keep).then(|| held.clone())
+    match settle_key_write(path, current, proposed) {
+        KeyWrite::Keep(key) => Some(key),
+        KeyWrite::NoSwitch | KeyWrite::Switched => None,
+    }
+}
+
+/// How [`settle`] settled one key in place of another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settled {
+    /// The same key, or both keys sign in as the same account.
+    SameAccount,
+    /// Another account, and the switch was agreed.
+    Switched,
+    /// Another (or an unknown) account, and the switch was not agreed.
+    Kept,
 }
 
 /// Whether a write may put `proposed` in place of `current` in the entry at
 /// `path`. Asks, warns or says what it did when the keys sign in as different
 /// accounts (or either account is unknown); keys never appear in what it says.
-pub(crate) fn settle(path: &Path, current: &str, proposed: &str) -> Choice {
+pub(crate) fn settle(path: &Path, current: &str, proposed: &str) -> Settled {
     if current == proposed {
-        return Choice::Switch;
+        return Settled::SameAccount;
     }
     let (from, to) = accounts_of(current, proposed);
     if from.is_same(&to) {
-        return Choice::Switch;
+        return Settled::SameAccount;
     }
     let proposal = Proposal { path, from, to };
-    decide(&proposal, mode(), ask, &mut |line| eprintln!("{line}"))
+    match decide(&proposal, mode(), ask, &mut |line| eprintln!("{line}")) {
+        Choice::Switch => Settled::Switched,
+        Choice::Keep => Settled::Kept,
+    }
+}
+
+/// Say that the entry at `path` still runs `kept`, a binary from another home
+/// than this one, where this write would have run `instead`.
+pub(crate) fn say_binary_from_another_home(path: &Path, kept: &str, instead: &str) {
+    eprintln!("{}", binary_from_another_home_line(path, kept, instead));
+}
+
+fn binary_from_another_home_line(path: &Path, kept: &str, instead: &str) -> String {
+    let ui = ui::ui();
+    ui.line(
+        Mark::Warn,
+        &format!(
+            "{} runs {}, from another home than this one; it was not pointed at {}.",
+            ui.path(&path.display().to_string()),
+            ui.path(kept),
+            ui.path(instead)
+        ),
+        None,
+    )
 }
 
 /// What to do with `proposal` in `mode`, saying it line by line through `say`;
@@ -441,18 +509,64 @@ mod tests {
     fn the_same_key_or_the_same_account_is_no_switch() {
         let _policy = test_policy(Mode::Keep, false);
         let path = Path::new("/work/repo/.mcp.json");
-        assert_eq!(settle(path, "cs_key_a", "cs_key_a"), Choice::Switch);
+        assert_eq!(settle(path, "cs_key_a", "cs_key_a"), Settled::SameAccount);
 
         let _accounts = test_accounts(&[
             ("cs_key_a", "Erik@Example.test"),
             ("cs_key_b", "erik@example.test"),
             ("cs_key_c", "chase@example.test"),
         ]);
-        assert_eq!(settle(path, "cs_key_a", "cs_key_b"), Choice::Switch);
-        assert_eq!(settle(path, "cs_key_a", "cs_key_c"), Choice::Keep);
+        assert_eq!(settle(path, "cs_key_a", "cs_key_b"), Settled::SameAccount);
+        assert_eq!(settle(path, "cs_key_a", "cs_key_c"), Settled::Kept);
         // A key nobody can resolve is an unknown account: a different key
         // still counts as a switch.
-        assert_eq!(settle(path, "cs_unknown", "cs_key_c"), Choice::Keep);
+        assert_eq!(settle(path, "cs_unknown", "cs_key_c"), Settled::Kept);
+    }
+
+    #[test]
+    fn settle_key_write_tells_no_switch_an_agreed_switch_and_a_kept_key_apart() {
+        let path = Path::new("/work/repo/.mcp.json");
+        let keys = |list: &[&str]| list.iter().map(|key| key.to_string()).collect::<Vec<_>>();
+        let _accounts = test_accounts(&[
+            ("cs_erik", "erik@example.test"),
+            ("cs_erik_new", "erik@example.test"),
+            ("cs_chase", "chase@example.test"),
+        ]);
+        let _policy = test_policy(Mode::Keep, false);
+        assert_eq!(
+            settle_key_write(path, &keys(&["cs_erik"]), &keys(&["cs_erik_new"])),
+            KeyWrite::NoSwitch
+        );
+        assert_eq!(
+            settle_key_write(path, &[], &keys(&["cs_chase"])),
+            KeyWrite::NoSwitch
+        );
+        assert_eq!(
+            settle_key_write(path, &keys(&["cs_erik"]), &keys(&["cs_chase"])),
+            KeyWrite::Keep("cs_erik".to_string())
+        );
+        let _policy = test_policy(Mode::Switch, false);
+        assert_eq!(
+            settle_key_write(path, &keys(&["cs_erik"]), &keys(&["cs_chase"])),
+            KeyWrite::Switched
+        );
+    }
+
+    #[test]
+    fn the_other_home_warning_names_both_binaries() {
+        let line = binary_from_another_home_line(
+            Path::new("/work/repo/.mcp.json"),
+            "/home/erik/.contextstream/bin/contextstream-mcp",
+            "/home/chase/.contextstream/bin/contextstream-mcp",
+        );
+        assert!(
+            line.contains(
+                "/work/repo/.mcp.json runs /home/erik/.contextstream/bin/contextstream-mcp, from \
+                 another home than this one; it was not pointed at \
+                 /home/chase/.contextstream/bin/contextstream-mcp."
+            ),
+            "{line}"
+        );
     }
 
     #[test]

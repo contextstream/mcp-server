@@ -764,6 +764,7 @@ pub async fn resolve_read_scope(
     drop(config);
 
     let mut resolved_folder_project_id = None;
+    let mut workspace_backed_by_folder = false;
     let mut note = None;
     if let Some(ref path) = folder_path {
         if let Some(mapping) = resolve_workspace(path).await {
@@ -781,6 +782,7 @@ pub async fn resolve_read_scope(
                     }
                     if workspace_id == Some(mapping.workspace_id) {
                         resolved_folder_project_id = mapping.project_id;
+                        workspace_backed_by_folder = true;
                     }
                 } else {
                     if workspace_id == Some(mapping.workspace_id) {
@@ -794,6 +796,7 @@ pub async fn resolve_read_scope(
                 }
             } else if workspace_id == Some(mapping.workspace_id) {
                 resolved_folder_project_id = mapping.project_id;
+                workspace_backed_by_folder = true;
             }
         }
     }
@@ -801,14 +804,28 @@ pub async fn resolve_read_scope(
         .as_deref()
         .and_then(ContextStreamClient::tracked_project_id_for_folder);
 
+    // When the active workspace came solely from `config.default_workspace_id`
+    // (no caller workspace_id, no initialized session workspace, no task-auth
+    // workspace, and no live folder mapping), an explicitly requested project
+    // that the caller can read sets the read's workspace instead of being
+    // dropped as foreign.
+    let workspace_from_default_only = !raw_workspace_provided
+        && state.workspace_id.is_none()
+        && task_workspace_id.is_none()
+        && !workspace_backed_by_folder;
+
     if let Some(explicit_id) = explicit_project_id {
         match client.get_project(explicit_id).await {
             Ok(project) => {
                 if let Some(project_ws) = project.workspace_id {
                     match workspace_id {
                         Some(active_ws) if active_ws != project_ws => {
-                            note = Some(foreign_project_ignored_note(explicit_id));
-                            explicit_project_id = None;
+                            if workspace_from_default_only {
+                                workspace_id = Some(project_ws);
+                            } else {
+                                note = Some(foreign_project_ignored_note(explicit_id));
+                                explicit_project_id = None;
+                            }
                         }
                         None => workspace_id = Some(project_ws),
                         _ => {}
@@ -1599,6 +1616,153 @@ mod tests {
         assert_eq!(scope.workspace_id, Some(project_workspace));
         assert_eq!(scope.project_id, Some(project_id));
         assert_eq!(scope.note, None);
+    }
+
+    #[tokio::test]
+    async fn read_scope_ignores_foreign_explicit_project_when_workspace_id_was_passed() {
+        let explicit_workspace = Uuid::new_v4();
+        let project_workspace = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let (client, session) = scope_test_client(Some(explicit_workspace), None);
+
+        let scope = mcp_client::run_with_session_key(mcp_types::SessionKey::Local, || async {
+            client.prime_cached_project(project_in_workspace(project_id, project_workspace));
+            resolve_read_scope(
+                &client,
+                &session,
+                Some(&explicit_workspace.to_string()),
+                Some(&project_id.to_string()),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+
+        assert_eq!(scope.workspace_id, Some(explicit_workspace));
+        assert_eq!(scope.project_id, None);
+        assert_eq!(scope.note, Some(foreign_project_ignored_note(project_id)));
+    }
+
+    #[tokio::test]
+    async fn read_scope_ignores_foreign_explicit_project_when_session_workspace_is_set() {
+        let session_workspace = Uuid::new_v4();
+        let project_workspace = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let (client, session) = scope_test_client(None, None);
+
+        let scope = mcp_client::run_with_session_key(mcp_types::SessionKey::Local, || async {
+            session
+                .initialize(Some(session_workspace), None, None, None)
+                .await;
+            client.prime_cached_project(project_in_workspace(project_id, project_workspace));
+            resolve_read_scope(&client, &session, None, Some(&project_id.to_string()))
+                .await
+                .unwrap()
+        })
+        .await;
+
+        assert_eq!(scope.workspace_id, Some(session_workspace));
+        assert_eq!(scope.project_id, None);
+        assert_eq!(scope.note, Some(foreign_project_ignored_note(project_id)));
+    }
+
+    async fn spawn_single_json_response(
+        status_line: &'static str,
+        body: String,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    #[tokio::test]
+    async fn read_scope_ignores_foreign_explicit_project_under_task_auth_workspace() {
+        let task_workspace = Uuid::new_v4();
+        let project_workspace = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let body =
+            serde_json::to_string(&project_in_workspace(project_id, project_workspace)).unwrap();
+        let (api_url, server) = spawn_single_json_response("200 OK", body).await;
+
+        let config = mcp_types::Config {
+            api_url,
+            ..mcp_types::Config::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = SessionManager::new(client.clone(), config);
+
+        let scope = mcp_client::run_with_auth_override(
+            mcp_types::AuthOverride {
+                api_key: Some("test-key".to_string()),
+                workspace_id: Some(task_workspace),
+                project_id: None,
+                ..Default::default()
+            },
+            || async {
+                resolve_read_scope(&client, &session, None, Some(&project_id.to_string()))
+                    .await
+                    .unwrap()
+            },
+        )
+        .await;
+
+        server.await.unwrap();
+        assert_eq!(scope.workspace_id, Some(task_workspace));
+        assert_eq!(scope.project_id, None);
+        assert_eq!(scope.note, Some(foreign_project_ignored_note(project_id)));
+    }
+
+    #[tokio::test]
+    async fn read_scope_ignores_missing_explicit_project_over_config_default_workspace() {
+        let header_default_workspace = Uuid::new_v4();
+        let missing_project_id = Uuid::new_v4();
+        let (api_url, server) = spawn_single_json_response(
+            "404 Not Found",
+            r#"{"error":{"code":"NOT_FOUND","message":"Project not found"}}"#.to_string(),
+        )
+        .await;
+
+        let config = mcp_types::Config {
+            api_url,
+            api_key: Some("test-key".to_string()),
+            default_workspace_id: Some(header_default_workspace),
+            ..mcp_types::Config::default()
+        };
+        let client = ContextStreamClient::new(config.clone());
+        let session = SessionManager::new(client.clone(), config);
+
+        let scope = mcp_client::run_with_session_key(mcp_types::SessionKey::Local, || async {
+            resolve_read_scope(
+                &client,
+                &session,
+                None,
+                Some(&missing_project_id.to_string()),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+
+        server.await.unwrap();
+        assert_eq!(scope.workspace_id, Some(header_default_workspace));
+        assert_eq!(scope.project_id, None);
+        assert_eq!(
+            scope.note,
+            Some(missing_project_ignored_note(missing_project_id))
+        );
     }
 
     #[tokio::test]

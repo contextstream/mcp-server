@@ -3,6 +3,7 @@
 ## Unreleased
 
 - A refresh in a repository whose ContextStream entries hold their key by reference (`${CONTEXTSTREAM_API_KEY}`, `{env:…}`) no longer writes the running account into it without a word. It creates another editor's project entry (such as `.cursor/mcp.json`) with this run's key only when this run's own API shows that this run's key can see the workspace or project the repository names (in `.contextstream/config.json` or its entries' workspace and project ids); otherwise it asks on a terminal, or skips it and says why. The same check decides whether such an entry that runs no binary gets this home's `headersHelper`. An entry with a key held by reference keeps its installation id as written, and `doctor` no longer requires that id to be this installation's. No refresh points a ContextStream binary outside any home (such as `/usr/local/bin/contextstream-mcp`) at a home's binary.
+- `CONTEXTSTREAM_WATCH=0`, the one opt-out for the sync bridge, now holds for every command: none starts a `contextstream-mcp watch` or registers or starts its service. `connect` registered and started the service anyway; under the opt-out it now stops before it uses the connection link, and says why. `update` run in a folder that belongs to another user than its home no longer starts the sync bridge: it says so and runs its refresh with the bridge off. The CLI tests use the real opt-out, and a test fails when one of them leaves a watcher running.
 
 ## 1.0.108
 

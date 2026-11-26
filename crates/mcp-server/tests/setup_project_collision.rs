@@ -356,6 +356,7 @@ async fn run_setup(
             .args(["setup", "--yes", "--editors", "claude"])
             .args(&extra)
             .current_dir(&cwd)
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &home)
             .env("USERPROFILE", &home)
             .env("CONTEXTSTREAM_API_URL", &api_url)

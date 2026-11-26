@@ -83,7 +83,6 @@ impl Home {
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("CONTEXTSTREAM_API_URL", "http://127.0.0.1:9")
             .env("CONTEXTSTREAM_WATCH", "0")
-            .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
             .env("NO_COLOR", "1");
         for (key, value) in env {
             cmd.env(key, value);

@@ -287,7 +287,7 @@ fn run_cli_with_stdin(
             "CONTEXTSTREAM_MCP_HTTP_URL",
             format!("{api_url}/mcp?default_context_mode=fast"),
         )
-        .env("CONTEXTSTREAM_WATCH_ENABLED", "false")
+        .env("CONTEXTSTREAM_WATCH", "0")
         .env_remove("CONTEXTSTREAM_API_KEY")
         .env_remove("CONTEXTSTREAM_JWT")
         .env_remove("CONTEXTSTREAM_WORKSPACE_ID")

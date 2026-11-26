@@ -310,6 +310,7 @@ async fn pinned_project_link_passes_link_and_doctor_and_survives_repairs() {
     tokio::task::spawn_blocking(move || {
         let mut child = Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
             .args(["configure", "--api-key-stdin"])
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &cfg_home)
             .env("USERPROFILE", &cfg_home)
             .env("CONTEXTSTREAM_API_URL", &cfg_url)
@@ -347,7 +348,7 @@ async fn pinned_project_link_passes_link_and_doctor_and_survives_repairs() {
                 .env("HOME", &h)
                 .env("USERPROFILE", &h)
                 .env("CONTEXTSTREAM_API_URL", &url)
-                .env("CONTEXTSTREAM_WATCH_DISABLED", "1")
+                .env("CONTEXTSTREAM_WATCH", "0")
                 .env("NO_COLOR", "1")
                 .current_dir(&dir)
                 .output()
@@ -429,6 +430,7 @@ async fn pinned_project_link_passes_link_and_doctor_and_survives_repairs() {
     let doc_out = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
             .args(["doctor", "--json"])
+            .env("CONTEXTSTREAM_WATCH", "0")
             .env("HOME", &doc_home)
             .env("USERPROFILE", &doc_home)
             .env("CONTEXTSTREAM_API_URL", &doc_url)
@@ -456,6 +458,7 @@ async fn pinned_project_link_passes_link_and_doctor_and_survives_repairs() {
         let rep_out = tokio::task::spawn_blocking(move || {
             Command::new(env!("CARGO_BIN_EXE_contextstream-mcp"))
                 .args(&owned)
+                .env("CONTEXTSTREAM_WATCH", "0")
                 .env("HOME", &rep_home)
                 .env("USERPROFILE", &rep_home)
                 .env("CONTEXTSTREAM_API_URL", &rep_url)

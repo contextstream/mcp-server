@@ -1028,7 +1028,11 @@ fn a_request_without_a_credential_is_refused_and_asks_the_api_nothing() {
     assert_eq!(api.asked().len(), 0, "{:?}", api.asked());
 }
 
-fn quiet_workspace_paths(paths: &[&str], personal_key: bool) -> bool {
+/// Whether one caller's requests are those of a quiet workspace: the check at
+/// `initialize`, the report with the read of open runs before it, and three
+/// calls of `help`; and, for a credential `receives` (one what a person sends a
+/// run comes back to), exactly one read of what was sent, after the report.
+fn quiet_workspace_paths(paths: &[&str], receives: bool) -> bool {
     let mut reads = paths
         .iter()
         .enumerate()
@@ -1040,8 +1044,8 @@ fn quiet_workspace_paths(paths: &[&str], personal_key: bool) -> bool {
         .filter(|p| *p != DELIVERIES)
         .eq(expected)
         && match reads.next() {
-            Some(i) => personal_key && i >= 3 && reads.next().is_none(),
-            None => !personal_key,
+            Some(i) => receives && i >= 3 && reads.next().is_none(),
+            None => !receives,
         }
 }
 
@@ -1078,31 +1082,35 @@ fn nothing_is_asked_for_a_workspace_the_setting_does_not_name() {
             }
         }
         // Completion of help does not join the report's delivery reader.
-        // Wait for the expected request itself before inspecting the trace.
+        // Wait for the expected requests themselves (one read per caller)
+        // before inspecting the trace.
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !api.paths().iter().any(|p| p == DELIVERIES) && Instant::now() < deadline {
+        let delivery_reads = || {
+            api.paths()
+                .iter()
+                .filter(|p| p.as_str() == DELIVERIES)
+                .count()
+        };
+        while delivery_reads() < 2 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         api.settle();
         // For each caller: the check of the credential at `initialize`, the
         // report (with the read of open runs before it), and each call's own
-        // question. Nothing else: no read of a run, no sign. After a report
-        // under an API key, what a person sent the run is read; a sign-in is
-        // a credential no answer comes back to, so nothing is read for it.
+        // question. Nothing else: no read of a run, no sign. After a report,
+        // what a person sent the run is read: under an API key, and under an
+        // app's own OAuth token, which on the hosted gateway receives it too.
         let calls = api.asked();
         assert!(calls
             .iter()
             .all(|c| c.credential == "cbiq_fixture" || c.credential == ann));
-        for (key, personal_key) in [("cbiq_fixture", true), (ann.as_str(), false)] {
+        for key in ["cbiq_fixture", ann.as_str()] {
             let paths: Vec<_> = calls
                 .iter()
                 .filter(|c| c.credential == key)
                 .map(|c| c.path.as_str())
                 .collect();
-            assert!(
-                quiet_workspace_paths(&paths, personal_key),
-                "{env:?}: {paths:?}"
-            );
+            assert!(quiet_workspace_paths(&paths, true), "{env:?}: {paths:?}");
         }
     }
 }

@@ -84,6 +84,13 @@ struct Cli {
     /// Default team vs personal execution mode (also CONTEXTSTREAM_ACCOUNT_MODE).
     #[arg(long, global = true, value_enum)]
     account_mode: Option<AccountModeCli>,
+
+    /// When a ContextStream MCP entry holds another account's API key, switch
+    /// it to the account in HOME without asking. Without this flag, setup,
+    /// update and config refreshes ask first on a terminal and otherwise keep
+    /// the entry's key.
+    #[arg(long, global = true)]
+    switch_account: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -966,6 +973,7 @@ fn main() -> Result<()> {
         );
     }
 
+    setup::account_switch::allow_switch(cli.switch_account);
     setup_logging(cli.verbose, cli.quiet);
     restore_default_sigpipe(&cli.command);
     exit_on_unwritable_output(&cli.command);
@@ -1235,6 +1243,9 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
             options.scope_was_explicit = scope_was_explicit;
             options.repair = repair;
             options.dry_run = dry_run;
+            // Repair never stops on a question: an entry that holds another
+            // account's key keeps it unless --switch-account says otherwise.
+            setup::account_switch::set_questions_allowed(false);
             match setup::doctor::run_doctor(options, json, support).await {
                 Ok(true) => std::process::exit(1),
                 Ok(false) => {}
@@ -1262,6 +1273,11 @@ async fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             setup::safe_edit::set_dry_run(dry_run);
             setup::set_keep_claude_auto_memory(keep_claude_auto_memory);
+            // `--yes` and a setup profile run unattended: they keep a key
+            // that belongs to another account unless --switch-account is given.
+            if yes || profile.is_some() || profile_file.is_some() {
+                setup::account_switch::set_questions_allowed(false);
+            }
             if dry_run && profile.is_some() {
                 eprintln!(
                     "Setup failed: --dry-run cannot redeem a one-time --profile token because \
@@ -2334,6 +2350,17 @@ const UPDATE_HOOKS_ARGS: &[&str] = &["update-hooks", "--scope=global", "--only-c
 /// Hosted-remote migration for the editors setup configured. Its last step
 /// refreshes the global hooks for those same editors.
 const MIGRATE_REMOTE_ARGS: &[&str] = &["migrate-remote", "--scope=all", "--only-configured"];
+
+/// The migration `update` runs. It writes the API key into existing entries,
+/// so `update --switch-account` hands the flag on; without it the migration
+/// asks (it shares this terminal) or keeps another account's key.
+fn migrate_remote_args(switch_account: bool) -> Vec<&'static str> {
+    let mut args = MIGRATE_REMOTE_ARGS.to_vec();
+    if switch_account {
+        args.push(setup::account_switch::SWITCH_ACCOUNT_FLAG);
+    }
+    args
+}
 const UPDATE_GLOBAL_RULES_ARGS: &[&str] = &["update-rules", "--scope=global", "--only-configured"];
 const UPDATE_PROJECT_RULES_ARGS: &[&str] =
     &["update-rules", "--scope=project", "--only-configured"];
@@ -2496,7 +2523,7 @@ async fn refresh_editor_integrations_after_update(
     if migrated {
         update_detail("Ensuring MCP configs use the hosted remote gateway");
         run_post_update_command_with_installed_binary(
-            MIGRATE_REMOTE_ARGS,
+            &migrate_remote_args(setup::account_switch::switch_allowed()),
             "hosted remote migration",
         )
         .await?;
@@ -2958,11 +2985,17 @@ async fn run_configure(
             3 => {
                 let (api_key, email) = setup::authenticate().await?;
                 let api_url = setup::get_api_url();
+                // Read before it is overwritten: entries holding it are this
+                // same credential being rotated.
+                let replaced_key = setup::saved_api_key_before_rotation();
                 setup::persist_setup_credentials(&api_key, &api_url)?;
                 if !setup::ui::is_quiet() {
                     eprintln!("Credentials saved. Authenticated as {}.", email);
                 }
-                let refreshed = setup::refresh_existing_mcp_config_credentials(&api_key);
+                let refreshed = setup::refresh_existing_mcp_config_credentials(
+                    &api_key,
+                    replaced_key.as_deref(),
+                );
                 if refreshed > 0 && !setup::ui::is_quiet() {
                     if mcp_server::setup::safe_edit::is_dry_run() {
                         eprintln!("Would refresh API key in {refreshed} editor MCP config(s).");
@@ -3110,6 +3143,10 @@ async fn run_configure_api_key_from_stdin() -> Result<()> {
             }
         })?;
 
+    // Read before it is overwritten: entries holding exactly this key are the
+    // same credential being rotated and take the new key without a question,
+    // even when the API now refuses the old one.
+    let replaced_key = setup::saved_api_key_before_rotation();
     setup::persist_setup_credentials(api_key, &api_url)?;
     if !setup::ui::is_quiet() {
         eprintln!(
@@ -3118,7 +3155,8 @@ async fn run_configure_api_key_from_stdin() -> Result<()> {
             user.email
         );
     }
-    let refreshed = setup::refresh_existing_mcp_config_credentials(api_key);
+    let refreshed =
+        setup::refresh_existing_mcp_config_credentials(api_key, replaced_key.as_deref());
     if refreshed > 0 && !setup::ui::is_quiet() {
         if mcp_server::setup::safe_edit::is_dry_run() {
             eprintln!("Would refresh API key in {refreshed} editor MCP config(s).");
@@ -4933,6 +4971,33 @@ mod tests {
         let note = project_rules_refresh_note(false).expect("a note outside a project");
         assert!(note.contains("update-rules --scope=project"), "{note}");
         assert_eq!(project_rules_refresh_note(true), None);
+    }
+
+    #[test]
+    fn update_hands_switch_account_on_to_its_migration_only_when_given() {
+        assert_eq!(migrate_remote_args(false), MIGRATE_REMOTE_ARGS);
+        let with_flag = migrate_remote_args(true);
+        assert_eq!(&with_flag[..MIGRATE_REMOTE_ARGS.len()], MIGRATE_REMOTE_ARGS);
+        assert_eq!(with_flag.last(), Some(&"--switch-account"));
+
+        // The flag is global, so the migration (and every other command)
+        // accepts it.
+        for args in [
+            &["contextstream-mcp", "update", "--switch-account"][..],
+            &[
+                "contextstream-mcp",
+                "migrate-remote",
+                "--scope=all",
+                "--only-configured",
+                "--switch-account",
+            ][..],
+            &["contextstream-mcp", "setup", "--yes", "--switch-account"][..],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("--switch-account parses");
+            assert!(cli.switch_account, "{args:?}");
+        }
+        let cli = Cli::try_parse_from(["contextstream-mcp", "update"]).expect("update parses");
+        assert!(!cli.switch_account);
     }
 
     #[test]

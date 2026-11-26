@@ -7,6 +7,7 @@
 //! - AI rules generation
 
 pub mod account_learning;
+pub mod account_switch;
 mod antigravity_plugin;
 pub mod clients;
 
@@ -1547,11 +1548,27 @@ pub async fn update_configs(scope: &str) -> Result<()> {
     update_configs_scoped(scope, None, false).await
 }
 
+/// The saved API key, read before `configure` replaces it, so the rotation
+/// refresh can tell the credential being rotated from another account's key.
+pub fn saved_api_key_before_rotation() -> Option<String> {
+    read_saved_credentials()
+        .ok()?
+        .api_key
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+}
+
 /// Refresh pre-authenticated API keys in existing global and active-project
 /// editor MCP configs after credential rotation (`configure --api-key-stdin`
 /// or interactive `configure`). Never creates missing MCP configs or adds an
 /// embedded key where none existed.
-pub fn refresh_existing_mcp_config_credentials(api_key: &str) -> usize {
+///
+/// `replaced_key` is the saved key the rotation replaced (see
+/// [`saved_api_key_before_rotation`]): entries holding exactly it are the same
+/// credential and take `api_key` without a question, even when the API now
+/// refuses the old key. Entries holding any other key go through the
+/// account-switch check.
+pub fn refresh_existing_mcp_config_credentials(api_key: &str, replaced_key: Option<&str>) -> usize {
     let mut project_roots = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         if let Ok(canonical_cwd) = cwd.canonicalize() {
@@ -1567,9 +1584,11 @@ pub fn refresh_existing_mcp_config_credentials(api_key: &str) -> usize {
     }
 
     let mut updated_paths = HashSet::new();
-    for (path, outcome) in
-        mcp_config::refresh_embedded_api_key_in_existing_configs(api_key, &project_roots)
-    {
+    for (path, outcome) in mcp_config::refresh_embedded_api_key_in_existing_configs(
+        api_key,
+        replaced_key,
+        &project_roots,
+    ) {
         match outcome {
             Ok(true) => {
                 let dedupe_key = path.canonicalize().unwrap_or(path);
@@ -1847,7 +1866,10 @@ async fn update_configs_scoped_with_interactivity(
                     )
                 };
                 match project_write_result {
-                    Ok(()) => {
+                    // Not created: the project signs in as another account,
+                    // and the warning above says how to create it on purpose.
+                    Ok(false) => {}
+                    Ok(true) => {
                         let label = transport_label.to_lowercase();
                         let name = editor.display_name();
                         note!(
@@ -2041,7 +2063,8 @@ pub async fn update_transcript_defaults_scoped(
                     transcripts_enabled,
                     hook_transcripts_enabled,
                 ) {
-                    Ok(()) => {
+                    Ok(false) => {}
+                    Ok(true) => {
                         updates += 1;
                         let name = editor.display_name();
                         note!(
@@ -2188,7 +2211,8 @@ pub async fn migrate_remote_scoped(
                     None,
                     None,
                 ) {
-                    Ok(()) => {
+                    Ok(false) => {}
+                    Ok(true) => {
                         migrated += 1;
                         let name = editor.display_name();
                         note!(
@@ -4654,7 +4678,8 @@ pub(crate) async fn configure_editor_with_workspace_and_project_name(
         };
 
         match project_config_result {
-            Ok(()) => {
+            Ok(false) => {}
+            Ok(true) => {
                 mcp_targets.push("project");
                 wrote_project_mcp = true;
                 if let Ok(Some(ignored_entry)) = mcp_config::protect_non_git_secret_project_config(

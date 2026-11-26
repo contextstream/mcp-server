@@ -116,7 +116,18 @@ impl Fixture {
 
     /// The tool as the hosted HTTP gateway has it.
     fn hosted_tool(&self, api: &Api) -> ProgressTool {
+        self.hosted_tool_with(api, TestFixtures::test_config())
+    }
+
+    /// The tool as the production gateway has it: it holds no key of its own (its environment names only the API's
+    /// address), so a caller's own OAuth token is what its requests go under.
+    fn keyless_hosted_tool(&self, api: &Api) -> ProgressTool {
         let mut config = TestFixtures::test_config();
+        config.api_key = None;
+        self.hosted_tool_with(api, config)
+    }
+
+    fn hosted_tool_with(&self, api: &Api, mut config: mcp_types::Config) -> ProgressTool {
         config.api_url = api.base_url.clone();
         config.default_workspace_id = Some(self.workspace);
         config.default_project_id = Some(self.project);
@@ -691,6 +702,71 @@ async fn the_hosted_gateway_shows_a_delivery_and_claims_it_too() {
             assert_eq!(sent(&api, "POST", "/claim").len(), 1);
         })
         .await;
+    })
+    .await;
+}
+
+/// An MCP client connected to the hosted gateway through OAuth (claude.ai, ChatGPT, Claude Code on the web):
+/// its reports go under its own app token, every request says it carries deliveries, and what its person
+/// answered its run is shown and claimed exactly as for a caller with a key (owner, 2026-11-26: a person answers
+/// every bot whose ContextStream MCP is connected).
+#[tokio::test]
+async fn the_hosted_gateway_shows_an_oauth_callers_delivery_and_claims_it_under_its_token() {
+    use base64::Engine;
+    let encode = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+    let app_token = format!(
+        "{}.{}.signature",
+        encode(r#"{"alg":"HS256"}"#),
+        encode(&format!(r#"{{"sub":"{}","jti":"first"}}"#, Uuid::new_v4()))
+    );
+    let auth = mcp_types::AuthOverride {
+        jwt: Some(app_token.clone()),
+        ..Default::default()
+    };
+    mcp_client::run_with_auth_override(auth, || async {
+        let fixture = Fixture::new();
+        let delivery = fixture.answer(json!([]));
+        let api = Api::start(vec![
+            fixture.recorded("working"),
+            offered(vec![delivery.clone()]),
+            (CLAIM, 200, held_with("claimed", &delivery, TOKEN)),
+        ])
+        .await;
+        let mut tool = fixture.keyless_hosted_tool(&api);
+        tool.deliveries = Arc::default();
+        mcp_client::run_with_mcp_session_id("oauth-session".into(), || async {
+            let first = tool
+                .report_then_collect(json!({"step": "Running the tests", "run_key": "warm-cache"}))
+                .await
+                .expect("report");
+            assert!(
+                text_of(&first).ends_with(&format!("\n\n{}", answer_block(fixture.delivery))),
+                "{}",
+                text_of(&first)
+            );
+        })
+        .await;
+        let bearer = format!("Bearer {app_token}");
+        for (method, piece) in [
+            ("POST", "/run-progress/report"),
+            ("GET", "/decision-requests/deliveries"),
+            ("POST", "/claim"),
+        ] {
+            let seen = sent(&api, method, piece);
+            assert!(!seen.is_empty(), "{method} {piece}");
+            for request in &seen {
+                assert_eq!(
+                    request.header("authorization").as_deref(),
+                    Some(bearer.as_str()),
+                    "{piece}"
+                );
+                assert_eq!(
+                    request.header("x-contextstream-receives").as_deref(),
+                    Some("deliveries"),
+                    "{piece}"
+                );
+            }
+        }
     })
     .await;
 }
@@ -1962,7 +2038,7 @@ async fn a_session_signed_in_with_oauth_is_never_told_to_wait_and_asks_for_nothi
         let result = tool.execute(call.clone()).await.expect("an answer");
         let text = text_of(&result);
         assert!(
-            text.contains("not recorded: this session's credential cannot receive or confirm what a person sends a run (only a person's full API key can)"),
+            text.contains("not recorded: this session's credential cannot receive or confirm what a person sends a run (only a person's full API key, or an app's own OAuth token on the hosted gateway, can)"),
             "{call}: {text}"
         );
         assert_eq!(result.structured_content.unwrap()["reason"], "no_way_back");

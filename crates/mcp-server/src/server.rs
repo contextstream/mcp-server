@@ -409,6 +409,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
     } else if name == domains::questions::TOOL_NAME {
         metadata["actions"] = serde_json::json!({
             "list": "Listing saved questions",
+            "templates": "Listing starter questions",
             "get": "Loading a saved question",
             "create": "Saving a question to ContextStream",
             "version": "Saving a new version of a question",
@@ -3661,10 +3662,11 @@ mod tests {
         ),
         (
             // New row for saved questions: the `questions` tool; `action` is
-            // required. Advanced for `export` and write-back's `attribute`;
-            // additive only (export_and_attribute_only_add_to_the_questions_schema).
+            // required. Advanced for `export`, write-back's `attribute`,
+            // `templates` and a trial's `model`; additive only
+            // (later_inputs_only_add_to_the_questions_schema).
             "questions",
-            "a9eed5b69be0966c4d1c82f5855fbff3c704b268346863a7d67fe4b28ae283b2",
+            "5d4054bfac98df03374acfb39d8287c38b32505c0ec9ce054346bb0023868fc2",
         ),
         (
             "reminder",
@@ -4291,14 +4293,20 @@ mod tests {
     }
 
     #[test]
-    fn export_and_attribute_only_add_to_the_questions_schema() {
-        // A run as a CSV (`export`) and the contact property an audience's
-        // answers go under (`attribute`) came after the tool's first
+    fn later_inputs_only_add_to_the_questions_schema() {
+        // A run as a CSV (`export`), the contact property an audience's
+        // answers go under (`attribute`), the starter templates (`templates`)
+        // and who answers a trial (`model`) came after the tool's first
         // contract. Without them the schema is exactly that contract, so
         // every other action and parameter is unchanged.
         let tools = contextstream_tools_list(&test_registry(Config::default()), None);
         assert_eq!(
-            schema_contract_without(&tools, "questions", &["export"], &["attribute"]),
+            schema_contract_without(
+                &tools,
+                "questions",
+                &["export", "templates"],
+                &["attribute", "model"]
+            ),
             "ce91789331c82c91d5f63f43295062ed24121d308c7b19a68f3f1ad72feaa2b5"
         );
     }
@@ -4320,6 +4328,7 @@ mod tests {
             questions["inputSchema"]["properties"]["action"]["enum"],
             serde_json::json!([
                 "list",
+                "templates",
                 "get",
                 "create",
                 "version",

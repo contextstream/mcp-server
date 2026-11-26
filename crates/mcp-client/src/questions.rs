@@ -8,13 +8,16 @@
 //! session's default):
 //!
 //! - `GET /questions?workspace_id&archived&limit` lists the saved questions;
-//!   `POST /questions` `{workspace_id, name, spec, shared?, template?}` (201)
-//!   saves one; `GET /questions/:id?workspace_id&version` reads one with its
-//!   history; `POST /questions/:id/versions`
+//!   `GET /questions/templates?workspace_id` the starter templates;
+//!   `POST /questions` `{workspace_id, name, spec?, shared?, template?}`
+//!   (201) saves one, a copy of the starter template `template` names when
+//!   no spec is sent; `GET /questions/:id?workspace_id&version` reads one with
+//!   its history; `POST /questions/:id/versions`
 //!   `{workspace_id, spec, expected_revision}` (201) writes a new version;
 //! - `GET` and `POST /questions/:id/test-rows` read and add the rows a person
 //!   labeled; `POST /questions/:id/sample` picks rows worth labeling;
-//!   `POST /questions/:id/trial` tries a version on the labeled rows;
+//!   `POST /questions/:id/trial` `{workspace_id, version?, model?}` tries a
+//!   version on the labeled rows;
 //!   `POST /questions/:id/activate` lets a version answer on its own;
 //! - `POST /questions/:id/describe` `{workspace_id, source}` reads a list's
 //!   columns; `POST /questions/:id/runs` `{workspace_id, source, mapping?,
@@ -55,7 +58,16 @@ pub const QUESTION_TYPES: &[&str] = &["noul", "choice"];
 /// What a checklist's answers come to.
 pub const ROLLUP_RULES: &[&str] = &["all", "any", "at_least"];
 /// Where a list comes from: `kind` of a [`ListSource`].
-pub const SOURCE_KINDS: &[&str] = &["rows", "csv", "audience", "sheet", "excel"];
+pub const SOURCE_KINDS: &[&str] = &[
+    "rows", "csv", "audience", "sheet", "excel", "notion", "linear", "issues",
+];
+/// Which of a repository's issues an `issues` list takes: open ones unless
+/// it says otherwise.
+pub const ISSUE_STATES: &[&str] = &["open", "closed", "all"];
+/// Who a version is tried on: `bison`, whose trial lets the version answer
+/// on its own (the default), or `mammoth`, which then answers the rows of a
+/// run `bison` gives no answer to.
+pub const TRIAL_MODELS: &[&str] = &["bison", "mammoth"];
 /// Which rows of a run to read.
 pub const ROW_FILTERS: &[&str] = &["all", "check", "sure"];
 /// `surface` of every run this client starts: an agent's tools.
@@ -196,13 +208,35 @@ pub enum ListSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_column: Option<String>,
     },
+    /// A Notion database's data source through a connected app: one row a
+    /// page, each property a field.
+    Notion {
+        connection_id: Uuid,
+        data_source_id: String,
+    },
+    /// A Linear project's issues through a connected app: `identifier`,
+    /// `title`, `state` and `url`.
+    Linear {
+        connection_id: Uuid,
+        project_id: String,
+    },
+    /// A repository's issues as the workspace keeps them in sync; `state` is
+    /// one of [`ISSUE_STATES`], `open` when left out.
+    Issues {
+        repository_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+    },
 }
 
 /// A new saved question: the body of `POST /questions` without its workspace.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NewQuestion {
     pub name: String,
-    pub spec: QuestionSpec,
+    /// The question. Left out with `template`, it is a copy of that starter
+    /// template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec: Option<QuestionSpec>,
     /// Shared with the workspace (the API's default) or kept to its maker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared: Option<bool>,
@@ -424,20 +458,31 @@ impl ContextStreamClient {
             .await
     }
 
-    /// Try a version (else the newest) on the labeled rows.
+    /// Try a version (else the newest) on the labeled rows, on `model` (one
+    /// of [`TRIAL_MODELS`], `bison` when left out).
     /// Endpoint: `POST /questions/:id/trial`, answered `{question, version, trial}`.
     pub async fn try_question(
         &self,
         workspace_id: Option<Uuid>,
         question_id: Uuid,
         version: Option<i64>,
+        model: Option<&str>,
     ) -> Result<Value> {
         let workspace_id = self.question_workspace(workspace_id).await?;
         let body = strip_nulls(serde_json::json!({
             "workspace_id": workspace_id,
             "version": version,
+            "model": model,
         }));
         self.post(&question_path(question_id, "/trial"), body).await
+    }
+
+    /// The starter templates a workspace copies: `{templates: [{key, name,
+    /// about, shape, spec}]}`. Endpoint: `GET /questions/templates?workspace_id`.
+    pub async fn list_question_templates(&self, workspace_id: Option<Uuid>) -> Result<Value> {
+        let workspace_id = self.question_workspace(workspace_id).await?;
+        self.get(&format!("/questions/templates?workspace_id={workspace_id}"))
+            .await
     }
 
     /// Let a version whose trial said it may answer on its own do so.
@@ -718,6 +763,50 @@ mod tests {
         let stray =
             serde_json::from_value::<ListSource>(json!({"kind": "csv", "text": "a", "sheet": "x"}));
         assert!(stray.unwrap_err().to_string().contains("sheet"));
+
+        // Lists read through a connected app, and a repository's issues.
+        let connection = Uuid::new_v4();
+        let repository = Uuid::new_v4();
+        for (sent, kind) in [
+            (
+                json!({"kind": "notion", "connection_id": connection, "data_source_id": "ds-1"}),
+                "notion",
+            ),
+            (
+                json!({"kind": "linear", "connection_id": connection, "project_id": "proj-1"}),
+                "linear",
+            ),
+            (
+                json!({"kind": "issues", "repository_id": repository, "state": "all"}),
+                "issues",
+            ),
+            (
+                json!({"kind": "issues", "repository_id": repository}),
+                "issues",
+            ),
+        ] {
+            let source: ListSource = serde_json::from_value(sent.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&source).unwrap(), sent, "{kind}");
+            assert!(SOURCE_KINDS.contains(&kind));
+        }
+        let missing = serde_json::from_value::<ListSource>(
+            json!({"kind": "notion", "connection_id": connection}),
+        );
+        assert!(missing.unwrap_err().to_string().contains("data_source_id"));
+    }
+
+    #[test]
+    fn a_question_made_from_a_template_sends_no_spec() {
+        let copy = NewQuestion {
+            name: "Lead fit".into(),
+            spec: None,
+            shared: None,
+            template: Some("lead-fit".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&copy).unwrap(),
+            json!({"name": "Lead fit", "template": "lead-fit"})
+        );
     }
 
     #[test]

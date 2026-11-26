@@ -2,8 +2,9 @@
 //!
 //! A saved question is a question with fixed answers that a person asks about
 //! every row of a list. Each row gets an answer and is either sure or left
-//! for the person to check. With this tool an agent finds a saved question,
-//! makes one ready (labels rows with the person's answers, tries it, lets it
+//! for the person to check. With this tool an agent finds a saved question
+//! (or copies a starter template), makes one ready (labels rows with the
+//! person's answers, tries it, lets it
 //! answer on its own), runs it on a list, answers one row, reads the results
 //! (page by page, or the whole run as a CSV) and writes them back where the
 //! list lives (a Google Sheet, an Excel workbook or an audience's contacts).
@@ -18,7 +19,8 @@
 
 use async_trait::async_trait;
 use mcp_client::questions::{
-    refusal_code, Mapping, QUESTION_TYPES, ROLLUP_RULES, ROW_FILTERS, SHAPES, SOURCE_KINDS,
+    refusal_code, Mapping, ISSUE_STATES, QUESTION_TYPES, ROLLUP_RULES, ROW_FILTERS, SHAPES,
+    SOURCE_KINDS, TRIAL_MODELS,
 };
 use mcp_client::{
     ContextStreamClient, LabeledRow, ListRow, ListSource, NewQuestion, OneRow, QuestionSpec,
@@ -45,6 +47,7 @@ pub const TOOL_NAME: &str = "questions";
 /// The tool's actions.
 pub(crate) const VALID_ACTIONS: &[&str] = &[
     "list",
+    "templates",
     "get",
     "create",
     "version",
@@ -81,17 +84,17 @@ const EXPORT_ROWS_SHOWN: usize = 50;
 const EXPORT_CHARS_SHOWN: usize = 16_000;
 
 /// Routing summary advertised as the tool description (<= 1024 chars).
-pub(crate) const TOOL_DESCRIPTION: &str = "Saved questions: a question with fixed answers, asked about every row of a list (leads, tickets, contracts). Each row gets an answer and Sure or Check; a person settles the Check rows.\n\nFind one (list, get) or save one (create; version for a change). Make it ready: label rows with the answers the person gives (label; sample picks rows worth asking about), try it on them (try says whether it may answer on its own), then activate that version. Only an active question runs on a list (run; describe shows the list's columns first) or answers one row (answer). Follow a run with status, read its rows with results (which=check for the rows a person settles) or as a CSV (export), cancel or resume it, and write_back its answers where the list lives (a Google Sheet, an Excel workbook or an audience).\n\nworkspace_id defaults to the session's. Saved questions are switched on per workspace: when a call says they are not switched on here, stop and tell the person. Full reference: the `action` parameter.";
+pub(crate) const TOOL_DESCRIPTION: &str = "Saved questions: a question with fixed answers, asked about every row of a list (leads, tickets, contracts). Each row gets an answer and Sure or Check; a person settles the Check rows.\n\nFind one (list, get) or save one (create, from a spec or a starter template: templates; version for a change). Make it ready: label rows with the person's answers (sample picks rows worth asking about), try it (it says whether it may answer on its own), then activate that version. Only an active question runs on a list (run; describe shows its columns first) or answers one row (answer). Follow a run with status, read its rows with results (which=check: the rows a person settles) or as a CSV (export), cancel or resume it, and write_back its answers where the list lives (a Google Sheet, an Excel workbook or an audience).\n\nworkspace_id defaults to the session's. Saved questions are switched on per workspace: when a call says they are not switched on here, stop and tell the person. Full reference: the `action` parameter.";
 
 /// Complete tool reference, advertised on the `action` parameter; see
 /// [`crate::schema::with_full_reference`].
-const TOOL_REFERENCE: &str = "Saved questions: a question with fixed answers asked about every row of a list. Each row gets an answer and Sure (it stands) or Check (a person settles it). Every call names the workspace: workspace_id, else the session's.\n\nActions:\n- list: the saved questions you can see; archived=true for the ones put away; limit.\n- get: question_id, version (else the one that answers, else the newest): the question with its revision, that version's spec and what trying it came to, its versions, and how many rows are labeled.\n- create: name, spec, shared (default true), template (a starter template's key). It is a draft: it answers nothing until a version is tried and activated.\n- version: question_id, spec, expected_revision (the revision get shows). A change is a new version; the shape stays.\n- label: question_id, rows=[{key, fields: {<field>: <value>}, want: {<question key, or \"answer\" for the row's answer>: <answer>}}]. The answers are the person's own, never your guesses. A row labeled before takes the new label. Without rows: the labeled rows.\n- sample: question_id, rows=[{key, fields}] from the list (up to 200), pick (how many, default 25), version: the rows worth asking the person to label, spread over every kind of answer, unclear ones first.\n- try: question_id, version (else the newest): tries it on the labeled rows and says in plain words what it came to and whether it may answer on its own.\n- activate: question_id, version, expected_revision: lets a version its trial calls ready answer on its own.\n- describe: question_id, source (or rows): the list's columns with a few values each, the fields the question looks at, and the ones the list lacks (name their columns with mapping).\n- run: question_id, source (or rows), mapping: asks an active question about every row, in the background; answers with the run and an estimate (rows, credits at most, minutes at least).\n- status: question_id, run_id: how far a run is (answered, sure, to check) and its spot checks; without run_id, the question's runs.\n- results: question_id, run_id, which=all|check|sure, after (the next a page gave), limit (default 25): rows with their answer, Sure or Check and why, and the person's call.\n- export: question_id, run_id: the run's rows as a CSV, done or not: row, the fields the question looks at, its answer (the person's call first), Sure or check, Why, and each question's answer when it asks more than one. The text shows the first rows; the structured result has the whole file (csv).\n- answer: question_id, fields={<field>: <value>}, key, mapping: one row now, by an active question; an answer kept for the same row is read, not asked again.\n- cancel, resume: question_id, run_id: stop a run; go on with a paused or stalled one.\n- write_back: question_id, run_id, mapping: writes a finished run's answers where its list lives. A Google Sheet or an Excel workbook gets two columns right of the list's range (the answer, and Sure, Check or Your call), recorded under session_id (default: the session's). An audience gets two properties on each contact: the answer under attribute (default: the question's name; at most 26 letters, digits or _) and Sure, Check or Your call under the same name with _sure_or_check. Any other list: export it.\n\nA spec, sent without lines (trying chooses them): {spec: 1, shape: screen|sort|rate|checklist|match, about: \"what a row is\", show: [the fields it looks at], questions: [{key, ask, type: noul (yes or no) or choice, options: [{key, means}] with one keyed \"none\"}], pair: {first: [fields], second: [fields]} (match only, without show), rollup: {rule: all|any|at_least, k} (checklist only)}.\nA source: {kind: \"rows\", rows: [{key, fields}]}, {kind: \"csv\", text, key_column}, {kind: \"audience\", audience_id}, {kind: \"sheet\", connection_id, spreadsheet_id, range, key_column}, {kind: \"excel\", connection_id, drive_id, item_id, worksheet_id, range, key_column}.\nA mapping: {<field the question looks at>: <column of the list>}.\n\nA refusal says what to do next; one that ends with a code in brackets ([NOT_ACTIVE], [NOT_READY], [NO_TEST_ROWS], [NOT_WRITABLE], [NOT_EMPTY], ...) names why. When saved questions are not switched on for the workspace, they are not offered there yet: stop and tell the person.";
+const TOOL_REFERENCE: &str = "Saved questions: a question with fixed answers asked about every row of a list. Each row gets an answer and Sure (it stands) or Check (a person settles it). Every call names the workspace: workspace_id, else the session's.\n\nActions:\n- list: the saved questions you can see; archived=true for the ones put away; limit.\n- templates: the starter templates to copy (key, name, what a row is, the question). An unchanged copy needs fewer labeled rows before it may answer on its own.\n- get: question_id, version (else the one that answers, else the newest): the question with its revision, that version's spec and what trying it came to, its versions, and how many rows are labeled.\n- create: name, then spec, or template (a starter template's key, which templates lists) to save a copy of it; shared (default true). It is a draft: it answers nothing until a version is tried and activated.\n- version: question_id, spec, expected_revision (the revision get shows). A change is a new version; the shape stays.\n- label: question_id, rows=[{key, fields: {<field>: <value>}, want: {<question key, or \"answer\" for the row's answer>: <answer>}}]. The answers are the person's own, never your guesses. A row labeled before takes the new label. Without rows: the labeled rows.\n- sample: question_id, rows=[{key, fields}] from the list (up to 200), pick (how many, default 25), version: the rows worth asking the person to label, spread over every kind of answer, unclear ones first.\n- try: question_id, version (else the newest), and who answers: bison (the default; its trial decides whether the version may answer on its own) or mammoth, the second answerer (a version tried on it too has it answer the rows of a run bison gives no answer to). Tries it on the labeled rows and says in plain words what it came to. A question that decides about people (a job, credit, a place to live or insurance) is kept for a person: none of its rows is Sure, and each comes back as Check, about a person.\n- activate: question_id, version, expected_revision: lets a version its trial calls ready answer on its own.\n- describe: question_id, source (or rows): the list's columns with a few values each, the fields the question looks at, and the ones the list lacks (name their columns with mapping).\n- run: question_id, source (or rows), mapping: asks an active question about every row, in the background; answers with the run and an estimate (rows, credits at most, minutes at least).\n- status: question_id, run_id: how far a run is (answered, sure, to check) and its spot checks; without run_id, the question's runs.\n- results: question_id, run_id, which=all|check|sure, after (the next a page gave), limit (default 25): rows with their answer, Sure or Check and why, and the person's call.\n- export: question_id, run_id: the run's rows as a CSV, done or not: row, the fields the question looks at, its answer (the person's call first), Sure or check, Why, and each question's answer when it asks more than one. The text shows the first rows; the structured result has the whole file (csv).\n- answer: question_id, fields={<field>: <value>}, key, mapping: one row now, by an active question; an answer kept for the same row is read, not asked again.\n- cancel, resume: question_id, run_id: stop a run; go on with a paused or stalled one.\n- write_back: question_id, run_id, mapping: writes a finished run's answers where its list lives. A Google Sheet or an Excel workbook gets two columns right of the list's range (the answer, and Sure, Check or Your call), recorded under session_id (default: the session's). An audience gets two properties on each contact: the answer under attribute (default: the question's name; at most 26 letters, digits or _) and Sure, Check or Your call under the same name with _sure_or_check. Any other list (rows, a CSV, Notion, Linear, a repository's issues): export it.\n\nA spec, sent without lines (trying chooses them): {spec: 1, shape: screen|sort|rate|checklist|match, about: \"what a row is\", show: [the fields it looks at], questions: [{key, ask, type: noul (yes or no) or choice, options: [{key, means}] with one keyed \"none\"}], pair: {first: [fields], second: [fields]} (match only, without show), rollup: {rule: all|any|at_least, k} (checklist only)}.\nA source: {kind: \"rows\", rows: [{key, fields}]}, {kind: \"csv\", text, key_column}, {kind: \"audience\", audience_id}, {kind: \"sheet\", connection_id, spreadsheet_id, range, key_column}, {kind: \"excel\", connection_id, drive_id, item_id, worksheet_id, range, key_column}, {kind: \"notion\", connection_id, data_source_id} (one row a page, each property a field), {kind: \"linear\", connection_id, project_id} (a project's issues: identifier, title, state, url), {kind: \"issues\", repository_id, state: open|closed|all} (a repository's issues as ContextStream keeps them in sync; open when left out).\nA mapping: {<field the question looks at>: <column of the list>}.\n\nA refusal says what to do next; one that ends with a code in brackets ([NOT_ACTIVE], [NOT_READY], [NO_TEST_ROWS], [NOT_WRITABLE], [NOT_EMPTY], ...) names why. When saved questions are not switched on for the workspace, they are not offered there yet: stop and tell the person.";
 
 /// The form of a spec, said with a refusal of one.
 const SPEC_FORM: &str = "A spec is {spec: 1, shape: screen|sort|rate|checklist|match, about, show: [fields], questions: [{key, ask, type: noul|choice, options: [{key, means}]}], pair: {first, second} (match only), rollup: {rule: all|any|at_least, k} (checklist only)}, without lines.";
 
 /// The form of a list, said with a refusal of one.
-const SOURCE_FORM: &str = "A source is {kind: \"rows\", rows: [{key, fields}]}, {kind: \"csv\", text, key_column}, {kind: \"audience\", audience_id}, {kind: \"sheet\", connection_id, spreadsheet_id, range, key_column} or {kind: \"excel\", connection_id, drive_id, item_id, worksheet_id, range, key_column}.";
+const SOURCE_FORM: &str = "A source is {kind: \"rows\", rows: [{key, fields}]}, {kind: \"csv\", text, key_column}, {kind: \"audience\", audience_id}, {kind: \"sheet\", connection_id, spreadsheet_id, range, key_column}, {kind: \"excel\", connection_id, drive_id, item_id, worksheet_id, range, key_column}, {kind: \"notion\", connection_id, data_source_id}, {kind: \"linear\", connection_id, project_id} or {kind: \"issues\", repository_id, state: open|closed|all}.";
 
 /// What a 404 from these routes means when it names no record: the routes
 /// are not there for this workspace.
@@ -119,6 +122,8 @@ pub struct QuestionsInput {
     pub template: Option<String>,
     pub expected_revision: Option<i64>,
     pub version: Option<i64>,
+    // try
+    pub model: Option<String>,
     // label / sample / a list sent as it is
     pub rows: Option<Value>,
     pub pick: Option<i64>,
@@ -194,6 +199,13 @@ impl QuestionsTool {
                     .map_err(|error| explain(error, action, None, None))?;
                 Ok(ToolResult::with_structured(list_text(&result), result))
             }
+            "templates" => {
+                let result = client
+                    .list_question_templates(workspace)
+                    .await
+                    .map_err(|error| explain(error, action, None, None))?;
+                Ok(ToolResult::with_structured(templates_text(&result), result))
+            }
             "get" => {
                 let question = question_id(input.question_id.as_deref(), action)?;
                 let version = checked_version(input.version)?;
@@ -213,11 +225,23 @@ impl QuestionsTool {
                             .to_string(),
                     )
                 })?;
+                let template = non_empty(input.template.as_deref()).map(str::to_string);
+                // A spec sent is the question; without one, a template's key
+                // makes a copy of that starter template.
+                let spec = match (input.spec.as_ref().filter(|spec| !spec.is_null()), &template) {
+                    (Some(_), _) => Some(checked_spec(input.spec.as_ref(), action)?),
+                    (None, Some(_)) => None,
+                    (None, None) => {
+                        return Err(Error::Validation(format!(
+                            "create needs spec, or template: a starter template's key, to save a copy of it (questions(action=\"templates\") lists them). {SPEC_FORM}"
+                        )))
+                    }
+                };
                 let new = NewQuestion {
                     name: name.to_string(),
-                    spec: checked_spec(input.spec.as_ref(), action)?,
+                    spec,
                     shared: input.shared,
-                    template: non_empty(input.template.as_deref()).map(str::to_string),
+                    template,
                 };
                 let result = client
                     .create_question(workspace, &new)
@@ -299,8 +323,10 @@ impl QuestionsTool {
             "try" => {
                 let question = question_id(input.question_id.as_deref(), action)?;
                 let version = checked_version(input.version)?;
+                let model = enum_argument("model", input.model.clone(), TRIAL_MODELS)
+                    .map_err(Error::Validation)?;
                 let result = client
-                    .try_question(workspace, question, version)
+                    .try_question(workspace, question, version, model.as_deref())
                     .await
                     .map_err(|error| explain(error, action, Some(question), None))?;
                 Ok(ToolResult::with_structured(
@@ -534,7 +560,7 @@ impl ToolHandler for QuestionsTool {
             .string("name", "create: the question's name", false)
             .object(
                 "spec",
-                "create, version: the question, sent without lines (see action)",
+                "create (or template instead), version: the question, sent without lines (see action)",
                 false,
             )
             .boolean(
@@ -544,7 +570,7 @@ impl ToolHandler for QuestionsTool {
             )
             .string(
                 "template",
-                "create: the starter template's key it was made from",
+                "create: a starter template's key (templates lists them); without spec, the question is a copy of it",
                 false,
             )
             .integer(
@@ -566,10 +592,16 @@ impl ToolHandler for QuestionsTool {
                 }),
                 false,
             )
+            .string_enum(
+                "model",
+                "try: who answers the trial: bison (the default; its trial decides whether the question answers on its own), or mammoth, the second answerer, which once tried too answers the rows of a run bison gives no answer to",
+                TRIAL_MODELS,
+                false,
+            )
             .integer("pick", "sample: how many rows to offer (default 25)", false)
             .object(
                 "source",
-                "describe, run: the list, {kind: rows|csv|audience|sheet|excel, ...} (see action)",
+                "describe, run: the list, {kind: rows|csv|audience|sheet|excel|notion|linear|issues, ...} (see action)",
                 false,
             )
             .object(
@@ -800,6 +832,9 @@ fn list_source(source: Option<&Value>, rows: Option<&Value>, action: &str) -> Re
                 )));
             }
             canonical_enum(&mut source, "kind", "source.kind", SOURCE_KINDS)?;
+            if source.get("kind").and_then(Value::as_str) == Some("issues") {
+                canonical_enum(&mut source, "state", "source.state", ISSUE_STATES)?;
+            }
             serde_json::from_value(Value::Object(source))
                 .map_err(|error| Error::Validation(format!("source: {error}. {SOURCE_FORM}")))
         }
@@ -915,6 +950,10 @@ fn advice(
                     .to_string()
             })
         }
+        404 if lower.contains("no such repository") => Some(
+            "That repository is not one you can see in this workspace: vcs(action=\"list_repos\") lists the repositories it keeps in sync, with their ids."
+                .to_string(),
+        ),
         // Any other record the API names in its own words.
         404 => None,
         503 if message.contains(mcp_client::questions::NOT_ASKING) => Some(
@@ -926,6 +965,11 @@ fn advice(
                 .to_string(),
         ),
         400 if lower.contains("not in the form") => Some(SPEC_FORM.to_string()),
+        // An API before starter templates reads `templates` as a question's id.
+        400 if action == "templates" => Some(
+            "This ContextStream API has no starter templates yet: save a question with its own spec instead (questions(action=\"create\", name=\"...\", spec={...}))."
+                .to_string(),
+        ),
         409 | 422 => match refusal_code(message) {
             Some("NOT_ACTIVE") => Some(format!(
                 "Make it ready first: label rows with the person's answers (action=\"label\"), try it (questions(action=\"try\", {target})), then activate the version its trial calls ready."
@@ -939,6 +983,17 @@ fn advice(
             Some("NO_TEST_ROWS") => Some(format!(
                 "Label rows with the person's answers first: questions(action=\"label\", {target}, rows=[{{key, fields, want}}])."
             )),
+            Some("TEMPLATE") => Some(
+                "questions(action=\"templates\") lists the starter templates and their keys."
+                    .to_string(),
+            ),
+            Some("SPEC") => Some(format!(
+                "Send the question's spec, or template with a starter template's key (questions(action=\"templates\") lists them). {SPEC_FORM}"
+            )),
+            Some("MODEL") => Some(
+                "A trial is answered by bison (the default) or mammoth, the second answerer."
+                    .to_string(),
+            ),
             Some("SHAPE_CHANGED") => Some(
                 "A question keeps its shape: save another question for another shape (action=\"create\")."
                     .to_string(),
@@ -1094,17 +1149,35 @@ fn list_text(result: &Value) -> String {
     lines.join("\n")
 }
 
-/// The trial of a version as the API keeps it: under its answering engine's
-/// key, or the trial itself.
-fn trial_of(trial: Option<&Value>) -> Option<&Value> {
-    let trial = trial.filter(|trial| trial.is_object())?;
-    if trial.get("ready").is_some() || trial.get("summary").is_some() {
-        return Some(trial);
+/// Who answers first: its trial decides whether a version answers on its own.
+const FIRST_ANSWERER: &str = "bison";
+
+fn is_trial(value: &Value) -> bool {
+    value.get("ready").is_some() || value.get("summary").is_some()
+}
+
+/// The trials kept on a version, by who answered them, the first answerer's
+/// first: a version keeps each under its answerer's key. A trial sent as it
+/// is says who answered it, else it is the first answerer's.
+fn trials_of(trial: Option<&Value>) -> Vec<(&str, &Value)> {
+    let Some(trial) = trial.filter(|trial| trial.is_object()) else {
+        return Vec::new();
+    };
+    if is_trial(trial) {
+        return vec![(
+            text_field(trial, &["model"]).unwrap_or(FIRST_ANSWERER),
+            trial,
+        )];
     }
-    trial
-        .as_object()?
-        .values()
-        .find(|value| value.get("ready").is_some() || value.get("summary").is_some())
+    let mut trials: Vec<(&str, &Value)> = trial
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, value)| is_trial(value))
+        .map(|(answerer, value)| (answerer.as_str(), value))
+        .collect();
+    trials.sort_by_key(|(answerer, _)| *answerer != FIRST_ANSWERER);
+    trials
 }
 
 /// What a trial lacks, in words.
@@ -1125,17 +1198,33 @@ fn needs_words(trial: &Value) -> Vec<String> {
         .collect()
 }
 
-/// A trial in a few lines: ready or not, its summary, and what it came to.
-fn trial_lines(trial: &Value) -> Vec<String> {
+/// A trial in a few lines: ready or not, whether a person makes every call,
+/// its summary, and what it came to. `answerer` is who answered it.
+fn trial_lines(trial: &Value, answerer: &str) -> Vec<String> {
     let mut lines = Vec::new();
+    let first = answerer == FIRST_ANSWERER;
+    let label = if first {
+        "Trial:".to_string()
+    } else {
+        format!("Trial on {}:", one_line(answerer))
+    };
     let ready = trial.get("ready").and_then(Value::as_bool);
     let needs = needs_words(trial);
     lines.push(match (ready, needs.is_empty()) {
-        (Some(true), _) => "Trial: ready to answer on its own.".to_string(),
-        (Some(false), false) => format!("Trial: not ready; it needs {}.", needs.join(", ")),
-        (Some(false), true) => "Trial: not ready.".to_string(),
-        (None, _) => "Trial: tried.".to_string(),
+        (Some(true), _) if first => format!("{label} ready to answer on its own."),
+        (Some(true), _) => format!(
+            "{label} ready: it answers the rows of a run that {FIRST_ANSWERER} gives no answer to."
+        ),
+        (Some(false), false) => format!("{label} not ready; it needs {}.", needs.join(", ")),
+        (Some(false), true) => format!("{label} not ready."),
+        (None, _) => format!("{label} tried."),
     });
+    if trial.get("review_only").and_then(Value::as_bool) == Some(true) {
+        lines.push(
+            "It decides about people (a job, credit, a place to live or insurance), so a person makes every call: no row of it is Sure, and each comes back as Check, about a person."
+                .to_string(),
+        );
+    }
     if let Some(summary) = text_field(trial, &["summary"]) {
         for line in quoted_body(summary).lines() {
             lines.push(format!("  | {line}"));
@@ -1195,12 +1284,19 @@ fn question_text(result: &Value, question: Uuid) -> String {
         line.push('.');
         lines.push(line);
     }
-    let trial = trial_of(version.get("trial"));
-    match trial {
-        Some(trial) => lines.extend(trial_lines(trial)),
-        None if number.is_some() => lines.push("Trial: not tried yet.".to_string()),
-        None => {}
+    let trials = trials_of(version.get("trial"));
+    for (answerer, trial) in &trials {
+        lines.extend(trial_lines(trial, answerer));
     }
+    if trials.is_empty() && number.is_some() {
+        lines.push("Trial: not tried yet.".to_string());
+    }
+    // The first answerer's trial decides whether the version answers on its
+    // own.
+    let trial = trials
+        .iter()
+        .find(|(answerer, _)| *answerer == FIRST_ANSWERER)
+        .map(|(_, trial)| *trial);
     let versions = items(result, "versions");
     if !versions.is_empty() {
         let listed: Vec<String> = versions
@@ -1255,8 +1351,16 @@ fn saved_text(result: &Value, created: bool) -> String {
     let version = version.map_or_else(unknown, |n| n.to_string());
     let mut lines = vec![format!("[QUESTIONS] {}", question_line(saved))];
     if created {
+        let copy = text_field(saved, &["template"])
+            .map(|template| {
+                format!(
+                    " It started from the starter template {}; unchanged, it needs fewer labeled rows.",
+                    one_line(template)
+                )
+            })
+            .unwrap_or_default();
         lines.push(format!(
-            "Saved as a draft (version {version}): it answers nothing until a version is tried on rows the person labeled and activated."
+            "Saved as a draft (version {version}): it answers nothing until a version is tried on rows the person labeled and activated.{copy}"
         ));
         lines.push(format!(
             "Next: label rows with the person's answers: questions(action=\"label\", {target}, rows=[{{key, fields, want}}]); action=\"sample\" picks rows worth asking about."
@@ -1266,6 +1370,36 @@ fn saved_text(result: &Value, created: bool) -> String {
             "Version {version} written; the ones before stay as they were. When the question has labeled rows it is tried on them in the background: questions(action=\"get\", {target}, version={version}) shows what it came to, or questions(action=\"try\", {target}, version={version}) tries it now."
         ));
     }
+    lines.join("\n")
+}
+
+fn templates_text(result: &Value) -> String {
+    let templates = items(result, "templates");
+    if templates.is_empty() {
+        return "[QUESTIONS] No starter templates here. Save a question with its own spec: questions(action=\"create\", name=\"...\", spec={...}).".to_string();
+    }
+    let mut lines = vec![format!(
+        "[QUESTIONS] {} starter template(s). Save a copy to change as the workspace's own with questions(action=\"create\", name=\"...\", template=\"<key>\"); an unchanged copy needs fewer labeled rows before it may answer on its own.",
+        templates.len()
+    )];
+    lines.extend(templates.iter().take(MOST_LINES).map(|template| {
+        format!(
+            "- {} (template=\"{}\"): {}, {}",
+            text_field(template, &["name"])
+                .map(one_line)
+                .unwrap_or_else(|| "(unnamed)".into()),
+            text_field(template, &["key"])
+                .map(one_line)
+                .unwrap_or_else(|| "?".into()),
+            text_field(template, &["shape"])
+                .map(one_line)
+                .unwrap_or_else(|| "?".into()),
+            text_field(template, &["about"])
+                .map(|about| cut(about, 200))
+                .unwrap_or_default()
+        )
+    }));
+    lines.extend(more_line(MOST_LINES, templates.len()));
     lines.join("\n")
 }
 
@@ -1354,17 +1488,39 @@ fn trial_text(result: &Value, question: Uuid) -> String {
     let name = text_field(saved, &["name"])
         .map(|name| format!("\"{}\"", one_line(name)))
         .unwrap_or_else(|| "the question".to_string());
+    let tried = trials_of(result.get("trial")).into_iter().next();
+    let answerer = tried.map_or(FIRST_ANSWERER, |(answerer, _)| answerer);
+    let by = if answerer == FIRST_ANSWERER {
+        String::new()
+    } else {
+        format!(", answered by {}", one_line(answerer))
+    };
     let mut lines = vec![format!(
-        "[QUESTIONS] Tried version {} of {name} on its labeled rows.",
+        "[QUESTIONS] Tried version {} of {name} on its labeled rows{by}.",
         version.map_or_else(unknown, |n| n.to_string())
     )];
-    let trial = trial_of(result.get("trial"));
-    if let Some(trial) = trial {
-        lines.extend(trial_lines(trial));
+    if let Some((answerer, trial)) = tried {
+        lines.extend(trial_lines(trial, answerer));
     }
-    let ready = trial
-        .and_then(|trial| trial.get("ready"))
+    let ready = tried
+        .and_then(|(_, trial)| trial.get("ready"))
         .and_then(Value::as_bool);
+    if answerer != FIRST_ANSWERER {
+        // The second answerer's trial lets it take the rows the first gives
+        // no answer to; whether the version answers at all is the first's.
+        lines.push(if ready == Some(true) {
+            format!(
+                "Next: nothing more for it. Once the version answers on its own (its {FIRST_ANSWERER} trial decides: questions(action=\"try\", question_id=\"{question}\")), {} answers the rows of its runs that {FIRST_ANSWERER} gives no answer to.",
+                one_line(answerer)
+            )
+        } else {
+            format!(
+                "Next: until this trial is ready, the rows {FIRST_ANSWERER} gives no answer to stay for a person. Label more rows with the person's answers, then questions(action=\"try\", question_id=\"{question}\", model=\"{}\").",
+                one_line(answerer)
+            )
+        });
+        return lines.join("\n");
+    }
     lines.push(match (ready, version, int_field(saved, "revision")) {
         (Some(true), Some(version), Some(revision)) => format!(
             "Next: questions(action=\"activate\", question_id=\"{question}\", version={version}, expected_revision={revision}) lets it answer on its own."
@@ -1606,6 +1762,9 @@ fn answer_words(answer: &Value) -> String {
         text_field(answer, &["reason"]),
     ) {
         (Some("sure"), _) => words.push_str(" (Sure)"),
+        (Some(_), Some("about_a_person")) => {
+            words.push_str(" (Check: about a person, a person's call)")
+        }
         (Some(_), Some(reason)) => {
             words.push_str(&format!(" (Check: {})", one_line(reason).replace('_', " ")))
         }

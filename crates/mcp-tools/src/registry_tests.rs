@@ -845,6 +845,16 @@ mod constants_tests {
         assert!(STANDARD_TOOLS.contains(&"progress"));
         assert!(CONSOLIDATED_TOOLS.contains(&"feed"));
         assert!(STANDARD_TOOLS.contains(&"feed"));
+        // Saved questions: the standard toolset, not the light one, the core
+        // bundle or the compact OpenAI surface.
+        assert!(CONSOLIDATED_TOOLS.contains(&"questions"));
+        assert!(STANDARD_TOOLS.contains(&"questions"));
+        assert!(!LIGHT_TOOLS.contains(&"questions"));
+        assert!(!CORE_BUNDLE.contains(&"questions"));
+        assert!(!OPENAI_AGENTIC_CORE_TOOLS.contains(&"questions"));
+        assert!(!TOOL_BUNDLES
+            .values()
+            .any(|tools| tools.contains(&"questions")));
     }
 
     #[test]

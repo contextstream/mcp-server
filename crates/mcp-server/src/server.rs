@@ -113,6 +113,9 @@ pub fn build_registry(
     // A local server keeps a reported run alive on a timer; the hosted
     // gateway runs none (the tool reads the transport from the client config).
     domains::progress::register_progress_tools(&mut registry, client.clone(), session.clone());
+    // Saved questions: a thin client of the API's `/questions` routes, for
+    // stdio and the hosted gateway alike.
+    domains::questions::register_questions_tools(&mut registry, client.clone(), session.clone());
     domains::feed::register_feed_tools(&mut registry, client.clone(), session.clone());
     // Phase 1-3 taxonomy expansion: unified entity CRUD across tickets,
     // handoffs, backlog_views, incidents, releases, experiments, goals,
@@ -270,6 +273,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "entity" => "Updating ContextStream entity".to_string(),
         "reminder" => "Setting reminder in ContextStream".to_string(),
         "progress" => "Reporting progress to ContextStream".to_string(),
+        "questions" => "Working on saved questions in ContextStream".to_string(),
         "integration" => "Updating ContextStream integration".to_string(),
         "vcs" => "Linking VCS with ContextStream".to_string(),
         "feed" => "Updating ContextStream feed".to_string(),
@@ -310,6 +314,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
         "entity" => "ContextStream entity updated".to_string(),
         "reminder" => "Reminder saved to ContextStream".to_string(),
         "progress" => "Progress reported to ContextStream".to_string(),
+        "questions" => "ContextStream saved questions complete".to_string(),
         "integration" => "ContextStream integration updated".to_string(),
         "vcs" => "VCS linked with ContextStream".to_string(),
         "feed" => "ContextStream feed updated".to_string(),
@@ -400,6 +405,25 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "report": "Reporting progress to ContextStream",
             "get": "Loading a run from ContextStream",
             "list": "Listing ContextStream runs"
+        });
+    } else if name == domains::questions::TOOL_NAME {
+        metadata["actions"] = serde_json::json!({
+            "list": "Listing saved questions",
+            "get": "Loading a saved question",
+            "create": "Saving a question to ContextStream",
+            "version": "Saving a new version of a question",
+            "label": "Saving labeled rows for a question",
+            "sample": "Picking rows to label",
+            "try": "Trying a question on labeled rows",
+            "activate": "Letting a question answer on its own",
+            "describe": "Reading a list's columns",
+            "run": "Asking a question about a list",
+            "status": "Checking a run of a question",
+            "results": "Reading a run's answers",
+            "answer": "Answering one row",
+            "cancel": "Cancelling a run of a question",
+            "resume": "Resuming a run of a question",
+            "write_back": "Writing answers back to the sheet"
         });
     } else if name == "memory" {
         metadata["actions"] = serde_json::json!({
@@ -3411,6 +3435,8 @@ mod tests {
         "project",
         "project_read",
         "qa",
+        // Saved questions: a new tool; no existing tool changes for it.
+        "questions",
         "reminder",
         "search",
         "session",
@@ -3631,6 +3657,12 @@ mod tests {
         (
             "qa",
             "e4716ffb4e7f26147df700a3d38cd799139bfccc36958a7825e115c60bf18098",
+        ),
+        (
+            // New row for saved questions: the `questions` tool; `action` is
+            // required.
+            "questions",
+            "ce91789331c82c91d5f63f43295062ed24121d308c7b19a68f3f1ad72feaa2b5",
         ),
         (
             "reminder",
@@ -4253,6 +4285,81 @@ mod tests {
                 &serde_json::json!({"step": "Running the tests"})
             ),
             "Reporting progress to ContextStream"
+        );
+    }
+
+    #[test]
+    fn the_questions_tool_is_in_the_standard_toolset_only() {
+        // Saved questions: on the default (standard) surface and the hosted
+        // gateway's complete one, not on the light toolset or the compact
+        // OpenAI surface, where it is reached through tool_search. A write
+        // that destroys nothing and asks for a person's confirmation (a run
+        // spends credits).
+        let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        let questions = tool_by_name(&tools, "questions");
+        assert_eq!(
+            questions["inputSchema"]["required"],
+            serde_json::json!(["action"])
+        );
+        assert_eq!(
+            questions["inputSchema"]["properties"]["action"]["enum"],
+            serde_json::json!([
+                "list",
+                "get",
+                "create",
+                "version",
+                "label",
+                "sample",
+                "try",
+                "activate",
+                "describe",
+                "run",
+                "status",
+                "results",
+                "answer",
+                "cancel",
+                "resume",
+                "write_back"
+            ])
+        );
+        assert_eq!(questions["annotations"]["readOnlyHint"], false);
+        assert_eq!(questions["annotations"]["destructiveHint"], false);
+        assert_eq!(
+            questions["_meta"]["contextstream"]["safety"]["requiresConfirmation"],
+            true
+        );
+        let description = questions["description"].as_str().expect("description");
+        assert!(description.chars().count() <= PORTABLE_DESCRIPTION_LIMIT);
+        let hosted = contextstream_tools_list(
+            &test_registry(Config {
+                toolset: mcp_types::config::Toolset::Complete,
+                ..Config::default()
+            }),
+            None,
+        );
+        assert!(listed_names(&hosted).contains(&"questions"));
+        for config in [
+            Config {
+                toolset: mcp_types::config::Toolset::Light,
+                ..Config::default()
+            },
+            Config {
+                tool_surface_profile: ToolSurfaceProfile::OpenaiAgentic,
+                ..Config::default()
+            },
+        ] {
+            let listed = contextstream_tools_list(&test_registry(config), None);
+            assert!(!listed_names(&listed).contains(&"questions"));
+        }
+        // A call's title follows its action.
+        assert_eq!(
+            contextstream_call_title(
+                "questions",
+                "Saved Questions",
+                false,
+                &serde_json::json!({"action": "run"})
+            ),
+            "Asking a question about a list"
         );
     }
 

@@ -31,6 +31,7 @@ pub mod progress;
 pub mod project;
 pub mod project_brief;
 pub mod qa;
+pub mod questions;
 pub mod read_only;
 pub mod reminder;
 pub mod remote_checks;

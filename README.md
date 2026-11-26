@@ -204,62 +204,6 @@ come from the August 1 run on the same queries. The agent-task result uses one
 repository and one agent model, so treat it as directional.
 [Results, methodology, and limitations](https://contextstream.io/benchmarks).
 
-## ContextStudio
-
-For people ContextStream Create offers one-prompt making to, the server adds one tool,
-`studio`: ask for a film, a product explainer filmed from your connected product, an
-image, sound or music in plain words, and ContextStudio's producer plans the pieces from
-what your team knows (brand kit, docs, decisions, connected products). There are no models
-to pick.
-
-- **Brand work by name.** Brand images (social sets in each network's size, ad sets, hero
-  and product shots, posters and flyers with print PDFs, email headers, brand graphics) and
-  brand sounds (sonic logos, music beds, loops, effect packs, voice-overs, podcast intros
-  and outros): pass `form`, with `sizes` (up to 6, such as `instagram-post` or
-  `linkedin-post`) or a `voice`, and the plan keeps to it.
-- **Plan, then price.** `plan` returns the pieces and one price ("up to N credits, likely
-  about M") and spends nothing. Pass what your agent knows that the workspace may not (the
-  diff it just made, release notes, the doc it has open) as `context`; the producer reads
-  it next to the team's own context.
-- **Your go-ahead.** `make` spends at most the plan's price, and only after you agree. The
-  agent shows you the plan and its price and passes the price you accepted. A client that
-  shows you a form in the middle of a call (MCP elicitation) still asks you itself, for up
-  to 45 seconds: your no wins, and if you give no answer in that time the price the agent
-  passed counts. A client that answers through the call's result (`input_required`, as Claude Code
-  does) asks you only when the agent passed no accepted price: with one, the plan is made at
-  once. To take no go-ahead from the agent at all, set `CONTEXTSTREAM_GO_AHEAD=asked` (a
-  local binary) or send `X-ContextStream-Go-Ahead: asked` (a hosted connection): then only
-  your own yes in the client's form counts for spending and sending, and the `delete` tool,
-  which never asks, deletes nothing.
-- **Following it.** `status` reports each piece while it waits (with
-  `notifications/progress` where the call asks for them); a product film takes 13 to 21
-  minutes. `result` shows images inline and links video and sound (signed links valid
-  about 15 minutes), with each piece's placard. Brand work comes as files, each with its
-  own link: every size as PNG, JPG and WebP with a ZIP of the set, a print PDF, or WAV and
-  MP3 for the web with a broadcast master and stems, plus alt text, a caption and the
-  checks it was held to.
-- **Revising.** `revise` starts from a made image or sound: a `variation` (more like it), a
-  `revision` (it, changed as you say) or a `resize` (an image in new `sizes`). Also `stop`,
-  `library`, `brand` and `products`.
-- **Email, where Create offers it.** Manage campaigns on your team's Resend account. Ask
-  `email_audiences` which lists exist, what each is for and how many people subscribe.
-  `email_contacts` updates contact fields and membership, previews a CSV and imports it
-  with your consent source, note and confirmed eligible count. Use `email_segments` to
-  preview or save rules and `email_recipients` to see who a campaign would reach today.
-  Draft from a prompt with `email_draft` or from a saved template with `email_templates`.
-  Revise or duplicate the draft, compare subjects with `email_ab`, open a shareable
-  mail-client preview or send a test to yourself. Before `email_send` sends or schedules,
-  review the audience or segment, its purpose, eligible count, sender, local time and
-  warnings. A live client asks you first. You can cancel a campaign, pause delivery or
-  resume it after confirming how many people still wait.
-  `email_report` shows campaign results and workspace trends. `email_unsubscribes`
-  reports opt-outs, bounces and complaints, and `email_diagnostics` shows whether webhook
-  events are arriving. `email_connection` checks or refreshes the sender and domain status.
-  Connect Resend in the studio. Erase a contact, audience, segment or template through
-  the full MCP's `delete` tool after confirmation, or on its email page in the studio.
-- **Connector.** The hosted path `/studio` serves only this tool, for Claude.ai or ChatGPT
-  connectors, with OAuth tokens bound to that resource (`read:studio`, `write:studio`).
-
 ## Data controls
 
 **Scoped access. Traceable sources. Configurable capture.**

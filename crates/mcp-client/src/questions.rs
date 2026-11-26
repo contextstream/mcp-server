@@ -21,8 +21,12 @@
 //!   surface}` (202) asks the question about every row of a list, and
 //!   `GET .../runs`, `GET .../runs/:run_id`, `POST .../cancel`,
 //!   `POST .../resume` and `GET .../rows?which&after&limit` follow a run;
-//!   `POST .../runs/:run_id/write-back` writes a Google Sheet run's answers
-//!   back beside the list;
+//!   `GET .../runs/:run_id/export?workspace_id` reads a run's rows as a CSV
+//!   (`text/csv`, done or not); `POST .../runs/:run_id/write-back`
+//!   `{workspace_id, session_id?, mapping?, attribute?}` writes a finished
+//!   run's answers back where its list lives: beside a Google Sheet's or an
+//!   Excel workbook's range (`session_id` required), or onto an audience's
+//!   contacts (`attribute`);
 //! - `POST /questions/:id/answer` `{workspace_id, key?, fields, mapping?}`
 //!   answers one row.
 //!
@@ -61,6 +65,8 @@ pub const RUN_SURFACE: &str = "mcp";
 pub const NOT_ASKING: &str = "[NOT_ASKING]";
 /// The spec format the API reads, filled in when a spec leaves it out.
 pub const SPEC_FORMAT: u32 = 1;
+/// What a run's export is asked for as.
+pub const CSV_MEDIA_TYPE: &str = "text/csv";
 
 fn spec_format() -> u32 {
     SPEC_FORMAT
@@ -214,6 +220,21 @@ pub struct OneRow {
     pub fields: Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping: Option<Mapping>,
+}
+
+/// How a finished run's answers are written back: the body of
+/// `POST .../write-back` without its workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteBack {
+    /// For a Google Sheet or an Excel workbook: the session the change is
+    /// recorded under (the app asks for its review there). An audience needs
+    /// none.
+    pub session_id: Option<String>,
+    pub mapping: Option<Mapping>,
+    /// For an audience: the contact property the answer is kept under, the
+    /// question's name when left out. Sure, Check or Your call is kept under
+    /// the same name with `_sure_or_check`.
+    pub attribute: Option<String>,
 }
 
 /// Which page of a run's rows `GET .../rows` reads.
@@ -578,27 +599,52 @@ impl ContextStreamClient {
             .await
     }
 
-    /// Write a finished Google Sheet run's answers back as two columns right
-    /// of the list, through the connected app; `session_id` is the session
-    /// the change is recorded under.
+    /// Write a finished run's answers back where its list lives: two columns
+    /// right of a Google Sheet's or an Excel workbook's range, through the
+    /// connected app, or two properties on each contact of an audience.
     /// Endpoint: `POST /questions/:id/runs/:run_id/write-back`, answered
-    /// `{range, write}`.
+    /// `{range, write}` for a sheet or a workbook and
+    /// `{property, sure_or_check_property, contacts}` for an audience.
     pub async fn write_back_question_run(
         &self,
         workspace_id: Option<Uuid>,
         question_id: Uuid,
         run_id: Uuid,
-        session_id: &str,
-        mapping: Option<&Mapping>,
+        write: &WriteBack,
     ) -> Result<Value> {
         let workspace_id = self.question_workspace(workspace_id).await?;
         let body = strip_nulls(serde_json::json!({
             "workspace_id": workspace_id,
-            "session_id": session_id,
-            "mapping": mapping,
+            "session_id": write.session_id,
+            "mapping": write.mapping,
+            "attribute": write.attribute,
         }));
         self.post(&run_path(question_id, run_id, "/write-back"), body)
             .await
+    }
+
+    /// A run's rows as a CSV, done or not: each row's key and the fields the
+    /// question looks at, its answer (a person's call first), Sure, Check or
+    /// Your call, why a person should look, and each question's answer when
+    /// it asks more than one.
+    /// Endpoint: `GET /questions/:id/runs/:run_id/export?workspace_id`,
+    /// answered with `text/csv`.
+    pub async fn export_question_run(
+        &self,
+        workspace_id: Option<Uuid>,
+        question_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<String> {
+        let workspace_id = self.question_workspace(workspace_id).await?;
+        self.get_text(
+            &run_path(
+                question_id,
+                run_id,
+                &format!("/export?workspace_id={workspace_id}"),
+            ),
+            Some(CSV_MEDIA_TYPE),
+        )
+        .await
     }
 }
 

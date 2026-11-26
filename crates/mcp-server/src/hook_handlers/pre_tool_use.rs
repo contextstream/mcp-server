@@ -1325,7 +1325,7 @@ fn is_contextstream_read_only_operation(tool_name: &str, tool_input: &Value) -> 
         // answer changes something.
         "questions" => matches!(
             action.as_str(),
-            "list" | "get" | "status" | "results" | "describe"
+            "list" | "get" | "status" | "results" | "export" | "describe"
         ),
         _ => false,
     }
@@ -4802,7 +4802,7 @@ mod tests {
 
     #[test]
     fn a_saved_question_read_is_not_a_change_and_its_writes_are() {
-        for action in ["list", "get", "status", "results", "describe"] {
+        for action in ["list", "get", "status", "results", "export", "describe"] {
             assert!(
                 !is_likely_state_changing_tool(
                     "questions",
@@ -4814,7 +4814,14 @@ mod tests {
             );
         }
         for action in [
-            "create", "version", "label", "try", "activate", "run", "answer",
+            "create",
+            "version",
+            "label",
+            "try",
+            "activate",
+            "run",
+            "answer",
+            "write_back",
         ] {
             assert!(
                 is_likely_state_changing_tool(

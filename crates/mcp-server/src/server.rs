@@ -420,10 +420,11 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "run": "Asking a question about a list",
             "status": "Checking a run of a question",
             "results": "Reading a run's answers",
+            "export": "Exporting a run's answers as CSV",
             "answer": "Answering one row",
             "cancel": "Cancelling a run of a question",
             "resume": "Resuming a run of a question",
-            "write_back": "Writing answers back to the sheet"
+            "write_back": "Writing answers back where the list lives"
         });
     } else if name == "memory" {
         metadata["actions"] = serde_json::json!({
@@ -3660,9 +3661,10 @@ mod tests {
         ),
         (
             // New row for saved questions: the `questions` tool; `action` is
-            // required.
+            // required. Advanced for `export` and write-back's `attribute`;
+            // additive only (export_and_attribute_only_add_to_the_questions_schema).
             "questions",
-            "ce91789331c82c91d5f63f43295062ed24121d308c7b19a68f3f1ad72feaa2b5",
+            "a9eed5b69be0966c4d1c82f5855fbff3c704b268346863a7d67fe4b28ae283b2",
         ),
         (
             "reminder",
@@ -4289,6 +4291,19 @@ mod tests {
     }
 
     #[test]
+    fn export_and_attribute_only_add_to_the_questions_schema() {
+        // A run as a CSV (`export`) and the contact property an audience's
+        // answers go under (`attribute`) came after the tool's first
+        // contract. Without them the schema is exactly that contract, so
+        // every other action and parameter is unchanged.
+        let tools = contextstream_tools_list(&test_registry(Config::default()), None);
+        assert_eq!(
+            schema_contract_without(&tools, "questions", &["export"], &["attribute"]),
+            "ce91789331c82c91d5f63f43295062ed24121d308c7b19a68f3f1ad72feaa2b5"
+        );
+    }
+
+    #[test]
     fn the_questions_tool_is_in_the_standard_toolset_only() {
         // Saved questions: on the default (standard) surface and the hosted
         // gateway's complete one, not on the light toolset or the compact
@@ -4316,6 +4331,7 @@ mod tests {
                 "run",
                 "status",
                 "results",
+                "export",
                 "answer",
                 "cancel",
                 "resume",
@@ -4360,6 +4376,21 @@ mod tests {
                 &serde_json::json!({"action": "run"})
             ),
             "Asking a question about a list"
+        );
+        assert_eq!(
+            contextstream_call_title(
+                "questions",
+                "Saved Questions",
+                false,
+                &serde_json::json!({"action": "export"})
+            ),
+            "Exporting a run's answers as CSV"
+        );
+        // `attribute` names the contact property an audience's answers go
+        // under.
+        assert_eq!(
+            questions["inputSchema"]["properties"]["attribute"]["type"],
+            "string"
         );
     }
 

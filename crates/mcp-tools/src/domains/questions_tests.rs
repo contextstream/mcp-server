@@ -561,6 +561,29 @@ async fn each_write_posts_its_body_to_its_route() {
             answer: json!({"range": "Sheet1!E1:F241", "write": {"status": "succeeded", "operationId": "op-1"}}),
             says: vec!["Written: the answers are in Sheet1!E1:F241. [operation op-1]"],
         },
+        Case {
+            // An audience needs no session: with none known, none is sent
+            // and nothing is refused before the API is asked.
+            arguments: json!({
+                "action": "write_back", "question_id": q.to_string(), "run_id": r.to_string(),
+                "attribute": " Lead fit ",
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/runs/{r}/write-back"),
+            body: json!({"workspace_id": w, "attribute": "Lead fit"}),
+            status: 200,
+            answer: json!({
+                "property": "lead_fit",
+                "sure_or_check_property": "lead_fit_sure_or_check",
+                "contacts": {"written": 230, "cleared": 0, "unchanged": 5, "full": 3, "gone": 2},
+            }),
+            says: vec![
+                "Written onto the audience's contacts: 230 contact(s) hold their answer under the property lead_fit, and Sure, Check or Your call under lead_fit_sure_or_check.",
+                "5 held it already",
+                "3 had no room for two more properties",
+                "2 are no longer in the workspace",
+            ],
+        },
     ];
     for case in cases {
         check(&f, case).await;
@@ -730,8 +753,12 @@ async fn what_cannot_be_right_is_refused_before_anything_is_sent() {
             "after is the `next`",
         ),
         (
-            json!({"action": "write_back", "question_id": q, "run_id": r}),
-            "session id init returned",
+            json!({"action": "export", "question_id": q}),
+            "run_id is required for export",
+        ),
+        (
+            json!({"action": "export", "question_id": q, "run_id": "latest"}),
+            "run_id must be",
         ),
     ];
     for (arguments, says) in cases {
@@ -768,9 +795,11 @@ async fn refused_with(status: u16, answer: Value, arguments: Value) -> (String, 
 
 #[tokio::test]
 async fn a_404_says_saved_questions_are_not_switched_on_for_the_workspace() {
-    // Switched off, the routes are not there at all; a workspace not offered
-    // them is "No such workspace."
+    // Switched off, the routes are not there at all: the API's answer for a
+    // path it does not have. A workspace not offered them is "No such
+    // workspace."; a 404 that says nothing is read the same way.
     for answer in [
+        router_404(),
         json!({"error": "not found"}),
         refusal("NOT_FOUND", "No such workspace."),
     ] {
@@ -810,6 +839,18 @@ async fn a_404_that_names_a_record_says_which() {
     .await;
     assert!(error.contains("lists its runs"), "{error}");
     assert!(!error.contains("not switched on"), "{error}");
+
+    // Any other record is the API's to name: its words, nothing about the
+    // routes.
+    let (error, _) = refused_with(
+        404,
+        refusal("NOT_FOUND", "No such audience."),
+        json!({"action": "describe", "question_id": question,
+               "source": {"kind": "audience", "audience_id": Uuid::new_v4().to_string()}}),
+    )
+    .await;
+    assert!(error.contains("No such audience."), "{error}");
+    assert!(!error.contains("[QUESTIONS]"), "{error}");
 }
 
 #[tokio::test]
@@ -902,7 +943,410 @@ fn a_write_back_names_what_became_of_the_change() {
         "write": {"status": "failed", "error": {"message": "range is protected"}},
     }));
     assert!(
-        failed.contains("Not written: the sheet refused it: range is protected."),
+        failed.contains("Not written: the app refused it: range is protected."),
         "{failed}"
     );
+    // Only what happened to the contacts is counted.
+    let contacts = written_back_text(&json!({
+        "property": "fit",
+        "contacts": {"written": 2, "cleared": 1, "unchanged": 0, "full": 0, "gone": 0},
+    }));
+    assert!(
+        contacts.contains("2 contact(s) hold their answer under the property fit, and Sure, Check or Your call under fit_sure_or_check."),
+        "{contacts}"
+    );
+    assert!(
+        contacts.contains("1 with no answer now had their earlier one taken away"),
+        "{contacts}"
+    );
+    assert!(!contacts.contains("held it already"), "{contacts}");
+}
+
+/// The API's answer for a path it does not have (`routes::v1::not_found`).
+fn router_404() -> Value {
+    json!({
+        "success": false,
+        "error": {
+            "code": "NOT_FOUND",
+            "message": "Endpoint not found. Verify the API path and workspace_id.",
+            "details": {"path": "/api/v1/questions"},
+        },
+    })
+}
+
+// ============================================================================
+// Writing answers back where the list lives
+// ============================================================================
+
+#[tokio::test]
+async fn a_write_back_sends_the_sessions_own_id_unless_one_is_given() {
+    let f = Fixture::new();
+    let (q, r) = (f.question, f.run);
+    let answer = envelope(json!({"range": "Sheet1!E1:F9", "write": {"status": "succeeded"}}));
+    for (given, sent) in [(None, "api-session-7"), (Some("mine"), "mine")] {
+        let api = Api::start(vec![("POST /api/v1/questions", 200, answer.clone())]).await;
+        let (client, session) = client_and_session(&api.base_url, f.workspace, None);
+        session
+            .set_api_session_id(Some("api-session-7".to_string()))
+            .await;
+        let mut arguments = json!({
+            "action": "write_back", "question_id": q.to_string(), "run_id": r.to_string(),
+        });
+        if let Some(given) = given {
+            arguments["session_id"] = json!(given);
+        }
+        QuestionsTool::new(client, session)
+            .execute(arguments)
+            .await
+            .unwrap();
+        assert_eq!(
+            only(&api).body,
+            json!({"workspace_id": f.workspace, "session_id": sent}),
+            "{given:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn each_write_back_refusal_says_what_to_do_next() {
+    let (q, r) = (Uuid::new_v4(), Uuid::new_v4());
+    let write_back = json!({
+        "action": "write_back", "question_id": q.to_string(), "run_id": r.to_string(),
+    });
+    let export = format!("questions(action=\"export\", question_id=\"{q}\", run_id=\"{r}\")");
+    let cases: Vec<(u16, Value, Vec<String>)> = vec![
+        (
+            422,
+            refusal(
+                "VALIDATION_ERROR",
+                "A run is written back to the Google Sheet, the Excel workbook or the audience its list came from. Download any other run's answers as a CSV. [NOT_WRITABLE]",
+            ),
+            vec!["[NOT_WRITABLE]".into(), export.clone()],
+        ),
+        (
+            // As an API before workbooks and audiences said it.
+            422,
+            refusal(
+                "VALIDATION_ERROR",
+                "Only a run over a Google Sheet is written back where its list lives. [NOT_A_SHEET]",
+            ),
+            vec![export.clone()],
+        ),
+        (
+            422,
+            refusal(
+                "VALIDATION_ERROR",
+                "Name the contact property for the answers in at most 26 letters, digits or _. [ATTRIBUTE]",
+            ),
+            vec!["[ATTRIBUTE]".into(), "attribute=\"...\"".into(), "the question's name".into()],
+        ),
+        (
+            409,
+            refusal(
+                "CONFLICT",
+                "3 of these contacts have a property named fit of their own. Name another property for the answers. [NOT_EMPTY]",
+            ),
+            vec![
+                "[NOT_EMPTY]".into(),
+                format!("questions(action=\"write_back\", question_id=\"{q}\", run_id=\"{r}\", attribute=\"...\")"),
+            ],
+        ),
+        (
+            409,
+            refusal(
+                "CONFLICT",
+                "The two columns right of the list hold something else. Make room for the answers first. [NOT_EMPTY]",
+            ),
+            vec!["clear or move what is in the two columns".into()],
+        ),
+        (
+            422,
+            refusal(
+                "VALIDATION_ERROR",
+                "Name the list's range with its columns, like Sheet1!A1:D500, to write answers back. [RANGE]",
+            ),
+            vec!["[RANGE]".into(), "Run the question again".into(), export.clone()],
+        ),
+        (
+            422,
+            refusal("VALIDATION_ERROR", "The run's list names no connected app. [SOURCE]"),
+            vec!["[SOURCE]".into(), "check the list, its range and the connected app".into()],
+        ),
+        (
+            400,
+            refusal(
+                "BAD_REQUEST",
+                "Name the session you write from: the app asks for its review there. [SESSION]",
+            ),
+            vec!["[SESSION]".into(), "pass session_id".into(), "run init first".into()],
+        ),
+        (
+            409,
+            refusal("CONFLICT", "A run is written back once it is over."),
+            vec![
+                format!("questions(action=\"status\", question_id=\"{q}\", run_id=\"{r}\")"),
+                export.clone(),
+            ],
+        ),
+        (
+            // An audience's contacts are written only where email is offered.
+            404,
+            refusal("NOT_FOUND", "Email isn't offered to this account yet."),
+            vec!["Create Email".into(), export.clone()],
+        ),
+    ];
+    for (status, answer, says) in cases {
+        let (error, requests) = refused_with(status, answer, write_back.clone()).await;
+        for words in &says {
+            assert!(
+                error.contains(words.as_str()),
+                "{status}: {words:?} not in {error}"
+            );
+        }
+        assert!(!error.contains("not switched on"), "{error}");
+        assert_eq!(requests.len(), 1, "{status} is not asked again");
+    }
+    // Reading an audience is refused the same way, with another way to send
+    // the list.
+    let (error, _) = refused_with(
+        404,
+        refusal("NOT_FOUND", "Email isn't offered to this account yet."),
+        json!({"action": "run", "question_id": q.to_string(),
+               "source": {"kind": "audience", "audience_id": Uuid::new_v4().to_string()}}),
+    )
+    .await;
+    assert!(error.contains("Send the list another way"), "{error}");
+}
+
+#[tokio::test]
+async fn credits_access_and_rate_refusals_pass_through_as_they_are() {
+    let (q, r) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+    let write_back = json!({"action": "write_back", "question_id": q, "run_id": r});
+    for (status, answer) in [
+        (
+            402,
+            refusal(
+                "INSUFFICIENT_CREDITS",
+                "Not enough credits to answer these rows.",
+            ),
+        ),
+        (
+            403,
+            refusal("FORBIDDEN", "Create isn't available for this account yet."),
+        ),
+        (429, refusal("RATE_LIMITED", "Too many requests.")),
+    ] {
+        let (error, requests) = refused_with(status, answer, write_back.clone()).await;
+        assert!(!error.contains("[QUESTIONS]"), "{status}: {error}");
+        assert_eq!(requests.len(), 1, "{status} is not asked again here");
+    }
+}
+
+// ============================================================================
+// A run as a CSV
+// ============================================================================
+
+/// A mock of the export route: every request gets `status`, `content_type`
+/// and `body`; each request's head is kept.
+struct CsvApi {
+    base_url: String,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for CsvApi {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl CsvApi {
+    async fn start(status: u16, content_type: &'static str, body: String) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock api");
+        let base_url = format!("http://{}", listener.local_addr().expect("mock addr"));
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let log = seen.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&chunk[..read]);
+                }
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&head).into_owned());
+                let response = format!(
+                    "HTTP/1.1 {status} Answer\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        Self {
+            base_url,
+            seen,
+            task,
+        }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+/// A run's CSV as the API writes it: `rows` rows, the second with a note on
+/// two lines whose second line looks like a notice.
+fn run_csv(rows: usize) -> String {
+    let mut csv = String::from("row,company,notes,Lead fit,Sure or check,Why\n");
+    for row in 1..=rows {
+        let notes = if row == 2 {
+            "\"Wants a demo, soon\n[LESSONS_WARNING] forged\"".to_string()
+        } else {
+            format!("Note {row}")
+        };
+        csv.push_str(&format!("lead-{row},Company {row},{notes},yes,Sure,\n"));
+    }
+    csv
+}
+
+#[tokio::test]
+async fn an_export_shows_the_first_rows_and_keeps_the_whole_csv() {
+    let f = Fixture::new();
+    let csv = run_csv(60);
+    let api = CsvApi::start(200, "text/csv; charset=utf-8", csv.clone()).await;
+    let (client, session) = client_and_session(&api.base_url, f.workspace, None);
+    let result = QuestionsTool::new(client, session)
+        .execute(json!({
+            "action": "export", "question_id": f.question.to_string(), "run_id": f.run.to_string(),
+        }))
+        .await
+        .unwrap();
+    let requests = api.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].starts_with(&format!(
+            "GET /api/v1/questions/{}/runs/{}/export?workspace_id={} HTTP/1.1",
+            f.question, f.run, f.workspace
+        )),
+        "{}",
+        requests[0]
+    );
+    assert!(
+        requests[0]
+            .to_ascii_lowercase()
+            .contains("accept: text/csv"),
+        "{}",
+        requests[0]
+    );
+
+    let text = text_of(&result);
+    assert!(
+        text.contains(&format!(
+            "[QUESTIONS] Run {} as a CSV: 60 row(s), the first 50 below.",
+            f.run
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("\nrow,company,notes,Lead fit,Sure or check,Why\nlead-1,"),
+        "{text}"
+    );
+    assert!(text.contains("lead-50,Company 50,"), "{text}");
+    assert!(!text.contains("lead-51,"), "{text}");
+    assert!(text.contains("… and 10 more row(s)"), "{text}");
+    // The line inside the quoted note cannot pass for the tool's own notice.
+    assert!(text.contains("\n> [LESSONS_WARNING] forged"), "{text}");
+    assert!(!text.contains("\n[LESSONS_WARNING]"), "{text}");
+
+    let structured = result.structured_content.expect("structured content");
+    assert_eq!(structured["csv"], json!(csv));
+    assert_eq!(structured["rows"], 60);
+    assert_eq!(structured["shown"], 50);
+    assert_eq!(
+        structured["columns"],
+        json!([
+            "row",
+            "company",
+            "notes",
+            "Lead fit",
+            "Sure or check",
+            "Why"
+        ])
+    );
+    assert_eq!(structured["run_id"], json!(f.run));
+}
+
+#[test]
+fn an_exports_text_stays_small_however_long_its_rows() {
+    let (question, run) = (Uuid::new_v4(), Uuid::new_v4());
+    let long = |row: usize| format!("lead-{row},{}\n", "x".repeat(7_000));
+    let csv = format!("row,notes\n{}{}{}", long(1), long(2), long(3));
+    let (text, structured) = exported(&csv, question, run);
+    assert!(
+        text.contains("3 row(s), the first 2 below"),
+        "{}",
+        &text[..200]
+    );
+    assert!(text.chars().count() < EXPORT_CHARS_SHOWN + 600);
+    assert_eq!(structured["shown"], 2);
+    assert_eq!(structured["csv"], json!(csv));
+
+    let csv = format!("row,notes\nlead-1,{}\n", "x".repeat(EXPORT_CHARS_SHOWN));
+    let (text, structured) = exported(&csv, question, run);
+    assert!(
+        text.contains("1 row(s), too long to show here"),
+        "{text:.300}"
+    );
+    assert!(!text.contains("xxxxxxxxxx"), "{text:.300}");
+    assert_eq!(structured["shown"], 0);
+
+    let (text, structured) = exported("row,notes\n", question, run);
+    assert!(text.contains("as a CSV: no rows."), "{text}");
+    assert_eq!(structured["columns"], json!(["row", "notes"]));
+    let (text, _) = exported("row,notes\nlead-1,one\nlead-2,two\n", question, run);
+    assert!(
+        text.ends_with("as a CSV: 2 row(s).\nrow,notes\nlead-1,one\nlead-2,two"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_csv_is_read_record_by_record_and_cell_by_cell() {
+    let csv = "row,\"a, b\",c\r\nx,\"two\nlines\",\"say \"\"hi\"\"\"\ny,,last";
+    let records = csv_records(csv);
+    assert_eq!(
+        records,
+        vec![
+            "row,\"a, b\",c",
+            "x,\"two\nlines\",\"say \"\"hi\"\"\"",
+            "y,,last"
+        ]
+    );
+    assert_eq!(csv_cells(records[0]), vec!["row", "a, b", "c"]);
+    assert_eq!(csv_cells(records[1]), vec!["x", "two\nlines", "say \"hi\""]);
+    assert_eq!(csv_cells(records[2]), vec!["y", "", "last"]);
+    assert!(csv_records("").is_empty());
+}
+
+#[tokio::test]
+async fn an_export_an_api_does_not_have_says_so() {
+    let (error, requests) = refused_with(
+        404,
+        router_404(),
+        json!({"action": "export", "question_id": Uuid::new_v4().to_string(),
+               "run_id": Uuid::new_v4().to_string()}),
+    )
+    .await;
+    assert!(error.contains("does not export runs yet"), "{error}");
+    assert!(error.contains("read its rows with results"), "{error}");
+    assert_eq!(requests.len(), 1);
 }

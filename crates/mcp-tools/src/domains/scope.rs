@@ -1582,6 +1582,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_scope_adopts_explicit_project_workspace_over_config_default_workspace() {
+        let header_default_workspace = Uuid::new_v4();
+        let project_workspace = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let (client, session) = scope_test_client(Some(header_default_workspace), None);
+
+        let scope = mcp_client::run_with_session_key(mcp_types::SessionKey::Local, || async {
+            client.prime_cached_project(project_in_workspace(project_id, project_workspace));
+            resolve_read_scope(&client, &session, None, Some(&project_id.to_string()))
+                .await
+                .unwrap()
+        })
+        .await;
+
+        assert_eq!(scope.workspace_id, Some(project_workspace));
+        assert_eq!(scope.project_id, Some(project_id));
+        assert_eq!(scope.note, None);
+    }
+
+    #[tokio::test]
     async fn write_scope_prefers_initialized_session_over_task_auth_workspace() {
         let config = mcp_types::config::Config::default();
         let client = ContextStreamClient::new(config.clone());

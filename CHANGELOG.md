@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- A refresh in a repository whose ContextStream entries hold their key by reference (`${CONTEXTSTREAM_API_KEY}`, `{env:…}`) no longer writes the running account into it without a word. It creates another editor's project entry (such as `.cursor/mcp.json`) with this run's key only when this run's own API shows that this run's key can see the workspace or project the repository names (in `.contextstream/config.json` or its entries' workspace and project ids); otherwise it asks on a terminal, or skips it and says why. The same check decides whether such an entry that runs no binary gets this home's `headersHelper`. An entry with a key held by reference keeps its installation id as written, and `doctor` no longer requires that id to be this installation's. No refresh points a ContextStream binary outside any home (such as `/usr/local/bin/contextstream-mcp`) at a home's binary.
+
 ## 1.0.108
 
 - An agent connected through OAuth (claude.ai, ChatGPT and Claude Code on the web, all on the hosted server) can now be answered from the Agent Hub, as a run reported with a full API key already could. Every API request says this client carries back what a person sends a run (`X-ContextStream-Receives: deliveries`). On the hosted server, which has no key of its own, the caller's own OAuth token reads, claims and confirms the answers and messages sent to its runs, with each account's claims kept apart, and `progress` shows them as `[PERSON ANSWER]` and `[PERSON MESSAGE]` blocks. When nothing can come back, what `progress` says names the OAuth token too. A server that does not know the header ignores it.

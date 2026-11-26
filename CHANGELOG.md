@@ -3,6 +3,7 @@
 ## 1.0.106
 
 - A read that names a `project_id` from another workspace now uses that project's workspace when the session's workspace is only the connection's default (the `X-ContextStream-Workspace-Id` header, with no workspace passed, no `init`, no task sign-in and no folder mapping). Before, hosted graph reads such as impact and call paths answered "Choose a project for code graph queries" until `init` had run.
+- The `graph` tool's description, its unknown-action error and the `help` tool catalog now name the newer graph actions (`hotspots`, `pr_brief`, `health_digest`, `code_drift`, `cross_project`, `contradictions`, `resolve_contradiction` and `resolve_drift`), so clients can find them. The managed editor rules add the questions that lead to them (blast radius, risky files, PR brief, code drift and contradictions) and list `resolve_contradiction` and `resolve_drift` as `graph` writes.
 
 ## 1.0.105
 

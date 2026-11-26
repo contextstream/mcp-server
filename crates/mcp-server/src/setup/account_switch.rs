@@ -165,12 +165,14 @@ pub(crate) enum Choice {
 
 /// A write that would switch the entry at `path` from one account to
 /// another, or, with `creating`, create that project config beside `path`
-/// signed in as another account than `path`.
+/// signed in as another account than `path`. `note` says why, when the
+/// accounts alone do not.
 pub(crate) struct Proposal<'a> {
     pub path: &'a Path,
     pub from: Account,
     pub to: Account,
     pub creating: Option<&'a Path>,
+    pub note: Option<&'a str>,
 }
 
 /// How a write that holds `proposed` keys may replace an entry that holds
@@ -273,6 +275,7 @@ pub(crate) fn settle_new_entry(
                         from,
                         to,
                         creating: Some(new_path),
+                        note: None,
                     };
                     settled_by(decide(&proposal, mode(), ask, &mut |line| {
                         eprintln!("{line}")
@@ -285,6 +288,42 @@ pub(crate) fn settle_new_entry(
         }
     }
     Settled::SameAccount
+}
+
+/// Whether a write may create the project config `new_path`, signed in with
+/// `proposed` (this run's own key), in a project whose ContextStream entries
+/// hold their key only by reference (`evidence`, the first of them). A
+/// reference resolves to whoever runs the editor, so the project tells
+/// nothing about its account; `sees` says whether this run's key can see the
+/// workspace or project it names (see [`runner_sees`]). When it can, the
+/// project is the runner's own and the entry is created without a word;
+/// when it cannot, or that could not be told, creating it is a switch.
+pub(crate) fn settle_reference_project(
+    new_path: &Path,
+    evidence: &ProjectEvidence,
+    sees: Option<bool>,
+) -> Settled {
+    if sees == Some(true) {
+        return Settled::SameAccount;
+    }
+    let reference = match &evidence.held {
+        Held::Key(key) => key.value.trim().to_string(),
+        Held::Email(email) => email.clone(),
+    };
+    let note = match sees {
+        Some(false) => "Your account cannot see the workspace or project it names.",
+        _ => "Could not tell whether your account can see the workspace or project it names.",
+    };
+    let proposal = Proposal {
+        path: &evidence.path,
+        from: Account::Reference(reference),
+        to: Account::Yours,
+        creating: Some(new_path),
+        note: Some(note),
+    };
+    settled_by(decide(&proposal, mode(), ask, &mut |line| {
+        eprintln!("{line}")
+    }))
 }
 
 /// How [`settle`] settled one key in place of another.
@@ -327,6 +366,7 @@ pub(crate) fn settle(
         from,
         to,
         creating,
+        note: None,
     };
     settled_by(decide(&proposal, mode(), ask, &mut |line| {
         eprintln!("{line}")
@@ -424,6 +464,9 @@ pub(crate) fn decide(
         None => format!("{path} signs in as {from}; this would switch it to {to}."),
     };
     say(ui.line(Mark::Warn, &head, None));
+    if let Some(note) = proposal.note {
+        say(format!("{GUTTER}  {note}"));
+    }
     let kept = match (&creating, safe_edit::is_dry_run()) {
         (Some(creating), true) => format!("{GUTTER}  Would not create {creating}."),
         (Some(creating), false) => format!("{GUTTER}  Did not create {creating}."),
@@ -558,6 +601,65 @@ fn lookup_accounts(_api_url: &str, keys: &[String]) -> Vec<Account> {
     })
 }
 
+/// Whether `key` (this run's own) can see any of `resources` (API paths such
+/// as `/api/v1/workspaces/<id>`) on `api_url` (this run's own API, and only
+/// that one), following no redirect: `Some(true)` when one answers with
+/// success, `Some(false)` when every one refuses (401, 403 or 404), and
+/// `None` when nothing could tell (offline, another answer, nothing to ask).
+#[cfg(not(test))]
+pub(crate) fn runner_sees(api_url: &str, key: &str, resources: &[String]) -> Option<bool> {
+    if resources.is_empty() {
+        return None;
+    }
+    let base = api_url.trim().trim_end_matches('/').to_string();
+    let key = key.to_string();
+    let resources = resources.to_vec();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        let http = mcp_client::http::client_builder()
+            .timeout(LOOKUP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .ok()?;
+        runtime.block_on(async {
+            let mut refused = 0;
+            for resource in &resources {
+                let response = http
+                    .get(format!("{base}{resource}"))
+                    .header("X-API-Key", &key)
+                    .send()
+                    .await;
+                match response.map(|response| response.status().as_u16()) {
+                    Ok(status) if (200..300).contains(&status) => return Some(true),
+                    Ok(401 | 403 | 404) => refused += 1,
+                    _ => {}
+                }
+            }
+            (refused == resources.len()).then_some(false)
+        })
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
+#[cfg(test)]
+pub(crate) fn runner_sees(_api_url: &str, _key: &str, resources: &[String]) -> Option<bool> {
+    if resources.is_empty() {
+        return None;
+    }
+    TEST_VISIBLE.with(|visible| {
+        visible.borrow().as_ref().map(|visible| {
+            resources
+                .iter()
+                .any(|resource| visible.iter().any(|id| resource.ends_with(id.as_str())))
+        })
+    })
+}
+
 /// Ask `<api_url>/api/v1/auth/me` whose each key is, following no redirect.
 /// A key the API does not answer for (offline, refused, revoked, redirected,
 /// no email) is an unknown account. The lookups run on their own thread and
@@ -619,6 +721,20 @@ thread_local! {
     /// an unknown account.
     static TEST_ACCOUNTS: std::cell::RefCell<Vec<(String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The workspace and project ids this run's key can see on this test
+    /// thread; `None` is an API that cannot be reached.
+    static TEST_VISIBLE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Until dropped, this run's key can see exactly these workspace and project
+/// ids on this test thread (`None`: the API cannot be reached).
+#[cfg(test)]
+pub(crate) fn test_visible(ids: Option<&[&str]>) -> TestGuard {
+    TEST_VISIBLE.with(|visible| {
+        *visible.borrow_mut() = ids.map(|ids| ids.iter().map(|id| id.to_string()).collect());
+    });
+    TestGuard
 }
 
 /// Until dropped, config writes on this test thread settle switches in `mode`,
@@ -650,6 +766,7 @@ impl Drop for TestGuard {
     fn drop(&mut self) {
         TEST_POLICY.set(None);
         TEST_ACCOUNTS.with(|known| known.borrow_mut().clear());
+        TEST_VISIBLE.with(|visible| *visible.borrow_mut() = None);
     }
 }
 
@@ -673,6 +790,7 @@ mod tests {
             from,
             to,
             creating: None,
+            note: None,
         }
     }
 
@@ -765,6 +883,7 @@ mod tests {
             from: erik(),
             to: chase(),
             creating: Some(&creating),
+            note: None,
         };
         let mut lines = Vec::new();
         let choice = decide(&proposal, Mode::Keep, |_| Ok(true), &mut |line| {
@@ -804,6 +923,7 @@ mod tests {
             from: Account::OtherApi(Some("http://127.0.0.1:9".to_string())),
             to: Account::Yours,
             creating: Some(&creating),
+            note: None,
         };
         let mut asked = None;
         let mut lines = Vec::new();

@@ -1014,37 +1014,215 @@ fn restore_json_entry_installation_id(entry: &mut Value, installation_id: Option
 
 /// Before `server` replaces `existing` in the config at `path`.
 ///
-/// When it would sign the entry in as another account and that was not
-/// agreed to (see [`account_switch`]), the entry keeps its own key, its
-/// installation id and the binary it runs (its stdio command and Claude
-/// Code's `headersHelper`), exactly as they are; the rest of the refresh
-/// stays. An agreed switch takes all of the write.
+/// When it would sign the entry in as another account (or an unknown one,
+/// such as a key held by reference) and that was not agreed to (see
+/// [`account_switch`]), the entry stays as it is: see
+/// [`keep_entry_as_it_is`].
 ///
-/// A write that leaves the account alone still never moves the binary an
-/// entry runs from another home to this one (see
-/// [`keep_binary_from_another_home`]).
+/// Any other write, an agreed switch included, still never moves the binary
+/// an entry runs from one home to another, nor writes a path over a bare
+/// `contextstream-mcp` (see [`keep_binary_across_homes`]). A write that
+/// leaves the account alone also keeps a key held by reference.
 fn settle_json_entry_account(path: &Path, existing: Option<&Value>, server: &mut Value) {
     let Some(existing) = existing else {
         return;
     };
     match account_switch::settle_key_write(
         path,
-        &embedded_json_api_keys(existing),
-        &embedded_json_api_keys(server),
+        &json_entry_held_keys(existing),
+        &json_entry_held_keys(server),
     ) {
-        account_switch::KeyWrite::Switched => {}
-        account_switch::KeyWrite::Keep(kept) => {
-            if !keep_entry_binary(existing, server) {
-                *server = existing.clone();
-                return;
-            }
-            refresh_json_entry_embedded_api_key(server, &kept);
-            restore_json_entry_installation_id(
-                server,
-                json_entry_installation_id(existing).as_deref(),
-            );
+        account_switch::KeyWrite::Keep(_) => keep_entry_as_it_is(existing, server),
+        account_switch::KeyWrite::Switched => keep_binary_across_homes(path, existing, server),
+        account_switch::KeyWrite::NoSwitch => {
+            keep_key_references(existing, server);
+            keep_binary_across_homes(path, existing, server);
         }
-        account_switch::KeyWrite::NoSwitch => keep_binary_from_another_home(path, existing, server),
+    }
+}
+
+/// The API a JSON-like entry sends its key to: a local entry's
+/// `CONTEXTSTREAM_API_URL` (the default API when it names none), the default
+/// API for a hosted entry at the default gateway, and the origin of any other
+/// gateway, which receives the key on every request anyway. `None` when the
+/// entry's URL is itself held by reference.
+fn json_entry_api_url(entry: &Value) -> Option<String> {
+    if let Some(url) = ["url", "serverUrl", "httpUrl"]
+        .into_iter()
+        .find_map(|field| entry.get(field).and_then(Value::as_str))
+    {
+        return hosted_api_url(url);
+    }
+    let named = ["env", "environment"].into_iter().find_map(|field| {
+        entry
+            .get(field)?
+            .get("CONTEXTSTREAM_API_URL")?
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    named_api_url(named)
+}
+
+fn named_api_url(named: Option<&str>) -> Option<String> {
+    match named {
+        Some(url) if account_switch::is_key_reference(url) => None,
+        Some(url) => Some(normalize_api_url(url)),
+        None => Some(DEFAULT_API_URL.to_string()),
+    }
+}
+
+fn hosted_api_url(url: &str) -> Option<String> {
+    if is_default_contextstream_remote_url(url) {
+        return Some(DEFAULT_API_URL.to_string());
+    }
+    let origin = reqwest::Url::parse(url.trim()).ok()?.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+/// Whether a header carries an entry's key: its API key headers, or an
+/// `Authorization` value.
+fn is_key_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case(HEADER_API_KEY)
+        || name.eq_ignore_ascii_case("x-api-key")
+        || name.eq_ignore_ascii_case("authorization")
+}
+
+/// The key or key reference a bearer `Authorization` value carries (not a
+/// JWT, which is no API key).
+fn bearer_key_or_reference(raw: &str) -> Option<String> {
+    let token = raw.trim().get(7..)?.trim();
+    let prefix = raw.trim().get(..7)?;
+    if !prefix.eq_ignore_ascii_case("bearer ") || token.is_empty() {
+        return None;
+    }
+    if account_switch::is_key_reference(token) {
+        return Some(token.to_string());
+    }
+    extract_bearer_api_key(raw).map(String::from)
+}
+
+/// Every key a JSON-like entry holds, literal or by reference, with the API
+/// its entry sends it to.
+fn json_entry_held_keys(entry: &Value) -> Vec<account_switch::HeldKey> {
+    let api_url = json_entry_api_url(entry);
+    let mut values: Vec<String> = Vec::new();
+    if let Some(headers) = entry.get("headers").and_then(Value::as_object) {
+        for (name, value) in headers {
+            let Some(raw) = value.as_str().map(str::trim).filter(|raw| !raw.is_empty()) else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case(HEADER_API_KEY) || name.eq_ignore_ascii_case("x-api-key") {
+                values.push(raw.to_string());
+            } else if name.eq_ignore_ascii_case("authorization") {
+                values.extend(bearer_key_or_reference(raw));
+            }
+        }
+    }
+    for field in ["env", "environment"] {
+        if let Some(raw) = entry
+            .get(field)
+            .and_then(|env| env.get("CONTEXTSTREAM_API_KEY"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
+            values.push(raw.to_string());
+        }
+    }
+    let mut held: Vec<account_switch::HeldKey> = Vec::new();
+    for value in values {
+        if !held.iter().any(|key| key.value == value) {
+            held.push(account_switch::HeldKey::new(value, api_url.clone()));
+        }
+    }
+    held
+}
+
+/// Set `server`'s `field` values that `matches` names back to `existing`'s,
+/// taking out those `existing` does not have.
+fn restore_entry_values(
+    existing: &Value,
+    server: &mut Value,
+    field: &str,
+    matches: impl Fn(&str) -> bool,
+) {
+    let Some(target) = server.get_mut(field).and_then(Value::as_object_mut) else {
+        return;
+    };
+    target.retain(|name, _| !matches(name));
+    if let Some(source) = existing.get(field).and_then(Value::as_object) {
+        for (name, value) in source {
+            if matches(name) {
+                target.insert(name.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// A refused (or unknown-account) switch keeps the entry as it is: its keys
+/// (literal or by reference), installation id, binary, API URL and
+/// transport. The rest of the refresh (managed markers, project and
+/// workspace ids, transcript settings) still applies when the transport
+/// stays the same; a write that would change the transport, or give a hosted
+/// entry a command, keeps the whole entry as it is.
+fn keep_entry_as_it_is(existing: &Value, server: &mut Value) {
+    if existing_json_like_server_is_remote(Some(existing))
+        != existing_json_like_server_is_remote(Some(server))
+        || !keep_entry_binary(existing, server)
+    {
+        *server = existing.clone();
+        return;
+    }
+    restore_entry_values(existing, server, "headers", is_key_header);
+    for field in ["env", "environment"] {
+        restore_entry_values(existing, server, field, |name| {
+            name == "CONTEXTSTREAM_API_KEY" || name == "CONTEXTSTREAM_API_URL"
+        });
+    }
+    restore_json_entry_installation_id(server, json_entry_installation_id(existing).as_deref());
+    if let Some(url) = ["url", "serverUrl", "httpUrl"]
+        .into_iter()
+        .find_map(|field| existing.get(field))
+        .cloned()
+    {
+        if let Some(entry) = server.as_object_mut() {
+            for field in ["url", "serverUrl", "httpUrl"] {
+                if entry.contains_key(field) {
+                    entry.insert(field.to_string(), url.clone());
+                }
+            }
+        }
+    }
+}
+
+/// A write that leaves the account alone keeps a key the entry holds by
+/// reference where the write would drop it (a project entry refreshed
+/// without its key).
+fn keep_key_references(existing: &Value, server: &mut Value) {
+    let reference = |value: &Value| {
+        value.as_str().is_some_and(|raw| {
+            account_switch::is_key_reference(raw)
+                || bearer_key_or_reference(raw)
+                    .is_some_and(|token| account_switch::is_key_reference(&token))
+        })
+    };
+    for (field, matches) in [
+        ("headers", is_key_header as fn(&str) -> bool),
+        ("env", |name: &str| name == "CONTEXTSTREAM_API_KEY"),
+        ("environment", |name: &str| name == "CONTEXTSTREAM_API_KEY"),
+    ] {
+        let Some(source) = existing.get(field).and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(target) = server.get_mut(field).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for (name, value) in source {
+            if matches(name) && reference(value) && !target.contains_key(name) {
+                target.insert(name.clone(), value.clone());
+            }
+        }
     }
 }
 
@@ -1056,8 +1234,7 @@ const BINARY_FIELDS: [&str; 3] = ["command", "args", HEADERS_HELPER_FIELD];
 /// Keep the binary `existing` runs in `server`, exactly as it is: each of
 /// [`BINARY_FIELDS`] the write sets goes back to the entry's own value, or
 /// out when the entry had none. False when that would break the entry
-/// because the write turns a hosted entry into a local one, which needs a
-/// command: the caller then keeps the whole entry as it is.
+/// because the write gives a hosted entry a command.
 fn keep_entry_binary(existing: &Value, server: &mut Value) -> bool {
     if server.get("command").is_some() && existing.get("command").is_none() {
         return false;
@@ -1081,26 +1258,104 @@ fn keep_entry_binary(existing: &Value, server: &mut Value) -> bool {
     true
 }
 
-/// The words an entry runs a binary with: the program of its `headersHelper`
-/// line, then its command and arguments.
-fn json_entry_binary_words(entry: &Value) -> Vec<String> {
-    let mut words: Vec<String> = entry
+/// The programs an entry runs: its `headersHelper` program, and its
+/// command's (the word after `cmd /c` on Windows).
+fn json_entry_programs(entry: &Value) -> Vec<String> {
+    let mut programs: Vec<String> = entry
         .get(HEADERS_HELPER_FIELD)
         .and_then(Value::as_str)
         .and_then(|line| line.split_whitespace().next())
         .map(String::from)
         .into_iter()
         .collect();
-    for field in ["command", "args"] {
-        match entry.get(field) {
-            Some(Value::String(word)) => words.push(word.clone()),
-            Some(Value::Array(list)) => {
-                words.extend(list.iter().filter_map(Value::as_str).map(String::from))
-            }
-            _ => {}
-        }
+    let words: Vec<String> = match entry.get("command") {
+        Some(Value::String(command)) => std::iter::once(command.clone())
+            .chain(
+                entry
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(String::from),
+            )
+            .collect(),
+        Some(Value::Array(list)) => list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    };
+    programs.extend(command_program(&words).map(|(_, program)| program));
+    programs
+}
+
+/// The program a command runs and its index among the command's words: the
+/// first word, or the one after `cmd /c`.
+fn command_program(words: &[String]) -> Option<(usize, String)> {
+    let first = words.first()?;
+    let shell = matches!(
+        path_token_basename(first).to_ascii_lowercase().as_str(),
+        "cmd" | "cmd.exe"
+    );
+    if shell
+        && words
+            .get(1)
+            .is_some_and(|flag| flag.eq_ignore_ascii_case("/c"))
+    {
+        return words.get(2).map(|program| (2, program.clone()));
     }
-    words
+    Some((0, first.clone()))
+}
+
+/// `contextstream-mcp` named without a path: PATH finds it when it runs.
+fn is_bare_contextstream_program(program: &str) -> bool {
+    !program.contains(['/', '\\']) && is_contextstream_binary_token(program)
+}
+
+/// Point the command `server` runs at `program`, keeping its shape.
+fn repoint_command_program(server: &mut Value, program: &str) {
+    let words: Vec<String> = match server.get("command") {
+        Some(Value::String(command)) => std::iter::once(command.clone())
+            .chain(
+                server
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(String::from),
+            )
+            .collect(),
+        Some(Value::Array(list)) => list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect(),
+        _ => return,
+    };
+    let Some((index, _)) = command_program(&words) else {
+        return;
+    };
+    match server.get_mut("command") {
+        Some(Value::Array(list)) => {
+            if let Some(slot) = list.get_mut(index) {
+                *slot = json!(program);
+            }
+        }
+        Some(command @ Value::String(_)) if index == 0 => *command = json!(program),
+        Some(Value::String(_)) => {
+            if let Some(slot) = server
+                .get_mut("args")
+                .and_then(Value::as_array_mut)
+                .and_then(|args| args.get_mut(index - 1))
+            {
+                *slot = json!(program);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Whether `path` lies in a home directory other than `home`: a managed
@@ -1152,60 +1407,75 @@ fn path_in_another_home(path: &str, home: &Path) -> bool {
     }
 }
 
-/// On a write that leaves the account alone: when `existing` runs a binary
-/// from another home than this one and `server` would run another binary,
-/// keep the entry's own (see [`keep_entry_binary`]) and say so once, naming
-/// both. The same account in another person's home is still another
-/// identity's binary.
-fn keep_binary_from_another_home(path: &Path, existing: &Value, server: &mut Value) {
+/// A write, an agreed switch included, never moves the binary an entry runs
+/// from one home to another: the binary serves any account, and another
+/// person's home holds another identity's binary. Nor does it write a path
+/// over a bare `contextstream-mcp`, which PATH resolves. In both cases the
+/// entry keeps running its own program; a move between homes is said once,
+/// naming both paths. A program in this home or in no home (a system
+/// install) is refreshed as before.
+fn keep_binary_across_homes(path: &Path, existing: &Value, server: &mut Value) {
     let Some(home) = dirs::home_dir() else {
         return;
     };
-    let Some((kept, instead)) = binary_moved_from_another_home(existing, server, &home) else {
+    let held = json_entry_programs(existing);
+    let Some(pinned) = held
+        .iter()
+        .find(|program| {
+            is_bare_contextstream_program(program) || path_in_another_home(program, &home)
+        })
+        .cloned()
+    else {
         return;
     };
-    if !keep_entry_binary(existing, server) {
-        *server = existing.clone();
-    }
-    account_switch::say_binary_from_another_home(path, &kept, &instead);
-}
-
-/// The binary from another home than `home` that `existing` runs, and the
-/// one `server` would run instead, when the write changes what it runs.
-fn binary_moved_from_another_home(
-    existing: &Value,
-    server: &Value,
-    home: &Path,
-) -> Option<(String, String)> {
-    let held = json_entry_binary_words(existing);
-    let kept = held
-        .iter()
-        .find(|word| path_in_another_home(word, home))?
-        .clone();
     let changes = BINARY_FIELDS.iter().any(|field| {
         server
             .get(*field)
             .is_some_and(|value| existing.get(*field) != Some(value))
     });
     if !changes {
-        return None;
+        return;
     }
-    let instead = json_entry_binary_words(server)
+    let instead = json_entry_programs(server)
         .into_iter()
-        .find(|word| !held.contains(word))
-        .unwrap_or_default();
-    Some((kept, instead))
+        .find(|program| !held.contains(program));
+    let same_transport = existing_json_like_server_is_remote(Some(existing))
+        == existing_json_like_server_is_remote(Some(server));
+    if !(same_transport && keep_entry_binary(existing, server)) {
+        // The write changes the transport: whatever the new entry runs, it
+        // runs the entry's own program.
+        if server
+            .get(HEADERS_HELPER_FIELD)
+            .and_then(Value::as_str)
+            .is_some_and(is_managed_headers_helper)
+        {
+            server[HEADERS_HELPER_FIELD] = json!(headers_helper_line(&pinned, cfg!(windows)));
+        }
+        repoint_command_program(server, &pinned);
+    }
+    if !is_bare_contextstream_program(&pinned) {
+        if let Some(instead) = instead.filter(|instead| *instead != pinned) {
+            account_switch::say_binary_from_another_home(path, &pinned, &instead);
+        }
+    }
 }
 
 /// The keys an entry holds that a rotation to a new key must settle with
 /// [`account_switch`]: all of them except `replaced_key`, the saved key
 /// `configure` is replacing. An entry holding exactly that key holds the same
 /// credential being rotated, so it takes the new key without a question, even
-/// when the API now refuses the old one (a revoked key).
-fn keys_to_settle_on_rotation(held: Vec<String>, replaced_key: Option<&str>) -> Vec<String> {
+/// when the API now refuses the old one (a revoked key). A rotation replaces
+/// only literal keys, so a key held by reference is left alone and needs no
+/// question.
+fn keys_to_settle_on_rotation(
+    held: Vec<String>,
+    replaced_key: Option<&str>,
+    api_url: Option<String>,
+) -> Vec<account_switch::HeldKey> {
     let replaced_key = replaced_key.map(str::trim).filter(|key| !key.is_empty());
     held.into_iter()
         .filter(|key| Some(key.as_str()) != replaced_key)
+        .map(|key| account_switch::HeldKey::new(key, api_url.clone()))
         .collect()
 }
 
@@ -1217,69 +1487,140 @@ fn refresh_json_entry_key_settled(
     api_key: &str,
     replaced_key: Option<&str>,
 ) -> bool {
-    let held = keys_to_settle_on_rotation(embedded_json_api_keys(entry), replaced_key);
-    if account_switch::key_to_keep(path, &held, &[api_key.to_string()]).is_some() {
+    let api_url = json_entry_api_url(entry);
+    let held =
+        keys_to_settle_on_rotation(embedded_json_api_keys(entry), replaced_key, api_url.clone());
+    let proposed = [account_switch::HeldKey::new(api_key, api_url)];
+    if account_switch::key_to_keep(path, &held, &proposed).is_some() {
         return false;
     }
     refresh_json_entry_embedded_api_key(entry, api_key)
 }
 
-/// The installation id a Codex entry names, in its env or its headers.
-fn codex_toml_installation_id(entry: &Item) -> Option<String> {
-    toml_nested_string(entry, "env", ENV_INSTALLATION_ID)
-        .or_else(|| toml_nested_string(entry, "http_headers", HEADER_INSTALLATION_ID))
-        .or_else(|| toml_nested_string(entry, "headers", HEADER_INSTALLATION_ID))
-        .map(String::from)
+/// The API a Codex entry sends its key to (see [`json_entry_api_url`]).
+fn codex_entry_api_url(entry: &Item) -> Option<String> {
+    if let Some(url) = toml_item_string(entry, "url") {
+        return hosted_api_url(url);
+    }
+    named_api_url(
+        toml_nested_string(entry, "env", "CONTEXTSTREAM_API_URL")
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    )
 }
 
-/// [`restore_json_entry_installation_id`] for a Codex entry.
-fn restore_codex_toml_installation_id(
-    entry: &mut dyn toml_edit::TableLike,
-    installation_id: Option<&str>,
-) {
-    for (table_key, key) in [
-        ("env", ENV_INSTALLATION_ID),
-        ("http_headers", HEADER_INSTALLATION_ID),
-        ("headers", HEADER_INSTALLATION_ID),
-    ] {
-        let Some(nested) = entry.get_mut(table_key) else {
-            continue;
-        };
-        if let Some(table) = nested.as_table_mut() {
-            match installation_id {
-                Some(id) if table.contains_key(key) => {
-                    table.insert(key, toml_edit::value(id));
-                }
-                Some(_) => {}
-                None => {
-                    table.remove(key);
+/// Every key a Codex entry holds, literal or by reference (an env value, an
+/// API key or bearer header, or a header or bearer token named by an env
+/// variable), with the API its entry sends it to.
+fn codex_entry_held_keys(entry: &Item) -> Vec<account_switch::HeldKey> {
+    let api_url = codex_entry_api_url(entry);
+    let mut values: Vec<String> = Vec::new();
+    if let Some(raw) = toml_nested_string(entry, "env", "CONTEXTSTREAM_API_KEY")
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+    {
+        values.push(raw.to_string());
+    }
+    if let Some(table) = entry.as_table_like() {
+        for table_name in ["http_headers", "headers"] {
+            let Some(nested) = table.get(table_name).and_then(Item::as_table_like) else {
+                continue;
+            };
+            for (name, item) in nested.iter() {
+                let Some(raw) = item
+                    .as_value()
+                    .and_then(toml_edit::Value::as_str)
+                    .map(str::trim)
+                    .filter(|raw| !raw.is_empty())
+                else {
+                    continue;
+                };
+                if name.eq_ignore_ascii_case(HEADER_API_KEY)
+                    || name.eq_ignore_ascii_case("x-api-key")
+                {
+                    values.push(raw.to_string());
+                } else if name.eq_ignore_ascii_case("authorization") {
+                    values.extend(bearer_key_or_reference(raw));
                 }
             }
-        } else if let Some(inline) = nested
-            .as_value_mut()
-            .and_then(toml_edit::Value::as_inline_table_mut)
-        {
-            match installation_id {
-                Some(id) => {
-                    if let Some(value) = inline.get_mut(key) {
-                        let decor = value.decor().clone();
-                        *value = toml_edit::Value::from(id);
-                        *value.decor_mut() = decor;
+        }
+        if let Some(variable) = toml_item_string(entry, "bearer_token_env_var") {
+            values.push(format!("${{{}}}", variable.trim()));
+        }
+        if let Some(nested) = table.get("env_http_headers").and_then(Item::as_table_like) {
+            for (name, item) in nested.iter() {
+                if is_key_header(name) {
+                    if let Some(variable) = item.as_value().and_then(toml_edit::Value::as_str) {
+                        values.push(format!("${{{}}}", variable.trim()));
                     }
-                }
-                None => {
-                    inline.remove(key);
                 }
             }
         }
     }
+    let mut held: Vec<account_switch::HeldKey> = Vec::new();
+    for value in values {
+        if !held.iter().any(|key| key.value == value) {
+            held.push(account_switch::HeldKey::new(value, api_url.clone()));
+        }
+    }
+    held
 }
 
-/// The words a Codex entry runs its binary with: its command and arguments.
-fn codex_entry_binary_words(entry: &Item) -> Vec<String> {
-    let Some(table) = entry.as_table_like() else {
-        return Vec::new();
+/// [`restore_entry_values`] for a Codex entry's `table_key` table (a table or
+/// an inline table).
+fn restore_codex_values(
+    existing: &Item,
+    entry: &mut dyn toml_edit::TableLike,
+    table_key: &str,
+    matches: impl Fn(&str) -> bool,
+) {
+    let source: Vec<(String, toml_edit::Value)> = existing
+        .as_table_like()
+        .and_then(|table| table.get(table_key))
+        .and_then(Item::as_table_like)
+        .map(|table| {
+            table
+                .iter()
+                .filter(|(name, _)| matches(name))
+                .filter_map(|(name, item)| {
+                    item.as_value()
+                        .map(|value| (name.to_string(), value.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(target) = entry.get_mut(table_key).and_then(Item::as_table_like_mut) else {
+        return;
     };
+    let stale: Vec<String> = target
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .filter(|name| matches(name))
+        .collect();
+    for name in stale {
+        target.remove(&name);
+    }
+    for (name, value) in source {
+        target.insert(&name, Item::Value(value));
+    }
+}
+
+/// Set `entry`'s top-level `field` back to `existing`'s, or take it out when
+/// `existing` has none.
+fn restore_codex_field(existing: &Item, entry: &mut dyn toml_edit::TableLike, field: &str) {
+    match existing.as_table_like().and_then(|table| table.get(field)) {
+        Some(item) => {
+            entry.insert(field, item.clone());
+        }
+        None => {
+            entry.remove(field);
+        }
+    }
+}
+
+/// The program a Codex entry runs: its command's (see [`command_program`]).
+fn codex_entry_program(entry: &Item) -> Option<String> {
+    let table = entry.as_table_like()?;
     let mut words: Vec<String> = table
         .get("command")
         .and_then(Item::as_value)
@@ -1298,7 +1639,7 @@ fn codex_entry_binary_words(entry: &Item) -> Vec<String> {
                 .map(String::from),
         );
     }
-    words
+    command_program(&words).map(|(_, program)| program)
 }
 
 /// [`keep_entry_binary`] for a Codex entry: its command and arguments.
@@ -1308,17 +1649,38 @@ fn keep_codex_entry_binary(existing: &Item, entry: &mut dyn toml_edit::TableLike
         return false;
     }
     for field in ["command", "args"] {
-        if !entry.contains_key(field) {
-            continue;
+        if entry.contains_key(field) {
+            restore_codex_field(existing, entry, field);
         }
-        match held.and_then(|table| table.get(field)) {
-            Some(item) => {
-                entry.insert(field, item.clone());
-            }
-            None => {
-                entry.remove(field);
-            }
+    }
+    true
+}
+
+/// [`keep_entry_as_it_is`] for a Codex entry. False when the write would
+/// change its transport: the caller then leaves the entry as it is.
+fn keep_codex_entry_as_it_is(existing: &Item, entry: &mut dyn toml_edit::TableLike) -> bool {
+    let existing_hosted = toml_item_string(existing, "url").is_some();
+    if existing_hosted != entry.contains_key("url") || !keep_codex_entry_binary(existing, entry) {
+        return false;
+    }
+    for field in ["url", "bearer_token_env_var", "env_http_headers"] {
+        if entry.contains_key(field)
+            || existing
+                .as_table_like()
+                .is_some_and(|t| t.contains_key(field))
+        {
+            restore_codex_field(existing, entry, field);
         }
+    }
+    restore_codex_values(existing, entry, "env", |name| {
+        name == "CONTEXTSTREAM_API_KEY"
+            || name == "CONTEXTSTREAM_API_URL"
+            || name == ENV_INSTALLATION_ID
+    });
+    for table_key in ["http_headers", "headers"] {
+        restore_codex_values(existing, entry, table_key, |name| {
+            is_key_header(name) || name.eq_ignore_ascii_case(HEADER_INSTALLATION_ID)
+        });
     }
     true
 }
@@ -1337,19 +1699,11 @@ fn settle_codex_block_account(
     };
     let mut document = parse_codex_toml(&new_block, path)
         .context("Internal error: generated Codex configuration is invalid")?;
-    let (proposed, new_words) = contextstream_toml_item(&document)
-        .map(|entry| {
-            (
-                embedded_codex_toml_api_keys(entry),
-                codex_entry_binary_words(entry),
-            )
-        })
+    let (proposed, new_program) = contextstream_toml_item(&document)
+        .map(|entry| (codex_entry_held_keys(entry), codex_entry_program(entry)))
         .unwrap_or_default();
-    let settled = account_switch::settle_key_write(
-        path,
-        &embedded_codex_toml_api_keys(existing_entry),
-        &proposed,
-    );
+    let settled =
+        account_switch::settle_key_write(path, &codex_entry_held_keys(existing_entry), &proposed);
     let Some(entry) = document
         .get_mut("mcp_servers")
         .and_then(Item::as_table_like_mut)
@@ -1358,39 +1712,31 @@ fn settle_codex_block_account(
     else {
         return Ok(Some(new_block));
     };
-    match settled {
-        account_switch::KeyWrite::Switched => return Ok(Some(new_block)),
-        account_switch::KeyWrite::Keep(kept) => {
-            if !keep_codex_entry_binary(existing_entry, entry) {
-                return Ok(None);
-            }
-            refresh_codex_toml_entry_embedded_api_key(entry, &kept);
-            restore_codex_toml_installation_id(
-                entry,
-                codex_toml_installation_id(existing_entry).as_deref(),
-            );
+    if let account_switch::KeyWrite::Keep(_) = settled {
+        if !keep_codex_entry_as_it_is(existing_entry, entry) {
+            return Ok(None);
         }
-        account_switch::KeyWrite::NoSwitch => {
-            let held = codex_entry_binary_words(existing_entry);
-            let Some(home) = dirs::home_dir() else {
-                return Ok(Some(new_block));
-            };
-            let Some(kept) = held.iter().find(|word| path_in_another_home(word, &home)) else {
-                return Ok(Some(new_block));
-            };
-            if new_words.is_empty() || new_words == held {
-                return Ok(Some(new_block));
-            }
-            let instead = new_words
-                .iter()
-                .find(|word| !held.contains(word))
-                .cloned()
-                .unwrap_or_default();
-            account_switch::say_binary_from_another_home(path, kept, &instead);
-            if !keep_codex_entry_binary(existing_entry, entry) {
-                return Ok(None);
-            }
-        }
+        return Ok(Some(document.to_string()));
+    }
+    // Any other write keeps a program from another home, or a bare one (see
+    // [`keep_binary_across_homes`]); only a local entry runs one.
+    let (Some(home), Some(held_program), Some(new_program)) = (
+        dirs::home_dir(),
+        codex_entry_program(existing_entry),
+        new_program,
+    ) else {
+        return Ok(Some(new_block));
+    };
+    let pinned =
+        is_bare_contextstream_program(&held_program) || path_in_another_home(&held_program, &home);
+    if !pinned || held_program == new_program {
+        return Ok(Some(new_block));
+    }
+    if !keep_codex_entry_binary(existing_entry, entry) {
+        return Ok(Some(new_block));
+    }
+    if !is_bare_contextstream_program(&held_program) {
+        account_switch::say_binary_from_another_home(path, &held_program, &new_program);
     }
     Ok(Some(document.to_string()))
 }
@@ -4492,6 +4838,11 @@ fn remove_trailing_commas(content: &str) -> String {
 }
 
 /// Write project-level MCP configuration for an editor.
+///
+/// Every project writer answers `Ok(false)` when it left a new entry
+/// uncreated because the project already signs in as another account and
+/// that was not agreed to (see [`new_project_entry_settled`]), and `Ok(true)`
+/// otherwise.
 #[allow(dead_code)]
 pub fn write_project_mcp_config(
     editor: &Editor,
@@ -4499,7 +4850,7 @@ pub fn write_project_mcp_config(
     api_key: &str,
     workspace_id: Option<&str>,
     project_id: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     write_project_mcp_config_with_remote_auth(
         editor,
         project_path,
@@ -4521,7 +4872,7 @@ pub fn write_project_mcp_config_with_overrides(
     project_id: Option<&str>,
     transcripts_enabled: Option<bool>,
     hook_transcripts_enabled: Option<bool>,
-) -> Result<()> {
+) -> Result<bool> {
     write_project_mcp_config_with_remote_auth(
         editor,
         project_path,
@@ -4543,7 +4894,7 @@ pub fn write_project_mcp_config_with_remote_auth(
     transcripts_enabled: Option<bool>,
     hook_transcripts_enabled: Option<bool>,
     remote_auth_api_key: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     write_project_mcp_config_with_transport_mode(
         editor,
         project_path,
@@ -4565,7 +4916,7 @@ pub fn write_project_mcp_config_force_local(
     project_id: Option<&str>,
     transcripts_enabled: Option<bool>,
     hook_transcripts_enabled: Option<bool>,
-) -> Result<()> {
+) -> Result<bool> {
     write_project_mcp_config_with_transport_mode(
         editor,
         project_path,
@@ -4588,7 +4939,7 @@ pub fn write_project_mcp_config_force_remote_with_auth(
     transcripts_enabled: Option<bool>,
     hook_transcripts_enabled: Option<bool>,
     remote_auth_api_key: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     write_project_mcp_config_with_transport_mode(
         editor,
         project_path,
@@ -4610,7 +4961,7 @@ pub fn migrate_project_mcp_config(
     project_id: Option<&str>,
     transcripts_enabled: Option<bool>,
     hook_transcripts_enabled: Option<bool>,
-) -> Result<()> {
+) -> Result<bool> {
     let transport_mode = TransportMode::ForceRemote;
     write_project_mcp_config_with_transport_mode(
         editor,
@@ -4637,10 +4988,10 @@ fn write_project_mcp_config_with_transport_mode(
     hook_transcripts_enabled: Option<bool>,
     transport_mode: TransportMode,
     remote_auth_api_key: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     let mcp_path = match editor.project_mcp_config_path(project_path) {
         Some(p) => p,
-        None => return Ok(()), // Editor doesn't support project MCP config
+        None => return Ok(true), // Editor doesn't support project MCP config
     };
     let identity = ManagedConfigIdentity::for_write()?;
     let server_path = project_server_map_path(editor);
@@ -4704,6 +5055,9 @@ fn write_project_mcp_config_with_transport_mode(
     };
     apply_managed_config_metadata(editor, &mut server, &identity);
     settle_json_entry_account(&mcp_path, existing_server.as_ref(), &mut server);
+    if existing_server.is_none() && !new_project_entry_settled(project_path, &mcp_path, &server) {
+        return Ok(false);
+    }
     let carries_key = [Some(api_key), remote_auth_api_key]
         .into_iter()
         .flatten()
@@ -4725,7 +5079,100 @@ fn write_project_mcp_config_with_transport_mode(
     }
     record_configured_evidence(editor);
 
-    Ok(())
+    Ok(true)
+}
+
+/// Whether a write may create `server` as a new project entry at `new_path`:
+/// always when it carries no key or the project has no other ContextStream
+/// config; otherwise as [`account_switch::settle_new_entry`] settles it
+/// against what the project already uses (see [`project_account_evidence`]).
+fn new_project_entry_settled(project_path: &Path, new_path: &Path, server: &Value) -> bool {
+    let Some(proposed) = json_entry_held_keys(server)
+        .into_iter()
+        .find(|key| !account_switch::is_key_reference(&key.value))
+    else {
+        return true;
+    };
+    let evidence = project_account_evidence(project_path, new_path);
+    account_switch::settle_new_entry(new_path, &evidence, &proposed)
+        != account_switch::Settled::Kept
+}
+
+/// What a project already signs in as: the keys of the ContextStream entries
+/// in its editors' project configs (other than `new_path`), and a key or an
+/// account its `.contextstream/config.json` names.
+fn project_account_evidence(
+    project_path: &Path,
+    new_path: &Path,
+) -> Vec<account_switch::ProjectEvidence> {
+    use account_switch::{Held, ProjectEvidence};
+    let mut evidence = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for editor in Editor::all() {
+        let Some(path) = editor.project_mcp_config_path(project_path) else {
+            continue;
+        };
+        if path == new_path || !path.is_file() || !seen.insert(path.clone()) {
+            continue;
+        }
+        let Ok(loaded) = safe_edit::read_for_edit(&path, mcp_json_dialect(editor, &path)) else {
+            continue;
+        };
+        let Some(entry) = server_map(&loaded.value, project_server_map_path(editor))
+            .and_then(|servers| servers.get("contextstream"))
+        else {
+            continue;
+        };
+        evidence.extend(
+            json_entry_held_keys(entry)
+                .into_iter()
+                .map(|key| ProjectEvidence {
+                    path: path.clone(),
+                    held: Held::Key(key),
+                }),
+        );
+    }
+    let codex = project_path.join(".codex").join("config.toml");
+    if let Some(document) = std::fs::read_to_string(&codex)
+        .ok()
+        .and_then(|raw| raw.parse::<DocumentMut>().ok())
+    {
+        if let Some(entry) = contextstream_toml_item(&document) {
+            evidence.extend(
+                codex_entry_held_keys(entry)
+                    .into_iter()
+                    .map(|key| ProjectEvidence {
+                        path: codex.clone(),
+                        held: Held::Key(key),
+                    }),
+            );
+        }
+    }
+    if let Ok(Some(config)) = super::wizard_config::read_project_config(project_path) {
+        let path = super::wizard_config::project_config_path(project_path);
+        let text = |names: &[&str]| {
+            names
+                .iter()
+                .find_map(|name| config.extra.get(*name).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+        };
+        if let Some(key) = text(&["api_key", "apiKey"]) {
+            let api_url = named_api_url(text(&["api_url", "apiUrl"]).as_deref());
+            evidence.push(ProjectEvidence {
+                path: path.clone(),
+                held: Held::Key(account_switch::HeldKey::new(key, api_url)),
+            });
+        }
+        if let Some(email) = text(&["account_email", "user_email", "email"]) {
+            evidence.push(ProjectEvidence {
+                path,
+                held: Held::Email(email),
+            });
+        }
+    }
+    evidence
 }
 
 /// How much of a project MCP config is this machine's.
@@ -4854,13 +5301,17 @@ fn refresh_codex_toml_file_embedded_api_key(
     let raw_existing = std::fs::read_to_string(path)
         .with_context(|| format!("Could not read Codex config {}", path.display()))?;
     let mut document = parse_codex_toml(&raw_existing, path)?;
-    let held = keys_to_settle_on_rotation(
-        contextstream_toml_item(&document)
-            .map(embedded_codex_toml_api_keys)
-            .unwrap_or_default(),
-        replaced_key,
-    );
-    if account_switch::key_to_keep(path, &held, &[api_key.to_string()]).is_some() {
+    let (held, api_url) = contextstream_toml_item(&document)
+        .map(|entry| {
+            (
+                embedded_codex_toml_api_keys(entry),
+                codex_entry_api_url(entry),
+            )
+        })
+        .unwrap_or_default();
+    let held = keys_to_settle_on_rotation(held, replaced_key, api_url.clone());
+    let proposed = [account_switch::HeldKey::new(api_key, api_url)];
+    if account_switch::key_to_keep(path, &held, &proposed).is_some() {
         return Ok(false);
     }
     let Some(entry) = document
@@ -11395,7 +11846,7 @@ CONTEXTSTREAM_API_KEY = "test-key"
     }
 
     #[test]
-    fn a_kept_entry_keeps_the_binary_it_runs_and_an_agreed_switch_repoints_it() {
+    fn a_kept_entry_and_an_agreed_switch_both_keep_the_binary_it_runs() {
         let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("chase-home");
@@ -11427,17 +11878,33 @@ CONTEXTSTREAM_API_KEY = "test-key"
             );
         }
 
-        // Agreed: each entry moves to Chase's key and this home's binary.
+        // Agreed: each entry moves to Chase's key and installation, but keeps
+        // running the binary from Erik's home, which serves any account.
         let _switch = account_switch::test_policy(account_switch::Mode::Switch, false);
         let _accounts = erik_and_chase();
         entries.seed(ERIK_KEY);
         entries.refresh(CHASE_KEY);
+        assert_eq!(entries.helper(), json!(entries.erik_helper));
         assert_eq!(
-            entries.helper(),
-            json!(format!("{} hook mcp-headers", entries.chase_binary))
+            entries.cursor_command(),
+            (json!(entries.erik_binary), json!([]))
         );
-        assert_eq!(entries.cursor_command().0, json!(entries.chase_binary));
-        assert_eq!(entries.codex_command(), Some(entries.chase_binary.clone()));
+        assert_eq!(entries.codex_command(), Some(entries.erik_binary.clone()));
+        for path in [&entries.project_config, &entries.cursor, &entries.codex] {
+            let raw = std::fs::read_to_string(path).expect("read");
+            assert!(raw.contains(CHASE_KEY), "{}: {raw}", path.display());
+            assert!(!raw.contains(ERIK_KEY), "{}: {raw}", path.display());
+            assert!(
+                raw.contains(TEST_MANAGED_INSTALLATION_ID),
+                "{}: {raw}",
+                path.display()
+            );
+            assert!(
+                !raw.contains(&entries.chase_binary),
+                "{}: {raw}",
+                path.display()
+            );
+        }
     }
 
     #[test]
@@ -11522,6 +11989,268 @@ CONTEXTSTREAM_API_KEY = "test-key"
                 "{path} from {home:?}"
             );
         }
+    }
+
+    fn isolated_home(temp: &Path) -> (HomeGuard, XdgConfigGuard, EnvVarGuard, PathBuf) {
+        let home = temp.join("chase-home");
+        std::fs::create_dir_all(home.join(".claude")).expect("mkdir .claude");
+        (
+            HomeGuard::isolate_under(&home),
+            XdgConfigGuard::isolate_under(&home),
+            EnvVarGuard::set("CONTEXTSTREAM_API_URL", DEFAULT_API_URL),
+            home,
+        )
+    }
+
+    #[test]
+    fn an_entry_holding_a_key_by_reference_never_gets_a_literal_key_unasked() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = isolated_home(temp.path());
+        let project = temp.path().join("repo");
+        let reference = "${CONTEXTSTREAM_API_KEY}";
+        let seed = || {
+            seed_json(
+                &project.join(".mcp.json"),
+                &json!({"mcpServers": {"contextstream": {
+                    "type": "http",
+                    "url": default_remote_mcp_url(),
+                    "headers": {
+                        HEADER_MANAGED_CONFIG_VERSION: MANAGED_CONFIG_VERSION,
+                        HEADER_API_KEY: reference,
+                        HEADER_INSTALLATION_ID: ERIK_INSTALLATION,
+                    },
+                }}}),
+            )
+        };
+        let _accounts = erik_and_chase();
+
+        // No terminal: the reference and the installation stay; no literal
+        // key reaches the file.
+        seed();
+        let server = refresh_project_with(&project, CHASE_KEY);
+        assert_eq!(server["headers"][HEADER_API_KEY], json!(reference));
+        assert_eq!(
+            server["headers"][HEADER_INSTALLATION_ID],
+            json!(ERIK_INSTALLATION)
+        );
+        let raw = std::fs::read_to_string(project.join(".mcp.json")).expect("read");
+        assert!(!raw.contains(CHASE_KEY), "{raw}");
+
+        // Agreed: the literal key replaces it.
+        let _switch = account_switch::test_policy(account_switch::Mode::Switch, false);
+        let _accounts = erik_and_chase();
+        seed();
+        let server = refresh_project_with(&project, CHASE_KEY);
+        assert_eq!(server["headers"][HEADER_API_KEY], json!(CHASE_KEY));
+    }
+
+    #[test]
+    fn a_refresh_that_leaves_the_account_alone_keeps_a_key_reference() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = isolated_home(temp.path());
+        let project = temp.path().join("repo");
+        let config = project.join(".cursor").join("mcp.json");
+        seed_json(
+            &config,
+            &json!({"mcpServers": {"contextstream": {
+                "command": "/opt/tools/contextstream-mcp",
+                "args": [],
+                "env": {
+                    ENV_MANAGED_CONFIG_VERSION: MANAGED_CONFIG_VERSION,
+                    "CONTEXTSTREAM_API_KEY": "{env:CONTEXTSTREAM_API_KEY}",
+                },
+            }}}),
+        );
+        // A project's local entry is written without a key of its own.
+        let written = write_project_mcp_config_force_local(
+            &Editor::Cursor,
+            &project,
+            CHASE_KEY,
+            Some("ws-1"),
+            Some("proj-1"),
+            None,
+            None,
+        )
+        .expect("project refresh");
+        assert!(written);
+        let entry = read_json(&config)["mcpServers"]["contextstream"].clone();
+        assert_eq!(
+            entry["env"]["CONTEXTSTREAM_API_KEY"],
+            json!("{env:CONTEXTSTREAM_API_KEY}")
+        );
+        assert_eq!(entry["env"][ENV_PROJECT_ID], json!("proj-1"));
+    }
+
+    #[test]
+    fn a_new_project_entry_beside_another_accounts_entry_is_not_created_unasked() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = isolated_home(temp.path());
+        let project = temp.path().join("repo");
+        let claude = project.join(".mcp.json");
+        let cursor = project.join(".cursor").join("mcp.json");
+        let seed_claude = |api_key: &str| {
+            seed_json(
+                &claude,
+                &json!({"mcpServers": {"contextstream": {
+                    "type": "http",
+                    "url": default_remote_mcp_url(),
+                    "headers": {
+                        HEADER_MANAGED_CONFIG_VERSION: MANAGED_CONFIG_VERSION,
+                        HEADER_API_KEY: api_key,
+                    },
+                }}}),
+            )
+        };
+        let create_cursor = || {
+            let _ = std::fs::remove_file(&cursor);
+            write_project_mcp_config_force_remote_with_auth(
+                &Editor::Cursor,
+                &project,
+                CHASE_KEY,
+                Some("ws-1"),
+                Some("proj-1"),
+                None,
+                None,
+                Some(CHASE_KEY),
+            )
+            .expect("project write")
+        };
+        let _accounts = erik_and_chase();
+
+        // A project with no ContextStream config: created as before.
+        assert!(create_cursor());
+        assert!(cursor.is_file());
+
+        // The project signs in as Erik: not created without a terminal.
+        seed_claude(ERIK_KEY);
+        assert!(!create_cursor());
+        assert!(!cursor.exists());
+
+        // The same key, or a new key for the same account: created.
+        seed_claude(CHASE_KEY);
+        assert!(create_cursor());
+        assert!(cursor.is_file());
+
+        // `.contextstream/config.json` naming another account counts too.
+        std::fs::remove_file(&claude).expect("remove .mcp.json");
+        seed_json(
+            &project.join(".contextstream").join("config.json"),
+            &json!({"workspace_id": "ws-1", "account_email": "erik@example.test"}),
+        );
+        assert!(!create_cursor());
+        assert!(!cursor.exists());
+
+        // Agreed: created.
+        seed_claude(ERIK_KEY);
+        let _switch = account_switch::test_policy(account_switch::Mode::Switch, false);
+        let _accounts = erik_and_chase();
+        assert!(create_cursor());
+        assert!(cursor.is_file());
+    }
+
+    #[test]
+    fn a_kept_entry_keeps_its_api_url_and_its_transport() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_home, _xdg, _api_url, home) = isolated_home(temp.path());
+        // The refresh's own environment names another API.
+        let _refresh_api = EnvVarGuard::set("CONTEXTSTREAM_API_URL", "http://127.0.0.1:9");
+        let erik_entry = json!({"mcpServers": {"contextstream": {
+            "command": "/opt/tools/contextstream-mcp",
+            "args": [],
+            "env": {
+                ENV_MANAGED_CONFIG_VERSION: MANAGED_CONFIG_VERSION,
+                "CONTEXTSTREAM_API_KEY": ERIK_KEY,
+                "CONTEXTSTREAM_API_URL": "https://api.erik.test",
+                ENV_INSTALLATION_ID: ERIK_INSTALLATION,
+            },
+        }}});
+        let _accounts = erik_and_chase();
+
+        // A global stdio entry refreshed in place keeps Erik's API URL.
+        let cursor = home.join(".cursor").join("mcp.json");
+        seed_json(&cursor, &erik_entry);
+        write_mcp_config_with_overrides(&Editor::Cursor, CHASE_KEY, None, None, Some(false), None)
+            .expect("refresh");
+        let entry = read_json(&cursor)["mcpServers"]["contextstream"].clone();
+        assert_eq!(
+            entry["env"]["CONTEXTSTREAM_API_URL"],
+            json!("https://api.erik.test")
+        );
+        assert_eq!(entry["env"]["CONTEXTSTREAM_API_KEY"], json!(ERIK_KEY));
+        assert_eq!(entry["env"][ENV_TRANSCRIPTS_ENABLED], json!("false"));
+
+        // A project stdio entry is not turned into a hosted one.
+        let project = temp.path().join("repo");
+        let project_cursor = project.join(".cursor").join("mcp.json");
+        seed_json(&project_cursor, &erik_entry);
+        migrate_project_mcp_config(&Editor::Cursor, &project, CHASE_KEY, None, None, None, None)
+            .expect("migrate");
+        assert_eq!(read_json(&project_cursor), erik_entry);
+    }
+
+    #[test]
+    fn a_bare_contextstream_mcp_is_kept_as_written() {
+        let _guard = env_test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = isolated_home(temp.path());
+        let project = temp.path().join("repo");
+        let bare = "contextstream-mcp hook mcp-headers";
+        seed_json(
+            &project.join(".mcp.json"),
+            &json!({"mcpServers": {"contextstream": {
+                "type": "http",
+                "url": default_remote_mcp_url(),
+                HEADERS_HELPER_FIELD: bare,
+                "headers": {
+                    HEADER_MANAGED_CONFIG_VERSION: MANAGED_CONFIG_VERSION,
+                    HEADER_API_KEY: ERIK_KEY,
+                },
+            }}}),
+        );
+        let _accounts = erik_and_chase();
+        let server = refresh_project_with(&project, "cs_erik_rotated");
+        assert_eq!(server[HEADERS_HELPER_FIELD], json!(bare));
+        assert_eq!(server["headers"][HEADER_API_KEY], json!("cs_erik_rotated"));
+    }
+
+    #[test]
+    fn an_entry_names_the_api_its_key_goes_to() {
+        let local = |url: Option<&str>| {
+            let mut entry = json!({"command": "/opt/tools/contextstream-mcp", "env": {}});
+            if let Some(url) = url {
+                entry["env"]["CONTEXTSTREAM_API_URL"] = json!(url);
+            }
+            json_entry_api_url(&entry)
+        };
+        assert_eq!(
+            local(Some("https://api.erik.test/")),
+            Some("https://api.erik.test".to_string())
+        );
+        assert_eq!(local(None), Some(DEFAULT_API_URL.to_string()));
+        assert_eq!(local(Some("${CONTEXTSTREAM_API_URL}")), None);
+        assert_eq!(
+            json_entry_api_url(&json!({"type": "http", "url": default_remote_mcp_url()})),
+            Some(DEFAULT_API_URL.to_string())
+        );
+        assert_eq!(
+            json_entry_api_url(&json!({"type": "http", "url": "http://127.0.0.1:4321/mcp?x=1"})),
+            Some("http://127.0.0.1:4321".to_string())
+        );
+        assert_eq!(
+            json_entry_held_keys(&json!({
+                "type": "http",
+                "url": "http://127.0.0.1:4321/mcp",
+                "headers": {"Authorization": "Bearer ${CONTEXTSTREAM_API_KEY}"},
+            })),
+            vec![account_switch::HeldKey::new(
+                "${CONTEXTSTREAM_API_KEY}",
+                Some("http://127.0.0.1:4321".to_string())
+            )]
+        );
     }
 }
 

@@ -1866,7 +1866,10 @@ async fn update_configs_scoped_with_interactivity(
                     )
                 };
                 match project_write_result {
-                    Ok(()) => {
+                    // Not created: the project signs in as another account,
+                    // and the warning above says how to create it on purpose.
+                    Ok(false) => {}
+                    Ok(true) => {
                         let label = transport_label.to_lowercase();
                         let name = editor.display_name();
                         note!(
@@ -2060,7 +2063,8 @@ pub async fn update_transcript_defaults_scoped(
                     transcripts_enabled,
                     hook_transcripts_enabled,
                 ) {
-                    Ok(()) => {
+                    Ok(false) => {}
+                    Ok(true) => {
                         updates += 1;
                         let name = editor.display_name();
                         note!(
@@ -2207,7 +2211,8 @@ pub async fn migrate_remote_scoped(
                     None,
                     None,
                 ) {
-                    Ok(()) => {
+                    Ok(false) => {}
+                    Ok(true) => {
                         migrated += 1;
                         let name = editor.display_name();
                         note!(
@@ -4673,7 +4678,8 @@ pub(crate) async fn configure_editor_with_workspace_and_project_name(
         };
 
         match project_config_result {
-            Ok(()) => {
+            Ok(false) => {}
+            Ok(true) => {
                 mcp_targets.push("project");
                 wrote_project_mcp = true;
                 if let Ok(Some(ignored_entry)) = mcp_config::protect_non_git_secret_project_config(

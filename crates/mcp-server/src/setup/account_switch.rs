@@ -7,24 +7,32 @@
 //! HOME) would then sign in as the account in HOME without a word, and every
 //! call from that folder would fail on the right account's workspaces. So
 //! before a write puts a key for a different account in place of the one an
-//! entry holds, this module says which file, the account it signs in as now
-//! and the account it would switch to, by email, and asks (default No). With
-//! no terminal, or under `setup --yes`, it keeps the key and says how to switch
-//! on purpose: `--switch-account`, or setup in a terminal. A kept entry also
-//! keeps its installation id and the binary it runs
-//! (`mcp_config::settle_json_entry_account`).
+//! entry holds, or creates a project entry beside entries that sign in as
+//! another account, this module says which file, the account it signs in as
+//! now and the account it would switch to, by email, and asks (default No).
+//! With no terminal, or under `setup --yes`, the entry stays as it is (its
+//! key, installation id, binary, API URL and transport), a new entry is not
+//! created, and it says how to do it on purpose: `--switch-account`, or setup
+//! in a terminal (`mcp_config::settle_json_entry_account`).
 //!
 //! The same key, a new key for the same account and an entry with no key yet
 //! are written as before, without a word. A key `/auth/me` does not resolve
 //! (offline, refused, revoked) is "an unknown account", and a different key
-//! then still counts as a switch.
+//! then still counts as a switch. So is a key held by reference
+//! (`${CONTEXTSTREAM_API_KEY}`, `{env:…}`): a deliberate key this check
+//! cannot resolve.
+//!
+//! Each key is resolved only against the API its own entry talks to, with no
+//! redirects followed: a key is never sent anywhere its entry does not send
+//! it. Two entries that talk to different APIs are different accounts here,
+//! without any lookup.
 //!
 //! One exception: `configure` replacing the saved key passes that key to its
 //! rotation refresh, and an entry holding exactly it is the same credential
 //! being rotated. It takes the new key with no question, even when the API
 //! now refuses the old one (`mcp_config::keys_to_settle_on_rotation`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -57,18 +65,74 @@ pub fn set_questions_allowed(allowed: bool) {
     QUESTIONS_ALLOWED.store(allowed, Ordering::Relaxed);
 }
 
-/// The account a key signs in as, as the API's `/auth/me` names it.
+/// Whether `value` stands for a key the editor fills in when it starts
+/// (`${CONTEXTSTREAM_API_KEY}`, `{env:CONTEXTSTREAM_API_KEY}`) rather than
+/// being one.
+pub(crate) fn is_key_reference(value: &str) -> bool {
+    let value = value.trim();
+    (value.starts_with("${") || value.starts_with("{env:")) && value.ends_with('}')
+}
+
+/// A key an entry holds, or would hold after a write: the value as written (a
+/// literal key, or a reference the editor fills in) and the API URL the entry
+/// sends it to, when that is known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldKey {
+    pub value: String,
+    pub api_url: Option<String>,
+}
+
+impl HeldKey {
+    pub(crate) fn new(value: impl Into<String>, api_url: Option<String>) -> Self {
+        Self {
+            value: value.into(),
+            api_url,
+        }
+    }
+
+    fn is_reference(&self) -> bool {
+        is_key_reference(&self.value)
+    }
+}
+
+/// What a project already signs in as, found beside an entry a write would
+/// create: a key one of its configs holds, or an account its
+/// `.contextstream/config.json` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectEvidence {
+    pub path: PathBuf,
+    pub held: Held,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Held {
+    Key(HeldKey),
+    Email(String),
+}
+
+/// The account a key signs in as, as far as this check can tell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Account {
+    /// As the API's `/auth/me` names it.
     Email(String),
+    /// `/auth/me` did not name one (offline, refused, revoked, a stub).
     Unknown,
+    /// A key held by reference, which this check cannot resolve.
+    Reference(String),
+    /// A key whose entry talks to another API than the other key's (`None`
+    /// when its entry does not say which): not looked up.
+    OtherApi(Option<String>),
 }
 
 impl Account {
-    fn label(&self) -> &str {
+    fn label(&self) -> String {
         match self {
-            Account::Email(email) => email,
-            Account::Unknown => "an unknown account",
+            Account::Email(email) => email.clone(),
+            Account::Unknown | Account::OtherApi(None) => "an unknown account".to_string(),
+            Account::Reference(reference) => {
+                format!("an unknown account (the key {reference})")
+            }
+            Account::OtherApi(Some(api_url)) => format!("an unknown account on {api_url}"),
         }
     }
 
@@ -94,11 +158,14 @@ pub(crate) enum Choice {
     Keep,
 }
 
-/// A write that would switch the entry at `path` from one account to another.
+/// A write that would switch the entry at `path` from one account to
+/// another, or, with `creating`, create that project config beside `path`
+/// signed in as another account than `path`.
 pub(crate) struct Proposal<'a> {
     pub path: &'a Path,
     pub from: Account,
     pub to: Account,
+    pub creating: Option<&'a Path>,
 }
 
 /// How a write that holds `proposed` keys may replace an entry that holds
@@ -119,28 +186,72 @@ pub(crate) enum KeyWrite {
 /// What a write may do with the keys of the entry at `path`, which holds
 /// `current` keys now and would hold `proposed` ones. Asks or warns first
 /// when it would put a key for another account in place of one it holds.
-pub(crate) fn settle_key_write(path: &Path, current: &[String], proposed: &[String]) -> KeyWrite {
-    let Some(new_key) = proposed.iter().find(|key| !current.contains(key)) else {
+pub(crate) fn settle_key_write(path: &Path, current: &[HeldKey], proposed: &[HeldKey]) -> KeyWrite {
+    let Some(new_key) = proposed
+        .iter()
+        .find(|key| !current.iter().any(|held| held.value == key.value))
+    else {
         return KeyWrite::NoSwitch;
     };
-    let Some(held) = current.iter().find(|key| *key != new_key) else {
+    let Some(held) = current.iter().find(|held| held.value != new_key.value) else {
         return KeyWrite::NoSwitch;
     };
-    match settle(path, held, new_key) {
+    match settle(path, held, new_key, None) {
         Settled::SameAccount => KeyWrite::NoSwitch,
         Settled::Switched => KeyWrite::Switched,
-        Settled::Kept => KeyWrite::Keep(held.clone()),
+        Settled::Kept => KeyWrite::Keep(held.value.clone()),
     }
 }
 
 /// The key a write must keep in the entry at `path` (see [`settle_key_write`]):
 /// `Some` when the write would switch it to another account without
 /// agreement, `None` when it may go ahead.
-pub(crate) fn key_to_keep(path: &Path, current: &[String], proposed: &[String]) -> Option<String> {
+pub(crate) fn key_to_keep(
+    path: &Path,
+    current: &[HeldKey],
+    proposed: &[HeldKey],
+) -> Option<String> {
     match settle_key_write(path, current, proposed) {
         KeyWrite::Keep(key) => Some(key),
         KeyWrite::NoSwitch | KeyWrite::Switched => None,
     }
+}
+
+/// Whether a write may create the project config `new_path`, signed in with
+/// `proposed`, in a project that already signs in as `evidence` (see
+/// [`ProjectEvidence`]). A project with no ContextStream config has no
+/// evidence and is created as before.
+pub(crate) fn settle_new_entry(
+    new_path: &Path,
+    evidence: &[ProjectEvidence],
+    proposed: &HeldKey,
+) -> Settled {
+    for item in evidence {
+        let settled = match &item.held {
+            Held::Key(held) => settle(&item.path, held, proposed, Some(new_path)),
+            Held::Email(email) => {
+                let from = Account::Email(email.clone());
+                let to = account_of(proposed);
+                if from.is_same(&to) {
+                    Settled::SameAccount
+                } else {
+                    let proposal = Proposal {
+                        path: &item.path,
+                        from,
+                        to,
+                        creating: Some(new_path),
+                    };
+                    settled_by(decide(&proposal, mode(), ask, &mut |line| {
+                        eprintln!("{line}")
+                    }))
+                }
+            }
+        };
+        if settled != Settled::SameAccount {
+            return settled;
+        }
+    }
+    Settled::SameAccount
 }
 
 /// How [`settle`] settled one key in place of another.
@@ -154,26 +265,167 @@ pub(crate) enum Settled {
     Kept,
 }
 
-/// Whether a write may put `proposed` in place of `current` in the entry at
-/// `path`. Asks, warns or says what it did when the keys sign in as different
-/// accounts (or either account is unknown); keys never appear in what it says.
-pub(crate) fn settle(path: &Path, current: &str, proposed: &str) -> Settled {
-    if current == proposed {
-        return Settled::SameAccount;
-    }
-    let (from, to) = accounts_of(current, proposed);
-    if from.is_same(&to) {
-        return Settled::SameAccount;
-    }
-    let proposal = Proposal { path, from, to };
-    match decide(&proposal, mode(), ask, &mut |line| eprintln!("{line}")) {
+fn settled_by(choice: Choice) -> Settled {
+    match choice {
         Choice::Switch => Settled::Switched,
         Choice::Keep => Settled::Kept,
     }
 }
 
-/// Say that the entry at `path` still runs `kept`, a binary from another home
-/// than this one, where this write would have run `instead`.
+/// Whether a write may put `proposed` in place of `held` in the entry at
+/// `path` (or, with `creating`, create that config beside it). Asks, warns or
+/// says what it did when the keys sign in as different accounts (or either
+/// account is unknown); keys never appear in what it says.
+pub(crate) fn settle(
+    path: &Path,
+    held: &HeldKey,
+    proposed: &HeldKey,
+    creating: Option<&Path>,
+) -> Settled {
+    if held.value == proposed.value {
+        return Settled::SameAccount;
+    }
+    let (from, to) = accounts_of(held, proposed);
+    if from.is_same(&to) {
+        return Settled::SameAccount;
+    }
+    let proposal = Proposal {
+        path,
+        from,
+        to,
+        creating,
+    };
+    settled_by(decide(&proposal, mode(), ask, &mut |line| {
+        eprintln!("{line}")
+    }))
+}
+
+/// The accounts two keys sign in as. Each is asked of the API its own entry
+/// talks to, and only when both talk to the same one; a key held by
+/// reference is never looked up.
+fn accounts_of(held: &HeldKey, proposed: &HeldKey) -> (Account, Account) {
+    let unlooked = |key: &HeldKey| {
+        if key.is_reference() {
+            Account::Reference(key.value.trim().to_string())
+        } else {
+            Account::OtherApi(key.api_url.clone())
+        }
+    };
+    let api_url = match (&held.api_url, &proposed.api_url) {
+        (Some(a), Some(b)) if same_api_url(a, b) => a.clone(),
+        _ => return (unlooked(held), unlooked(proposed)),
+    };
+    let lookups: Vec<String> = [held, proposed]
+        .into_iter()
+        .filter(|key| !key.is_reference())
+        .map(|key| key.value.clone())
+        .collect();
+    let found = lookup_accounts(&api_url, &lookups);
+    let account = |key: &HeldKey| {
+        if key.is_reference() {
+            return Account::Reference(key.value.trim().to_string());
+        }
+        lookups
+            .iter()
+            .position(|value| value == &key.value)
+            .and_then(|index| found.get(index).cloned())
+            .unwrap_or(Account::Unknown)
+    };
+    (account(held), account(proposed))
+}
+
+/// The account one key signs in as, asked of its own entry's API.
+fn account_of(key: &HeldKey) -> Account {
+    if key.is_reference() {
+        return Account::Reference(key.value.trim().to_string());
+    }
+    let Some(api_url) = key.api_url.as_deref() else {
+        return Account::OtherApi(None);
+    };
+    lookup_accounts(api_url, std::slice::from_ref(&key.value))
+        .pop()
+        .unwrap_or(Account::Unknown)
+}
+
+pub(crate) fn same_api_url(a: &str, b: &str) -> bool {
+    let normalize = |url: &str| url.trim().trim_end_matches('/').to_ascii_lowercase();
+    normalize(a) == normalize(b)
+}
+
+/// What to do with `proposal` in `mode`, saying it line by line through `say`;
+/// `ask` puts the question to a person and answers whether they said yes.
+pub(crate) fn decide(
+    proposal: &Proposal<'_>,
+    mode: Mode,
+    ask: impl FnOnce(&str) -> anyhow::Result<bool>,
+    say: &mut dyn FnMut(String),
+) -> Choice {
+    let ui = ui::ui();
+    let path = ui.path(&proposal.path.display().to_string());
+    let creating = proposal
+        .creating
+        .map(|creating| ui.path(&creating.display().to_string()));
+    let (from, to) = (proposal.from.label(), proposal.to.label());
+    if mode == Mode::Switch {
+        let head = match &creating {
+            Some(creating) => {
+                format!("Creating {creating} for {to}, beside {path} for {from}")
+            }
+            None => format!("Switching {path} from {from} to {to}"),
+        };
+        say(ui.line(Mark::Info, &head, Some(SWITCH_ACCOUNT_FLAG)));
+        return Choice::Switch;
+    }
+    let head = match &creating {
+        Some(creating) => format!(
+            "{path} signs in as {from}; creating {creating} would sign this project in as {to}."
+        ),
+        None => format!("{path} signs in as {from}; this would switch it to {to}."),
+    };
+    say(ui.line(Mark::Warn, &head, None));
+    let kept = match (&creating, safe_edit::is_dry_run()) {
+        (Some(creating), true) => format!("{GUTTER}  Would not create {creating}."),
+        (Some(creating), false) => format!("{GUTTER}  Did not create {creating}."),
+        (None, true) => {
+            format!("{GUTTER}  Would keep its key, installation id, binary and API URL unchanged.")
+        }
+        (None, false) => {
+            format!("{GUTTER}  Kept its key, installation id, binary and API URL unchanged.")
+        }
+    };
+    if mode == Mode::Ask {
+        let question = match &creating {
+            Some(_) => format!("Create it for {to}?"),
+            None => format!("Switch it to {to}?"),
+        };
+        // A question the person could not answer (Esc, Ctrl-C, a closed
+        // terminal) is a No.
+        if ask(&question).unwrap_or(false) {
+            let done = match &creating {
+                Some(creating) => format!("Creating {creating} for {to}"),
+                None => format!("Switched {path} to {to}"),
+            };
+            say(ui.line(Mark::Ok, &done, None));
+            return Choice::Switch;
+        }
+        say(kept);
+        return Choice::Keep;
+    }
+    say(kept);
+    let what = if creating.is_some() {
+        "create it"
+    } else {
+        "switch it"
+    };
+    say(format!(
+        "{GUTTER}  To {what} on purpose, run the command again with {SWITCH_ACCOUNT_FLAG}, \
+         or run `contextstream-mcp setup` for it in a terminal and answer yes."
+    ));
+    Choice::Keep
+}
+
+/// Say that the entry at `path` keeps running `kept`, a binary in another
+/// home than this one, where this write would have run `instead`.
 pub(crate) fn say_binary_from_another_home(path: &Path, kept: &str, instead: &str) {
     eprintln!("{}", binary_from_another_home_line(path, kept, instead));
 }
@@ -190,53 +442,6 @@ fn binary_from_another_home_line(path: &Path, kept: &str, instead: &str) -> Stri
         ),
         None,
     )
-}
-
-/// What to do with `proposal` in `mode`, saying it line by line through `say`;
-/// `ask` puts the question to a person and answers whether they said yes.
-pub(crate) fn decide(
-    proposal: &Proposal<'_>,
-    mode: Mode,
-    ask: impl FnOnce(&str) -> anyhow::Result<bool>,
-    say: &mut dyn FnMut(String),
-) -> Choice {
-    let ui = ui::ui();
-    let path = ui.path(&proposal.path.display().to_string());
-    let (from, to) = (proposal.from.label(), proposal.to.label());
-    if mode == Mode::Switch {
-        say(ui.line(
-            Mark::Info,
-            &format!("Switching {path} from {from} to {to}"),
-            Some(SWITCH_ACCOUNT_FLAG),
-        ));
-        return Choice::Switch;
-    }
-    say(ui.line(
-        Mark::Warn,
-        &format!("{path} signs in as {from}; this would switch it to {to}."),
-        None,
-    ));
-    let kept = if safe_edit::is_dry_run() {
-        format!("{GUTTER}  Would keep its key and installation id unchanged.")
-    } else {
-        format!("{GUTTER}  Kept its key and installation id unchanged.")
-    };
-    if mode == Mode::Ask {
-        // A question the person could not answer (Esc, Ctrl-C, a closed
-        // terminal) is a No.
-        if ask(&format!("Switch it to {to}?")).unwrap_or(false) {
-            say(ui.line(Mark::Ok, &format!("Switched {path} to {to}"), None));
-            return Choice::Switch;
-        }
-        say(kept);
-        return Choice::Keep;
-    }
-    say(kept);
-    say(format!(
-        "{GUTTER}  To switch it on purpose, run the command again with {SWITCH_ACCOUNT_FLAG}, \
-         or run `contextstream-mcp setup` for it in a terminal and answer yes."
-    ));
-    Choice::Keep
 }
 
 fn mode() -> Mode {
@@ -269,48 +474,54 @@ fn ask(_prompt: &str) -> anyhow::Result<bool> {
     Ok(TEST_POLICY.get().is_some_and(|(_, answer)| answer))
 }
 
-/// The accounts two keys sign in as, each looked up once per process.
+/// The accounts `keys` sign in as on `api_url`, each looked up once per
+/// process.
 #[cfg(not(test))]
-fn accounts_of(current: &str, proposed: &str) -> (Account, Account) {
+fn lookup_accounts(api_url: &str, keys: &[String]) -> Vec<Account> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
-    static KNOWN: OnceLock<Mutex<HashMap<String, Account>>> = OnceLock::new();
+    static KNOWN: OnceLock<Mutex<HashMap<(String, String), Account>>> = OnceLock::new();
     let known = KNOWN.get_or_init(Default::default);
     let mut known = known.lock().unwrap_or_else(|error| error.into_inner());
-    let missing: Vec<String> = [current, proposed]
-        .into_iter()
-        .filter(|key| !known.contains_key(*key))
-        .map(String::from)
+    let slot = |key: &String| (api_url.trim_end_matches('/').to_string(), key.clone());
+    let missing: Vec<String> = keys
+        .iter()
+        .filter(|key| !known.contains_key(&slot(key)))
+        .cloned()
         .collect();
     if !missing.is_empty() {
-        let api_url = super::credentials::setup_client_config(proposed).api_url;
-        let found = resolve_over_api(&api_url, &missing);
-        known.extend(missing.into_iter().zip(found));
+        let found = resolve_over_api(api_url, &missing);
+        for (key, account) in missing.iter().zip(found) {
+            known.insert(slot(key), account);
+        }
     }
-    let account = |key: &str| known.get(key).cloned().unwrap_or(Account::Unknown);
-    (account(current), account(proposed))
+    keys.iter()
+        .map(|key| known.get(&slot(key)).cloned().unwrap_or(Account::Unknown))
+        .collect()
 }
 
 #[cfg(test)]
-fn accounts_of(current: &str, proposed: &str) -> (Account, Account) {
+fn lookup_accounts(_api_url: &str, keys: &[String]) -> Vec<Account> {
     TEST_ACCOUNTS.with(|accounts| {
         let accounts = accounts.borrow();
-        let account = |key: &str| {
-            accounts
-                .iter()
-                .find(|(known, _)| known == key)
-                .map(|(_, email)| Account::Email(email.clone()))
-                .unwrap_or(Account::Unknown)
-        };
-        (account(current), account(proposed))
+        keys.iter()
+            .map(|key| {
+                accounts
+                    .iter()
+                    .find(|(known, _)| known == key)
+                    .map(|(_, email)| Account::Email(email.clone()))
+                    .unwrap_or(Account::Unknown)
+            })
+            .collect()
     })
 }
 
-/// Ask `<api_url>/api/v1/auth/me` whose each key is. A key the API does not
-/// answer for (offline, refused, revoked, no email) is an unknown account.
-/// The lookups run on their own thread and runtime, so a synchronous config
-/// writer can make them from inside the CLI's runtime.
+/// Ask `<api_url>/api/v1/auth/me` whose each key is, following no redirect.
+/// A key the API does not answer for (offline, refused, revoked, redirected,
+/// no email) is an unknown account. The lookups run on their own thread and
+/// runtime, so a synchronous config writer can make them from inside the
+/// CLI's runtime.
 pub(crate) fn resolve_over_api(api_url: &str, keys: &[String]) -> Vec<Account> {
     let url = format!("{}/api/v1/auth/me", api_url.trim().trim_end_matches('/'));
     let lookup_keys = keys.to_vec();
@@ -321,6 +532,7 @@ pub(crate) fn resolve_over_api(api_url: &str, keys: &[String]) -> Vec<Account> {
             .ok()?;
         let http = mcp_client::http::client_builder()
             .timeout(LOOKUP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .ok()?;
         Some(
@@ -403,10 +615,24 @@ impl Drop for TestGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    fn proposal(path: &Path, from: Account, to: Account) -> Proposal<'_> {
-        Proposal { path, from, to }
+    const API: &str = "https://api.example.test";
+
+    fn key(value: &str) -> HeldKey {
+        HeldKey::new(value, Some(API.to_string()))
+    }
+
+    fn keys(values: &[&str]) -> Vec<HeldKey> {
+        values.iter().map(|value| key(value)).collect()
+    }
+
+    fn proposal<'a>(path: &'a Path, from: Account, to: Account) -> Proposal<'a> {
+        Proposal {
+            path,
+            from,
+            to,
+            creating: None,
+        }
     }
 
     fn erik() -> Account {
@@ -460,7 +686,7 @@ mod tests {
             assert_eq!(choice, Choice::Keep);
             let said = lines.join("\n");
             assert!(
-                said.contains("Kept its key and installation id unchanged."),
+                said.contains("Kept its key, installation id, binary and API URL unchanged."),
                 "{said}"
             );
             assert!(!said.contains(SWITCH_ACCOUNT_FLAG), "{said}");
@@ -490,43 +716,166 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_account_is_named_as_such() {
-        let path = PathBuf::from("/home/someone/.claude.json");
+    fn creating_a_project_entry_beside_another_account_is_asked_and_otherwise_skipped() {
+        let path = PathBuf::from("/work/repo/.mcp.json");
+        let creating = PathBuf::from("/work/repo/.cursor/mcp.json");
+        let proposal = Proposal {
+            path: &path,
+            from: erik(),
+            to: chase(),
+            creating: Some(&creating),
+        };
         let mut lines = Vec::new();
-        decide(
-            &proposal(&path, Account::Unknown, chase()),
-            Mode::Keep,
-            |_| Ok(true),
-            &mut |line| lines.push(line),
+        let choice = decide(&proposal, Mode::Keep, |_| Ok(true), &mut |line| {
+            lines.push(line)
+        });
+        assert_eq!(choice, Choice::Keep);
+        let said = lines.join("\n");
+        assert!(
+            said.contains(
+                "/work/repo/.mcp.json signs in as erik@example.test; creating \
+                 /work/repo/.cursor/mcp.json would sign this project in as chase@example.test."
+            ),
+            "{said}"
         );
         assert!(
-            lines[0].contains("signs in as an unknown account"),
-            "{lines:?}"
+            said.contains("Did not create /work/repo/.cursor/mcp.json."),
+            "{said}"
         );
+        assert!(said.contains("To create it on purpose"), "{said}");
+
+        let mut asked = None;
+        let choice = decide(
+            &proposal,
+            Mode::Ask,
+            |question| {
+                asked = Some(question.to_string());
+                Ok(true)
+            },
+            &mut |_| {},
+        );
+        assert_eq!(choice, Choice::Switch);
+        assert_eq!(asked.as_deref(), Some("Create it for chase@example.test?"));
+    }
+
+    #[test]
+    fn unknown_accounts_are_named_as_such() {
+        let path = PathBuf::from("/home/someone/.claude.json");
+        for (from, expected) in [
+            (Account::Unknown, "signs in as an unknown account;"),
+            (
+                Account::Reference("${CONTEXTSTREAM_API_KEY}".to_string()),
+                "signs in as an unknown account (the key ${CONTEXTSTREAM_API_KEY});",
+            ),
+            (
+                Account::OtherApi(Some("http://127.0.0.1:9".to_string())),
+                "signs in as an unknown account on http://127.0.0.1:9;",
+            ),
+        ] {
+            let mut lines = Vec::new();
+            decide(
+                &proposal(&path, from, chase()),
+                Mode::Keep,
+                |_| Ok(true),
+                &mut |line| lines.push(line),
+            );
+            assert!(lines[0].contains(expected), "{lines:?}");
+        }
     }
 
     #[test]
     fn the_same_key_or_the_same_account_is_no_switch() {
         let _policy = test_policy(Mode::Keep, false);
         let path = Path::new("/work/repo/.mcp.json");
-        assert_eq!(settle(path, "cs_key_a", "cs_key_a"), Settled::SameAccount);
+        assert_eq!(
+            settle(path, &key("cs_key_a"), &key("cs_key_a"), None),
+            Settled::SameAccount
+        );
 
         let _accounts = test_accounts(&[
             ("cs_key_a", "Erik@Example.test"),
             ("cs_key_b", "erik@example.test"),
             ("cs_key_c", "chase@example.test"),
         ]);
-        assert_eq!(settle(path, "cs_key_a", "cs_key_b"), Settled::SameAccount);
-        assert_eq!(settle(path, "cs_key_a", "cs_key_c"), Settled::Kept);
+        assert_eq!(
+            settle(path, &key("cs_key_a"), &key("cs_key_b"), None),
+            Settled::SameAccount
+        );
+        assert_eq!(
+            settle(path, &key("cs_key_a"), &key("cs_key_c"), None),
+            Settled::Kept
+        );
         // A key nobody can resolve is an unknown account: a different key
         // still counts as a switch.
-        assert_eq!(settle(path, "cs_unknown", "cs_key_c"), Settled::Kept);
+        assert_eq!(
+            settle(path, &key("cs_unknown"), &key("cs_key_c"), None),
+            Settled::Kept
+        );
+    }
+
+    #[test]
+    fn keys_on_different_apis_or_held_by_reference_are_never_the_same_account() {
+        let _policy = test_policy(Mode::Keep, false);
+        let _accounts = test_accounts(&[
+            ("cs_key_a", "erik@example.test"),
+            ("cs_key_b", "erik@example.test"),
+        ]);
+        let path = Path::new("/work/repo/.mcp.json");
+        // The same account on paper, but the entries talk to different APIs:
+        // a switch, decided without asking either API.
+        assert_eq!(
+            settle(
+                path,
+                &HeldKey::new("cs_key_a", Some("https://api.one.test".to_string())),
+                &HeldKey::new("cs_key_b", Some("https://api.two.test/".to_string())),
+                None
+            ),
+            Settled::Kept
+        );
+        assert_eq!(
+            accounts_of(
+                &HeldKey::new("cs_key_a", Some("https://api.one.test".to_string())),
+                &HeldKey::new("cs_key_b", None),
+            ),
+            (
+                Account::OtherApi(Some("https://api.one.test".to_string())),
+                Account::OtherApi(None)
+            )
+        );
+        // Trailing slashes and case do not make two APIs.
+        assert_eq!(
+            settle(
+                path,
+                &HeldKey::new("cs_key_a", Some("https://API.one.test/".to_string())),
+                &HeldKey::new("cs_key_b", Some("https://api.one.test".to_string())),
+                None
+            ),
+            Settled::SameAccount
+        );
+        // A key held by reference is a deliberate key this cannot resolve.
+        assert_eq!(
+            settle(
+                path,
+                &key("${CONTEXTSTREAM_API_KEY}"),
+                &key("cs_key_b"),
+                None
+            ),
+            Settled::Kept
+        );
+        assert_eq!(
+            settle(
+                path,
+                &key("{env:CONTEXTSTREAM_API_KEY}"),
+                &key("cs_key_b"),
+                None
+            ),
+            Settled::Kept
+        );
     }
 
     #[test]
     fn settle_key_write_tells_no_switch_an_agreed_switch_and_a_kept_key_apart() {
         let path = Path::new("/work/repo/.mcp.json");
-        let keys = |list: &[&str]| list.iter().map(|key| key.to_string()).collect::<Vec<_>>();
         let _accounts = test_accounts(&[
             ("cs_erik", "erik@example.test"),
             ("cs_erik_new", "erik@example.test"),
@@ -545,11 +894,101 @@ mod tests {
             settle_key_write(path, &keys(&["cs_erik"]), &keys(&["cs_chase"])),
             KeyWrite::Keep("cs_erik".to_string())
         );
+        // A reference the write leaves in place is no switch; a literal key
+        // in its place is.
+        let reference = keys(&["${CONTEXTSTREAM_API_KEY}"]);
+        assert_eq!(
+            settle_key_write(path, &reference, &reference),
+            KeyWrite::NoSwitch
+        );
+        assert_eq!(
+            settle_key_write(path, &reference, &keys(&["cs_chase"])),
+            KeyWrite::Keep("${CONTEXTSTREAM_API_KEY}".to_string())
+        );
         let _policy = test_policy(Mode::Switch, false);
         assert_eq!(
             settle_key_write(path, &keys(&["cs_erik"]), &keys(&["cs_chase"])),
             KeyWrite::Switched
         );
+    }
+
+    #[test]
+    fn a_new_entry_is_settled_against_what_the_project_already_uses() {
+        let _accounts = test_accounts(&[
+            ("cs_erik", "erik@example.test"),
+            ("cs_chase", "chase@example.test"),
+        ]);
+        let _policy = test_policy(Mode::Keep, false);
+        let new_path = Path::new("/work/repo/.cursor/mcp.json");
+        let evidence = |held: Held| {
+            vec![ProjectEvidence {
+                path: PathBuf::from("/work/repo/.mcp.json"),
+                held,
+            }]
+        };
+        assert_eq!(
+            settle_new_entry(new_path, &[], &key("cs_chase")),
+            Settled::SameAccount
+        );
+        assert_eq!(
+            settle_new_entry(
+                new_path,
+                &evidence(Held::Key(key("cs_chase"))),
+                &key("cs_chase")
+            ),
+            Settled::SameAccount
+        );
+        assert_eq!(
+            settle_new_entry(
+                new_path,
+                &evidence(Held::Key(key("cs_erik"))),
+                &key("cs_chase")
+            ),
+            Settled::Kept
+        );
+        assert_eq!(
+            settle_new_entry(
+                new_path,
+                &evidence(Held::Email("Chase@example.test".to_string())),
+                &key("cs_chase")
+            ),
+            Settled::SameAccount
+        );
+        assert_eq!(
+            settle_new_entry(
+                new_path,
+                &evidence(Held::Email("erik@example.test".to_string())),
+                &key("cs_chase")
+            ),
+            Settled::Kept
+        );
+        let _policy = test_policy(Mode::Switch, false);
+        assert_eq!(
+            settle_new_entry(
+                new_path,
+                &evidence(Held::Key(key("cs_erik"))),
+                &key("cs_chase")
+            ),
+            Settled::Switched
+        );
+    }
+
+    #[test]
+    fn key_to_keep_asks_only_when_a_held_key_would_be_replaced() {
+        let _policy = test_policy(Mode::Keep, false);
+        let path = Path::new("/work/repo/.mcp.json");
+        // No key yet, or no new key written: nothing to ask.
+        assert_eq!(key_to_keep(path, &[], &keys(&["cs_b"])), None);
+        assert_eq!(key_to_keep(path, &keys(&["cs_a"]), &[]), None);
+        assert_eq!(key_to_keep(path, &keys(&["cs_a"]), &keys(&["cs_a"])), None);
+        // Another key in place of the held one: kept without a terminal.
+        assert_eq!(
+            key_to_keep(path, &keys(&["cs_a"]), &keys(&["cs_b"])),
+            Some("cs_a".to_string())
+        );
+        drop(_policy);
+        let _policy = test_policy(Mode::Ask, true);
+        assert_eq!(key_to_keep(path, &keys(&["cs_a"]), &keys(&["cs_b"])), None);
     }
 
     #[test]
@@ -570,63 +1009,97 @@ mod tests {
     }
 
     #[test]
-    fn key_to_keep_asks_only_when_a_held_key_would_be_replaced() {
-        let _policy = test_policy(Mode::Keep, false);
-        let path = Path::new("/work/repo/.mcp.json");
-        let keys = |list: &[&str]| list.iter().map(|key| key.to_string()).collect::<Vec<_>>();
-        // No key yet, or no new key written: nothing to ask.
-        assert_eq!(key_to_keep(path, &[], &keys(&["cs_b"])), None);
-        assert_eq!(key_to_keep(path, &keys(&["cs_a"]), &[]), None);
-        assert_eq!(key_to_keep(path, &keys(&["cs_a"]), &keys(&["cs_a"])), None);
-        // Another key in place of the held one: kept without a terminal.
-        assert_eq!(
-            key_to_keep(path, &keys(&["cs_a"]), &keys(&["cs_b"])),
-            Some("cs_a".to_string())
-        );
-        drop(_policy);
-        let _policy = test_policy(Mode::Ask, true);
-        assert_eq!(key_to_keep(path, &keys(&["cs_a"]), &keys(&["cs_b"])), None);
+    fn key_references_are_recognized() {
+        for reference in ["${CONTEXTSTREAM_API_KEY}", " {env:CONTEXTSTREAM_API_KEY} "] {
+            assert!(is_key_reference(reference), "{reference}");
+        }
+        for literal in ["cs_live_key", "$CONTEXTSTREAM_API_KEY", "{cs}"] {
+            assert!(!is_key_reference(literal), "{literal}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn auth_me_names_each_key_and_anything_else_is_unknown() {
-        use axum::{http::HeaderMap, http::StatusCode, routing::get, Json, Router};
+    async fn auth_me_names_each_key_follows_no_redirect_and_anything_else_is_unknown() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+            Json, Router,
+        };
+        use std::sync::{Arc, Mutex};
+
+        // Where a redirect would lead: it must never be asked.
+        let elsewhere_hits = Arc::new(Mutex::new(0usize));
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let elsewhere_url = format!("http://{}", elsewhere.local_addr().expect("addr"));
+        let hits = Arc::clone(&elsewhere_hits);
+        let elsewhere_app = Router::new().route(
+            "/api/v1/auth/me",
+            get(move || {
+                *hits.lock().unwrap() += 1;
+                async { Json(serde_json::json!({"data": {"email": "elsewhere@example.test"}})) }
+            }),
+        );
+        let elsewhere_server = tokio::spawn(async move {
+            let _ = axum::serve(elsewhere, elsewhere_app).await;
+        });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let api_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let redirect_to = format!("{elsewhere_url}/api/v1/auth/me");
         let app = Router::new().route(
             "/api/v1/auth/me",
-            get(|headers: HeaderMap| async move {
-                let email = match headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-                    Some("cs_erik") => "erik@example.test",
-                    Some("cs_chase") => "chase@example.test",
-                    _ => {
-                        return (
+            get(move |headers: HeaderMap| {
+                let redirect_to = redirect_to.clone();
+                async move {
+                    match headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+                        Some("cs_erik") => {
+                            Json(serde_json::json!({"data": {"email": "erik@example.test"}}))
+                                .into_response()
+                        }
+                        Some("cs_chase") => {
+                            Json(serde_json::json!({"data": {"email": "chase@example.test"}}))
+                                .into_response()
+                        }
+                        Some("cs_moved") => (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(axum::http::header::LOCATION, redirect_to)],
+                        )
+                            .into_response(),
+                        _ => (
                             StatusCode::UNAUTHORIZED,
                             Json(serde_json::json!({"error": "invalid api key"})),
                         )
+                            .into_response(),
                     }
-                };
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({"data": {"email": email}})),
-                )
+                }
             }),
         );
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
 
-        let keys = ["cs_erik", "cs_chase", "cs_revoked"].map(String::from);
+        let keys = ["cs_erik", "cs_chase", "cs_revoked", "cs_moved"].map(String::from);
         // Called from inside a runtime, as the config writers are.
         let found = resolve_over_api(&format!("{api_url}/"), &keys);
-        assert_eq!(found, vec![erik(), chase(), Account::Unknown]);
+        assert_eq!(
+            found,
+            vec![erik(), chase(), Account::Unknown, Account::Unknown]
+        );
+        assert_eq!(
+            *elsewhere_hits.lock().unwrap(),
+            0,
+            "a redirect must not carry the key anywhere else"
+        );
 
         // Nothing listening: every key is unknown, and the lookup still ends.
         server.abort();
         let _ = server.await;
+        elsewhere_server.abort();
         let offline = resolve_over_api(&api_url, &keys[..1]);
         assert_eq!(offline, vec![Account::Unknown]);
     }

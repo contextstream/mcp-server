@@ -281,6 +281,12 @@ fn run_cli_with_stdin(
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("CONTEXTSTREAM_API_URL", api_url)
+        // Hosted entries talk to the mock's gateway, so an account check asks
+        // the mock, never the real API.
+        .env(
+            "CONTEXTSTREAM_MCP_HTTP_URL",
+            format!("{api_url}/mcp?default_context_mode=fast"),
+        )
         .env("CONTEXTSTREAM_WATCH_ENABLED", "false")
         .env_remove("CONTEXTSTREAM_API_KEY")
         .env_remove("CONTEXTSTREAM_JWT")
@@ -378,7 +384,7 @@ async fn configure_api_key_stdin_rotates_editor_configs_and_doctor_repairs_stale
     let project_config = project.join(".mcp.json");
     let other_entry = serde_json::to_string_pretty(&json!({"mcpServers": {"contextstream": {
         "type": "http",
-        "url": "https://mcp.contextstream.io/mcp?default_context_mode=fast",
+        "url": format!("{api_url}/mcp?default_context_mode=fast"),
         "headers": {
             "X-ContextStream-Managed-Config-Version": "2",
             "X-ContextStream-API-Key": OTHER_ACCOUNT_KEY

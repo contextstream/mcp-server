@@ -141,6 +141,10 @@ Every workspace-scoped call below must include `workspace_id="<current_workspace
 - "update a skill" → `skill(action="update", name="...", instruction_body="...", change_summary="...")`
 - "run skill" / "use skill" → `skill(action="run", name="...")`
 - "import skills" / "import my CLAUDE.md" → `skill(action="import", file_path="...", format="auto")`
+- "blast radius" / "what breaks if I change X" / "covering tests" → `graph_read(action="impact", target_type="module|function", target_id="...", project_id="<current_project_id>")`
+- "risky files" / "refactoring hotspots" / "tech debt" → `graph_read(action="hotspots", workspace_id="<current_workspace_id>", project_id="<current_project_id>")`
+- "PR brief" / "review PR" / "who should review" → `graph_read(action="pr_brief", changed_files=["..."], project_id="<current_project_id>")`
+- "code drift" / "graph health" / "contradictions" → `graph_read(action="health_digest"|"code_drift"|"contradictions", workspace_id="<current_workspace_id>", project_id="<current_project_id>")`; resolve with `graph(action="resolve_contradiction"|"resolve_drift", ...)`
 
 **Structured-entity queries (Phase 1-3 taxonomy expansion) — use the `entity` tool:**
 - "create ticket" / "file bug" / "track feature" / "log incident" → `entity(kind="ticket", action="create", target_project="<project that owns the code>", body={"title": "...", "kind": "bug|feature|task|chore|incident|epic", "priority": "low|medium|high|urgent"})`. File a ticket in the project that owns the code it is about (the repository of the files it cites), not the session's current project: pass `target_project` or `project_id`.
@@ -384,14 +388,15 @@ const PROJECT_SCOPE_GUIDANCE: &str = r#"## Project Scope Discipline
 /// Shared guidance for Code Health, Knowledge Graph, and Entity Spine workflows.
 const GRAPH_QUALITY_GUIDANCE: &str = r#"## Code Health and Dependency Recommendations
 
-Prefer **`graph_read`** (read-only, zero confirmation) for all graph queries; use **`graph`** only for mutations (`ingest`, `quality_snapshot`, `entity_upsert`, `relation_upsert`, `event_ingest`, `schema_upsert`, `install_domain_pack`).
+Prefer **`graph_read`** (read-only, zero confirmation) for all graph queries; use **`graph`** only for mutations (`ingest`, `quality_snapshot`, `resolve_contradiction`, `resolve_drift`, `entity_upsert`, `relation_upsert`, `event_ingest`, `schema_upsert`, `install_domain_pack`).
 
 ### Code Structure, Blast Radius & Health (`graph_read`)
 When asking about dependencies, refactor blast radius, covering tests, linked decisions, retired-value code drift, circular dependencies, unused code, complexity, or dashboard scans, use `graph_read` before guessing from source alone:
-- Module/function blast radius & covering tests → `graph_read(action="impact", target_type="module|function|type|variable", target_id="...")`
+- Module/function blast radius, co-change peers, owners & covering tests → `graph_read(action="impact", target_type="module|function|type|variable", target_id="...")`
 - Imports/callers/dependencies & usages → `graph_read(action="dependencies"|"usages"|"call_path"|"related", ...)`
 - Decisions/lessons tied to a file or module → `graph_read(action="decisions", target_id="<file_path>")`
-- Retired values still present in code → `graph_read(action="code_drift", project_id="...")`
+- Retired values still present in code → `graph_read(action="code_drift", project_id="...")`; close/dismiss with `graph(action="resolve_drift", finding_id="<uuid>", status="resolved|dismissed")`
+- Decision-prioritized contradictions → `graph_read(action="contradictions", workspace_id="<current_workspace_id>")`; resolve with `graph(action="resolve_contradiction", relation_id="<uuid>", resolution="supersede_older|supersede_newer|dismiss")`
 - Dashboard freshness/cache, trends, history → `graph_read(action="quality_freshness"|"quality_trends"|"quality_history", project_id="...")`
 - Circular dependencies, unused code, complexity → `graph_read(action="circular_dependencies"|"unused_code"|"complexity_metrics", project_id="...")`
 - Save a fresh dashboard baseline after scans/fixes → `graph(action="quality_snapshot", project_id="...")`

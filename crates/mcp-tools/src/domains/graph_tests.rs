@@ -331,8 +331,49 @@ mod validation_tests {
             .await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("Unknown action"));
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Unknown action"));
+        for action in [
+            "hotspots",
+            "pr_brief",
+            "health_digest",
+            "code_drift",
+            "cross_project",
+            "resolve_contradiction",
+            "resolve_drift",
+        ] {
+            assert!(
+                err.contains(action),
+                "unknown action error should advertise `{action}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_graph_tool_metadata_advertises_wave3_to_10_actions() {
+        let client = create_mock_client();
+        let tool = GraphTool::new(client);
+        let desc = &tool.metadata().description;
+        for action in [
+            "graph_read",
+            "hotspots",
+            "pr_brief",
+            "health_digest",
+            "code_drift",
+            "contradictions",
+            "cross_project",
+            "lineage",
+            "meeting_brief",
+            "universal_impact",
+            "entity_search",
+            "resolve_contradiction",
+            "resolve_drift",
+        ] {
+            assert!(
+                desc.contains(action),
+                "GraphTool description should advertise `{action}`: {desc}"
+            );
+        }
     }
 
     #[tokio::test]

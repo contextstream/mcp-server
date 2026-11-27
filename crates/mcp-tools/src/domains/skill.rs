@@ -118,9 +118,24 @@ const IMPORT_FORMATS: &[&str] = &[
     "zip",
 ];
 
+fn imported_skill_visibility(skill: &Value) -> Option<&str> {
+    if let Some(scope) = skill
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(scope);
+    }
+    skill
+        .get("is_personal")
+        .and_then(Value::as_bool)
+        .map(|personal| if personal { "personal" } else { "team" })
+}
+
 /// What an import did (#399): the counts (duplicates apart from skills the
-/// quality check refused), the skills created, and that drafts do not
-/// trigger until activated.
+/// quality check refused), the skills created with their stored status,
+/// visibility and project, and that drafts do not trigger until activated.
 fn import_result_text(result: &Value) -> String {
     let count = |key: &str| result.get(key).and_then(Value::as_u64).unwrap_or(0);
     let (imported, skipped, rejected) = (count("imported"), count("skipped"), count("rejected"));
@@ -141,7 +156,26 @@ fn import_result_text(result: &Value) -> String {
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("active");
-        text.push_str(&format!("\n- {name} ({status})"));
+        let mut details = Vec::new();
+        if let Some(visibility) = imported_skill_visibility(skill) {
+            details.push(format!("visibility={visibility}"));
+        }
+        if let Some(project_val) = skill.get("project_id") {
+            match project_val
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(project_id) => details.push(format!("project={project_id}")),
+                None if project_val.is_null() => details.push("project=none".to_string()),
+                None => {}
+            }
+        }
+        if details.is_empty() {
+            text.push_str(&format!("\n- {name} ({status})"));
+        } else {
+            text.push_str(&format!("\n- {name} ({status}) [{}]", details.join(", ")));
+        }
         if status.eq_ignore_ascii_case("draft") {
             drafts.push(name);
         }
@@ -1018,13 +1052,29 @@ impl SkillTool {
     }
 
     async fn handle_import(&self, input: &SkillInput) -> Result<ToolResult> {
-        // Read content from file_path if provided, otherwise use content field
-        let content = if let Some(file_path) = &input.file_path {
+        let non_empty_content = input
+            .content
+            .as_deref()
+            .filter(|c| !c.trim().is_empty())
+            .map(str::to_string);
+        let file_path = input
+            .file_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+
+        // When content is already provided, never read file_path from disk; on
+        // the hosted MCP gateway file_path is then treated strictly as
+        // source_file metadata instead of refusing.
+        let content = if let Some(content) = non_empty_content {
+            content
+        } else if let Some(file_path) = file_path {
             if !self.client.config().await.local_files_allowed() {
-                return Err(Error::Validation(
-                    "skill(action=\"import\", file_path=...) is disabled on the hosted MCP gateway because file_path reads the gateway host's own disk. Pass the skill text directly as `content` instead. (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)"
-                        .to_string(),
-                ));
+                let quoted_path = serde_json::to_string(file_path)
+                    .unwrap_or_else(|_| "\"<file_path>\"".to_string());
+                return Err(Error::Validation(format!(
+                    "skill(action=\"import\", file_path=...) is disabled on the hosted MCP gateway because file_path cannot read files from your machine (it would read the gateway host's own disk). Read the file on your own machine first, then call skill(action=\"import\", content=\"<file contents>\", source_file={quoted_path}) again (add scope=\"team\" or is_personal=false to share with the team). (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)"
+                )));
             }
             // The file is read and sent to the server as a skill: not a credential
             // file, whatever it holds (mcp-server#469; `media index` has the same rule).
@@ -1063,15 +1113,48 @@ impl SkillTool {
             crate::input_shape::enum_argument("format", input.format.clone(), IMPORT_FORMATS)
                 .map_err(Error::Validation)?;
 
+        let session_state = self.session.state().await;
+        let explicit_workspace_id = Self::parse_uuid(&input.workspace_id, "workspace_id")?;
+        let workspace_id = explicit_workspace_id.or(session_state.workspace_id);
+        let explicit_project_id = Self::parse_uuid(&input.project_id, "project_id")?;
+        let project_id = match explicit_project_id {
+            Some(id) => Some(id),
+            None => match self.resolve_target_project_id(input).await? {
+                Some(id) => Some(id),
+                None => {
+                    let same_workspace = match (explicit_workspace_id, session_state.workspace_id) {
+                        (Some(explicit), Some(session_ws)) => explicit == session_ws,
+                        (Some(_), None) => false,
+                        (None, _) => true,
+                    };
+                    if same_workspace {
+                        session_state.project_id
+                    } else {
+                        None
+                    }
+                }
+            },
+        };
+        let source_file = input
+            .source_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| file_path.map(str::to_string));
+
         let result = self
             .client
             .import_skills(ImportSkillParams {
                 content,
                 format,
                 source_tool: input.source_tool.clone(),
-                source_file: input.source_file.clone().or(input.file_path.clone()),
+                source_file,
                 scope: input.scope.clone(),
-                workspace_id: self.resolve_workspace_id(&input.workspace_id).await,
+                is_personal: input.is_personal,
+                status: input.status.clone(),
+                workspace_id,
+                project_id,
             })
             .await?;
 
@@ -1588,13 +1671,13 @@ impl ToolHandler for SkillTool {
             )
             .string_enum(
                 "scope",
-                "Visibility scope. For action='share', only team or public are allowed.",
+                "Visibility scope ('personal', 'team', or 'public'; 'all' is for list). On import, defaults to 'personal' unless scope='team' or is_personal=false is passed. For action='share', only team or public are allowed.",
                 &["personal", "team", "public", "all"],
                 false,
             )
             .string_enum(
                 "status",
-                "Skill status. Defaults to 'active' on create when omitted; pass 'draft' to save as a draft.",
+                "Skill status. Defaults to 'active' on create and import when omitted; pass 'draft' to save as a draft.",
                 SKILL_STATUSES,
                 false,
             )
@@ -1603,14 +1686,26 @@ impl ToolHandler for SkillTool {
                 "Replacement skill (name or id), recorded when action='supersede'",
                 false,
             )
-            .boolean("is_personal", "Whether skill is personal", false)
+            .boolean(
+                "is_personal",
+                "Whether the skill is personal (private to you). On import, defaults to true (personal) unless is_personal=false or scope='team' is passed.",
+                false,
+            )
             .integer(
                 "priority",
                 "Skill priority 0-100 (higher = matched first)",
                 false,
             )
-            .string("content", "Content string for import", false)
-            .string("file_path", "Local file path for import", false)
+            .string(
+                "content",
+                "Skill content string for import (required on the hosted MCP gateway; pair with source_file for provenance).",
+                false,
+            )
+            .string(
+                "file_path",
+                "Local file path for import (local/stdio MCP only; on the hosted MCP gateway read the file locally and pass content plus source_file, or pass both content and file_path to use file_path as source_file metadata).",
+                false,
+            )
             .string_enum(
                 "format",
                 "Import/export format",
@@ -1649,7 +1744,7 @@ impl ToolHandler for SkillTool {
             )
             .string(
                 "project_id",
-                "Project ID (UUID). For project-scoped skills, pass the current project_id returned by init/context instead of guessing.",
+                "Project ID (UUID). On import, defaults to the session's current project_id when omitted. For project-scoped skills, pass the current project_id returned by init/context instead of guessing.",
                 false,
             )
             .string(
@@ -2536,5 +2631,390 @@ mod import_path_tests {
         std::fs::write(&file, "  \n").expect("file");
         let text = import_error(&file).await;
         assert!(text.contains("nothing to import"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod import_forwarding_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn spawn_import_mock(
+        response_skills: Value,
+    ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let recorded = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded_clone = recorded.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded_clone = recorded_clone.clone();
+                let response_skills = response_skills.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let body_start = loop {
+                        let mut chunk = [0u8; 4096];
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                            let len: usize = head
+                                .lines()
+                                .filter_map(|line| line.split_once(':'))
+                                .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                                .and_then(|(_, v)| v.trim().parse().ok())
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break end + 4;
+                            }
+                        }
+                    };
+                    let body: Value =
+                        serde_json::from_slice(&buf[body_start..]).unwrap_or_else(|_| json!({}));
+                    recorded_clone.lock().unwrap().push(body);
+                    let imported = response_skills.as_array().map_or(0, Vec::len);
+                    let payload = json!({
+                        "success": true,
+                        "data": {
+                            "imported": imported,
+                            "skipped": 0,
+                            "rejected": 0,
+                            "skills": response_skills,
+                        }
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (base_url, recorded, task)
+    }
+
+    fn tool_for(base_url: String) -> (SkillTool, Arc<mcp_session::SessionManager>) {
+        let config = mcp_types::Config {
+            api_url: base_url,
+            api_key: Some("test-api-key".to_string()),
+            ..mcp_types::Config::default()
+        };
+        let client = mcp_client::ContextStreamClient::new(config.clone());
+        let session = Arc::new(mcp_session::SessionManager::new(client.clone(), config));
+        let tool = SkillTool::new(client, session.clone());
+        (tool, session)
+    }
+
+    fn text_of(result: &ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|item| match item {
+                mcp_types::tool::ContentItem::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn skill_import_forwards_session_project_is_personal_and_status_and_reports_stored_fields(
+    ) {
+        let ws_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let project_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let (base_url, recorded, task) = spawn_import_mock(json!([{
+            "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "name": "ledger-retry-rules",
+            "status": "active",
+            "scope": "team",
+            "is_personal": false,
+            "project_id": project_id.to_string(),
+        }]))
+        .await;
+
+        let (tool, session) = tool_for(base_url);
+        session
+            .initialize(
+                Some(ws_id),
+                Some(project_id),
+                Some("/tmp/sample-repo".to_string()),
+                None,
+            )
+            .await;
+
+        let result = tool
+            .execute(json!({
+                "action": "import",
+                "content": "## Ledger Retry Rules\n1. Inspect retry deadlines before changing worker backoff.",
+                "format": "claude_md",
+                "source_file": "CLAUDE.md",
+                "is_personal": false,
+                "status": "active"
+            }))
+            .await
+            .expect("import should succeed");
+        task.abort();
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = &requests[0];
+        assert_eq!(
+            body.get("workspace_id").and_then(Value::as_str),
+            Some("11111111-1111-4111-8111-111111111111"),
+            "body: {body}"
+        );
+        assert_eq!(
+            body.get("project_id").and_then(Value::as_str),
+            Some("22222222-2222-4222-8222-222222222222"),
+            "session project_id must be forwarded: {body}"
+        );
+        assert_eq!(
+            body.get("is_personal").and_then(Value::as_bool),
+            Some(false),
+            "is_personal must be forwarded: {body}"
+        );
+        assert_eq!(
+            body.get("status").and_then(Value::as_str),
+            Some("active"),
+            "status must be forwarded: {body}"
+        );
+        assert_eq!(
+            body.get("source_file").and_then(Value::as_str),
+            Some("CLAUDE.md")
+        );
+
+        let text = text_of(&result);
+        assert!(text.contains("ledger-retry-rules"), "{text}");
+        assert!(text.contains("active"), "{text}");
+        assert!(
+            text.contains("visibility=team"),
+            "result must report stored visibility: {text}"
+        );
+        assert!(
+            text.contains("project=22222222-2222-4222-8222-222222222222"),
+            "result must report stored project: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_import_prefers_explicit_project_id_and_forwards_draft_status_and_personal_visibility(
+    ) {
+        let ws_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let session_project = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let explicit_project = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let (base_url, recorded, task) = spawn_import_mock(json!([{
+            "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "name": "local-checklist",
+            "status": "draft",
+            "scope": "personal",
+            "is_personal": true,
+            "project_id": explicit_project.to_string(),
+        }]))
+        .await;
+
+        let (tool, session) = tool_for(base_url);
+        session
+            .initialize(Some(ws_id), Some(session_project), None, None)
+            .await;
+
+        let result = tool
+            .execute(json!({
+                "action": "import",
+                "content": "## Local Checklist\n1. Run unit tests before opening a draft PR.",
+                "project_id": explicit_project.to_string(),
+                "is_personal": true,
+                "status": "draft"
+            }))
+            .await
+            .expect("import should succeed");
+        task.abort();
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = &requests[0];
+        assert_eq!(
+            body.get("project_id").and_then(Value::as_str),
+            Some("33333333-3333-4333-8333-333333333333"),
+            "explicit project_id must win over session project: {body}"
+        );
+        assert_eq!(body.get("is_personal").and_then(Value::as_bool), Some(true));
+        assert_eq!(body.get("status").and_then(Value::as_str), Some("draft"));
+
+        let text = text_of(&result);
+        assert!(text.contains("local-checklist (draft)"), "{text}");
+        assert!(text.contains("visibility=personal"), "{text}");
+        assert!(
+            text.contains("project=33333333-3333-4333-8333-333333333333"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Drafts do not trigger until activated"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_import_omits_unset_optional_fields_and_does_not_leak_session_project_on_workspace_override(
+    ) {
+        let session_ws = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let other_ws = Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
+        let session_project = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let (base_url, recorded, task) = spawn_import_mock(json!([{
+            "id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "name": "review-habits",
+            "status": "active",
+            "scope": "personal",
+            "is_personal": true,
+            "project_id": null,
+        }]))
+        .await;
+
+        let (tool, session) = tool_for(base_url);
+        session
+            .initialize(Some(session_ws), Some(session_project), None, None)
+            .await;
+
+        tool.execute(json!({
+            "action": "import",
+            "content": "## Review Habits\n1. Read the diff twice before approving a retry change."
+        }))
+        .await
+        .expect("default import should succeed");
+
+        let switched = tool
+            .execute(json!({
+                "action": "import",
+                "workspace_id": other_ws.to_string(),
+                "content": "## Review Habits\n1. Read the diff twice before approving a retry change."
+            }))
+            .await
+            .expect("workspace-override import should succeed");
+        task.abort();
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+
+        // First request: uses session workspace and session project; omits is_personal and status.
+        assert_eq!(
+            requests[0].get("workspace_id").and_then(Value::as_str),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(
+            requests[0].get("project_id").and_then(Value::as_str),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+        assert!(
+            requests[0].get("is_personal").is_none(),
+            "unset is_personal should be omitted: {}",
+            requests[0]
+        );
+        assert!(
+            requests[0].get("status").is_none(),
+            "unset status should be omitted so API defaults/JSON statuses apply: {}",
+            requests[0]
+        );
+
+        // Second request: explicit different workspace must NOT carry session_project from session_ws.
+        assert_eq!(
+            requests[1].get("workspace_id").and_then(Value::as_str),
+            Some("44444444-4444-4444-8444-444444444444")
+        );
+        assert!(
+            requests[1].get("project_id").is_none(),
+            "session project from another workspace must not leak: {}",
+            requests[1]
+        );
+
+        let text = text_of(&switched);
+        assert!(text.contains("visibility=personal"), "{text}");
+        assert!(text.contains("project=none"), "{text}");
+    }
+
+    #[test]
+    fn skill_import_schema_documents_project_id_is_personal_status_and_gateway_content() {
+        let config = mcp_types::Config::default();
+        let client = mcp_client::ContextStreamClient::new(config.clone());
+        let session = Arc::new(mcp_session::SessionManager::new(client.clone(), config));
+        let tool = SkillTool::new(client, session);
+        let schema = tool.input_schema();
+        let props = schema.get("properties").expect("properties");
+
+        let desc = |name: &str| {
+            props
+                .get(name)
+                .and_then(|p| p.get("description"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        };
+
+        assert!(
+            desc("project_id").to_ascii_lowercase().contains("import"),
+            "project_id description must document import behavior: {}",
+            desc("project_id")
+        );
+        assert!(
+            desc("is_personal").to_ascii_lowercase().contains("import"),
+            "is_personal description must document import behavior: {}",
+            desc("is_personal")
+        );
+        assert!(
+            desc("status").to_ascii_lowercase().contains("import"),
+            "status description must document import behavior: {}",
+            desc("status")
+        );
+        assert!(
+            desc("file_path").contains("content") && desc("file_path").contains("source_file"),
+            "file_path description must document content + source_file for hosted gateway: {}",
+            desc("file_path")
+        );
+    }
+
+    #[test]
+    fn import_result_text_reports_visibility_project_and_status_from_api_response() {
+        let team = import_result_text(&json!({
+            "imported": 1,
+            "skipped": 0,
+            "rejected": 0,
+            "skills": [{
+                "name": "deploy-safety",
+                "status": "active",
+                "scope": "team",
+                "is_personal": false,
+                "project_id": "22222222-2222-4222-8222-222222222222"
+            }]
+        }));
+        assert!(
+            team.contains(
+                "- deploy-safety (active) [visibility=team, project=22222222-2222-4222-8222-222222222222]"
+            ),
+            "{team}"
+        );
+
+        let personal_no_project = import_result_text(&json!({
+            "imported": 1,
+            "skipped": 0,
+            "rejected": 0,
+            "skills": [{
+                "name": "my-notes",
+                "status": "active",
+                "is_personal": true,
+                "project_id": null
+            }]
+        }));
+        assert!(
+            personal_no_project.contains("- my-notes (active) [visibility=personal, project=none]"),
+            "{personal_no_project}"
+        );
     }
 }

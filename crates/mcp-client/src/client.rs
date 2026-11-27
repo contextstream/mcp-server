@@ -22748,18 +22748,29 @@ pub struct ImportSkillParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_personal: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl ImportSkillParams {
     fn with_defaults(self, config: &Config) -> serde_json::Value {
+        let (workspace_id, project_id) =
+            scope_ids_with_defaults(self.workspace_id, self.project_id, config);
         strip_nulls(serde_json::json!({
             "content": self.content,
             "format": self.format,
             "source_tool": self.source_tool,
             "source_file": self.source_file,
             "scope": self.scope,
-            "workspace_id": self.workspace_id.or(config.default_workspace_id),
+            "is_personal": self.is_personal,
+            "status": self.status,
+            "workspace_id": workspace_id,
+            "project_id": project_id,
         }))
     }
 }
@@ -37421,5 +37432,70 @@ mod review_capsule_client_tests {
         assert_eq!(part.sha256.as_deref(), Some("deadbeef"));
         assert!(part.markdown.contains("Review capsule 0123456789abcdef"));
         task2.abort();
+    }
+
+    #[test]
+    fn import_skill_params_with_defaults_forwards_project_is_personal_and_status() {
+        let default_ws = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let default_proj = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let other_ws = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let explicit_proj = Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
+        let config = Config {
+            default_workspace_id: Some(default_ws),
+            default_project_id: Some(default_proj),
+            ..Config::default()
+        };
+
+        let explicit = ImportSkillParams {
+            content: "## Team Rules\n1. Check tests.".to_string(),
+            format: Some("claude_md".to_string()),
+            source_tool: Some("claude".to_string()),
+            source_file: Some("CLAUDE.md".to_string()),
+            scope: Some("team".to_string()),
+            is_personal: Some(false),
+            status: Some("draft".to_string()),
+            workspace_id: Some(other_ws),
+            project_id: Some(explicit_proj),
+        }
+        .with_defaults(&config);
+        assert_eq!(
+            explicit["workspace_id"].as_str(),
+            Some("33333333-3333-4333-8333-333333333333")
+        );
+        assert_eq!(
+            explicit["project_id"].as_str(),
+            Some("44444444-4444-4444-8444-444444444444")
+        );
+        assert_eq!(explicit["is_personal"].as_bool(), Some(false));
+        assert_eq!(explicit["status"].as_str(), Some("draft"));
+        assert_eq!(explicit["scope"].as_str(), Some("team"));
+
+        let defaulted = ImportSkillParams {
+            content: "## Defaults\n1. Use config defaults.".to_string(),
+            ..ImportSkillParams::default()
+        }
+        .with_defaults(&config);
+        assert_eq!(
+            defaulted["workspace_id"].as_str(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(
+            defaulted["project_id"].as_str(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+        assert!(defaulted.get("is_personal").is_none());
+        assert!(defaulted.get("status").is_none());
+
+        let switched_ws = ImportSkillParams {
+            content: "## Switched\n1. Keep workspace-scoped.".to_string(),
+            workspace_id: Some(other_ws),
+            ..ImportSkillParams::default()
+        }
+        .with_defaults(&config);
+        assert_eq!(
+            switched_ws["workspace_id"].as_str(),
+            Some("33333333-3333-4333-8333-333333333333")
+        );
+        assert!(switched_ws.get("project_id").is_none());
     }
 }

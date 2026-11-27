@@ -85,8 +85,152 @@ async fn http_gateway_refuses_skill_import_file_path() {
     );
     assert!(text.contains(DISABLED_MARKER), "got: {text}");
     assert!(
+        text.to_ascii_lowercase().contains("your own machine"),
+        "tells the agent to read the file locally on its own machine: {text}"
+    );
+    assert!(
         text.contains("content"),
         "names the safe alternative: {text}"
+    );
+    assert!(
+        text.contains("source_file"),
+        "tells the agent to pass source_file with content: {text}"
+    );
+}
+
+#[tokio::test]
+async fn http_gateway_skill_import_with_both_content_and_file_path_uses_file_path_only_as_source_file(
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let bodies_clone = bodies.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let bodies_clone = bodies_clone.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let body_start = loop {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap_or(0);
+                    if count == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        let len: usize = head
+                            .lines()
+                            .filter_map(|l| l.split_once(':'))
+                            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, v)| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break end + 4;
+                        }
+                    }
+                };
+                let parsed: serde_json::Value =
+                    serde_json::from_slice(&buf[body_start..]).unwrap_or_else(|_| json!({}));
+                bodies_clone.lock().unwrap().push(parsed);
+                let payload = json!({
+                    "success": true,
+                    "data": {
+                        "imported": 1,
+                        "skipped": 0,
+                        "rejected": 0,
+                        "skills": [{
+                            "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                            "name": "team-guidelines",
+                            "status": "active",
+                            "scope": "team",
+                            "is_personal": false,
+                            "project_id": TEST_PROJECT
+                        }]
+                    }
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let cfg = Config {
+        api_url: base_url,
+        api_key: Some("test-api-key".to_string()),
+        allow_header_auth: true,
+        is_http_transport: true,
+        http_local_files: false,
+        ..Config::default()
+    };
+    let client = ContextStreamClient::new(cfg.clone());
+    let session = Arc::new(SessionManager::new(client.clone(), cfg));
+    session
+        .initialize(
+            Some(uuid::Uuid::parse_str(TEST_WS).unwrap()),
+            Some(uuid::Uuid::parse_str(TEST_PROJECT).unwrap()),
+            None,
+            None,
+        )
+        .await;
+    let skill = SkillTool::new(client, session);
+
+    // Even though /etc/hostname exists on the gateway host, passing content
+    // alongside file_path must NEVER read the file and must only use file_path
+    // as source_file metadata.
+    let expected_content =
+        "## Team Guidelines\n1. Check ledger invariants before deploying worker changes.";
+    let first = skill
+        .execute(json!({
+            "action": "import",
+            "content": expected_content,
+            "file_path": "/etc/hostname",
+            "scope": "team"
+        }))
+        .await
+        .expect("gateway import with both content and file_path should succeed");
+
+    // When source_file is also given explicitly, source_file takes precedence.
+    skill
+        .execute(json!({
+            "action": "import",
+            "content": expected_content,
+            "file_path": "/etc/hostname",
+            "source_file": "CLAUDE.md",
+            "scope": "team"
+        }))
+        .await
+        .expect("gateway import with content, file_path and explicit source_file should succeed");
+
+    task.abort();
+
+    let sent = bodies.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2, "expected two import requests: {sent:?}");
+    assert_eq!(sent[0]["content"].as_str(), Some(expected_content));
+    assert_eq!(sent[0]["source_file"].as_str(), Some("/etc/hostname"));
+    assert_eq!(sent[0]["scope"].as_str(), Some("team"));
+    assert_eq!(sent[0]["workspace_id"].as_str(), Some(TEST_WS));
+    assert_eq!(sent[0]["project_id"].as_str(), Some(TEST_PROJECT));
+
+    assert_eq!(sent[1]["content"].as_str(), Some(expected_content));
+    assert_eq!(sent[1]["source_file"].as_str(), Some("CLAUDE.md"));
+
+    let rendered = result_text(Ok(first));
+    assert!(rendered.contains("team-guidelines"), "got: {rendered}");
+    assert!(rendered.contains("active"), "got: {rendered}");
+    assert!(rendered.contains("visibility=team"), "got: {rendered}");
+    assert!(
+        rendered.contains(&format!("project={TEST_PROJECT}")),
+        "got: {rendered}"
     );
 }
 

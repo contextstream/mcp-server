@@ -20,7 +20,7 @@ const NOTE: &str = "This command was handed to `contextstream-mcp run`, which se
 /// The hook's answer for a `Bash` call whose command a tool takes, or `None`
 /// to leave the call as it is.
 pub fn rewritten_bash(tool_input: &Value, cwd: &str) -> Option<Value> {
-    if command_hints::switched_off(std::env::var(command_hints::ENV_SWITCH).ok().as_deref()) {
+    if command_hints::off_in_env() {
         return None;
     }
     let _ = tool_input.get("command")?.as_str()?;
@@ -45,6 +45,10 @@ fn rewrite_with_cache(
     let prefix = format!("{} run ", shell_quote(binary));
     // Already handed to `run`: never wrap a second time.
     if command.contains(&prefix) {
+        return None;
+    }
+    // A line that names the switch as off runs as typed: the person or the agent said where.
+    if command_hints::off_in_command(command) {
         return None;
     }
     if let Some(tool) = cache.tool_for(command) {
@@ -106,15 +110,24 @@ fn build_rewrite_output(tool_input: &Value, rewritten_command: String) -> Value 
     })
 }
 
-const SHELL_KEYWORDS: &[&str] = &[
-    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac",
-    "select", "function", "coproc", "!",
+/// Words before a command that leave it a command: the shell runs what follows `if`, `then`, `do`, `!` or `time` as it
+/// would alone, so the check after one is still the check.
+const LEADING_KEYWORDS: &[&str] = &[
+    "if", "then", "elif", "else", "do", "while", "until", "!", "time",
 ];
+/// Words that start a list item this reader does not follow (a loop's variable and words, a function's name): the item
+/// is left as it is, and the items around it are read as usual.
+const OPAQUE_KEYWORDS: &[&str] = &["for", "select", "function", "coproc"];
+/// A `case` ends its patterns with `)`, which this reader takes for the end of a group: the whole line is left alone.
+const REFUSED_KEYWORDS: &[&str] = &["case", "esac"];
+/// The longest line read. A line that edits a file from a here-document and then runs the check is long.
+const MAX_LINE_LEN: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenKind {
     Word,
-    ListSep,     // ; && || \n
+    ListSep,     // ; && || newline, and the ( ) { } of a group or subshell
+    Background,  // & : what stands before it runs on its own and is left as typed
     Pipe,        // | |&
     OutputRedir, // > >> >| &> &>> (optionally with leading fd and/or attached target)
     DupRedir,    // >& [fd]>&[fd|-]
@@ -129,58 +142,77 @@ struct Token {
     needs_target: bool,
 }
 
-/// Tokenize a top-level POSIX shell command line with byte spans, refusing subshells,
-/// command groups, heredocs, background `&`, and unclosed quotes.
+fn token(start: usize, end: usize, kind: TokenKind) -> Token {
+    Token {
+        start,
+        end,
+        kind,
+        needs_target: false,
+    }
+}
+
+/// Tokenize a POSIX shell command line with byte spans.
+///
+/// What it does not follow it steps over whole, so the commands around it are still found: a command substitution or a
+/// parameter expansion is part of its word, a here-document's body is skipped, a comment ends at its line, and the
+/// parentheses and braces of a group or subshell separate the commands inside as `;` does. `None` for a line it cannot
+/// read to the end (an unclosed quote or substitution, a here-document with no end, a `case`).
 fn tokenize_shell(input: &str) -> Option<Vec<Token>> {
-    if input.is_empty() || input.len() > 8192 {
+    if input.is_empty() || input.len() > MAX_LINE_LEN {
         return None;
     }
     let bytes = input.as_bytes();
     let len = bytes.len();
     let mut i = 0;
     let mut tokens = Vec::new();
+    // The here-documents opened on the line being read: (the word that ends one, whether `<<-` strips its tabs).
+    let mut pending: Vec<(Vec<u8>, bool)> = Vec::new();
 
     while i < len {
-        // Skip horizontal whitespace.
+        // Skip horizontal whitespace, and a backslash at a line's end, which joins it to the next.
         while i < len && matches!(bytes[i], b' ' | b'\t') {
             i += 1;
         }
         if i >= len {
             break;
         }
+        if bytes[i] == b'\\' && i + 1 < len && bytes[i + 1] == b'\n' {
+            i += 2;
+            continue;
+        }
         let b = bytes[i];
         match b {
             b'\n' => {
-                tokens.push(Token {
-                    start: i,
-                    end: i + 1,
-                    kind: TokenKind::ListSep,
-                    needs_target: false,
-                });
+                tokens.push(token(i, i + 1, TokenKind::ListSep));
                 i += 1;
+                if !pending.is_empty() {
+                    i = skip_here_documents(bytes, i, &mut pending)?;
+                }
             }
             b';' => {
                 if i + 1 < len && bytes[i + 1] == b';' {
                     return None; // case terminator
                 }
-                tokens.push(Token {
-                    start: i,
-                    end: i + 1,
-                    kind: TokenKind::ListSep,
-                    needs_target: false,
-                });
+                tokens.push(token(i, i + 1, TokenKind::ListSep));
                 i += 1;
             }
-            b'(' | b')' | b'{' | b'}' => return None,
-            b'#' => return None,
+            b'(' | b')' => {
+                tokens.push(token(i, i + 1, TokenKind::ListSep));
+                i += 1;
+            }
+            b'{' | b'}' if stands_alone(bytes, i) => {
+                tokens.push(token(i, i + 1, TokenKind::ListSep));
+                i += 1;
+            }
+            b'#' => {
+                // A comment: to the end of its line.
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
             b'&' => {
                 if i + 1 < len && bytes[i + 1] == b'&' {
-                    tokens.push(Token {
-                        start: i,
-                        end: i + 2,
-                        kind: TokenKind::ListSep,
-                        needs_target: false,
-                    });
+                    tokens.push(token(i, i + 2, TokenKind::ListSep));
                     i += 2;
                 } else if i + 1 < len && bytes[i + 1] == b'>' {
                     let start = i;
@@ -197,56 +229,26 @@ fn tokenize_shell(input: &str) -> Option<Vec<Token>> {
                         needs_target: i == op_end,
                     });
                 } else {
-                    // Background job `&`: leave alone.
-                    return None;
+                    tokens.push(token(i, i + 1, TokenKind::Background));
+                    i += 1;
                 }
             }
             b'|' => {
                 if i + 1 < len && bytes[i + 1] == b'|' {
-                    tokens.push(Token {
-                        start: i,
-                        end: i + 2,
-                        kind: TokenKind::ListSep,
-                        needs_target: false,
-                    });
+                    tokens.push(token(i, i + 2, TokenKind::ListSep));
                     i += 2;
                 } else if i + 1 < len && bytes[i + 1] == b'&' {
-                    tokens.push(Token {
-                        start: i,
-                        end: i + 2,
-                        kind: TokenKind::Pipe,
-                        needs_target: false,
-                    });
+                    tokens.push(token(i, i + 2, TokenKind::Pipe));
                     i += 2;
                 } else {
-                    tokens.push(Token {
-                        start: i,
-                        end: i + 1,
-                        kind: TokenKind::Pipe,
-                        needs_target: false,
-                    });
+                    tokens.push(token(i, i + 1, TokenKind::Pipe));
                     i += 1;
                 }
             }
             b'<' => {
-                let start = i;
-                i += 1;
-                if i < len && matches!(bytes[i], b'<' | b'>' | b'&') {
-                    i += 1;
-                    if i < len && bytes[i] == b'<' {
-                        i += 1;
-                    }
-                }
-                if &bytes[start..i] == b"<<" || &bytes[start..i] == b"<<<" {
-                    return None;
-                }
-                i = scan_word_tail(bytes, i)?;
-                tokens.push(Token {
-                    start,
-                    end: i,
-                    kind: TokenKind::InputRedir,
-                    needs_target: false,
-                });
+                let (tok, next) = scan_input_redir(bytes, i, i, &mut pending)?;
+                tokens.push(tok);
+                i = next;
             }
             b'>' => {
                 let (tok, next) = scan_output_redir(bytes, i, i)?;
@@ -265,36 +267,123 @@ fn tokenize_shell(input: &str) -> Option<Vec<Token>> {
                     tokens.push(tok);
                     i = next;
                 } else if d > i && d < len && bytes[d] == b'<' {
-                    let mut op_end = d + 1;
-                    if op_end < len && matches!(bytes[op_end], b'<' | b'>' | b'&') {
-                        op_end += 1;
-                    }
-                    if &bytes[d..op_end] == b"<<" {
-                        return None;
-                    }
-                    let next = scan_word_tail(bytes, op_end)?;
-                    tokens.push(Token {
-                        start,
-                        end: next,
-                        kind: TokenKind::InputRedir,
-                        needs_target: false,
-                    });
+                    let (tok, next) = scan_input_redir(bytes, start, d, &mut pending)?;
+                    tokens.push(tok);
                     i = next;
                 } else {
                     let next = scan_word_tail(bytes, i)?;
-                    tokens.push(Token {
-                        start,
-                        end: next,
-                        kind: TokenKind::Word,
-                        needs_target: false,
-                    });
+                    if next == i {
+                        return None; // nothing this reader can step over
+                    }
+                    tokens.push(token(start, next, TokenKind::Word));
                     i = next;
                 }
             }
         }
     }
 
+    // A here-document whose body never came.
+    if !pending.is_empty() {
+        return None;
+    }
     Some(tokens)
+}
+
+/// Whether the `{` or `}` at `i` is a group's own word and not part of another (`{a,b}`, `}x`): bash reads `{` as a
+/// group only with a blank after it, and `}` only where a command could end.
+fn stands_alone(bytes: &[u8], i: usize) -> bool {
+    match bytes.get(i + 1) {
+        None => true,
+        Some(next) if bytes[i] == b'{' => matches!(next, b' ' | b'\t' | b'\n'),
+        Some(next) => matches!(next, b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b')'),
+    }
+}
+
+/// An input redirection whose `<` is at `lt_pos` (after an optional fd from `start`). A here-document's end word is
+/// kept in `pending`, so its body is skipped when its line ends.
+fn scan_input_redir(
+    bytes: &[u8],
+    start: usize,
+    lt_pos: usize,
+    pending: &mut Vec<(Vec<u8>, bool)>,
+) -> Option<(Token, usize)> {
+    let len = bytes.len();
+    let rest = &bytes[lt_pos..];
+    if rest.starts_with(b"<<<") {
+        // A here-string: its word is the redirection's.
+        let mut i = lt_pos + 3;
+        while i < len && matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+        }
+        let end = scan_word_tail(bytes, i)?;
+        return Some((token(start, end, TokenKind::InputRedir), end));
+    }
+    if rest.starts_with(b"<<") {
+        let mut i = lt_pos + 2;
+        let strip_tabs = i < len && bytes[i] == b'-';
+        if strip_tabs {
+            i += 1;
+        }
+        while i < len && matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+        }
+        let word_start = i;
+        let end = scan_word_tail(bytes, i)?;
+        if end == word_start {
+            return None;
+        }
+        // The word as the shell compares it: without its quotes and backslashes.
+        let delimiter: Vec<u8> = bytes[word_start..end]
+            .iter()
+            .copied()
+            .filter(|b| !matches!(b, b'\'' | b'"' | b'\\'))
+            .collect();
+        if delimiter.is_empty() {
+            return None;
+        }
+        pending.push((delimiter, strip_tabs));
+        return Some((token(start, end, TokenKind::InputRedir), end));
+    }
+    let mut i = lt_pos + 1;
+    if i < len && matches!(bytes[i], b'>' | b'&') {
+        i += 1;
+    }
+    let end = scan_word_tail(bytes, i)?;
+    Some((token(start, end, TokenKind::InputRedir), end))
+}
+
+/// Step over the bodies of the here-documents opened on the line that ended just before `i`: each runs to the line
+/// that is its end word alone. `None` when one never ends.
+fn skip_here_documents(
+    bytes: &[u8],
+    mut i: usize,
+    pending: &mut Vec<(Vec<u8>, bool)>,
+) -> Option<usize> {
+    for (delimiter, strip_tabs) in pending.drain(..) {
+        loop {
+            if i >= bytes.len() {
+                return None;
+            }
+            let end = bytes[i..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(bytes.len(), |at| i + at);
+            let mut line = &bytes[i..end];
+            if strip_tabs {
+                while line.first() == Some(&b'\t') {
+                    line = &line[1..];
+                }
+            }
+            i = (end + 1).min(bytes.len());
+            if line == delimiter.as_slice() {
+                break;
+            }
+            if end >= bytes.len() {
+                return None;
+            }
+        }
+    }
+    Some(i)
 }
 
 fn scan_output_redir(bytes: &[u8], start: usize, gt_pos: usize) -> Option<(Token, usize)> {
@@ -327,39 +416,31 @@ fn scan_output_redir(bytes: &[u8], start: usize, gt_pos: usize) -> Option<(Token
     ))
 }
 
+/// The end of the word that starts at `i`: quotes, a command substitution (`$(…)`, backticks) and a parameter
+/// expansion (`${…}`) are part of it, whatever they hold.
 fn scan_word_tail(bytes: &[u8], mut i: usize) -> Option<usize> {
     let len = bytes.len();
     while i < len {
         match bytes[i] {
             b' ' | b'\t' | b'\n' | b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')' => break,
-            b'\'' => {
-                i += 1;
-                while i < len && bytes[i] != b'\'' {
-                    i += 1;
-                }
-                if i >= len {
-                    return None;
-                }
-                i += 1;
-            }
-            b'"' => {
-                i += 1;
-                while i < len && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                        if i >= len {
-                            return None;
-                        }
-                    }
-                    i += 1;
-                }
-                if i >= len {
-                    return None;
-                }
-                i += 1;
-            }
+            b'\'' => i = scan_single_quoted(bytes, i)?,
+            b'"' => i = scan_double_quoted(bytes, i)?,
+            b'`' => i = scan_backticks(bytes, i)?,
             b'\\' => {
                 i += 1;
+                if i >= len {
+                    return None;
+                }
+                i += 1;
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'(') => i = scan_parens(bytes, i + 1)?,
+            b'$' if bytes.get(i + 1) == Some(&b'{') => i = scan_braces(bytes, i + 1)?,
+            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                // $'…': a literal in which a backslash keeps the next character.
+                i += 2;
+                while i < len && bytes[i] != b'\'' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
                 if i >= len {
                     return None;
                 }
@@ -371,8 +452,109 @@ fn scan_word_tail(bytes: &[u8], mut i: usize) -> Option<usize> {
     Some(i)
 }
 
-/// Rewrite wrapped check commands (e.g. `cargo check ... 2>&1 | grep ... | head; echo ${PIPESTATUS[0]}`)
-/// by wrapping only the inner check command(s) while preserving surrounding pipes, redirections, and list items.
+/// After the single-quoted text that opens at `i`.
+fn scan_single_quoted(bytes: &[u8], mut i: usize) -> Option<usize> {
+    i += 1;
+    while i < bytes.len() && bytes[i] != b'\'' {
+        i += 1;
+    }
+    (i < bytes.len()).then_some(i + 1)
+}
+
+/// After the double-quoted text that opens at `i`; a substitution inside it is stepped over whole.
+fn scan_double_quoted(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let len = bytes.len();
+    i += 1;
+    while i < len && bytes[i] != b'"' {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'`' => i = scan_backticks(bytes, i)?,
+            b'$' if bytes.get(i + 1) == Some(&b'(') => i = scan_parens(bytes, i + 1)?,
+            b'$' if bytes.get(i + 1) == Some(&b'{') => i = scan_braces(bytes, i + 1)?,
+            _ => i += 1,
+        }
+    }
+    (i < len).then_some(i + 1)
+}
+
+/// After the backticks that open at `i`.
+fn scan_backticks(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let len = bytes.len();
+    i += 1;
+    while i < len && bytes[i] != b'`' {
+        i += if bytes[i] == b'\\' { 2 } else { 1 };
+    }
+    (i < len).then_some(i + 1)
+}
+
+/// After the parenthesis that closes the one at `i` (a `$(…)` or `$((…))`). `None` for what cannot be paired by
+/// counting: a `case` inside (`;;`), a here-document inside.
+fn scan_parens(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let len = bytes.len();
+    let mut depth = 0usize;
+    while i < len {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.checked_sub(1)?;
+                i += 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'\'' => i = scan_single_quoted(bytes, i)?,
+            b'"' => i = scan_double_quoted(bytes, i)?,
+            b'`' => i = scan_backticks(bytes, i)?,
+            b'\\' => i += 2,
+            b';' if bytes.get(i + 1) == Some(&b';') => return None,
+            b'<' if bytes.get(i + 1) == Some(&b'<') && bytes.get(i + 2) != Some(&b'<') => {
+                return None
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// After the brace that closes the one at `i` (a `${…}`).
+fn scan_braces(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let len = bytes.len();
+    let mut depth = 0usize;
+    while i < len {
+        match bytes[i] {
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                i += 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'\'' => i = scan_single_quoted(bytes, i)?,
+            b'"' => i = scan_double_quoted(bytes, i)?,
+            b'`' => i = scan_backticks(bytes, i)?,
+            b'\\' => i += 2,
+            b'$' if bytes.get(i + 1) == Some(&b'(') => i = scan_parens(bytes, i + 1)?,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Rewrite the check commands of a longer line (e.g. `cargo check ... 2>&1 | grep ... | head; echo ${PIPESTATUS[0]}`)
+/// by wrapping only each check, with the pipes, redirections and other commands around it as they were typed.
+///
+/// A check is the leading simple command of a list item: what stands between `;`, `&&`, `||`, a newline or a group's
+/// parentheses and braces, up to its first pipe. So a line that changes folder, sets a variable from `$(…)`, edits a
+/// file from a here-document, times the check (`time`), tests it (`if … ; then`) or groups it (`( … )`) still has its
+/// check sent. Left as typed: a command put in the background (`&`), one that reads its input from a redirection, what
+/// is inside a substitution, and a line that names the switch that turns remote checks off.
 fn rewrite_wrapped_command(
     command: &str,
     prefix: &str,
@@ -388,22 +570,38 @@ fn rewrite_wrapped_command(
 
     while idx < tokens.len() {
         let item_start = idx;
-        while idx < tokens.len() && tokens[idx].kind != TokenKind::ListSep {
+        while idx < tokens.len()
+            && !matches!(tokens[idx].kind, TokenKind::ListSep | TokenKind::Background)
+        {
             idx += 1;
         }
-        let item = &tokens[item_start..idx];
+        let mut item = &tokens[item_start..idx];
+        let background = idx < tokens.len() && tokens[idx].kind == TokenKind::Background;
         // Advance past the separator for the next iteration.
-        if idx < tokens.len() && tokens[idx].kind == TokenKind::ListSep {
+        if idx < tokens.len() {
             idx += 1;
         }
-        if item.is_empty() {
+        if background {
             continue;
         }
-        // Any control keyword at command position aborts wrapping the whole command.
-        if item[0].kind == TokenKind::Word
-            && SHELL_KEYWORDS.contains(&&command[item[0].start..item[0].end])
-        {
-            return None;
+        // The words before the command that leave it a command, and the ones that start what is not followed.
+        let mut opaque = false;
+        while let Some(first) = item.first().filter(|first| first.kind == TokenKind::Word) {
+            let word = &command[first.start..first.end];
+            if REFUSED_KEYWORDS.contains(&word) {
+                return None;
+            }
+            if OPAQUE_KEYWORDS.contains(&word) {
+                opaque = true;
+                break;
+            }
+            if !LEADING_KEYWORDS.contains(&word) {
+                break;
+            }
+            item = &item[1..];
+        }
+        if opaque || item.is_empty() {
+            continue;
         }
         // Inspect the leading simple command of this list item (before the first pipe/redirect).
         let mut word_end_idx = 0;
@@ -434,7 +632,7 @@ fn rewrite_wrapped_command(
                         j += 1;
                     }
                 }
-                TokenKind::Word | TokenKind::ListSep => {
+                TokenKind::Word | TokenKind::ListSep | TokenKind::Background => {
                     // Stray argument after a redirect (e.g. `cargo check > out --workspace`):
                     // never split arguments away from the command.
                     valid_tail = false;
@@ -639,17 +837,147 @@ mod tests {
         for cmd in [
             "cargo test < input.txt",
             "cargo test <<EOF\nhi\nEOF",
-            "(cargo check)",
-            "if cargo check; then echo ok; fi",
+            "cargo test <<< 'input'",
             "cargo check &",
             "cargo check > out.txt --workspace",
             "echo \"cargo check\" | grep cargo",
             "ls -la | head -n 20",
             "'/usr/local/bin/contextstream-mcp' run --tool 'check' -- 'cargo check' 2>&1 | head -n 20",
+            // What a substitution holds is its word's, never a command of the line.
+            "X=$(cargo check 2>&1 | tail -1); echo \"$X\"",
+            "echo `cargo check`",
+            "echo \"$(cargo test)\"",
+            // A loop's own words, a case, and what this reader cannot read to its end.
+            "for cargo in check; do echo $cargo; done",
+            "case $1 in a) cargo check;; esac",
+            "cargo check; echo 'unclosed",
+            "cargo check; echo $(unclosed",
+            "python3 - <<EOF\nprint(1)\ncargo check",
+            // A comment and a here-document's body are text.
+            "echo done # cargo check",
+            "cat > notes.txt <<'EOF'\ncargo check\nEOF",
+            "cat <<-END\n\tcargo test\n\tEND\necho ok",
         ] {
             assert!(
                 rewrite_with_cache(&json!({"command": cmd}), bin, &cache).is_none(),
                 "expected None for: {cmd}"
+            );
+        }
+    }
+
+    // What the lines agents type look like (35,020 of them, 2026-11-27): the check stands beside a `cd` to a worktree,
+    // a variable set from `$(…)`, a file edited from a here-document, a group, `time` or `if`. Each check is sent.
+    #[test]
+    fn a_check_beside_what_this_reader_steps_over_is_still_sent() {
+        let cache = test_cache();
+        let bin = "/usr/local/bin/contextstream-mcp";
+        let run = |command: &str| format!("'{bin}' run --tool 'check' -- '{command}'");
+        let rewritten = |cmd: &str| {
+            rewrite_with_cache(&json!({"command": cmd}), bin, &cache)
+                .map(|out| {
+                    out["hookSpecificOutput"]["updatedInput"]["command"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .unwrap_or_else(|| panic!("expected a rewrite of: {cmd}"))
+        };
+        for (cmd, expected) in [
+            (
+                "H=$(mktemp -d) && export HOME=$H && cargo check 2>&1 | tail -20; echo \"exit=${PIPESTATUS[0]}\"".to_string(),
+                format!("H=$(mktemp -d) && export HOME=$H && {} 2>&1 | tail -20; echo \"exit=${{PIPESTATUS[0]}}\"", run("cargo check")),
+            ),
+            (
+                "python3 - <<'EOF'\nimport re  # cargo check (text)\nprint(\"it's )\")\nEOF\ncargo test -p thing 2>&1 | tail -5".to_string(),
+                format!("python3 - <<'EOF'\nimport re  # cargo check (text)\nprint(\"it's )\")\nEOF\n{} 2>&1 | tail -5", run("cargo test -p thing")),
+            ),
+            (
+                "cat > a.txt <<EOF && cargo check\nline (one\nEOF\ncargo test".to_string(),
+                format!("cat > a.txt <<EOF && {}\nline (one\nEOF\n{}", run("cargo check"), run("cargo test")),
+            ),
+            (
+                "cd /home/me/wt && (cargo check 2>&1 | grep -E 'error|warning'; echo \"--- tests\"; cargo test -p a 2>&1 | tail -3)".to_string(),
+                format!("cd /home/me/wt && ({} 2>&1 | grep -E 'error|warning'; echo \"--- tests\"; {} 2>&1 | tail -3)", run("cargo check"), run("cargo test -p a")),
+            ),
+            (
+                "{ cargo check; cargo test; } > out.log 2>&1".to_string(),
+                format!("{{ {}; {}; }} > out.log 2>&1", run("cargo check"), run("cargo test")),
+            ),
+            (
+                "time cargo check --workspace".to_string(),
+                format!("time {}", run("cargo check --workspace")),
+            ),
+            (
+                "if cargo check; then echo ok; else cargo test; fi".to_string(),
+                format!("if {}; then echo ok; else {}; fi", run("cargo check"), run("cargo test")),
+            ),
+            (
+                "! cargo check || echo broken".to_string(),
+                format!("! {} || echo broken", run("cargo check")),
+            ),
+            (
+                "for p in a b; do echo $p; done; cargo test".to_string(),
+                format!("for p in a b; do echo $p; done; {}", run("cargo test")),
+            ),
+            (
+                "sleep 30 & cargo check".to_string(),
+                format!("sleep 30 & {}", run("cargo check")),
+            ),
+            (
+                "echo start # then: cargo check\ncargo test".to_string(),
+                format!("echo start # then: cargo check\n{}", run("cargo test")),
+            ),
+            (
+                "echo \"at $(date +%s) in ${PWD:-.}\"; cargo check".to_string(),
+                format!("echo \"at $(date +%s) in ${{PWD:-.}}\"; {}", run("cargo check")),
+            ),
+            (
+                "diff <(cargo check 2>&1) expected.txt".to_string(),
+                format!("diff <({} 2>&1) expected.txt", run("cargo check")),
+            ),
+            (
+                "echo a{b,c} }x; cargo check".to_string(),
+                format!("echo a{{b,c}} }}x; {}", run("cargo check")),
+            ),
+        ] {
+            assert_eq!(rewritten(&cmd), expected, "{cmd}");
+        }
+        // A line longer than a pattern's reach is still read: its check is found after a long here-document.
+        let long = format!(
+            "cat > big.txt <<'EOF'\n{}\nEOF\ncargo check",
+            "x".repeat(20_000)
+        );
+        assert!(rewritten(&long).ends_with(&run("cargo check")));
+    }
+
+    // The switch named on the line keeps the whole line here, under the name the docs give and the one agents write.
+    #[test]
+    fn a_line_that_switches_remote_checks_off_is_left_as_typed() {
+        let cache = test_cache();
+        let bin = "/usr/local/bin/contextstream-mcp";
+        for cmd in [
+            "CONTEXTSTREAM_HOSTED_TOOLS=off cargo check",
+            "CONTEXTSTREAM_REMOTE_CHECKS=off cargo test -p thing 2>&1 | tail -5",
+            "cd wt && export PATH=/usr/local/go/bin:$PATH CONTEXTSTREAM_REMOTE_CHECKS=off; cargo check; cargo test",
+            "CONTEXTSTREAM_REMOTE_CHECKS='0' cargo check",
+            "cargo check; CONTEXTSTREAM_HOSTED_TOOLS=false cargo test",
+        ] {
+            assert!(command_hints::off_in_command(cmd), "{cmd}");
+            assert!(
+                rewrite_with_cache(&json!({"command": cmd}), bin, &cache).is_none(),
+                "expected None for: {cmd}"
+            );
+        }
+        for cmd in [
+            "CONTEXTSTREAM_REMOTE_CHECKS=on cargo check",
+            "MY_CONTEXTSTREAM_REMOTE_CHECKS=off cargo check",
+            "CONTEXTSTREAM_REMOTE_CHECKS=offline cargo check",
+            "cargo check",
+        ] {
+            assert!(!command_hints::off_in_command(cmd), "{cmd}");
+            assert!(
+                rewrite_with_cache(&json!({"command": cmd}), bin, &cache).is_some(),
+                "expected a rewrite of: {cmd}"
             );
         }
     }

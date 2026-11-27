@@ -81,6 +81,36 @@ pub fn switched_off(value: Option<&str>) -> bool {
     })
 }
 
+/// The name agents write for the switch when they want one command kept local (`CONTEXTSTREAM_REMOTE_CHECKS=off go
+/// test ./...`): read as [`ENV_SWITCH`] is, in the environment and on a command.
+pub const ENV_SWITCH_ALSO: &str = "CONTEXTSTREAM_REMOTE_CHECKS";
+
+/// Whether this process's environment turns the feature off, under either name.
+pub fn off_in_env() -> bool {
+    [ENV_SWITCH, ENV_SWITCH_ALSO]
+        .iter()
+        .any(|name| switched_off(std::env::var(name).ok().as_deref()))
+}
+
+/// Whether a command line names the switch as off anywhere (`NAME=off cmd`, `export NAME=off; cmd`): the hook reads its
+/// own environment, never one a command sets, so the line itself is asked. A line that says so runs as typed.
+pub fn off_in_command(command: &str) -> bool {
+    [ENV_SWITCH, ENV_SWITCH_ALSO].iter().any(|name| {
+        let needle = format!("{name}=");
+        command.match_indices(&needle).any(|(at, _)| {
+            let own_name = command[..at]
+                .bytes()
+                .next_back()
+                .is_none_or(|before| !(before.is_ascii_alphanumeric() || before == b'_'));
+            let value: String = command[at + needle.len()..]
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | ')'))
+                .collect();
+            own_name && switched_off(Some(value.trim_matches(|c| c == '\'' || c == '"')))
+        })
+    })
+}
+
 /// The identity a local caller's cached reads are kept under: a digest of its
 /// credential, never the credential.
 pub fn local_identity(credential: &str) -> String {

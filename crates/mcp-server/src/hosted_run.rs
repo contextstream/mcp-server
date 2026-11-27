@@ -110,7 +110,7 @@ fn out_of_credits_line() -> String {
 }
 
 async fn try_remote(tool: Option<&str>, command: &str, cwd: &Path, verbose: bool) -> Remote {
-    if command_hints::switched_off(std::env::var(command_hints::ENV_SWITCH).ok().as_deref()) {
+    if command_hints::off_in_env() || command_hints::off_in_command(command) {
         return Remote::Here(None);
     }
     let config = crate::hook_handlers::common::load_config(&cwd.to_string_lossy());

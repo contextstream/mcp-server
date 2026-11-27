@@ -39,7 +39,10 @@
 //! - A frame that was claimed and not yet shown is recorded as unshown in
 //!   that ledger. A session that lost it (its slot evicted once the frame
 //!   stopped pinning it, or another replica) claims it again under the same
-//!   attempt, and whichever response clears the record shows it: once.
+//!   attempt, and whichever response clears the record shows it: once. The
+//!   response that claimed it keeps the delivery's reservation until it has
+//!   settled the frame, so a session that waited for that reservation finds
+//!   the record already cleared and does not claim it again.
 //! - Only the credential that reported the run claims what is sent to it.
 //!   ContextStream raises a question for a waiting run, and takes a message
 //!   for it, only where the run was reported under a person's full API key,
@@ -57,7 +60,7 @@
 //!   costs the call nothing; after a 404 or that 503 the API is not asked
 //!   again for a while.
 
-use super::delivery_bindings::{Owner, OwnerKey, Unshown};
+use super::delivery_bindings::{FileLock, Owner, OwnerKey, Unshown};
 use mcp_client::deliveries::{
     error_tag, is_malformed, is_no_way_back, is_not_ready, is_not_there, refusal_code, Answer,
     ClaimToken, Delivery, DeliveryActor, DeliveryReader, Refused, DECLINE_REASONS, KIND_ANSWER,
@@ -1111,9 +1114,12 @@ pub(super) async fn poll(
             ..Default::default()
         };
     };
+    // The reservations of what this call claimed, held until the frames
+    // below are settled in the book ([`claim_offers`]).
+    let mut held = Vec::new();
     let collect = async {
         if owner.reported(run_id) || owner.bind(run_id, None, 0, None).await {
-            claim_offers(client, ledger, owner, run_id, agent, batch).await?;
+            claim_offers(client, ledger, owner, run_id, agent, batch, &mut held).await?;
         }
         Ok(())
     };
@@ -1134,6 +1140,7 @@ pub(super) async fn poll(
     let mut offered = ledger
         .show_frames(owner, run_id, tool, MAX_SHOWN_AT_ONCE)
         .await;
+    drop(held);
     offered.notice = notice(late && batch.deliveries.len() > offered.shown.len());
     offered
 }
@@ -1217,6 +1224,12 @@ async fn read(
     }
 }
 
+/// Claim what `batch` offers that this session was not shown, and take up
+/// again its claims whose frames no response showed. Each claim that came
+/// back leaves its delivery's reservation in `held`, which the caller keeps
+/// until its response has settled the frames ([`Ledger::show_frames`]): until
+/// then the record still says unshown, and a session that got the
+/// reservation would claim the delivery again.
 async fn claim_offers(
     client: &ContextStreamClient,
     ledger: &Arc<Ledger>,
@@ -1224,6 +1237,7 @@ async fn claim_offers(
     run_id: Uuid,
     agent: &Value,
     batch: &Batch,
+    held: &mut Vec<FileLock>,
 ) -> std::result::Result<(), AtCapacity> {
     let session = &owner.key;
     let deadline = batch.read_at + OFFER_FRESH_FOR;
@@ -1239,8 +1253,14 @@ async fn claim_offers(
         if Instant::now() >= deadline {
             break;
         }
-        let Ok(reservation) = owner.reserve(delivery.id).await else {
-            continue;
+        // A bucket this call already holds is this delivery's reservation too.
+        let reservation = if owner.covers(held, delivery.id) {
+            None
+        } else {
+            let Ok(reservation) = owner.reserve(delivery.id).await else {
+                continue;
+            };
+            Some(reservation)
         };
         // A claim of this owner's whose frame no response showed is taken up
         // again under its own attempt, while the record still says so; any
@@ -1292,7 +1312,7 @@ async fn claim_offers(
             let limited =
                 recover_unshown(client, ledger, owner, run_id, agent, delivery.id, record).await;
             ledger.finish_flight(session, delivery.id, attempt);
-            drop(reservation);
+            held.extend(reservation);
             drop(finished);
             if limited {
                 break;
@@ -1343,15 +1363,25 @@ async fn claim_offers(
                 _ => {}
             }
             ledger.finish_flight(&owner.key, id, attempt);
-            drop(reservation);
             drop(finished);
-            limited
+            // The reservation goes back to the caller, which holds it until
+            // its response has settled the frame. If the caller is gone, the
+            // runtime drops it with this task's output.
+            (limited, reservation)
         });
         tokio::select! {
             // The first request exhausted its timeout. Leave its replay running,
             // but do not spend another request timeout in this report.
             Ok(()) = replay_started => break,
-            limited = worker => if limited.unwrap_or(true) { break; },
+            done = worker => match done {
+                Ok((limited, reservation)) => {
+                    held.extend(reservation);
+                    if limited {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            },
         }
     }
     Ok(())

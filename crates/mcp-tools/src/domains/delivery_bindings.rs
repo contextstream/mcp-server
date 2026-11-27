@@ -187,16 +187,27 @@ impl Owner {
         Ok(answer)
     }
 
+    /// The lock file of the reservation bucket `id` falls in.
+    fn reservation_path(&self, id: Uuid) -> PathBuf {
+        self.store
+            .with_extension(format!("claim-{:02x}.lock", id.as_bytes()[0]))
+    }
+
     /// The 256 reservation buckets are shared by all writers to this book.
     /// Wait off the async runtime; dropping the guard removes the lock file.
     pub async fn reserve(&self, id: Uuid) -> io::Result<FileLock> {
         if !self.store.is_file() {
             return Err(io::ErrorKind::NotFound.into());
         }
-        let path = self
-            .store
-            .with_extension(format!("claim-{:02x}.lock", id.as_bytes()[0]));
+        let path = self.reservation_path(id);
         tokio::task::spawn_blocking(move || FileLock::acquire(path)).await?
+    }
+
+    /// Whether one of `held` is the reservation of `id`'s bucket. A holder
+    /// does not reserve that bucket again: the lock would wait for itself.
+    pub fn covers(&self, held: &[FileLock], id: Uuid) -> bool {
+        let path = self.reservation_path(id);
+        held.iter().any(|lock| lock.1 == path)
     }
 
     pub async fn bind(

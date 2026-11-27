@@ -51,6 +51,7 @@ pub mod subagent_stop;
 pub mod task_completed;
 pub mod task_created;
 pub mod teammate_idle;
+pub(crate) mod transcript_capture;
 pub mod user_prompt_submit;
 pub(crate) mod verification_gate;
 pub(crate) mod working_set;

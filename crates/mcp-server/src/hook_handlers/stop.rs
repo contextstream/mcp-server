@@ -7,19 +7,12 @@
 
 use anyhow::Result;
 use serde_json::Value;
-use std::time::Duration;
 
 use super::common::{
-    extract_cwd, extract_id, extract_items, host_session_key, load_transcript_hook_config,
-    post_memory_event, prefix_within_bytes, scrub_credential_tokens, scrub_setup_secrets,
-    transcript_has_account_setup, ApiConfig, TranscriptHookConfig,
+    extract_cwd, host_session_key, load_transcript_hook_config, post_memory_event, ApiConfig,
 };
+use super::transcript_capture::{append_assistant_reply, prepare_transcript_message};
 use super::{read_stdin_json, write_stdout_json, HookOutput};
-
-/// Maximum UTF-8 byte length kept for an assistant reply appended from Stop.
-const MAX_ASSISTANT_MESSAGE_BYTES: usize = 16 * 1024;
-const TRUNCATION_SUFFIX: &str = "...";
-const TRANSCRIPT_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Handle the Stop hook.
 pub async fn handle() -> Result<()> {
@@ -128,142 +121,12 @@ pub async fn handle() -> Result<()> {
 
 /// Scrub secrets and cap an assistant reply before appending it to a transcript.
 fn prepare_assistant_reply(reply: &str, input: &Value) -> Option<String> {
-    let trimmed = reply.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let setup_flow = input
-        .get("transcript_path")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .is_some_and(|raw| transcript_has_account_setup(&raw));
-
-    let scrubbed = if setup_flow {
-        scrub_setup_secrets(trimmed)
-    } else {
-        scrub_credential_tokens(trimmed)
-    };
-    let scrubbed = scrubbed.trim();
-    if scrubbed.is_empty() {
-        return None;
-    }
-
-    Some(cap_assistant_message(scrubbed, MAX_ASSISTANT_MESSAGE_BYTES))
+    prepare_transcript_message(reply, input)
 }
 
-/// Bound `text` to at most `max_bytes` UTF-8 bytes, cutting on a character
-/// boundary and appending `...` when truncated.
+#[cfg(test)]
 fn cap_assistant_message(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    if max_bytes <= TRUNCATION_SUFFIX.len() {
-        return prefix_within_bytes(text, max_bytes).to_string();
-    }
-    let prefix = prefix_within_bytes(text, max_bytes - TRUNCATION_SUFFIX.len());
-    format!("{prefix}{TRUNCATION_SUFFIX}")
-}
-
-/// Session IDs to query for this conversation's transcript, preferring the
-/// ContextStream API session ID recorded when `init` ran over the host's own
-/// session ID.
-fn candidate_session_ids(input: &Value) -> Vec<String> {
-    let mut ids = Vec::new();
-    if let Some(host_session) = host_session_key(input) {
-        if let Some(api_session) = super::durable_capture::session_api_session_id(&host_session) {
-            if api_session != "unknown" {
-                ids.push(api_session);
-            }
-        }
-        if host_session != "unknown" && !ids.iter().any(|existing| existing == &host_session) {
-            ids.push(host_session);
-        }
-    }
-    ids
-}
-
-/// Best-effort append of the assistant reply to the session's existing
-/// transcript via `GET /api/v1/transcripts` + `POST /api/v1/transcripts/:id/messages`.
-/// Network and API errors are ignored so the Stop hook never fails.
-async fn append_assistant_reply(config: &TranscriptHookConfig, input: &Value, content: &str) {
-    let candidates = candidate_session_ids(input);
-    if candidates.is_empty() {
-        return;
-    }
-
-    let mut transcript_id = None;
-    for session_id in &candidates {
-        if let Some(id) = find_session_transcript_id(config, session_id).await {
-            transcript_id = Some(id);
-            break;
-        }
-    }
-
-    let Some(transcript_id) = transcript_id else {
-        return;
-    };
-
-    append_transcript_message(config, &transcript_id, content).await;
-}
-
-async fn find_session_transcript_id(
-    config: &TranscriptHookConfig,
-    session_id: &str,
-) -> Option<String> {
-    let mut query = vec![("session_id", session_id), ("per_page", "1")];
-    if let Some(ref ws_id) = config.workspace_id {
-        query.push(("workspace_id", ws_id.as_str()));
-    }
-    if let Some(ref proj_id) = config.project_id {
-        query.push(("project_id", proj_id.as_str()));
-    }
-
-    let response = super::api_http_client()
-        .get(format!("{}/api/v1/transcripts", config.api_url))
-        .header("X-API-Key", &config.api_key)
-        .query(&query)
-        .timeout(TRANSCRIPT_HTTP_TIMEOUT)
-        .send()
-        .await
-        .ok()?;
-
-    if !response.status().is_success() {
-        return None;
-    }
-
-    let value: Value = response.json().await.ok()?;
-    let items = extract_items(&value);
-    items
-        .first()
-        .and_then(extract_id)
-        .and_then(|id| super::durable_capture::plain_session_id(&id))
-}
-
-async fn append_transcript_message(
-    config: &TranscriptHookConfig,
-    transcript_id: &str,
-    content: &str,
-) {
-    let payload = serde_json::json!({
-        "role": "assistant",
-        "content": content,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-    });
-
-    let _ = super::api_http_client()
-        .post(format!(
-            "{}/api/v1/transcripts/{}/messages",
-            config.api_url, transcript_id
-        ))
-        .header("X-API-Key", &config.api_key)
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .timeout(TRANSCRIPT_HTTP_TIMEOUT)
-        .send()
-        .await;
+    super::transcript_capture::cap_transcript_message(text, max_bytes)
 }
 
 #[cfg(test)]

@@ -553,11 +553,54 @@ pub async fn handle() -> Result<()> {
         )
         .await
     };
-    let (context, _, (), contextagents) = tokio::join!(
+    let mut transcript_config = super::common::load_transcript_hook_config(
+        &cwd,
+        "CONTEXTSTREAM_USER_PROMPT_SAVE_TRANSCRIPT",
+        true,
+    );
+    if transcript_config.workspace_id.is_none() {
+        transcript_config.workspace_id = config.workspace_id.clone();
+    }
+    if transcript_config.project_id.is_none() {
+        transcript_config.project_id = config.project_id.clone();
+    }
+    if transcript_config.workspace_id.is_none() || transcript_config.project_id.is_none() {
+        if let Some((ws_id, proj_id)) = super::common::host_session_key(&input)
+            .as_deref()
+            .and_then(super::durable_capture::session_primary_scope)
+        {
+            if transcript_config.workspace_id.is_none() {
+                transcript_config.workspace_id = Some(ws_id.to_string());
+            }
+            if transcript_config.project_id.is_none() {
+                transcript_config.project_id = Some(proj_id.to_string());
+            }
+        }
+    }
+    let save_transcript = input
+        .get("transcripts_enabled")
+        .and_then(Value::as_bool)
+        .or_else(|| input.get("save_transcript").and_then(Value::as_bool))
+        .unwrap_or(transcript_config.save_transcript_default);
+
+    let transcript_fut = async {
+        if !save_transcript || transcript_config.api_key.is_empty() {
+            return;
+        }
+        super::transcript_capture::append_user_prompt(
+            &transcript_config,
+            &input,
+            Some(editor.as_api_str()),
+        )
+        .await;
+    };
+
+    let (context, _, (), contextagents, ()) = tokio::join!(
         context_fut,
         super::dirty_drain::drain_best_effort(std::time::Duration::from_secs(2)),
         coaching_fut,
         contextagents_fut,
+        transcript_fut,
     );
 
     // Standing text goes to a session once per window, not with every prompt.

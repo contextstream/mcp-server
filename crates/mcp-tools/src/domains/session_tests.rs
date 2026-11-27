@@ -660,6 +660,59 @@ mod context_fast_routing_tests {
         assert_eq!(scalar["data"], "legacy payload");
         assert_eq!(scalar["context_route"], "hook_fast");
     }
+
+    #[test]
+    fn hook_owns_transcript_capture_only_when_hook_transcripts_enabled_for_hook_clients() {
+        use mcp_types::HarnessId;
+
+        assert!(super::hook_owns_transcript_capture(
+            true,
+            Some(HarnessId::ClaudeCode),
+            None,
+            None,
+        ));
+        assert!(super::hook_owns_transcript_capture(
+            true,
+            None,
+            Some("claude-code"),
+            None,
+        ));
+        assert!(super::hook_owns_transcript_capture(
+            true,
+            None,
+            None,
+            Some("claude"),
+        ));
+        assert!(super::hook_owns_transcript_capture(
+            true,
+            Some(HarnessId::Cursor),
+            None,
+            None,
+        ));
+
+        // Disabled hook transcripts: context() retains fallback capture.
+        assert!(!super::hook_owns_transcript_capture(
+            false,
+            Some(HarnessId::ClaudeCode),
+            Some("claude-code"),
+            Some("claude"),
+        ));
+
+        // Non-hook or partial-hook clients keep context()-driven capture.
+        assert!(!super::hook_owns_transcript_capture(
+            true,
+            Some(HarnessId::Zed),
+            None,
+            None,
+        ));
+        assert!(!super::hook_owns_transcript_capture(
+            true,
+            None,
+            Some("codex"),
+            None,
+        ));
+        assert!(!super::hook_owns_transcript_capture(true, None, None, None));
+    }
 }
 
 mod context_guidance_tests {

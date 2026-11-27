@@ -2117,6 +2117,31 @@ fn is_read_only_context_lookup_message(message: &str) -> bool {
     lookup_target || version_target
 }
 
+/// Whether lifecycle hooks (`UserPromptSubmit` + `Stop`) own turn-by-turn
+/// transcript capture for the active client.
+///
+/// When true, `context()` leaves transcript persistence to the hooks so its
+/// `user_message` argument (which an LLM may enrich with resolved referents
+/// such as `"(the 504 screenshot)"` for retrieval) never rewrites or duplicates
+/// the user's verbatim transcript. Explicit `save_exchange` calls still win.
+fn hook_owns_transcript_capture(
+    hook_transcripts_enabled: bool,
+    auth_client: Option<mcp_types::HarnessId>,
+    input_client_name: Option<&str>,
+    env_client_name: Option<&str>,
+) -> bool {
+    if !hook_transcripts_enabled {
+        return false;
+    }
+    let harness = auth_client
+        .or_else(|| input_client_name.and_then(mcp_types::HarnessId::from_client_hint))
+        .or_else(|| env_client_name.and_then(mcp_types::HarnessId::from_client_hint));
+    matches!(
+        harness,
+        Some(mcp_types::HarnessId::ClaudeCode | mcp_types::HarnessId::Cursor)
+    )
+}
+
 fn context_fast_route(
     explicit_mode: Option<&str>,
     message: &str,
@@ -8849,16 +8874,28 @@ impl ToolHandler for ContextTool {
         // Priority:
         // 1) Explicit `save_exchange` on this call
         // 2) Prior explicit setting for this session
-        // 3) Process default (env), disabled by default
+        // 3) Process/header default, unless lifecycle hooks (`UserPromptSubmit`
+        //    + `Stop`) own verbatim transcript capture for this client. When
+        //    hooks own capture, `context()` uses `user_message` for retrieval
+        //    only so LLM-paraphrased queries (e.g. resolved referents like
+        //    `"What does it tell us? (the 504 screenshot)"`) never overwrite or
+        //    duplicate the user's verbatim transcript.
         if input.save_exchange.is_some() {
             self.session
                 .set_transcript_capture_enabled(input.save_exchange)
                 .await;
         }
+        let default_save_exchange = config_defaults.transcripts_enabled
+            && !hook_owns_transcript_capture(
+                config_defaults.hook_transcripts_enabled,
+                get_task_auth_override().and_then(|auth| auth.client),
+                input.client_name.as_deref(),
+                std::env::var("CONTEXTSTREAM_CLIENT").ok().as_deref(),
+            );
         let should_save = input
             .save_exchange
             .or(self.session.transcript_capture_enabled().await)
-            .unwrap_or(config_defaults.transcripts_enabled);
+            .unwrap_or(default_save_exchange);
 
         // Auto-calculate session tokens for pressure tracking
         let session_tokens = input.session_tokens.unwrap_or_else(|| state.total_tokens());

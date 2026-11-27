@@ -4101,3 +4101,536 @@ mod doc_listing_slim_tests {
         assert_eq!(doc["preview"], "y".repeat(DOC_LIST_PREVIEW_CHARS));
     }
 }
+
+mod update_visibility_and_team_listing_tests {
+    use super::{register_memory_tools, MemoryTool, TestFixtures, ToolHandler};
+    use crate::registry::ToolRegistry;
+    use mcp_client::ContextStreamClient;
+    use mcp_session::SessionManager;
+    use mcp_types::tool::ContentItem;
+    use mcp_types::ExecutionMode;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    const WORKSPACE: &str = "22222222-2222-4222-8222-222222222222";
+    const ITEM_ID: &str = "44444444-4444-4444-8444-444444444444";
+
+    #[derive(Debug)]
+    struct RecordedRequest {
+        line: String,
+        body: Option<Value>,
+    }
+
+    /// Mock HTTP server that records every request line + JSON body until `stop` fires.
+    /// Collection GETs (GET /api/v1/<collection>...) return `list`; all other requests return `other`.
+    fn start_mock_api(
+        listener: tokio::net::TcpListener,
+        list: Value,
+        other: Value,
+    ) -> (
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Vec<RecordedRequest>>,
+    ) {
+        let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let mut recorded = Vec::new();
+            loop {
+                let accepted = tokio::select! {
+                    _ = &mut stop_rx => break,
+                    res = listener.accept() => match res {
+                        Ok(pair) => pair,
+                        Err(_) => break,
+                    },
+                };
+                let (mut socket, _) = accepted;
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                let mut body_start = None;
+                let mut content_length = 0usize;
+                loop {
+                    let read = socket.read(&mut buf).await.expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                    if body_start.is_none() {
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let header_text = String::from_utf8_lossy(&raw[..pos]);
+                            content_length = header_text
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            body_start = Some(pos + 4);
+                        }
+                    }
+                    if let Some(start) = body_start {
+                        if raw.len() >= start + content_length {
+                            break;
+                        }
+                    }
+                }
+                let start = body_start.unwrap_or(raw.len());
+                let header_text = String::from_utf8_lossy(&raw[..start]).to_string();
+                let line = header_text.lines().next().unwrap_or_default().to_string();
+                let body_bytes = &raw[start..raw.len().min(start + content_length)];
+                let parsed_body = if body_bytes.is_empty() {
+                    None
+                } else {
+                    serde_json::from_slice::<Value>(body_bytes).ok()
+                };
+                let path = line.split(' ').nth(1).unwrap_or_default();
+                let route = path
+                    .trim_start_matches("/api/v1/")
+                    .split('?')
+                    .next()
+                    .unwrap_or_default();
+                let response_body = if line.starts_with("GET ") && !route.contains('/') {
+                    list.clone()
+                } else {
+                    other.clone()
+                }
+                .to_string();
+                recorded.push(RecordedRequest {
+                    line,
+                    body: parsed_body,
+                });
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            recorded
+        });
+        (stop_tx, handle)
+    }
+
+    async fn personal_mode_tool() -> (MemoryTool, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let mut config = TestFixtures::test_config();
+        config.api_url = format!("http://{}", listener.local_addr().expect("listener addr"));
+        config.api_key = Some("test-key".to_string());
+        config.default_project_id = None;
+        let client = ContextStreamClient::new(config.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), config));
+        session
+            .initialize(Some(WORKSPACE.parse().unwrap()), None, None, None)
+            .await;
+        assert_eq!(
+            session.active_execution_mode().await,
+            ExecutionMode::Personal
+        );
+        (
+            MemoryTool::new(client, session, mcp_types::atlas_layer::noop_layer()),
+            listener,
+        )
+    }
+
+    fn text_of(result: &mcp_types::tool::ToolResult) -> String {
+        match &result.content[0] {
+            ContentItem::Text { text } => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_diagram_passes_is_personal_only_when_caller_sets_it() {
+        let personal_diagram = json!({
+            "id": ITEM_ID,
+            "title": "Check Balance flow",
+            "diagram_type": "sequence",
+            "content": "sequenceDiagram\nA->>B: ping",
+            "is_personal": true
+        });
+        let team_diagram = json!({
+            "id": ITEM_ID,
+            "title": "Check Balance flow",
+            "diagram_type": "sequence",
+            "content": "sequenceDiagram\nA->>B: ping",
+            "is_personal": false
+        });
+
+        // 1. Promoting a personal diagram to team-visible by title sends is_personal=false
+        //    and does not filter the title lookup by is_personal=false.
+        let (tool, listener) = personal_mode_tool().await;
+        let (stop, server) = start_mock_api(
+            listener,
+            json!({"success": true, "data": {"items": [personal_diagram.clone()], "total": 1}}),
+            json!({"success": true, "data": team_diagram.clone()}),
+        );
+        tool.execute(json!({
+            "action": "update_diagram",
+            "diagram_id": "Check Balance flow",
+            "is_personal": false
+        }))
+        .await
+        .expect("update_diagram should succeed");
+        let _ = stop.send(());
+        let requests = server.await.expect("server");
+        let lookup = requests
+            .iter()
+            .find(|r| r.line.starts_with("GET /api/v1/diagrams"))
+            .expect("diagram lookup");
+        assert!(
+            !lookup.line.contains("is_personal="),
+            "update_diagram lookup must not filter by the new is_personal value: {}",
+            lookup.line
+        );
+        let patch = requests
+            .iter()
+            .find(|r| {
+                r.line
+                    .starts_with(&format!("PATCH /api/v1/diagrams/{ITEM_ID}"))
+            })
+            .expect("PATCH /diagrams/{id}");
+        assert_eq!(
+            patch.body.as_ref().and_then(|b| b.get("is_personal")),
+            Some(&json!(false)),
+            "expected is_personal=false in PATCH body: {:?}",
+            patch.body
+        );
+
+        // 2. Updating without is_personal must omit is_personal (even in personal mode).
+        let (tool, listener) = personal_mode_tool().await;
+        let (stop, server) = start_mock_api(
+            listener,
+            json!({"success": true, "data": {"items": [team_diagram.clone()], "total": 1}}),
+            json!({"success": true, "data": team_diagram}),
+        );
+        tool.execute(json!({
+            "action": "update_diagram",
+            "diagram_id": ITEM_ID,
+            "title": "Check Balance flow v2"
+        }))
+        .await
+        .expect("update_diagram without is_personal should succeed");
+        let _ = stop.send(());
+        let requests = server.await.expect("server");
+        let patch = requests
+            .iter()
+            .find(|r| {
+                r.line
+                    .starts_with(&format!("PATCH /api/v1/diagrams/{ITEM_ID}"))
+            })
+            .expect("PATCH /diagrams/{id}");
+        assert!(
+            patch
+                .body
+                .as_ref()
+                .and_then(|b| b.get("is_personal"))
+                .is_none(),
+            "omitted is_personal must not be sent on update_diagram: {:?}",
+            patch.body
+        );
+    }
+
+    #[tokio::test]
+    async fn update_doc_passes_is_personal_only_when_caller_sets_it() {
+        let personal_doc = json!({
+            "id": ITEM_ID,
+            "title": "Balance Runbook",
+            "doc_type": "runbook",
+            "content": "Steps",
+            "is_personal": true
+        });
+        let team_doc = json!({
+            "id": ITEM_ID,
+            "title": "Balance Runbook",
+            "doc_type": "runbook",
+            "content": "Steps",
+            "is_personal": false
+        });
+
+        // 1. Promoting a personal doc to team-visible by title sends is_personal=false.
+        let (tool, listener) = personal_mode_tool().await;
+        let (stop, server) = start_mock_api(
+            listener,
+            json!({"success": true, "data": {"items": [personal_doc.clone()], "total": 1}}),
+            json!({"success": true, "data": team_doc.clone()}),
+        );
+        tool.execute(json!({
+            "action": "update_doc",
+            "doc_id": "Balance Runbook",
+            "is_personal": false
+        }))
+        .await
+        .expect("update_doc should succeed");
+        let _ = stop.send(());
+        let requests = server.await.expect("server");
+        let lookup = requests
+            .iter()
+            .find(|r| r.line.starts_with("GET /api/v1/docs"))
+            .expect("doc lookup");
+        assert!(
+            !lookup.line.contains("is_personal="),
+            "update_doc lookup must not filter by the new is_personal value: {}",
+            lookup.line
+        );
+        let patch = requests
+            .iter()
+            .find(|r| r.line.starts_with(&format!("PATCH /api/v1/docs/{ITEM_ID}")))
+            .expect("PATCH /docs/{id}");
+        assert_eq!(
+            patch.body.as_ref().and_then(|b| b.get("is_personal")),
+            Some(&json!(false)),
+            "expected is_personal=false in PATCH body: {:?}",
+            patch.body
+        );
+
+        // 2. Updating without is_personal must omit is_personal (even in personal mode).
+        let (tool, listener) = personal_mode_tool().await;
+        let (stop, server) = start_mock_api(
+            listener,
+            json!({"success": true, "data": {"items": [team_doc.clone()], "total": 1}}),
+            json!({"success": true, "data": team_doc}),
+        );
+        tool.execute(json!({
+            "action": "update_doc",
+            "doc_id": ITEM_ID,
+            "title": "Balance Runbook v2"
+        }))
+        .await
+        .expect("update_doc without is_personal should succeed");
+        let _ = stop.send(());
+        let requests = server.await.expect("server");
+        let patch = requests
+            .iter()
+            .find(|r| r.line.starts_with(&format!("PATCH /api/v1/docs/{ITEM_ID}")))
+            .expect("PATCH /docs/{id}");
+        assert!(
+            patch
+                .body
+                .as_ref()
+                .and_then(|b| b.get("is_personal"))
+                .is_none(),
+            "omitted is_personal must not be sent on update_doc: {:?}",
+            patch.body
+        );
+    }
+
+    #[tokio::test]
+    async fn update_todo_passes_is_personal_only_when_caller_sets_it() {
+        let personal_todo = json!({
+            "id": ITEM_ID,
+            "title": "Ship balance fix",
+            "description": "Details",
+            "status": "pending",
+            "is_personal": true
+        });
+        let team_todo = json!({
+            "id": ITEM_ID,
+            "title": "Ship balance fix",
+            "description": "Details",
+            "status": "pending",
+            "is_personal": false
+        });
+
+        // 1. Promoting a personal todo to team-visible by title sends is_personal=false.
+        let (tool, listener) = personal_mode_tool().await;
+        let (stop, server) = start_mock_api(
+            listener,
+            json!({"success": true, "data": {"items": [personal_todo.clone()], "total": 1}}),
+            json!({"success": true, "data": team_todo.clone()}),
+        );
+        tool.execute(json!({
+            "action": "update_todo",
+            "todo_id": "Ship balance fix",
+            "is_personal": false
+        }))
+        .await
+        .expect("update_todo should succeed");
+        let _ = stop.send(());
+        let requests = server.await.expect("server");
+        let lookup = requests
+            .iter()
+            .find(|r| r.line.starts_with("GET /api/v1/todos"))
+            .expect("todo lookup");
+        assert!(
+            !lookup.line.contains("is_personal="),
+            "update_todo lookup must not filter by the new is_personal value: {}",
+            lookup.line
+        );
+        let patch = requests
+            .iter()
+            .find(|r| {
+                r.line
+                    .starts_with(&format!("PATCH /api/v1/todos/{ITEM_ID}"))
+            })
+            .expect("PATCH /todos/{id}");
+        assert_eq!(
+            patch.body.as_ref().and_then(|b| b.get("is_personal")),
+            Some(&json!(false)),
+            "expected is_personal=false in PATCH body: {:?}",
+            patch.body
+        );
+
+        // 2. Updating without is_personal must omit is_personal (even in personal mode).
+        let (tool, listener) = personal_mode_tool().await;
+        let (stop, server) = start_mock_api(
+            listener,
+            json!({"success": true, "data": {"items": [team_todo.clone()], "total": 1}}),
+            json!({"success": true, "data": team_todo}),
+        );
+        tool.execute(json!({
+            "action": "update_todo",
+            "todo_id": ITEM_ID,
+            "title": "Ship balance fix v2"
+        }))
+        .await
+        .expect("update_todo without is_personal should succeed");
+        let _ = stop.send(());
+        let requests = server.await.expect("server");
+        let patch = requests
+            .iter()
+            .find(|r| {
+                r.line
+                    .starts_with(&format!("PATCH /api/v1/todos/{ITEM_ID}"))
+            })
+            .expect("PATCH /todos/{id}");
+        assert!(
+            patch
+                .body
+                .as_ref()
+                .and_then(|b| b.get("is_personal"))
+                .is_none(),
+            "omitted is_personal must not be sent on update_todo: {:?}",
+            patch.body
+        );
+    }
+
+    #[tokio::test]
+    async fn team_listings_with_explicit_workspace_id_work_outside_team_mode() {
+        let cases = [
+            (
+                "team_diagrams",
+                "/api/v1/diagrams",
+                json!({"id": ITEM_ID, "title": "Team diagram", "diagram_type": "sequence", "is_personal": false}),
+            ),
+            (
+                "team_docs",
+                "/api/v1/docs",
+                json!({"id": ITEM_ID, "title": "Team doc", "doc_type": "runbook", "content": "Body", "is_personal": false}),
+            ),
+            (
+                "team_todos",
+                "/api/v1/todos",
+                json!({"id": ITEM_ID, "title": "Team todo", "status": "pending", "is_personal": false}),
+            ),
+            (
+                "team_tasks",
+                "/api/v1/tasks",
+                json!({"id": ITEM_ID, "title": "Team task", "status": "pending"}),
+            ),
+            (
+                "team_discussions",
+                "/api/v1/discussions",
+                json!({"id": ITEM_ID, "title": "Team discussion"}),
+            ),
+        ];
+
+        for (action, expected_path, item) in cases {
+            let (tool, listener) = personal_mode_tool().await;
+            let (stop, server) = start_mock_api(
+                listener,
+                json!({"success": true, "data": {"items": [item.clone()], "total": 1}}),
+                json!({"success": true, "data": {}}),
+            );
+            let result = tool
+                .execute(json!({
+                    "action": action,
+                    "workspace_id": WORKSPACE
+                }))
+                .await
+                .unwrap_or_else(|err| panic!("{action} with workspace_id failed: {err}"));
+            let _ = stop.send(());
+            let requests = server.await.expect("server");
+            let expected_title = item["title"].as_str().unwrap();
+            let text = text_of(&result);
+            assert!(
+                text.contains(expected_title),
+                "{action} should return team item '{expected_title}', got: {text}"
+            );
+            assert!(
+                requests.iter().any(|r| {
+                    r.line.starts_with(&format!("GET {expected_path}"))
+                        && r.line.contains(&format!("workspace_id={WORKSPACE}"))
+                }),
+                "{action} should query {expected_path} for workspace {WORKSPACE}: {requests:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn team_listings_without_workspace_id_outside_team_mode_explain_how_to_switch() {
+        let cases = [
+            json!({"action": "team_diagrams"}),
+            json!({"action": "team_docs"}),
+            json!({"action": "team_todos"}),
+            json!({"action": "team_tasks"}),
+            json!({"action": "team_discussions"}),
+            json!({"action": "team_transcript_topics", "query": "deploy"}),
+        ];
+
+        for call in cases {
+            let action = call["action"].as_str().unwrap().to_string();
+            let (tool, _listener) = personal_mode_tool().await;
+            let err = tool.execute(call).await.expect_err(&format!(
+                "{action} without workspace_id outside team mode should error"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("session(action=\"set_account_mode\", account_mode=\"team\")"),
+                "{action} error must tell caller how to switch to team mode, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_actions_schema_documents_is_personal() {
+        let client = super::create_mock_client();
+        let session = super::create_mock_session(&client);
+        let mut registry = ToolRegistry::new(&TestFixtures::test_config());
+        register_memory_tools(&mut registry, client, session);
+
+        let memory = registry.get("memory").expect("memory tool");
+        let schema = &memory.input_schema;
+        let is_personal_desc = schema["properties"]["is_personal"]["description"]
+            .as_str()
+            .expect("is_personal description");
+        assert!(
+            is_personal_desc.contains("update"),
+            "memory is_personal description should mention update actions: {is_personal_desc}"
+        );
+        let action_desc = schema["properties"]["action"]["description"]
+            .as_str()
+            .expect("action description");
+        assert!(
+            action_desc.contains("update_diagram")
+                && action_desc.contains("update_doc")
+                && action_desc.contains("update_todo")
+                && action_desc.contains("is_personal"),
+            "memory action reference should mention is_personal on update actions"
+        );
+
+        let update_doc = registry
+            .get("memory_update_doc")
+            .expect("memory_update_doc alias");
+        let update_doc_schema = &update_doc.input_schema;
+        let prop = update_doc_schema["properties"]
+            .get("is_personal")
+            .expect("memory_update_doc must advertise is_personal");
+        assert_eq!(prop["type"], "boolean");
+    }
+}

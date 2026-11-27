@@ -66,7 +66,7 @@ pub const QUESTION_TYPES: &[&str] = &["noul", "choice"];
 pub const ROLLUP_RULES: &[&str] = &["all", "any", "at_least"];
 /// Where a list comes from: `kind` of a [`ListSource`].
 pub const SOURCE_KINDS: &[&str] = &[
-    "rows", "csv", "audience", "sheet", "excel", "notion", "linear", "issues", "jira",
+    "rows", "csv", "audience", "sheet", "excel", "notion", "linear", "issues", "jira", "mail",
 ];
 /// Where a requirement check's document comes from: `kind` of a
 /// [`RunDocument`].
@@ -85,6 +85,9 @@ pub const RUN_SURFACE: &str = "mcp";
 /// The code a 503 ends with while answering is switched off where the API
 /// runs. It does not change in the seconds a retry waits.
 pub const NOT_ASKING: &str = "[NOT_ASKING]";
+/// The code a 503 ends with where Mail is not set up, so a person's mail is
+/// no list there. It does not change in the seconds a retry waits either.
+pub const MAIL_UNAVAILABLE: &str = "[MAIL_UNAVAILABLE]";
 /// The spec format the API reads, filled in when a spec leaves it out.
 pub const SPEC_FORMAT: u32 = 1;
 /// What a run's export is asked for as.
@@ -246,6 +249,34 @@ pub enum ListSource {
         project_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+    },
+    /// The caller's own mail, read with their own credential as Mail lets
+    /// them read it: one of their mailboxes (`address`), one `folder` (`inbox`
+    /// when left out), narrowed by Mail's filters. One row a message, keyed
+    /// by its id, without its body. A run over it is the caller's alone and
+    /// is never written back.
+    Mail {
+        address: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        /// What triage calls the mail (`customer`, `newsletter`, ...).
+        #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flagged: Option<bool>,
+        /// `any`, `high`, `medium` or `low`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<String>,
+        /// A date (`2026-11-01`) or an RFC 3339 time: mail received after it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unread: Option<bool>,
+        /// A sender's address or name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
     },
 }
 
@@ -885,6 +916,15 @@ mod tests {
                 "jira",
             ),
             (json!({"kind": "jira"}), "jira"),
+            // The caller's own mail: every filter as given, or only the
+            // mailbox.
+            (
+                json!({"kind": "mail", "address": "ada@acme.dev", "folder": "archive", "query": "invoice",
+                       "type": "customer", "flagged": false, "priority": "high",
+                       "since": "2026-11-01T09:00:00Z", "unread": true, "from": "Grace"}),
+                "mail",
+            ),
+            (json!({"kind": "mail", "address": "ada@acme.dev"}), "mail"),
         ] {
             let source: ListSource = serde_json::from_value(sent.clone()).unwrap();
             assert_eq!(serde_json::to_value(&source).unwrap(), sent, "{kind}");
@@ -901,6 +941,17 @@ mod tests {
             .contains("unknown field `project`"));
         let unknown = serde_json::from_value::<ListSource>(json!({"kind": "asana"}));
         assert!(unknown.unwrap_err().to_string().contains("asana"));
+        // Mail is read from one of the caller's mailboxes, and never with a
+        // body.
+        let missing = serde_json::from_value::<ListSource>(json!({"kind": "mail"}));
+        assert!(missing.unwrap_err().to_string().contains("address"));
+        let stray = serde_json::from_value::<ListSource>(
+            json!({"kind": "mail", "address": "ada@acme.dev", "body": true}),
+        );
+        assert!(stray
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field `body`"));
     }
 
     #[test]

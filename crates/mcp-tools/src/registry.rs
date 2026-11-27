@@ -2852,7 +2852,7 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
                 "nightly watch",
             ],
             tags: &["questions", "lists", "rows", "answers", "review", "runs"],
-            when_to_use: "Ask a saved question with fixed answers about every row of a list (leads, tickets, Jira issues, contracts): find or save one, label rows with the person's answers, try it, activate it, run it on a list or answer one row, check a list of requirements against a document, read which rows are Sure and which a person checks, export a run as a CSV, write its answers back to a Google Sheet, an Excel workbook or an audience, and read the nightly watch's checks of its answers.",
+            when_to_use: "Ask a saved question with fixed answers about every row of a list (leads, tickets, Jira issues, your own mail, contracts): find or save one, label rows with the person's answers, try it, activate it, run it on a list or answer one row, check a list of requirements against a document, read which rows are Sure and which a person checks, export a run as a CSV, write its answers back to a Google Sheet, an Excel workbook or an audience, and read the nightly watch's checks of its answers.",
             avoid_when: "Do not use for questions about the codebase or memory (search, answer, memory), or to label rows with your own guesses: labels are the person's answers.",
             examples: &[
                 "which saved questions does this workspace have",
@@ -2863,6 +2863,7 @@ fn discovery_hints(name: &str, metadata: &ToolMetadata) -> DiscoveryHints {
                 "copy the lead fit starter template",
                 "check these requirements against the vendor's response",
                 "run the triage question on our Jira issues",
+                "ask the urgency question about every message in my inbox",
                 "did the nightly watch hold any of our questions",
             ],
             latency_class: "variable",

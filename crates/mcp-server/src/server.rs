@@ -507,6 +507,7 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
             "index": "Indexing media in ContextStream",
             "upload_url": "Preparing ContextStream media upload URL",
             "complete_upload": "Completing ContextStream media upload",
+            "update": "Updating media in ContextStream",
             "delete": "Deleting media in ContextStream",
             "list": "Listing ContextStream media",
             "search": "Searching ContextStream media",
@@ -3639,11 +3640,11 @@ mod tests {
         ),
         (
             // Additive: hosted client-side upload actions (upload_url,
-            // complete_upload) and optional upload-init fields (filename,
-            // size_bytes, mime_type, title). Every earlier action and field
-            // remains accepted.
+            // complete_upload), update action, and optional upload/update
+            // fields (filename, size_bytes, mime_type, title, description,
+            // is_personal). Every earlier action and field remains accepted.
             "media",
-            "bd6e5e78af4fcf1d54b28bd3099d51e334cf3df9f243df0db45ffcf3580477c7",
+            "8f2495c8243d79e33dd93ba8b3af9f48fb61fd6dfb769ae7187d4d91315424b6",
         ),
         (
             // Advanced in Wave 3b: additive typed-decision inputs (sort,

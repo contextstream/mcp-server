@@ -155,6 +155,7 @@ pub use client::{
     // Media params
     MediaIndexParams,
     MediaSearchParams,
+    MediaUpdateParams,
     MediaUploadInitParams,
     MemorySearchParams,
     NotionCreateDatabaseParams,

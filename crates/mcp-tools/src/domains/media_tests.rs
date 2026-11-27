@@ -621,12 +621,13 @@ mod constants_tests {
         assert!(VALID_ACTIONS.contains(&"index"));
         assert!(VALID_ACTIONS.contains(&"upload_url"));
         assert!(VALID_ACTIONS.contains(&"complete_upload"));
+        assert!(VALID_ACTIONS.contains(&"update"));
         assert!(VALID_ACTIONS.contains(&"status"));
         assert!(VALID_ACTIONS.contains(&"search"));
         assert!(VALID_ACTIONS.contains(&"get_clip"));
         assert!(VALID_ACTIONS.contains(&"list"));
         assert!(VALID_ACTIONS.contains(&"delete"));
-        assert_eq!(VALID_ACTIONS.len(), 8);
+        assert_eq!(VALID_ACTIONS.len(), 9);
     }
 
     #[test]

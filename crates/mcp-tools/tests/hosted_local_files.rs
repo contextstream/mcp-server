@@ -91,23 +91,125 @@ async fn http_gateway_refuses_skill_import_file_path() {
 }
 
 #[tokio::test]
-async fn http_gateway_refuses_media_index_file_path() {
-    let (_, media, _) = build_tools(gateway_config(true, false));
-    let text = result_text(
-        media
-            .execute(json!({
-                "action": "index",
-                "file_path": "/etc/hostname",
-                "content_type": "document",
-                "allow_broad": true,
-                "workspace_id": TEST_WS
-            }))
-            .await,
-    );
-    assert!(text.contains(DISABLED_MARKER), "got: {text}");
+async fn http_gateway_media_index_file_path_returns_upload_plan_without_reading_disk() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen_clone = seen.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let seen_clone = seen_clone.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let head = loop {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap_or(0);
+                    if count == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        let len: usize = head
+                            .lines()
+                            .filter_map(|l| l.split_once(':'))
+                            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, v)| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break head;
+                        }
+                    }
+                };
+                let line = head.lines().next().unwrap_or_default().to_string();
+                seen_clone.lock().unwrap().push(line);
+                let payload = json!({
+                    "success": true,
+                    "data": {
+                        "content_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "upload_url": "https://storage.example.test/presigned",
+                        "headers": {"Content-Type": "text/plain"},
+                        "expires_in_seconds": 600
+                    }
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let cfg = Config {
+        api_url: base_url,
+        api_key: Some("test-api-key".to_string()),
+        allow_header_auth: true,
+        is_http_transport: true,
+        http_local_files: false,
+        ..Config::default()
+    };
+    let (_, media, _) = build_tools(cfg);
+    // Even though /etc/hostname exists on the gateway host, hosted media index
+    // must NEVER read it; it calls uploads/init and returns a client upload plan.
+    let result = media
+        .execute(json!({
+            "action": "index",
+            "file_path": "/etc/hostname",
+            "content_type": "document",
+            "size_bytes": 16,
+            "allow_broad": true,
+            "workspace_id": TEST_WS
+        }))
+        .await
+        .expect("hosted media index should return upload plan instead of dead-ending");
+
+    task.abort();
+
+    let calls = seen.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "only uploads/init should run: {calls:?}");
     assert!(
-        text.contains("external_url"),
-        "names the safe alternative: {text}"
+        calls[0].starts_with(&format!(
+            "POST /api/v1/workspaces/{TEST_WS}/content/uploads/init "
+        )),
+        "got: {:?}",
+        calls
+    );
+    let text = result_text(Ok(result));
+    assert!(
+        text.contains("curl -fsS -X PUT --upload-file '/etc/hostname'"),
+        "got: {text}"
+    );
+    assert!(text.contains("complete_upload"), "got: {text}");
+}
+
+#[tokio::test]
+async fn http_gateway_client_media_index_refusal_names_upload_path() {
+    let client = ContextStreamClient::new(gateway_config(true, false));
+    let err = client
+        .media_index(mcp_client::MediaIndexParams {
+            file_path: Some("/etc/hostname".to_string()),
+            workspace_id: Some(uuid::Uuid::parse_str(TEST_WS).unwrap()),
+            ..Default::default()
+        })
+        .await
+        .expect_err("direct client.media_index(file_path) must still refuse on hosted gateway")
+        .to_string();
+    assert!(err.contains(DISABLED_MARKER), "got: {err}");
+    assert!(err.contains("upload_url"), "names upload_url path: {err}");
+    assert!(
+        err.contains("complete_upload"),
+        "names complete_upload follow-up: {err}"
+    );
+    assert!(
+        err.contains("external_url"),
+        "still names external_url: {err}"
     );
 }
 

@@ -1308,3 +1308,666 @@ mod ingest_containment_tests {
         }
     }
 }
+
+// ============================================================================
+// Hosted Media Upload Plan & Complete Upload Tests
+// ============================================================================
+
+mod hosted_upload_plan_tests {
+    use super::*;
+    use crate::registry::ToolHandler;
+    use mcp_types::tool::ContentItem;
+    use mcp_types::Config;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TEST_WS: &str = "11111111-1111-4111-8111-111111111111";
+    const TEST_PROJECT: &str = "22222222-2222-4222-8222-222222222222";
+    const TEST_CONTENT_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        line: String,
+        body: Vec<u8>,
+    }
+
+    struct MediaStubServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl MediaStubServer {
+        async fn start<F>(handler: F) -> Self
+        where
+            F: Fn(&str, &[u8], &str) -> (u16, String) + Send + Sync + 'static,
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = requests.clone();
+            let handler = Arc::new(handler);
+            let server_base = base_url.clone();
+
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let recorded = recorded.clone();
+                    let handler = handler.clone();
+                    let server_base = server_base.clone();
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let (head, body) = loop {
+                            let mut chunk = [0u8; 4096];
+                            let count = socket.read(&mut chunk).await.unwrap_or(0);
+                            if count == 0 {
+                                return;
+                            }
+                            request.extend_from_slice(&chunk[..count]);
+                            let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n")
+                            else {
+                                continue;
+                            };
+                            let head = String::from_utf8_lossy(&request[..end]).to_string();
+                            let length: usize = head
+                                .lines()
+                                .filter_map(|line| line.split_once(':'))
+                                .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                                .and_then(|(_, value)| value.trim().parse().ok())
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                let body = request[end + 4..end + 4 + length].to_vec();
+                                break (head, body);
+                            }
+                        };
+                        let line = head.lines().next().unwrap_or_default().to_string();
+                        recorded.lock().unwrap().push(RecordedRequest {
+                            line: line.clone(),
+                            body: body.clone(),
+                        });
+                        let (status, payload) = handler(&line, &body, &server_base);
+                        let reason = match status {
+                            200 => "OK",
+                            400 => "Bad Request",
+                            422 => "Unprocessable Entity",
+                            _ => "Error",
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+
+            Self {
+                base_url,
+                requests,
+                task,
+            }
+        }
+
+        fn recorded(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for MediaStubServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn build_tool(
+        base_url: &str,
+        is_http_transport: bool,
+        http_local_files: bool,
+    ) -> (MediaTool, Arc<SessionManager>) {
+        let cfg = Config {
+            api_url: base_url.to_string(),
+            api_key: Some("test-api-key".to_string()),
+            is_http_transport,
+            http_local_files,
+            ..Config::default()
+        };
+        let client = ContextStreamClient::new(cfg.clone());
+        let session = Arc::new(SessionManager::new(client.clone(), cfg));
+        (MediaTool::new(client, session.clone()), session)
+    }
+
+    fn result_text(result: &ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|item| match item {
+                ContentItem::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn hosted_index_with_file_path_returns_upload_plan_without_reading_disk() {
+        let presigned_url =
+            "https://storage.example.test/upload/doc?X-Amz-Signature=SENSITIVE_PRESIGN_SIG&foo=bar";
+        let server = MediaStubServer::start(move |line, _body, _base| {
+            if line.starts_with(&format!(
+                "POST /api/v1/workspaces/{TEST_WS}/content/uploads/init "
+            )) {
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "content_id": TEST_CONTENT_ID,
+                            "upload_url": presigned_url,
+                            "headers": {
+                                "Content-Type": "application/pdf",
+                                "x-amz-meta-source": "mcp"
+                            },
+                            "expires_in_seconds": 900
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (
+                    400,
+                    json!({"error": {"message": format!("unexpected request: {line}")}})
+                        .to_string(),
+                )
+            }
+        })
+        .await;
+
+        let (tool, _) = build_tool(&server.base_url, true, false);
+        let client_path = "/home/chase/Downloads/Orrinvale's MSA KB-ODS-2026-014 (signed).pdf";
+
+        let result = tool
+            .execute(json!({
+                "action": "index",
+                "file_path": client_path,
+                "content_type": "document",
+                "size_bytes": 123456,
+                "title": "Orrinvale MSA",
+                "tags": ["contract", "signed"],
+                "workspace_id": TEST_WS,
+                "project_id": TEST_PROJECT
+            }))
+            .await
+            .expect("hosted index with file_path should return upload plan");
+
+        let recorded = server.recorded();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "expected only uploads/init call: {recorded:?}"
+        );
+        assert!(recorded[0].line.starts_with(&format!(
+            "POST /api/v1/workspaces/{TEST_WS}/content/uploads/init "
+        )));
+        let init_body: Value = serde_json::from_slice(&recorded[0].body).unwrap();
+        assert_eq!(
+            init_body["filename"],
+            "Orrinvale's MSA KB-ODS-2026-014 (signed).pdf"
+        );
+        assert_eq!(init_body["content_type"], "document");
+        assert_eq!(init_body["mime_type"], "application/pdf");
+        assert_eq!(init_body["size_bytes"], 123456);
+        assert_eq!(init_body["title"], "Orrinvale MSA");
+        assert_eq!(init_body["tags"], json!(["contract", "signed"]));
+        assert_eq!(init_body["project_id"], TEST_PROJECT);
+
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("upload plan should include structured_content");
+        assert_eq!(structured["content_id"], TEST_CONTENT_ID);
+        assert_eq!(structured["upload_url"], presigned_url);
+        assert_eq!(structured["headers"]["Content-Type"], "application/pdf");
+        assert_eq!(structured["headers"]["x-amz-meta-source"], "mcp");
+        assert_eq!(structured["expires_in_seconds"], 900);
+
+        let upload_command = structured["upload_command"]
+            .as_str()
+            .expect("upload_command string");
+        assert!(
+            upload_command.starts_with("curl -fsS -X PUT --upload-file "),
+            "got: {upload_command}"
+        );
+        assert!(
+            upload_command.contains(
+                "'/home/chase/Downloads/Orrinvale'\\''s MSA KB-ODS-2026-014 (signed).pdf'"
+            ),
+            "path must be safely single-quoted: {upload_command}"
+        );
+        assert!(
+            upload_command.contains("-H 'Content-Type: application/pdf'"),
+            "missing Content-Type header flag: {upload_command}"
+        );
+        assert!(
+            upload_command.contains("-H 'x-amz-meta-source: mcp'"),
+            "missing custom header flag: {upload_command}"
+        );
+        assert!(
+            upload_command.contains(&format!("'{presigned_url}'")),
+            "upload_url must be single-quoted: {upload_command}"
+        );
+
+        let expected_followup =
+            format!("media(action=\"complete_upload\", content_id=\"{TEST_CONTENT_ID}\")");
+        assert_eq!(structured["complete_upload_call"], expected_followup);
+
+        let text = result_text(&result);
+        assert!(text.contains(TEST_CONTENT_ID), "text: {text}");
+        assert!(text.contains(upload_command), "text: {text}");
+        assert!(text.contains(&expected_followup), "text: {text}");
+        assert!(text.contains("900"), "text should show expiry: {text}");
+    }
+
+    #[tokio::test]
+    async fn hosted_index_without_size_bytes_asks_with_stat_command_when_api_requires_it() {
+        let server = MediaStubServer::start(|line, _body, _base| {
+            if line.contains("/content/uploads/init") {
+                (
+                    422,
+                    json!({
+                        "success": false,
+                        "error": {
+                            "code": "VALIDATION_ERROR",
+                            "message": "Failed to deserialize the JSON body into the target type: missing field `size_bytes`"
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (400, "{}".to_string())
+            }
+        })
+        .await;
+
+        let (tool, _) = build_tool(&server.base_url, true, false);
+        let client_path = "/home/chase/Downloads/Orrinvale MSA (signed).pdf";
+
+        let err = tool
+            .execute(json!({
+                "action": "index",
+                "file_path": client_path,
+                "content_type": "document",
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect_err("should ask caller for size_bytes when API requires it")
+            .to_string();
+
+        assert!(err.contains("size_bytes"), "got: {err}");
+        assert!(
+            err.contains("stat -c %s '/home/chase/Downloads/Orrinvale MSA (signed).pdf'"),
+            "error must include exact stat command with quoted path, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_url_action_starts_upload_without_reading_disk() {
+        let server = MediaStubServer::start(|line, _body, _base| {
+            if line.contains("/content/uploads/init") {
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "content_id": TEST_CONTENT_ID,
+                            "upload_url": "https://storage.example.test/put/img",
+                            "headers": {"Content-Type": "image/png"},
+                            "expires_in_seconds": 600
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (400, "{}".to_string())
+            }
+        })
+        .await;
+
+        // Even in local stdio mode, action="upload_url" only starts the upload.
+        let (tool, _) = build_tool(&server.base_url, false, false);
+        let result = tool
+            .execute(json!({
+                "action": "upload_url",
+                "file_path": "/nonexistent/local/screenshot.png",
+                "size_bytes": 4096,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("upload_url should not read local disk");
+
+        let recorded = server.recorded();
+        assert_eq!(recorded.len(), 1);
+        let body: Value = serde_json::from_slice(&recorded[0].body).unwrap();
+        assert_eq!(body["filename"], "screenshot.png");
+        assert_eq!(body["content_type"], "image");
+        assert_eq!(body["mime_type"], "image/png");
+        assert_eq!(body["size_bytes"], 4096);
+
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["content_id"], TEST_CONTENT_ID);
+        assert_eq!(
+            structured["upload_url"],
+            "https://storage.example.test/put/img"
+        );
+        assert!(structured["upload_command"]
+            .as_str()
+            .unwrap()
+            .contains("curl -fsS -X PUT --upload-file '/nonexistent/local/screenshot.png'"));
+    }
+
+    #[tokio::test]
+    async fn complete_upload_calls_api_and_returns_status_followup() {
+        let server = MediaStubServer::start(|line, _body, _base| {
+            if line.starts_with(&format!(
+                "POST /api/v1/workspaces/{TEST_WS}/content/{TEST_CONTENT_ID}/complete-upload "
+            )) {
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "id": TEST_CONTENT_ID,
+                            "status": "processing",
+                            "filename": "contract.pdf",
+                            "content_type": "document"
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (
+                    400,
+                    json!({"error": {"message": format!("unexpected: {line}")}}).to_string(),
+                )
+            }
+        })
+        .await;
+
+        let (tool, _) = build_tool(&server.base_url, true, false);
+        let result = tool
+            .execute(json!({
+                "action": "complete_upload",
+                "content_id": TEST_CONTENT_ID,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("complete_upload should call the complete-upload endpoint");
+
+        let recorded = server.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].line.starts_with(&format!(
+            "POST /api/v1/workspaces/{TEST_WS}/content/{TEST_CONTENT_ID}/complete-upload "
+        )));
+
+        let text = result_text(&result);
+        assert!(text.contains(TEST_CONTENT_ID), "text: {text}");
+        assert!(text.contains("processing"), "text: {text}");
+        assert!(
+            text.contains(&format!(
+                "media(action=\"status\", content_id=\"{TEST_CONTENT_ID}\")"
+            )),
+            "text: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_upload_requires_content_id() {
+        let client = create_mock_client();
+        let session = create_mock_session(&client);
+        let tool = MediaTool::new(client, session);
+
+        let err = tool
+            .execute(json!({
+                "action": "complete_upload",
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect_err("complete_upload without content_id must fail")
+            .to_string();
+
+        assert!(err.contains("content_id"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn local_mode_and_self_hosted_opt_in_keep_direct_upload_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("contract.pdf");
+        let file_bytes = b"%PDF-1.7\ncontract body\n";
+        std::fs::write(&file, file_bytes).unwrap();
+        let file_str = file.to_string_lossy().to_string();
+
+        for (is_http, opt_in) in [(false, false), (true, true)] {
+            let server = MediaStubServer::start(|line, _body, base| {
+                if line.contains("/content/uploads/init") {
+                    (
+                        200,
+                        json!({
+                            "success": true,
+                            "data": {
+                                "content_id": TEST_CONTENT_ID,
+                                "upload_url": format!("{base}/put-target"),
+                                "headers": {"Content-Type": "application/pdf"},
+                                "expires_in_seconds": 300
+                            }
+                        })
+                        .to_string(),
+                    )
+                } else if line.starts_with("PUT /put-target ") {
+                    (200, "{}".to_string())
+                } else if line.contains("/complete-upload") {
+                    (
+                        200,
+                        json!({
+                            "success": true,
+                            "data": {
+                                "id": TEST_CONTENT_ID,
+                                "status": "processing"
+                            }
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (400, "{}".to_string())
+                }
+            })
+            .await;
+
+            let (tool, session) = build_tool(&server.base_url, is_http, opt_in);
+            session
+                .update_scope(
+                    Some(Uuid::parse_str(TEST_WS).unwrap()),
+                    None,
+                    Some(dir.path().to_string_lossy().to_string()),
+                )
+                .await;
+
+            let result = tool
+                .execute(json!({
+                    "action": "index",
+                    "file_path": file_str,
+                    "content_type": "document",
+                    "workspace_id": TEST_WS
+                }))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("direct upload failed (is_http={is_http}, opt_in={opt_in}): {e}")
+                });
+
+            let recorded = server.recorded();
+            assert_eq!(
+                recorded.len(),
+                3,
+                "expected init + PUT + complete-upload (is_http={is_http}, opt_in={opt_in}): {recorded:?}"
+            );
+            assert!(recorded[0].line.contains("/content/uploads/init"));
+            assert!(recorded[1].line.starts_with("PUT /put-target "));
+            assert_eq!(recorded[1].body, file_bytes);
+            assert!(recorded[2].line.contains("/complete-upload"));
+
+            let text = result_text(&result);
+            assert!(
+                text.contains("Media indexed with content_id:"),
+                "got: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_index_still_rejects_secret_paths_without_calling_api() {
+        let server = MediaStubServer::start(|_line, _body, _base| (200, "{}".to_string())).await;
+        let (tool, _) = build_tool(&server.base_url, true, false);
+
+        for secret_path in [
+            "/home/alice/.aws/credentials",
+            "/home/alice/.ssh/id_rsa",
+            "/app/.env",
+            "/app/server.pem",
+        ] {
+            let err = tool
+                .execute(json!({
+                    "action": "index",
+                    "file_path": secret_path,
+                    "size_bytes": 64,
+                    "workspace_id": TEST_WS
+                }))
+                .await
+                .expect_err("secret path must be rejected")
+                .to_string();
+            assert!(
+                err.contains("Secrets and credentials are never uploaded"),
+                "path {secret_path} got: {err}"
+            );
+        }
+        assert!(
+            server.recorded().is_empty(),
+            "secret paths must be rejected before any API call"
+        );
+    }
+
+    #[test]
+    fn metadata_and_schema_expose_upload_url_and_complete_upload() {
+        let client = create_mock_client();
+        let session = create_mock_session(&client);
+        let tool = MediaTool::new(client, session);
+
+        let desc = &tool.metadata().description;
+        assert!(desc.contains("upload_url"), "desc: {desc}");
+        assert!(desc.contains("complete_upload"), "desc: {desc}");
+
+        let schema = tool.input_schema();
+        let props = schema["properties"].as_object().unwrap();
+        let actions: Vec<&str> = props["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(actions.contains(&"upload_url"), "actions: {actions:?}");
+        assert!(actions.contains(&"complete_upload"), "actions: {actions:?}");
+        assert!(props.contains_key("size_bytes"));
+        assert!(props.contains_key("mime_type"));
+        assert!(props.contains_key("title"));
+        assert!(props.contains_key("filename"));
+    }
+
+    #[tokio::test]
+    async fn hosted_upload_plan_never_logs_presigned_url() {
+        use std::io::Write;
+        use tracing::Instrument;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+        struct Guard(Arc<Mutex<Vec<u8>>>);
+        impl Write for Guard {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufWriter {
+            type Writer = Guard;
+            fn make_writer(&'a self) -> Self::Writer {
+                Guard(self.0.clone())
+            }
+        }
+
+        let secret_token = "SENSITIVE_PRESIGN_SIGNATURE_NEVER_LOG";
+        let presigned_url = format!("https://storage.example.test/put?sig={secret_token}");
+        let presigned_clone = presigned_url.clone();
+        let server = MediaStubServer::start(move |line, _body, _base| {
+            if line.contains("/content/uploads/init") {
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "content_id": TEST_CONTENT_ID,
+                            "upload_url": presigned_clone,
+                            "headers": {"Content-Type": "application/pdf"},
+                            "expires_in_seconds": 300
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (400, "{}".to_string())
+            }
+        })
+        .await;
+
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        let (tool, _) = build_tool(&server.base_url, true, false);
+        let span = tracing::dispatcher::with_default(&dispatch, || {
+            tracing::trace_span!("hosted_media_upload_test")
+        });
+        let result = tracing::dispatcher::with_default(&dispatch, || {
+            async {
+                tool.execute(json!({
+                    "action": "index",
+                    "file_path": "/home/chase/Downloads/contract.pdf",
+                    "content_type": "document",
+                    "size_bytes": 2048,
+                    "workspace_id": TEST_WS
+                }))
+                .await
+            }
+            .instrument(span)
+        })
+        .await
+        .expect("hosted index should return upload plan");
+
+        let text = result_text(&result);
+        assert!(
+            text.contains(&presigned_url),
+            "tool result must return upload_url"
+        );
+        let logs = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
+        assert!(
+            !logs.contains(secret_token),
+            "presigned URL secret must never appear in logs: {logs}"
+        );
+    }
+}

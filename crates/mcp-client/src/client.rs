@@ -18556,6 +18556,65 @@ impl ContextStreamClient {
     // Media
     // =========================================================================
 
+    /// Initialize a managed media upload (`POST /workspaces/{ws}/content/uploads/init`).
+    ///
+    /// Returns the API upload-init response (`content_id`, presigned `upload_url`,
+    /// `headers`, `expires_in_seconds`). Never reads the local filesystem and never
+    /// logs the returned presigned URL.
+    pub async fn media_init_upload(
+        &self,
+        params: MediaUploadInitParams,
+    ) -> Result<serde_json::Value> {
+        let config = self.config.read().await;
+        let ws_id = params
+            .workspace_id
+            .or(config.default_workspace_id)
+            .ok_or_else(|| {
+                Error::Validation("workspace_id is required for media operations".to_string())
+            })?;
+        drop(config);
+
+        let init_body = strip_nulls(serde_json::json!({
+            "filename": params.filename,
+            "content_type": params.content_type.to_lowercase(),
+            "mime_type": params.mime_type,
+            "size_bytes": params.size_bytes,
+            "title": params.title,
+            "tags": params.tags.unwrap_or_default(),
+            "project_id": params.project_id,
+        }));
+        self.post(
+            &format!("/workspaces/{}/content/uploads/init", ws_id),
+            &init_body,
+        )
+        .await
+    }
+
+    /// Notify the API that a client-side media upload finished so indexing starts
+    /// (`POST /workspaces/{ws}/content/{content_id}/complete-upload`).
+    pub async fn media_complete_upload(
+        &self,
+        workspace_id: Option<Uuid>,
+        content_id: Uuid,
+    ) -> Result<serde_json::Value> {
+        let config = self.config.read().await;
+        let ws_id = workspace_id
+            .or(config.default_workspace_id)
+            .ok_or_else(|| {
+                Error::Validation("workspace_id is required for media operations".to_string())
+            })?;
+        drop(config);
+
+        self.post(
+            &format!(
+                "/workspaces/{}/content/{}/complete-upload",
+                ws_id, content_id
+            ),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
     /// Index a media file. For local files, initiates upload; for external URLs, indexes directly.
     pub async fn media_index(&self, params: MediaIndexParams) -> Result<serde_json::Value> {
         let config = self.config.read().await;
@@ -18571,7 +18630,7 @@ impl ContextStreamClient {
         if let Some(file_path) = &params.file_path {
             if !local_files_allowed {
                 return Err(Error::Validation(format!(
-                    "media(action=\"index\") cannot read local file_path '{}' on the hosted MCP gateway: it would read the gateway host's own disk. Pass external_url instead, or run a local MCP client. (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)",
+                    "media(action=\"index\") cannot read local file_path '{}' on the hosted MCP gateway: it would read the gateway host's own disk. Use media(action=\"upload_url\", file_path=...) (or hosted media(action=\"index\", file_path=...)) to get a presigned PUT upload plan, upload from your machine, then call media(action=\"complete_upload\", content_id=...), or pass external_url instead. (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)",
                     file_path
                 )));
             }
@@ -18624,24 +18683,26 @@ impl ContextStreamClient {
             });
 
             // Step 1: Initialize upload
-            let init_body = serde_json::json!({
-                "filename": filename,
-                "size_bytes": size_bytes,
-                "content_type": content_type.to_lowercase(),
-                "tags": params.tags.unwrap_or_default(),
-                "project_id": params.project_id,
-            });
-            let init_result: serde_json::Value = self
-                .post(
-                    &format!("/workspaces/{}/content/uploads/init", ws_id),
-                    &init_body,
-                )
+            let init_result = self
+                .media_init_upload(MediaUploadInitParams {
+                    filename,
+                    content_type,
+                    mime_type: params.mime_type,
+                    size_bytes: Some(size_bytes),
+                    title: params.title,
+                    tags: params.tags,
+                    workspace_id: Some(ws_id),
+                    project_id: params.project_id,
+                })
                 .await?;
 
-            let content_id = init_result
+            let content_id_str = init_result
                 .get("content_id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Tool("No content_id in upload init response".to_string()))?;
+            let content_id = Uuid::parse_str(content_id_str).map_err(|_| {
+                Error::Tool("Invalid content_id in upload init response".to_string())
+            })?;
             let upload_url = init_result
                 .get("upload_url")
                 .and_then(|v| v.as_str())
@@ -18676,17 +18737,7 @@ impl ContextStreamClient {
             }
 
             // Step 3: Complete upload
-            let complete_result: serde_json::Value = self
-                .post(
-                    &format!(
-                        "/workspaces/{}/content/{}/complete-upload",
-                        ws_id, content_id
-                    ),
-                    &serde_json::json!({}),
-                )
-                .await?;
-
-            Ok(complete_result)
+            self.media_complete_upload(Some(ws_id), content_id).await
         } else if let Some(external_url) = &params.external_url {
             // External URL: index directly (API handles fetching)
             let filename = external_media_filename(external_url, params.content_type.as_deref());
@@ -18998,7 +19049,7 @@ impl ContextStreamClient {
             serde_json::json!({"name":"progress","category":"session","description":"Report what you are doing now so people can watch your work live: the current step, your checklist, links you open, when you are blocked, and how it ended. Also reads runs.","actions":["report","get","list"],"key_parameters":["action","step","plan","ticket_id","links","waiting","status","summary"],"example":"progress(step=\"Running the tests\", plan=[{\"title\":\"Fix the parser\",\"state\":\"done\"},{\"title\":\"Run the tests\",\"state\":\"in_progress\"}])"}),
             serde_json::json!({"name":"feed","category":"memory","description":"Read, follow, post to, share, and curate Context Feeds: curated workspace, project, and topic activity streams.","actions":["list","ensure","get","update","archive","items","post","follow","unfollow","read","share","unshare","feedback","curate","runs","sources","ground"],"key_parameters":["action","feed_id","workspace_id","project_id","view","item_id","title","content"],"example":"feed(action=\"items\", feed_id=\"<uuid>\", view=\"unread\")"}),
             serde_json::json!({"name":"integration","category":"integrations","description":"Query and manage connected GitHub, Slack, Notion, Jira, and Linear data.","key_parameters":["action","workspace_id","project_id"],"example":"integration(action=\"status\", workspace_id=\"<uuid>\")"}),
-            serde_json::json!({"name":"media","category":"memory","description":"Index, search, list, inspect, and clip images, video, audio, and documents.","key_parameters":["action","content_type","file_path","query"],"example":"media(action=\"search\", query=\"architecture diagram\", content_types=[\"image\"])"}),
+            serde_json::json!({"name":"media","category":"memory","description":"Index, upload (upload_url/complete_upload), search, list, inspect, and clip images, video, audio, and documents.","key_parameters":["action","content_type","file_path","size_bytes","content_id","query"],"example":"media(action=\"search\", query=\"architecture diagram\", content_types=[\"image\"])"}),
             serde_json::json!({"name":"skill","category":"memory","description":"List, create, update, import, and run reusable instruction/action skills.","key_parameters":["action","name","project_id"],"example":"skill(action=\"list\")"}),
             serde_json::json!({"name":"capsule","category":"memory","description":"Create, share, open, and hydrate portable context capsules.","key_parameters":["action","scope","session_id","capsule_id"],"example":"capsule(action=\"create\", scope=\"session\", session_id=\"session-123\", purpose=\"handoff\")"}),
             serde_json::json!({"name":"qa","category":"memory","description":"Ask grounded questions and curate the workspace knowledge base.","key_parameters":["action","question","workspace_id","project_id"],"example":"qa(action=\"ask\", question=\"How does authentication work?\")"}),
@@ -19425,6 +19476,25 @@ pub struct FeedSourceParams {
 // Media Parameter Structs
 // ============================================================================
 
+/// Parameters for initializing a managed media upload.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MediaUploadInitParams {
+    pub filename: String,
+    pub content_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+}
+
 /// Parameters for indexing media.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MediaIndexParams {
@@ -19434,6 +19504,10 @@ pub struct MediaIndexParams {
     pub external_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]

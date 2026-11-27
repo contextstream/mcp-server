@@ -3968,6 +3968,8 @@ mod personal_mode_reference_tests {
 
     #[tokio::test]
     async fn a_caller_who_passes_is_personal_still_narrows_the_lookup() {
+        // Lookup-only actions like delete_doc still honor an explicit is_personal filter;
+        // update_doc treats is_personal as the new visibility to apply, not a lookup filter.
         let (tool, listener) = personal_mode_tool().await;
         let server = serve(
             listener,
@@ -3975,8 +3977,8 @@ mod personal_mode_reference_tests {
             json!({"success": true, "data": {}}),
         );
         let _ = tool
-            .execute(json!({"action": "update_doc", "doc_id": "Own team doc 492",
-                            "content": "v1", "is_personal": true}))
+            .execute(json!({"action": "delete_doc", "doc_id": "Own team doc 492",
+                            "is_personal": true}))
             .await;
         let lines = server.await.expect("server");
         assert!(

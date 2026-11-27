@@ -22369,6 +22369,8 @@ pub struct UpdateTodoParams {
     pub clear_due_at: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_personal: Option<bool>,
 }
 
 /// List todo parameters.
@@ -22455,6 +22457,8 @@ pub struct UpdateDiagramParams {
     pub diagram_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_personal: Option<bool>,
 }
 
 /// Create doc parameters.
@@ -22500,6 +22504,8 @@ pub struct UpdateDocParams {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_personal: Option<bool>,
 }
 
 /// Create roadmap parameters.

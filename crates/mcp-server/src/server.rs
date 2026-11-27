@@ -3684,8 +3684,11 @@ mod tests {
             "602c6fe50fa5be9bbb6a31fd6b08db20912815fbd337e61905df39f82d805efd",
         ),
         (
+            // Advanced for `is_personal` on doc updates (ticket 4454bb26):
+            // optional boolean only; without it the schema matches the
+            // previous contract (is_personal_only_adds_to_memory_update_doc_schema).
             "memory_update_doc",
-            "309cc52b1a02a6376007278fbbedb60f8110a3901167b8c032080b366b7acd5e",
+            "f693c7901065cfcb2ed392d2c85ff90816270986d070932ba0562d04af07c123",
         ),
         (
             "memory_update_task",
@@ -4273,6 +4276,24 @@ mod tests {
             assert_eq!(is_personal["type"], "boolean", "{name}");
             assert_eq!(schema_contract_hash(&schema), before, "{name}");
         }
+    }
+
+    #[test]
+    fn is_personal_only_adds_to_memory_update_doc_schema() {
+        // Ticket 4454bb26: memory_update_doc now advertises optional boolean
+        // `is_personal` so a personal doc can be made team-visible without
+        // creating a copy. Removing it restores the prior contract hash.
+        let tools = tools_before_remote_checks();
+        let mut schema = tool_by_name(&tools, "memory_update_doc")["inputSchema"].clone();
+        let properties = schema["properties"]
+            .as_object_mut()
+            .expect("schema properties");
+        let is_personal = properties.remove("is_personal").expect("memory_update_doc");
+        assert_eq!(is_personal["type"], "boolean");
+        assert_eq!(
+            schema_contract_hash(&schema),
+            "309cc52b1a02a6376007278fbbedb60f8110a3901167b8c032080b366b7acd5e"
+        );
     }
 
     #[test]

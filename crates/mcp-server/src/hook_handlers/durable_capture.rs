@@ -1076,6 +1076,7 @@ async fn mirror_doc_inner(
                         title: Some(title),
                         content: Some(content),
                         doc_type: Some(doc_type.to_string()),
+                        is_personal: None,
                     },
                 )
                 .await

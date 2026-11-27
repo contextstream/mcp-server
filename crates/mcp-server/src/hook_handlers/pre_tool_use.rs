@@ -2412,6 +2412,17 @@ async fn team_memory_action_guard(
         return None;
     }
 
+    // Workspace-scoped team listings work in any account mode when the caller
+    // passes an explicit workspace_id.
+    let has_explicit_workspace = tool_input
+        .get("workspace_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .is_some_and(|ws| uuid::Uuid::parse_str(ws).is_ok());
+    if has_explicit_workspace && action != "team_transcript_topics" {
+        return None;
+    }
+
     if matches!(
         std::env::var("CONTEXTSTREAM_ACCOUNT_MODE")
             .ok()

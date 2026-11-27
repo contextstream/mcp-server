@@ -99,6 +99,19 @@ impl Api {
         delay: Option<(&'static str, std::time::Duration)>,
         only_nth: Option<usize>,
     ) -> Self {
+        Self::start_gated(answers, in_turn, delay, only_nth, None).await
+    }
+
+    /// Like [`Api::start_delaying`], and each answer on `gate`'s route waits
+    /// for one of its permits: the request is recorded when it arrives, and
+    /// its answer goes out once the test adds a permit.
+    pub(super) async fn start_gated(
+        answers: Vec<(&'static str, u16, Value)>,
+        in_turn: bool,
+        delay: Option<(&'static str, std::time::Duration)>,
+        only_nth: Option<usize>,
+        gate: Option<(&'static str, Arc<tokio::sync::Semaphore>)>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock api");
@@ -119,6 +132,7 @@ impl Api {
                 let delay_count = delay_count.clone();
                 let served = served.clone();
                 let claimants = claimants.clone();
+                let gate = gate.clone();
                 tokio::spawn(async move {
                     let request = read_request(&mut socket).await;
                     let (head, body) = request
@@ -188,6 +202,11 @@ impl Api {
                         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nRetry-After: 60\r\nconnection: close\r\n\r\n{answer}",
                         answer.len()
                     );
+                    if let Some((_, permits)) = gate.as_ref().filter(|(route, _)| fits(route)) {
+                        if let Ok(permit) = permits.acquire().await {
+                            permit.forget();
+                        }
+                    }
                     if let Some((_, time)) = delay.filter(|(route, _)| fits(route)) {
                         let nth =
                             delay_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;

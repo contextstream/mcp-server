@@ -41,6 +41,7 @@
 //! entity(kind="incident", action="update", id="<uuid>", body={"status": "mitigated"})
 //! entity(kind="incident", action="update", id="<uuid>", body={"status": "resolved", "resolved_at": "2026-11-21T14:05:00Z"})
 //! entity(kind="risk",     action="list",   query={"impact": "severe", "status": "open"})
+//! entity(kind="review",   action="create", body={"title": "Review the retry path", "kind": "pr", "subject_ref": "github:org/repo#123", "reviewers": [{"entity_type": "team", "handle": "@example-org/platform"}, {"email": "ada@example.com"}]})
 //! ```
 
 use async_trait::async_trait;
@@ -736,9 +737,88 @@ fn visibility_line(kind: &str, result: &Value) -> Option<&'static str> {
     })
 }
 
+/// How many ignored field names a reply lists before it counts the rest.
+const MAX_IGNORED_FIELDS_NAMED: usize = 12;
+
+/// The body fields the tool added to a create itself (the scope ids, the
+/// session mode's `is_personal`): in `sent` and not in what the caller gave.
+fn fields_added_by_tool(given: &[String], sent: &Value) -> Vec<String> {
+    sent.as_object()
+        .map(|fields| {
+            fields
+                .keys()
+                .filter(|name| !given.contains(name))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What the API said it did not save. A create or update answer names in
+/// `ignored_fields` each body field the kind does not have (reviews answer it:
+/// `description`, or `reviewers[0].slug` for a key inside a reviewer entry),
+/// and stores nothing of it. A field in `added_by_tool` is left out: the
+/// caller did not send it, so there is nothing for them to correct. `None`
+/// when nothing is left to say.
+fn ignored_fields_note(kind: &str, result: &Value, added_by_tool: &[String]) -> Option<String> {
+    let names: Vec<String> = extract_entity_object(kind, result)
+        .get("ignored_fields")
+        .or_else(|| result.get("ignored_fields"))
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|name| {
+            // A name is a key the caller sent: one line, cut short.
+            name.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(80)
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty() && !added_by_tool.contains(name))
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let mut listed = names
+        .iter()
+        .take(MAX_IGNORED_FIELDS_NAMED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > MAX_IGNORED_FIELDS_NAMED {
+        listed.push_str(&format!(
+            " and {} more",
+            names.len() - MAX_IGNORED_FIELDS_NAMED
+        ));
+    }
+    let kind = kind.replace('_', " ");
+    let article = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "An"
+    } else {
+        "A"
+    };
+    let (fields, them) = if names.len() == 1 {
+        ("field", "it")
+    } else {
+        ("fields", "them")
+    };
+    Some(format!(
+        "Not saved: {listed}. {article} {kind} has no such {fields}, so the API ignored {them} (ignored_fields)."
+    ))
+}
+
 /// The lines every create and update reply ends with: the stored visibility,
-/// and any ticket field the API did not save.
-fn append_reply_notes(text: &mut String, kind: &str, body: &Value, result: &Value) {
+/// any ticket field the API did not save, and the fields the API said it
+/// ignored (`added_by_tool`: see [`ignored_fields_note`]).
+fn append_reply_notes(
+    text: &mut String,
+    kind: &str,
+    body: &Value,
+    added_by_tool: &[String],
+    result: &Value,
+) {
     if let Some(visibility) = visibility_line(kind, result) {
         text.push('\n');
         text.push_str(visibility);
@@ -750,6 +830,10 @@ fn append_reply_notes(text: &mut String, kind: &str, body: &Value, result: &Valu
             text.push('\n');
             text.push_str(&not_saved);
         }
+    }
+    if let Some(ignored) = ignored_fields_note(kind, result, added_by_tool) {
+        text.push('\n');
+        text.push_str(&ignored);
     }
 }
 
@@ -991,7 +1075,7 @@ fn format_entity_list(kind: &str, result: &Value) -> String {
 }
 
 /// Routing summary advertised as the tool description (<= 1024 chars).
-const ENTITY_TOOL_DESCRIPTION: &str = "Tickets, handoffs, incidents, releases, experiments, goals, key_results, sprints, reviews, risks, backlog_views. USE THIS TOOL for: 'create a handoff' / 'prepare a handoff' / 'hand this over' / 'continue with another agent' (kind=handoff, body={title, summary, scope, next_steps}; add to_user_id only when known and never invent it) · 'create a ticket' / 'file a bug' (kind=ticket; file in the project that owns the code: target_project) · 'log an incident' · 'track this release' · 'start an experiment' · 'create an OKR' (kind=goal/key_result) · 'plan a sprint' · 'design review' · 'log a risk'.\n\nNot this tool: memory(action=create_task) (todo), memory(action=create_doc, ...) (a runbook is a doc, not a handoff), session(action=capture, ...) (events). A generic handoff always creates entity(kind=handoff); additionally call capsule for a portable bundle or share link. HANDOFF.md or prose: local text is NOT the canonical handoff.\n\nActions: list | get | create | update; per-kind fields: see `action`.";
+const ENTITY_TOOL_DESCRIPTION: &str = "Tickets, handoffs, incidents, releases, experiments, goals, sprints, reviews, risks, backlog_views. USE THIS TOOL for: 'create a handoff' / 'prepare a handoff' / 'hand this over' / 'continue with another agent' (kind=handoff, body={title, summary, scope, next_steps}; add to_user_id only when known and never invent it) · 'create a ticket' / 'file a bug' (kind=ticket; file in the project that owns the code: target_project) · 'log an incident' · 'track this release' · 'start an experiment' · 'create an OKR' (kind=goal/key_result) · 'plan a sprint' · 'design review' (reviewers: [{entity_type: team, handle}, {email}]) · 'log a risk'.\n\nNot this tool: memory(action=create_task) (todo), memory(action=create_doc, ...) (a runbook is a doc), session(action=capture, ...) (events). A handoff always creates entity(kind=handoff); additionally call capsule for a portable bundle or share link. HANDOFF.md or prose: local text is NOT the canonical handoff.\n\nActions: list | get | create | update; per-kind fields: see `action`.";
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
@@ -1005,7 +1089,7 @@ const ENTITY_TOOL_REFERENCE: &str = "Structured taxonomy entities — tickets, h
                 'create a ticket' / 'file a bug' / 'track a feature' / 'log a chore' / \
                 'assign a ticket' / 'link a doc or plan to a ticket' \
                 (kind=ticket, body.kind=bug|feature|task|chore|epic; \
-                body.assignees=[{user_id?, email?, handle?, name?, entity_type=human|agent, role?}] (an agent is {entity_type: agent, handle, name}; [] clears them); \
+                body.assignees=[{user_id?, email?, handle?, name?, entity_type=human|agent|team, role?}] (an agent is {entity_type: agent, handle, name}; a team is {entity_type: team, handle}; [] clears them); \
                 body.linked_items=[{kind=doc|diagram|plan|task|todo|handoff|runbook|capsule, id, \
                 title_snapshot?, status_snapshot?, updated_at?}]) · \
                 'log an incident' / 'open a sev1' (kind=incident; body.started_at, detected_at, \
@@ -1013,7 +1097,12 @@ const ENTITY_TOOL_REFERENCE: &str = "Structured taxonomy entities — tickets, h
                 'track this release' / 'log a deployment' (kind=release) · \
                 'start an experiment' / 'A/B test' (kind=experiment) · \
                 'create an OKR' / 'new goal this quarter' (kind=goal, then kind=key_result for KRs) · \
-                'plan a sprint' (kind=sprint) · 'request a review' / 'design review' (kind=review) · \
+                'plan a sprint' (kind=sprint) · 'request a review' / 'design review' \
+                (kind=review, body={title, summary, kind=pr|code|design|security|architecture|product, subject_ref}; \
+                body.reviewers=[{entity_type=human|agent|team, user_id?, email?, handle?, name?, role?}] are objects like ticket assignees, e.g. \
+                [{entity_type: team, handle: \"@example-org/platform\"}, {email: \"ada@example.com\"}]; \
+                a CODEOWNERS team is entity_type team, never human; [] clears them. A field a review does not have \
+                (description: use summary) is not saved: the reply names it, from ignored_fields) · \
                 'log a risk' / 'risk register' (kind=risk) · 'save a backlog filter' (kind=backlog_view). \
                 \n\nDISTINCT FROM (don't use entity for these):\n\
                 · memory(action=create_task) — a lightweight project-tracking todo with \
@@ -1261,6 +1350,12 @@ impl ToolHandler for EntityTool {
                         "create needs the {kind}'s fields, e.g. body={{\"title\": \"...\"}}"
                     )));
                 }
+                // The fields the caller gave, before the tool adds the scope
+                // and the visibility: only these are theirs to correct.
+                let given: Vec<String> = body
+                    .as_object()
+                    .map(|fields| fields.keys().cloned().collect())
+                    .unwrap_or_default();
                 let (ws, proj) = self.resolve_scope(&input.workspace_id, &project_id).await;
                 Self::inject_scope_into_body(&mut body, &ws, &proj);
                 // A new item takes the session mode's visibility unless the
@@ -1298,7 +1393,13 @@ impl ToolHandler for EntityTool {
                 if let Some(location) = location {
                     text.push_str(&format!("\nFiled in {}.", location));
                 }
-                append_reply_notes(&mut text, &kind, &body, &result);
+                append_reply_notes(
+                    &mut text,
+                    &kind,
+                    &body,
+                    &fields_added_by_tool(&given, &body),
+                    &result,
+                );
                 Ok(ToolResult::with_structured(text, result))
             }
 
@@ -1389,7 +1490,8 @@ impl ToolHandler for EntityTool {
                         text.push_str(&format!("\nMoved to {}.", location));
                     }
                 }
-                append_reply_notes(&mut text, &kind, &body, &result);
+                // An update sends the body as given: every field is the caller's.
+                append_reply_notes(&mut text, &kind, &body, &[], &result);
                 Ok(with_scope_note(
                     found.tool_result(text, result),
                     &default_project_note,
@@ -1514,9 +1616,10 @@ impl ToolHandler for EntityTool {
                 "JSON body for create / update. Free-form; see API schema per kind. \
                  For kind=handoff create: title, summary, scope, and next_steps preserve the \
                  handoff; to_user_id is optional and must be omitted rather than invented. \
-                 For kind=ticket: assignees (hybrid user_id/email/handle plus name, entity_type human|agent; [] clears them) \
+                 For kind=ticket: assignees (hybrid user_id/email/handle plus name, entity_type human|agent|team; [] clears them) \
                  and linked_items (indexed refs: kind+id+title_snapshot+status_snapshot+updated_at; \
                  no URLs). Linked kinds: doc, diagram, plan, task, todo, handoff, runbook, capsule. \
+                 For kind=review: reviewers (objects in the assignee shape; a team is {entity_type: team, handle}). \
                  For kind=incident: title, summary, severity (sev1-4), status, services_affected, \
                  and the times started_at, detected_at, mitigated_at, resolved_at, closed_at \
                  (RFC3339) on create and update; a lifecycle time left out follows the status \
@@ -2068,6 +2171,215 @@ mod tests {
         assert!(structured.get("linked_items").is_none());
     }
 
+    const REVIEW_ID: &str = "66666666-6666-6666-6666-666666666666";
+    const TEAM_HANDLE: &str = "@example-org/platform";
+
+    /// A review as the API answers a create or an update: `ignored_fields`
+    /// names the body fields a review does not have, and is left out when
+    /// there are none.
+    fn stored_review(ignored_fields: &[&str]) -> Value {
+        let mut review = serde_json::json!({
+            "id": REVIEW_ID,
+            "title": "Review the retry path",
+            "kind": "pr",
+            "status": "requested",
+            "workspace_id": WORKSPACE_ID,
+            "project_id": MCP_SERVER_PROJECT_ID,
+            "reviewer_ids": [],
+            "reviewers": [
+                {"entity_type": "team", "handle": TEAM_HANDLE},
+                {"entity_type": "human", "email": "ada@example.com"},
+            ],
+        });
+        if !ignored_fields.is_empty() {
+            review["ignored_fields"] = serde_json::json!(ignored_fields);
+        }
+        review
+    }
+
+    #[tokio::test]
+    async fn a_review_create_sends_reviewers_as_given_and_names_what_was_not_saved() {
+        // The API ignored `description` (a review has none) and the
+        // `is_personal` this tool adds to every create. Only the first is the
+        // caller's, and the reply said nothing about either.
+        let (tool, server) = entity_tool_with_http_sequence(vec![(
+            "201 Created",
+            stored_review(&["description", "is_personal"]),
+        )])
+        .await;
+        let reviewers = serde_json::json!([
+            {"entity_type": "team", "handle": TEAM_HANDLE},
+            {"email": "ada@example.com"},
+        ]);
+
+        let result = tool
+            .execute(serde_json::json!({
+                "kind": "review",
+                "action": "create",
+                "workspace_id": WORKSPACE_ID,
+                "project_id": MCP_SERVER_PROJECT_ID,
+                "body": {
+                    "title": "Review the retry path",
+                    "kind": "pr",
+                    "description": "Please look at the retry path.",
+                    "reviewers": reviewers,
+                }
+            }))
+            .await
+            .expect("create succeeds");
+
+        let requests = server.await.expect("entity request server");
+        assert!(
+            requests[0].starts_with("POST /api/v1/reviews "),
+            "{}",
+            requests[0]
+        );
+        assert_eq!(request_body(&requests[0])["reviewers"], reviewers);
+        let text = result_text(&result);
+        assert!(text.contains("Not saved: description."), "{text}");
+        assert!(text.contains("A review has no such field"), "{text}");
+        assert!(
+            !text.contains("is_personal"),
+            "a field the caller did not send is not the caller's to fix: {text}"
+        );
+        // The structured reply is the API's answer, unchanged.
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("structured reply");
+        assert_eq!(
+            structured["ignored_fields"],
+            serde_json::json!(["description", "is_personal"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_review_update_names_every_field_the_api_ignored() {
+        let (tool, server) = entity_tool_with_http_sequence(vec![
+            (
+                "200 OK",
+                stored_review(&["description", "is_personal", "reviewers[0].slug"]),
+            ),
+            ("200 OK", stored_review(&[])),
+        ])
+        .await;
+
+        let ignored = tool
+            .execute(serde_json::json!({
+                "kind": "review",
+                "action": "update",
+                "id": REVIEW_ID,
+                "body": {
+                    "description": "Please look at the retry path.",
+                    "is_personal": false,
+                    "reviewers": [
+                        {"entity_type": "team", "handle": TEAM_HANDLE, "slug": "platform"}
+                    ],
+                }
+            }))
+            .await
+            .expect("update succeeds");
+        let saved = tool
+            .execute(serde_json::json!({
+                "kind": "review",
+                "action": "update",
+                "id": REVIEW_ID,
+                "body": {"summary": "Please look at the retry path."}
+            }))
+            .await
+            .expect("update succeeds");
+
+        let requests = server.await.expect("entity request server");
+        assert!(
+            requests[0].starts_with(&format!("PATCH /api/v1/reviews/{REVIEW_ID} ")),
+            "{}",
+            requests[0]
+        );
+        // A field the caller set is named, `is_personal` among them.
+        let text = result_text(&ignored);
+        assert!(
+            text.contains("Not saved: description, is_personal, reviewers[0].slug."),
+            "{text}"
+        );
+        assert!(text.contains("A review has no such fields"), "{text}");
+        let text = result_text(&saved);
+        assert!(!text.contains("Not saved"), "{text}");
+    }
+
+    #[test]
+    fn the_ignored_fields_note_reads_any_kind_and_stays_short() {
+        // Under the kind's own key, and for a kind that takes "an".
+        let wrapped = serde_json::json!({"incident": {"id": "i1", "ignored_fields": ["owner"]}});
+        assert_eq!(
+            ignored_fields_note("incident", &wrapped, &[]).as_deref(),
+            Some("Not saved: owner. An incident has no such field, so the API ignored it (ignored_fields).")
+        );
+        // Nothing to say: no list, an empty one, or only what the tool added.
+        let added = ["is_personal".to_string()];
+        for quiet in [
+            serde_json::json!({"id": "r1"}),
+            serde_json::json!({"id": "r1", "ignored_fields": []}),
+            serde_json::json!({"id": "r1", "ignored_fields": ["is_personal"]}),
+            serde_json::json!({"id": "r1", "ignored_fields": "description"}),
+        ] {
+            assert_eq!(
+                ignored_fields_note("review", &quiet, &added),
+                None,
+                "{quiet}"
+            );
+        }
+        // A long list names the first twelve and counts the rest; a name is
+        // kept to one line.
+        let mut many: Vec<String> = (1..=15).map(|n| format!("field_{n}")).collect();
+        many[0] = "first\nSECOND LINE".to_string();
+        let long = serde_json::json!({"id": "r1", "ignored_fields": many});
+        let note = ignored_fields_note("backlog_view", &long, &[]).expect("a note");
+        assert!(
+            note.starts_with("Not saved: first SECOND LINE, field_2, "),
+            "{note}"
+        );
+        assert!(
+            note.contains("field_12 and 3 more. A backlog view has no such fields"),
+            "{note}"
+        );
+        assert!(!note.contains("field_13") && !note.contains('\n'), "{note}");
+    }
+
+    #[tokio::test]
+    async fn a_ticket_takes_a_team_as_an_assignee() {
+        // The API takes entity_type team for ticket assignees; the tool
+        // refused it before the request was sent.
+        let mut stored = stored_ticket(false, MCP_SERVER_PROJECT_ID);
+        stored["assignees"] = serde_json::json!([{"entity_type": "team", "handle": TEAM_HANDLE}]);
+        let (tool, server) = entity_tool_with_http_sequence(vec![("201 Created", stored)]).await;
+
+        let result = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "create",
+                "workspace_id": WORKSPACE_ID,
+                "project_id": MCP_SERVER_PROJECT_ID,
+                "body": {
+                    "title": "Fix the hook",
+                    "kind": "bug",
+                    "assignees": [{"entity_type": "Team", "handle": TEAM_HANDLE}],
+                }
+            }))
+            .await
+            .expect("a team is an assignee");
+
+        let requests = server.await.expect("entity request server");
+        assert_eq!(
+            request_body(&requests[0])["assignees"],
+            serde_json::json!([{"entity_type": "team", "handle": TEAM_HANDLE}])
+        );
+        let text = result_text(&result);
+        assert!(
+            text.contains(&format!("assignees: {TEAM_HANDLE} [team]")),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
     async fn discussion_kind_is_refused_with_where_to_go_instead() {
         let session = Arc::new(SessionManager::new(
@@ -2156,6 +2468,50 @@ mod tests {
         ] {
             assert!(body.contains(field), "{field}: {body}");
         }
+    }
+
+    #[test]
+    fn the_tool_text_says_how_to_name_review_reviewers() {
+        // The text described ticket assignees only, so a caller asked to
+        // request a review guessed plain strings (the API answers 400), then
+        // entity_type human for a team.
+        let session = Arc::new(SessionManager::new(
+            ContextStreamClient::new(Config::default()),
+            Config::default(),
+        ));
+        let tool = EntityTool::new(ContextStreamClient::new(Config::default()), session);
+
+        // The description is sent with every request: one short hint, and it
+        // still fits the function-description limit.
+        let desc = tool.metadata().description.as_str();
+        assert!(desc.chars().count() <= 1024, "{}", desc.chars().count());
+        assert!(
+            desc.contains("'design review' (reviewers: [{entity_type: team, handle}, {email}])"),
+            "{desc}"
+        );
+
+        let schema = tool.input_schema();
+        let reference = schema["properties"]["action"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        for said in [
+            // The shape, and an example with a team handle and a person by email.
+            "body.reviewers=[{entity_type=human|agent|team, user_id?, email?, handle?, name?, role?}]",
+            "[{entity_type: team, handle: \"@example-org/platform\"}, {email: \"ada@example.com\"}]",
+            // Ticket assignees take a team too.
+            "entity_type=human|agent|team, role?}]",
+            "a team is {entity_type: team, handle}",
+            // What the API does not save is named in the reply.
+            "ignored_fields",
+        ] {
+            assert!(reference.contains(said), "{said}: {reference}");
+        }
+
+        let body = schema["properties"]["body"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(body.contains("entity_type human|agent|team"), "{body}");
+        assert!(body.contains("For kind=review: reviewers"), "{body}");
     }
 
     #[test]

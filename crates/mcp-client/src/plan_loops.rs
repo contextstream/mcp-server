@@ -120,7 +120,7 @@ pub struct NewLoopTicket {
     pub priority: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<String>>,
-    /// `[{entity_type: human|agent, user_id?, email?, handle?, name?, role?}]`,
+    /// `[{entity_type: human|agent|team, user_id?, email?, handle?, name?, role?}]`,
     /// as [`crate::normalize_assignees`] writes them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignees: Option<Value>,

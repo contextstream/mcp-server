@@ -11,9 +11,12 @@ pub const LINKED_ITEM_KINDS: &[&str] = &[
 /// Canonical linked artifact kinds for plans.
 pub const PLAN_LINKED_ITEM_KINDS: &[&str] = &["doc", "diagram", "runbook", "handoff"];
 
-/// Assignee entity types: a person, or an agent
-/// (`{entity_type: "agent", handle: "cinder", name: "Cinder"}`).
-pub const ASSIGNEE_ENTITY_TYPES: &[&str] = &["human", "agent"];
+/// Assignee entity types: a person, an agent
+/// (`{entity_type: "agent", handle: "cinder", name: "Cinder"}`), or a team
+/// named by its handle (`{entity_type: "team", handle: "@example-org/platform"}`,
+/// as a CODEOWNERS file names one). The API takes the same three for review
+/// reviewers.
+pub const ASSIGNEE_ENTITY_TYPES: &[&str] = &["human", "agent", "team"];
 
 /// Summary of linked items on a ticket, grouped by kind.
 #[derive(Debug, Clone, Default)]
@@ -356,10 +359,10 @@ pub fn format_ticket_assignee_summary(item: &Value) -> Option<String> {
                 "{}{}{}",
                 label,
                 role,
-                if entity_type == "agent" {
-                    " [agent]"
-                } else {
-                    ""
+                match entity_type {
+                    "agent" => " [agent]",
+                    "team" => " [team]",
+                    _ => "",
                 }
             ))
         })
@@ -479,6 +482,28 @@ mod tests {
         assert_eq!(assignees[0]["email"], "alice@example.com");
         assert_eq!(assignees[0]["role"], "owner");
         assert_eq!(assignees[1]["entity_type"], "agent");
+    }
+
+    #[test]
+    fn a_team_is_an_assignee_and_is_shown_as_one() {
+        // The API takes entity_type team (a CODEOWNERS team, named by its
+        // handle); only human and agent passed here.
+        let mut body = json!({
+            "assignees": [{"entity_type": "Team", "handle": " @example-org/platform "}]
+        });
+        normalize_ticket_body(&mut body).expect("a team is an assignee");
+        assert_eq!(
+            body["assignees"],
+            json!([{"entity_type": "team", "handle": "@example-org/platform"}])
+        );
+        assert_eq!(
+            format_ticket_assignee_summary(&body).as_deref(),
+            Some("assignees: @example-org/platform [team]")
+        );
+
+        let mut unknown = json!({"assignees": [{"entity_type": "group", "handle": "x"}]});
+        let refused = normalize_ticket_body(&mut unknown).unwrap_err().to_string();
+        assert!(refused.contains("human, agent, team"), "{refused}");
     }
 
     #[test]

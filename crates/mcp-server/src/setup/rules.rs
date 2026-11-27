@@ -165,7 +165,7 @@ Every workspace-scoped call below must include `workspace_id="<current_workspace
 - "add key result" / "track KR progress" → `entity(kind="key_result", action="create", body={"goal_id": "<uuid>", "title": "MAU > 10k", "unit": "number", "target_value": 10000, "current_value": 6500})`
 - "create sprint" / "new iteration" → `entity(kind="sprint", action="create", body={"name": "Sprint 42", "starts_at": "...", "ends_at": "...", "goal": "..."})`
 - "list sprints" / "active sprint" → `entity(kind="sprint", action="list", query={"status": "active"})`
-- "request review" / "PR review" / "design review" → `entity(kind="review", action="create", body={"title": "...", "kind": "pr|code|design|security|architecture|product", "subject_ref": "github:org/repo#123", "reviewer_ids": [...]})`
+- "request review" / "PR review" / "design review" → `entity(kind="review", action="create", body={"title": "...", "kind": "pr|code|design|security|architecture|product", "subject_ref": "github:org/repo#123", "reviewers": [{"entity_type": "team", "handle": "@example-org/platform"}, {"email": "ada@example.com"}]})`. Reviewers are objects (`entity_type` human, agent or team); `reviewer_ids` still takes user ids.
 - "list reviews" / "pending reviews" → `entity(kind="review", action="list", query={"status": "requested"})`
 - "log risk" / "track risk" / "risk register" → `entity(kind="risk", action="create", body={"title": "...", "likelihood": "possible", "impact": "major", "category": "...", "mitigation": "..."})`
 - "list risks" / "open risks" / "severe risks" → `entity(kind="risk", action="list", query={"status": "open", "impact": "severe"})`
@@ -4566,6 +4566,24 @@ mod tests {
             "closed_at",
         ] {
             assert!(line.contains(field), "{field}: {line}");
+        }
+    }
+
+    #[test]
+    fn the_review_example_names_reviewers_as_objects() {
+        // The example showed only reviewer_ids (user ids), so a team or a
+        // person known by email had nowhere to go.
+        let rules = generate_rule_content(&Editor::Codex, None, None, RulesMode::Bootstrap);
+        let line = rules
+            .lines()
+            .find(|line| line.contains("entity(kind=\"review\", action=\"create\""))
+            .expect("the review example");
+        for said in [
+            "\"reviewers\": [",
+            "{\"entity_type\": \"team\", \"handle\": \"@example-org/platform\"}",
+            "{\"email\": \"ada@example.com\"}",
+        ] {
+            assert!(line.contains(said), "{said}: {line}");
         }
     }
 

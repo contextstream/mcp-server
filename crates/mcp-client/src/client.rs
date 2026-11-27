@@ -18615,6 +18615,30 @@ impl ContextStreamClient {
         .await
     }
 
+    /// Update a media asset's title, description, or tags (including visibility tags)
+    /// via `PUT /workspaces/{ws}/content/{content_id}`.
+    pub async fn media_update(&self, params: MediaUpdateParams) -> Result<serde_json::Value> {
+        let config = self.config.read().await;
+        let ws_id = params
+            .workspace_id
+            .or(config.default_workspace_id)
+            .ok_or_else(|| {
+                Error::Validation("workspace_id is required for media operations".to_string())
+            })?;
+        drop(config);
+
+        let body = strip_nulls(serde_json::json!({
+            "title": params.title,
+            "description": params.description,
+            "tags": params.tags,
+        }));
+        self.put(
+            &format!("/workspaces/{}/content/{}", ws_id, params.content_id),
+            &body,
+        )
+        .await
+    }
+
     /// Index a media file. For local files, initiates upload; for external URLs, indexes directly.
     pub async fn media_index(&self, params: MediaIndexParams) -> Result<serde_json::Value> {
         let config = self.config.read().await;
@@ -19514,6 +19538,20 @@ pub struct MediaIndexParams {
     pub workspace_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
+}
+
+/// Parameters for updating a media asset's metadata, tags, or visibility.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MediaUpdateParams {
+    pub content_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<Uuid>,
 }
 
 impl MediaIndexParams {

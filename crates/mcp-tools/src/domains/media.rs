@@ -1,9 +1,9 @@
-//! Media asset tools: index, upload_url, complete_upload, status, search, get_clip, list, delete.
+//! Media asset tools: index, upload_url, complete_upload, update, status, search, get_clip, list, delete.
 
 use async_trait::async_trait;
 use mcp_client::{
     ContextStreamClient, MediaGetClipParams, MediaIndexParams, MediaSearchParams,
-    MediaUploadInitParams,
+    MediaUpdateParams, MediaUploadInitParams,
 };
 use mcp_session::SessionManager;
 use mcp_types::{
@@ -31,12 +31,18 @@ const VALID_ACTIONS: &[&str] = &[
     "index",
     "upload_url",
     "complete_upload",
+    "update",
     "status",
     "search",
     "get_clip",
     "list",
     "delete",
 ];
+
+/// Tag prefix and canonical visibility tags matching the API's media rules.
+const VISIBILITY_TAG_PREFIX: &str = "visibility:";
+const VISIBILITY_PERSONAL_TAG: &str = "visibility:personal";
+const VISIBILITY_TEAM_TAG: &str = "visibility:team";
 
 /// Valid canonical content types accepted by the API.
 const VALID_CONTENT_TYPES: &[&str] = &["video", "audio", "image", "document"];
@@ -66,7 +72,13 @@ pub struct MediaInput {
     pub mime_type: Option<String>,
     pub size_bytes: Option<u64>,
     pub title: Option<String>,
+    pub description: Option<String>,
     pub tags: Option<Vec<String>>,
+    /// Controls asset visibility on index, upload_url, complete_upload, and update:
+    /// `false` stores `visibility:team` (shared with workspace members),
+    /// `true` stores `visibility:personal` (uploader-only),
+    /// `None` leaves the default/existing visibility unchanged.
+    pub is_personal: Option<bool>,
     /// Opt-in to index a `file_path` that lives outside the active project root
     /// (P0 ingestion containment). Also honored via the
     /// `CONTEXTSTREAM_ALLOW_BROAD_INGEST` env var. Does NOT bypass the
@@ -569,6 +581,10 @@ impl MediaTool {
             .map(str::to_string);
 
         let upload_path_for_cmd = raw_path.unwrap_or(filename.as_str());
+        let effective_tags = apply_visibility_tag(input.tags.clone(), input.is_personal);
+        let stored_is_personal =
+            is_personal_from_tags_and_metadata(effective_tags.as_deref().unwrap_or(&[]), None);
+        let visibility = visibility_label(stored_is_personal);
 
         let init_result = match self
             .client
@@ -578,7 +594,7 @@ impl MediaTool {
                 mime_type: resolved_mime_type.clone(),
                 size_bytes: input.size_bytes,
                 title,
-                tags: input.tags.clone(),
+                tags: effective_tags,
                 workspace_id,
                 project_id,
             })
@@ -624,6 +640,8 @@ impl MediaTool {
         structured.insert("content_id".to_string(), json!(content_id));
         structured.insert("filename".to_string(), json!(filename));
         structured.insert("content_type".to_string(), json!(resolved_content_type));
+        structured.insert("visibility".to_string(), json!(visibility));
+        structured.insert("is_personal".to_string(), json!(stored_is_personal));
         if let Some(mime_type) = &resolved_mime_type {
             structured.insert("mime_type".to_string(), json!(mime_type));
         }
@@ -649,7 +667,7 @@ impl MediaTool {
         let headers_json =
             serde_json::to_string(&Value::Object(headers)).unwrap_or_else(|_| "{}".to_string());
         let mut message = format!(
-            "Upload initialized for {filename} (content_id: {content_id}{expiry_note}).\n{intro}\n\n1. Run:\n   {upload_command}\n\n2. Then call:\n   {complete_upload_call}\n\nUpload details:\n- content_id: {content_id}\n- upload_url: {upload_url}\n- headers: {headers_json}"
+            "Upload initialized for {filename} (content_id: {content_id}, visibility: {visibility}, is_personal: {stored_is_personal}{expiry_note}).\n{intro}\n\n1. Run:\n   {upload_command}\n\n2. Then call:\n   {complete_upload_call}\n\nUpload details:\n- content_id: {content_id}\n- visibility: {visibility} (is_personal: {stored_is_personal})\n- upload_url: {upload_url}\n- headers: {headers_json}"
         );
         if let Some(expires) = expires_in_seconds {
             message.push_str(&format!("\n- expires_in_seconds: {expires}"));
@@ -729,13 +747,14 @@ impl ToolHandler for MediaTool {
                     validate_external_media_url(external_url)?;
                 }
 
+                let effective_tags = apply_visibility_tag(input.tags, input.is_personal);
                 let params = MediaIndexParams {
                     file_path: input.file_path,
                     external_url: input.external_url,
                     content_type,
                     mime_type: input.mime_type,
                     title: input.title,
-                    tags: input.tags,
+                    tags: effective_tags.clone(),
                     workspace_id,
                     project_id,
                 };
@@ -749,9 +768,11 @@ impl ToolHandler for MediaTool {
                     .get("status")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
+                let stored_is_personal = response_is_personal(&result, effective_tags.as_deref());
+                let visibility = visibility_label(stored_is_personal);
                 let mut message = format!(
-                    "Media indexed with content_id: {} (status: {}). Next: call media(action=\"status\", content_id=\"{}\") until indexed, then media(action=\"search\", query=\"...\") or media(action=\"list\").",
-                    content_id, status, content_id
+                    "Media indexed with content_id: {} (status: {}, visibility: {}, is_personal: {}). Next: call media(action=\"status\", content_id=\"{}\") until indexed, then media(action=\"search\", query=\"...\") or media(action=\"list\").",
+                    content_id, status, visibility, stored_is_personal, content_id
                 );
                 if let Some(summary) = Self::video_text_extraction_summary(&result) {
                     message.push_str(&format!(" | video_text_extraction: {}", summary));
@@ -766,21 +787,102 @@ impl ToolHandler for MediaTool {
 
             "complete_upload" => {
                 let content_id = Self::parse_content_id(&input.content_id)?;
-                let result = self
+                let mut result = self
                     .client
                     .media_complete_upload(workspace_id, content_id)
                     .await?;
+                let mut fallback_tags = None;
+                if let Some(is_personal) = input.is_personal {
+                    let existing_tags = extract_tags(&result);
+                    let updated_tags = apply_visibility_tag(Some(existing_tags), Some(is_personal));
+                    fallback_tags = updated_tags.clone();
+                    result = self
+                        .client
+                        .media_update(MediaUpdateParams {
+                            content_id,
+                            title: None,
+                            description: None,
+                            tags: updated_tags,
+                            workspace_id,
+                        })
+                        .await?;
+                }
                 let status = result
                     .get("status")
                     .and_then(|v| v.as_str())
                     .unwrap_or("processing");
+                let stored_is_personal = response_is_personal(&result, fallback_tags.as_deref());
+                let visibility = visibility_label(stored_is_personal);
                 let mut message = format!(
-                    "Media upload completed for content_id: {} (status: {}). Next: call media(action=\"status\", content_id=\"{}\") until indexed, then media(action=\"search\", query=\"...\") or media(action=\"list\").",
-                    content_id, status, content_id
+                    "Media upload completed for content_id: {} (status: {}, visibility: {}, is_personal: {}). Next: call media(action=\"status\", content_id=\"{}\") until indexed, then media(action=\"search\", query=\"...\") or media(action=\"list\").",
+                    content_id, status, visibility, stored_is_personal, content_id
                 );
                 if let Some(summary) = Self::video_text_extraction_summary(&result) {
                     message.push_str(&format!(" | video_text_extraction: {}", summary));
                 }
+                Ok(ToolResult::with_structured(message, result))
+            }
+
+            "update" => {
+                let content_id = Self::parse_content_id(&input.content_id)?;
+                if input.is_personal.is_none()
+                    && input.title.is_none()
+                    && input.description.is_none()
+                    && input.tags.is_none()
+                {
+                    return Err(Error::Validation(
+                        "At least one of is_personal, title, description, or tags is required for update"
+                            .to_string(),
+                    ));
+                }
+
+                let resolved_tags = match (input.tags, input.is_personal) {
+                    (None, None) => None,
+                    (None, Some(is_personal)) => {
+                        let existing = self.client.media_status(workspace_id, content_id).await?;
+                        let existing_tags = extract_tags(&existing);
+                        apply_visibility_tag(Some(existing_tags), Some(is_personal))
+                    }
+                    (Some(new_tags), Some(is_personal)) => {
+                        apply_visibility_tag(Some(new_tags), Some(is_personal))
+                    }
+                    (Some(new_tags), None) => {
+                        if new_tags.iter().any(|tag| is_visibility_tag(tag)) {
+                            Some(new_tags)
+                        } else {
+                            let existing =
+                                self.client.media_status(workspace_id, content_id).await?;
+                            let existing_tags = extract_tags(&existing);
+                            if existing_tags.iter().any(|tag| tag == VISIBILITY_TEAM_TAG) {
+                                apply_visibility_tag(Some(new_tags), Some(false))
+                            } else if existing_tags
+                                .iter()
+                                .any(|tag| tag == VISIBILITY_PERSONAL_TAG)
+                            {
+                                apply_visibility_tag(Some(new_tags), Some(true))
+                            } else {
+                                Some(new_tags)
+                            }
+                        }
+                    }
+                };
+
+                let result = self
+                    .client
+                    .media_update(MediaUpdateParams {
+                        content_id,
+                        title: input.title,
+                        description: input.description,
+                        tags: resolved_tags.clone(),
+                        workspace_id,
+                    })
+                    .await?;
+                let stored_is_personal = response_is_personal(&result, resolved_tags.as_deref());
+                let visibility = visibility_label(stored_is_personal);
+                let message = format!(
+                    "Media {} updated (visibility: {}, is_personal: {}).",
+                    content_id, visibility, stored_is_personal
+                );
                 Ok(ToolResult::with_structured(message, result))
             }
 
@@ -1032,7 +1134,7 @@ impl ToolHandler for MediaTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "media".to_string(),
             title: "Media Operations".to_string(),
-            description: "Media operations for indexed assets: photos/images, videos, audio, and documents/PDFs. Actions: index (upload URL/local assets and trigger ML processing; on the hosted MCP gateway, local file_path returns a presigned upload_url, headers, curl command, and follow-up complete_upload call so the client uploads directly), upload_url (start a client-side upload and return the presigned PUT URL, headers, and curl command without reading disk), complete_upload (finalize a client-side upload by content_id so indexing starts), status (check processing), search (semantic search with Knowledge Stream fallback), get_clip (extract video/audio clip details with output_format: remotion/ffmpeg/raw), list (to delete an asset: the `delete` tool, action=\"media.delete\").".to_string(),
+            description: "Media operations for indexed assets: photos/images, videos, audio, and documents/PDFs. Actions: index (upload URL/local assets and trigger ML processing; on the hosted MCP gateway, local file_path returns a presigned upload_url, headers, curl command, and follow-up complete_upload call so the client uploads directly; accepts is_personal), upload_url (start a client-side upload and return the presigned PUT URL, headers, and curl command without reading disk; accepts is_personal), complete_upload (finalize a client-side upload by content_id so indexing starts; accepts is_personal), update (update an existing asset's visibility via is_personal, or its title, description, or tags using the API content update route), status (check processing), search (semantic search with Knowledge Stream fallback), get_clip (extract video/audio clip details with output_format: remotion/ffmpeg/raw), list (to delete an asset: the `delete` tool, action=\"media.delete\").".to_string(),
             category: ToolCategory::Ai,
             annotations: ToolAnnotations::destructive(),
             is_pro: true,
@@ -1045,7 +1147,7 @@ impl ToolHandler for MediaTool {
             .description("Media asset operations for photos/images, videos, audio, and documents/PDFs")
             .string_enum(
                 "action",
-                "Action to perform (index, upload_url, complete_upload, status, search, get_clip, list, delete)",
+                "Action to perform (index, upload_url, complete_upload, update, status, search, get_clip, list, delete)",
                 VALID_ACTIONS,
                 true,
             )
@@ -1079,7 +1181,13 @@ impl ToolHandler for MediaTool {
                 "MIME type for hosted index or upload_url (guessed from file extension when omitted, e.g. application/pdf, image/png)",
                 false,
             )
-            .string("title", "Optional display title for the uploaded media asset", false)
+            .string("title", "Optional display title for the media asset (used with index, upload_url, update)", false)
+            .string("description", "Optional description for the media asset (used with update)", false)
+            .boolean(
+                "is_personal",
+                "Asset visibility on index, upload_url, complete_upload, and update: false shares the asset with the team (stores visibility:team), true keeps it personal to the uploader (stores visibility:personal); omitting it leaves the default or existing visibility unchanged.",
+                false,
+            )
             .boolean(
                 "allow_broad",
                 "Opt in to index a file_path outside the active project root (P0 ingestion containment). Does not bypass the filename/dirname secret filter or the size cap (those always apply). Also settable via CONTEXTSTREAM_ALLOW_BROAD_INGEST=1.",
@@ -1092,10 +1200,10 @@ impl ToolHandler for MediaTool {
                 false,
             )
             .array("tags", "Tags to associate with media", "string", false)
-            // Complete / Status / get_clip / delete fields
+            // Complete / Update / Status / get_clip / delete fields
             .uuid(
                 "content_id",
-                "Content ID from index/upload_url/list/search results (required for complete_upload, status, get_clip, delete)",
+                "Content ID from index/upload_url/list/search results (required for complete_upload, update, status, get_clip, delete)",
                 false,
             )
             // Search fields
@@ -1118,6 +1226,95 @@ impl ToolHandler for MediaTool {
             )
             .integer("fps", "Frames per second for remotion format", false)
             .build()
+    }
+}
+
+// ============================================================================
+// Visibility Helpers (matches API services/media.rs rules)
+// ============================================================================
+
+fn is_visibility_tag(tag: &str) -> bool {
+    tag.trim()
+        .to_ascii_lowercase()
+        .starts_with(VISIBILITY_TAG_PREFIX)
+}
+
+/// Apply an explicit `is_personal` setting to a tag list, guaranteeing at most
+/// one `visibility:*` tag (`visibility:team` for `false`, `visibility:personal`
+/// for `true`). When `is_personal` is `None`, the input tags are returned
+/// unchanged so the default visibility behavior stays intact.
+fn apply_visibility_tag(
+    tags: Option<Vec<String>>,
+    is_personal: Option<bool>,
+) -> Option<Vec<String>> {
+    let Some(personal) = is_personal else {
+        return tags;
+    };
+    let mut kept: Vec<String> = tags
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|tag| !is_visibility_tag(tag))
+        .collect();
+    kept.push(
+        if personal {
+            VISIBILITY_PERSONAL_TAG
+        } else {
+            VISIBILITY_TEAM_TAG
+        }
+        .to_string(),
+    );
+    Some(kept)
+}
+
+fn extract_tags(value: &Value) -> Vec<String> {
+    value
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Evaluate whether an asset is personal using the same precedence as the API's
+/// `services/media.rs::is_personal`: `visibility:team` wins, then
+/// `visibility:personal`, then `metadata.visibility == "team"`, else personal.
+fn is_personal_from_tags_and_metadata(tags: &[String], metadata: Option<&Value>) -> bool {
+    if tags.iter().any(|tag| tag == VISIBILITY_TEAM_TAG) {
+        return false;
+    }
+    if tags.iter().any(|tag| tag == VISIBILITY_PERSONAL_TAG) {
+        return true;
+    }
+    metadata
+        .and_then(|meta| meta.get("visibility"))
+        .and_then(Value::as_str)
+        .map(|value| value != "team")
+        .unwrap_or(true)
+}
+
+fn response_is_personal(result: &Value, fallback_tags: Option<&[String]>) -> bool {
+    if let Some(is_personal) = result.get("is_personal").and_then(Value::as_bool) {
+        return is_personal;
+    }
+    if result.get("tags").and_then(Value::as_array).is_some() {
+        let tags = extract_tags(result);
+        return is_personal_from_tags_and_metadata(&tags, result.get("metadata"));
+    }
+    if let Some(tags) = fallback_tags {
+        return is_personal_from_tags_and_metadata(tags, result.get("metadata"));
+    }
+    true
+}
+
+fn visibility_label(is_personal: bool) -> &'static str {
+    if is_personal {
+        "personal"
+    } else {
+        "team"
     }
 }
 

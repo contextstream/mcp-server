@@ -505,6 +505,8 @@ fn contextstream_status_metadata(name: &str, title: &str, read_only: bool) -> se
     } else if name == "media" {
         metadata["actions"] = serde_json::json!({
             "index": "Indexing media in ContextStream",
+            "upload_url": "Preparing ContextStream media upload URL",
+            "complete_upload": "Completing ContextStream media upload",
             "delete": "Deleting media in ContextStream",
             "list": "Listing ContextStream media",
             "search": "Searching ContextStream media",
@@ -3636,8 +3638,12 @@ mod tests {
             "fa584db2acb26aa9f26584b17e8e2bf3369c2107803054b3da68c4099dc52d4f",
         ),
         (
+            // Additive: hosted client-side upload actions (upload_url,
+            // complete_upload) and optional upload-init fields (filename,
+            // size_bytes, mime_type, title). Every earlier action and field
+            // remains accepted.
             "media",
-            "7c0beba3b19f29d9c51bf6657420a62dcdd2804c2dbf5cd80ca52f2f11eb6ccc",
+            "bd6e5e78af4fcf1d54b28bd3099d51e334cf3df9f243df0db45ffcf3580477c7",
         ),
         (
             // Advanced in Wave 3b: additive typed-decision inputs (sort,

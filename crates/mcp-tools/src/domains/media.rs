@@ -1,14 +1,17 @@
-//! Media asset tools: index, status, search, get_clip, list, delete.
+//! Media asset tools: index, upload_url, complete_upload, status, search, get_clip, list, delete.
 
 use async_trait::async_trait;
-use mcp_client::{ContextStreamClient, MediaGetClipParams, MediaIndexParams, MediaSearchParams};
+use mcp_client::{
+    ContextStreamClient, MediaGetClipParams, MediaIndexParams, MediaSearchParams,
+    MediaUploadInitParams,
+};
 use mcp_session::SessionManager;
 use mcp_types::{
     tool::{ToolAnnotations, ToolCategory, ToolMetadata, ToolResult},
     Error, Result,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -24,7 +27,16 @@ use crate::schema::SchemaBuilder;
 // ============================================================================
 
 /// Valid actions.
-const VALID_ACTIONS: &[&str] = &["index", "status", "search", "get_clip", "list", "delete"];
+const VALID_ACTIONS: &[&str] = &[
+    "index",
+    "upload_url",
+    "complete_upload",
+    "status",
+    "search",
+    "get_clip",
+    "list",
+    "delete",
+];
 
 /// Valid canonical content types accepted by the API.
 const VALID_CONTENT_TYPES: &[&str] = &["video", "audio", "image", "document"];
@@ -46,17 +58,21 @@ pub struct MediaInput {
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
     pub target_project: Option<String>,
-    // Index fields
+    // Index / upload_url fields
     pub file_path: Option<String>,
+    pub filename: Option<String>,
     pub external_url: Option<String>,
     pub content_type: Option<String>,
+    pub mime_type: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub title: Option<String>,
     pub tags: Option<Vec<String>>,
     /// Opt-in to index a `file_path` that lives outside the active project root
     /// (P0 ingestion containment). Also honored via the
     /// `CONTEXTSTREAM_ALLOW_BROAD_INGEST` env var. Does NOT bypass the
     /// secret/credential filter or the size cap. Defaults to false.
     pub allow_broad: Option<bool>,
-    // Status/get_clip/delete fields
+    // Complete / Status / get_clip / delete fields
     pub content_id: Option<String>,
     // Search fields
     pub query: Option<String>,
@@ -470,6 +486,181 @@ impl MediaTool {
         );
         lines.join("\n")
     }
+
+    async fn start_client_upload(
+        &self,
+        input: &MediaInput,
+        content_type: Option<String>,
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        hosted_fallback: bool,
+    ) -> Result<ToolResult> {
+        let raw_path = input
+            .file_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let explicit_filename = input
+            .filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let filename = match (explicit_filename, raw_path) {
+            (Some(name), _) => basename_from_path(name)
+                .ok_or_else(|| Error::Validation(format!("Invalid filename '{}'", name)))?,
+            (None, Some(path)) => basename_from_path(path).ok_or_else(|| {
+                Error::Validation(format!(
+                    "file_path '{}' must include a valid file name",
+                    path
+                ))
+            })?,
+            (None, None) => {
+                return Err(Error::Validation(
+                    "file_path or filename is required for upload_url".to_string(),
+                ));
+            }
+        };
+
+        // Purely lexical secret/credential filter (never touches gateway disk).
+        if let Some(path) = raw_path {
+            if let Some(reason) = lexical_secret_path_rejection_reason(path) {
+                return Err(Error::Validation(format!(
+                    "media(action=\"{}\") refuses '{path}' because {reason}. Secrets and credentials are never uploaded.",
+                    input.action
+                )));
+            }
+        } else if mcp_client::ContextStreamClient::should_skip_file(&filename, true) {
+            return Err(Error::Validation(format!(
+                "media(action=\"{}\") refuses '{filename}' because '{filename}' matches the blocked-file filter (secrets, keys, archives, and binaries are never uploaded). Secrets and credentials are never uploaded.",
+                input.action
+            )));
+        }
+
+        if let Some(size_bytes) = input.size_bytes {
+            if size_bytes == 0 {
+                return Err(Error::Validation(
+                    "size_bytes must be at least 1 byte".to_string(),
+                ));
+            }
+            if size_bytes > mcp_client::MEDIA_INDEX_MAX_BYTES {
+                return Err(Error::Validation(format!(
+                    "media upload refused: {} bytes exceeds the {}-byte single-asset limit",
+                    size_bytes,
+                    mcp_client::MEDIA_INDEX_MAX_BYTES
+                )));
+            }
+        }
+
+        let resolved_content_type = content_type
+            .unwrap_or_else(|| detect_content_type_from_filename(&filename).to_string());
+        let resolved_mime_type = input
+            .mime_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| guess_mime_type_from_filename(&filename).map(str::to_string));
+        let title = input
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let upload_path_for_cmd = raw_path.unwrap_or(filename.as_str());
+
+        let init_result = match self
+            .client
+            .media_init_upload(MediaUploadInitParams {
+                filename: filename.clone(),
+                content_type: resolved_content_type.clone(),
+                mime_type: resolved_mime_type.clone(),
+                size_bytes: input.size_bytes,
+                title,
+                tags: input.tags.clone(),
+                workspace_id,
+                project_id,
+            })
+            .await
+        {
+            Ok(res) => res,
+            Err(err) if input.size_bytes.is_none() && is_missing_size_bytes_error(&err) => {
+                let quoted_path = shell_single_quote(upload_path_for_cmd);
+                return Err(Error::Validation(format!(
+                    "Upload init requires size_bytes (file size in bytes). Measure the file locally with `stat -c %s {quoted_path}` (macOS: `stat -f %z {quoted_path}`) and retry with size_bytes=<bytes>."
+                )));
+            }
+            Err(err) => return Err(err),
+        };
+
+        let content_id = init_result
+            .get("content_id")
+            .or_else(|| init_result.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Tool("No content_id in upload init response".to_string()))?;
+        let upload_url = init_result
+            .get("upload_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Tool("No upload_url in upload init response".to_string()))?;
+        let headers = init_result
+            .get("headers")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let expires_in_seconds = init_result
+            .get("expires_in_seconds")
+            .and_then(Value::as_u64);
+
+        let upload_command = build_curl_upload_command(upload_path_for_cmd, &headers, upload_url);
+        let complete_upload_call = format!(
+            "media(action=\"complete_upload\", content_id=\"{}\")",
+            content_id
+        );
+
+        let mut structured = Map::new();
+        structured.insert("mode".to_string(), json!("client_upload"));
+        structured.insert("status".to_string(), json!("awaiting_upload"));
+        structured.insert("content_id".to_string(), json!(content_id));
+        structured.insert("filename".to_string(), json!(filename));
+        structured.insert("content_type".to_string(), json!(resolved_content_type));
+        if let Some(mime_type) = &resolved_mime_type {
+            structured.insert("mime_type".to_string(), json!(mime_type));
+        }
+        structured.insert("upload_url".to_string(), json!(upload_url));
+        structured.insert("headers".to_string(), Value::Object(headers.clone()));
+        if let Some(expires) = expires_in_seconds {
+            structured.insert("expires_in_seconds".to_string(), json!(expires));
+        }
+        structured.insert("upload_command".to_string(), json!(upload_command));
+        structured.insert(
+            "complete_upload_call".to_string(),
+            json!(complete_upload_call),
+        );
+
+        let expiry_note = expires_in_seconds
+            .map(|secs| format!(", expires_in_seconds: {secs}"))
+            .unwrap_or_default();
+        let intro = if hosted_fallback {
+            "The hosted MCP gateway cannot read your local disk directly. Upload the file from your machine, then finalize indexing:"
+        } else {
+            "Upload the file from your machine, then finalize indexing:"
+        };
+        let headers_json =
+            serde_json::to_string(&Value::Object(headers)).unwrap_or_else(|_| "{}".to_string());
+        let mut message = format!(
+            "Upload initialized for {filename} (content_id: {content_id}{expiry_note}).\n{intro}\n\n1. Run:\n   {upload_command}\n\n2. Then call:\n   {complete_upload_call}\n\nUpload details:\n- content_id: {content_id}\n- upload_url: {upload_url}\n- headers: {headers_json}"
+        );
+        if let Some(expires) = expires_in_seconds {
+            message.push_str(&format!("\n- expires_in_seconds: {expires}"));
+        }
+
+        // Never log the presigned upload_url; return it only in the tool result.
+        Ok(ToolResult::with_structured(
+            message,
+            Value::Object(structured),
+        ))
+    }
 }
 
 #[async_trait]
@@ -511,6 +702,16 @@ impl ToolHandler for MediaTool {
                     ));
                 }
 
+                // On the hosted MCP gateway (local_files_allowed == false), we never
+                // read the gateway host's own disk. Instead of dead-ending on a local
+                // file_path, initialize a presigned upload plan that the client runs
+                // on its own machine and finishes with media(action="complete_upload").
+                if input.file_path.is_some() && !self.client.config().await.local_files_allowed() {
+                    return self
+                        .start_client_upload(&input, content_type, workspace_id, project_id, true)
+                        .await;
+                }
+
                 // P0 ingestion-containment: validate the source before any
                 // upload. Local files must be a regular file within the size cap,
                 // must not be a secret/credential, and must live inside the
@@ -520,11 +721,6 @@ impl ToolHandler for MediaTool {
                 let opt_in = input.allow_broad.unwrap_or(false)
                     || mcp_client::broad_ingest_opt_in_from_env();
                 if let Some(file_path) = input.file_path.as_deref() {
-                    if !self.client.config().await.local_files_allowed() {
-                        return Err(Error::Validation(format!(
-                            "media(action=\"index\", file_path=\"{file_path}\") is disabled on the hosted MCP gateway because file_path reads the gateway host's own disk. Use external_url=... instead. (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)"
-                        )));
-                    }
                     let project_root = self.session.state().await.folder_path;
                     let root_path: Option<&Path> = project_root.as_deref().map(Path::new);
                     validate_media_index_file(Path::new(file_path), root_path, opt_in)?;
@@ -537,6 +733,8 @@ impl ToolHandler for MediaTool {
                     file_path: input.file_path,
                     external_url: input.external_url,
                     content_type,
+                    mime_type: input.mime_type,
+                    title: input.title,
                     tags: input.tags,
                     workspace_id,
                     project_id,
@@ -553,6 +751,31 @@ impl ToolHandler for MediaTool {
                     .unwrap_or("unknown");
                 let mut message = format!(
                     "Media indexed with content_id: {} (status: {}). Next: call media(action=\"status\", content_id=\"{}\") until indexed, then media(action=\"search\", query=\"...\") or media(action=\"list\").",
+                    content_id, status, content_id
+                );
+                if let Some(summary) = Self::video_text_extraction_summary(&result) {
+                    message.push_str(&format!(" | video_text_extraction: {}", summary));
+                }
+                Ok(ToolResult::with_structured(message, result))
+            }
+
+            "upload_url" => {
+                self.start_client_upload(&input, content_type, workspace_id, project_id, false)
+                    .await
+            }
+
+            "complete_upload" => {
+                let content_id = Self::parse_content_id(&input.content_id)?;
+                let result = self
+                    .client
+                    .media_complete_upload(workspace_id, content_id)
+                    .await?;
+                let status = result
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("processing");
+                let mut message = format!(
+                    "Media upload completed for content_id: {} (status: {}). Next: call media(action=\"status\", content_id=\"{}\") until indexed, then media(action=\"search\", query=\"...\") or media(action=\"list\").",
                     content_id, status, content_id
                 );
                 if let Some(summary) = Self::video_text_extraction_summary(&result) {
@@ -809,7 +1032,7 @@ impl ToolHandler for MediaTool {
         METADATA.get_or_init(|| ToolMetadata {
             name: "media".to_string(),
             title: "Media Operations".to_string(),
-            description: "Media operations for indexed assets: photos/images, videos, audio, and documents/PDFs. Actions: index (upload URL/local assets and trigger ML processing), status (check processing), search (semantic search with Knowledge Stream fallback), get_clip (extract video/audio clip details with output_format: remotion/ffmpeg/raw), list (to delete an asset: the `delete` tool, action=\"media.delete\").".to_string(),
+            description: "Media operations for indexed assets: photos/images, videos, audio, and documents/PDFs. Actions: index (upload URL/local assets and trigger ML processing; on the hosted MCP gateway, local file_path returns a presigned upload_url, headers, curl command, and follow-up complete_upload call so the client uploads directly), upload_url (start a client-side upload and return the presigned PUT URL, headers, and curl command without reading disk), complete_upload (finalize a client-side upload by content_id so indexing starts), status (check processing), search (semantic search with Knowledge Stream fallback), get_clip (extract video/audio clip details with output_format: remotion/ffmpeg/raw), list (to delete an asset: the `delete` tool, action=\"media.delete\").".to_string(),
             category: ToolCategory::Ai,
             annotations: ToolAnnotations::destructive(),
             is_pro: true,
@@ -820,7 +1043,12 @@ impl ToolHandler for MediaTool {
     fn input_schema(&self) -> Value {
         SchemaBuilder::new()
             .description("Media asset operations for photos/images, videos, audio, and documents/PDFs")
-            .string_enum("action", "Action to perform", VALID_ACTIONS, true)
+            .string_enum(
+                "action",
+                "Action to perform (index, upload_url, complete_upload, status, search, get_clip, list, delete)",
+                VALID_ACTIONS,
+                true,
+            )
             // Common fields
             .uuid("workspace_id", "Workspace ID", false)
             .uuid("project_id", "Project ID", false)
@@ -829,9 +1057,29 @@ impl ToolHandler for MediaTool {
                 "Target child project by folder name or project name (e.g. 'contextstream', 'mcp-server')",
                 false,
             )
-            // Index fields
-            .string("file_path", "Local path to a media asset (photo/image, video, audio, document/PDF)", false)
+            // Index / upload_url fields
+            .string(
+                "file_path",
+                "Local path to a media asset (photo/image, video, audio, document/PDF). In local MCP mode the file is uploaded directly; on the hosted MCP gateway, index/upload_url returns a presigned upload_url, headers, curl upload command, and complete_upload follow-up without reading gateway disk.",
+                false,
+            )
+            .string(
+                "filename",
+                "File name for upload_url when file_path is not given (defaults to the basename of file_path)",
+                false,
+            )
             .string("external_url", "External URL to a media asset (http/https only; IP-literal private/loopback/link-local/metadata hosts are rejected as a best-effort pre-filter — authoritative SSRF checks run server-side at fetch time)", false)
+            .integer(
+                "size_bytes",
+                "File size in bytes for hosted index or upload_url (pass when known; if required by the API and omitted, the error returns the exact stat command to measure it)",
+                false,
+            )
+            .string(
+                "mime_type",
+                "MIME type for hosted index or upload_url (guessed from file extension when omitted, e.g. application/pdf, image/png)",
+                false,
+            )
+            .string("title", "Optional display title for the uploaded media asset", false)
             .boolean(
                 "allow_broad",
                 "Opt in to index a file_path outside the active project root (P0 ingestion containment). Does not bypass the filename/dirname secret filter or the size cap (those always apply). Also settable via CONTEXTSTREAM_ALLOW_BROAD_INGEST=1.",
@@ -844,8 +1092,12 @@ impl ToolHandler for MediaTool {
                 false,
             )
             .array("tags", "Tags to associate with media", "string", false)
-            // Status/get_clip/delete fields
-            .uuid("content_id", "Content ID from index/list/search results", false)
+            // Complete / Status / get_clip / delete fields
+            .uuid(
+                "content_id",
+                "Content ID from index/upload_url/list/search results (required for complete_upload, status, get_clip, delete)",
+                false,
+            )
             // Search fields
             .string("query", "Semantic search query for indexed media content, transcripts, OCR/document text, titles, and tags", false)
             .array(
@@ -866,6 +1118,152 @@ impl ToolHandler for MediaTool {
             )
             .integer("fps", "Frames per second for remotion format", false)
             .build()
+    }
+}
+
+// ============================================================================
+// Client-side Hosted Upload Helpers (never read gateway disk)
+// ============================================================================
+
+/// Extract the final path component from a Unix or Windows path string without
+/// touching the local filesystem.
+fn basename_from_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches(['/', '\\']);
+    let name = trimmed.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    if name.is_empty() || name == "." || name == ".." {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn extension_lower(filename: &str) -> Option<String> {
+    let (_, ext) = filename.rsplit_once('.')?;
+    let trimmed = ext.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_ascii_lowercase())
+    }
+}
+
+fn detect_content_type_from_filename(filename: &str) -> &'static str {
+    match extension_lower(filename).as_deref() {
+        Some("mp4" | "m4v" | "mov" | "avi" | "mkv" | "webm" | "mpeg" | "mpg") => "video",
+        Some("mp3" | "wav" | "ogg" | "oga" | "m4a" | "flac" | "aac" | "opus" | "weba") => "audio",
+        Some(
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "tif" | "tiff" | "heic"
+            | "heif" | "avif",
+        ) => "image",
+        _ => "document",
+    }
+}
+
+fn guess_mime_type_from_filename(filename: &str) -> Option<&'static str> {
+    match extension_lower(filename).as_deref()? {
+        "pdf" => Some("application/pdf"),
+        "doc" => Some("application/msword"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "ppt" => Some("application/vnd.ms-powerpoint"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        "xls" => Some("application/vnd.ms-excel"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "txt" => Some("text/plain"),
+        "md" | "markdown" => Some("text/markdown"),
+        "csv" => Some("text/csv"),
+        "json" => Some("application/json"),
+        "html" | "htm" => Some("text/html"),
+        "rtf" => Some("application/rtf"),
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "heic" => Some("image/heic"),
+        "heif" => Some("image/heif"),
+        "avif" => Some("image/avif"),
+        "mp4" | "m4v" => Some("video/mp4"),
+        "mov" => Some("video/quicktime"),
+        "webm" => Some("video/webm"),
+        "avi" => Some("video/x-msvideo"),
+        "mkv" => Some("video/x-matroska"),
+        "mpeg" | "mpg" => Some("video/mpeg"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" | "oga" => Some("audio/ogg"),
+        "m4a" => Some("audio/mp4"),
+        "flac" => Some("audio/flac"),
+        "aac" => Some("audio/aac"),
+        "opus" => Some("audio/opus"),
+        "weba" => Some("audio/webm"),
+        _ => None,
+    }
+}
+
+/// POSIX single-quote `value`: wrap in `'` and escape embedded `'` as `'\''`.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Build a copy-pasteable `curl` command that PUTs `file_path` to `upload_url`
+/// with every signed header returned by the API.
+fn build_curl_upload_command(
+    file_path: &str,
+    headers: &Map<String, Value>,
+    upload_url: &str,
+) -> String {
+    let mut parts = vec![
+        "curl".to_string(),
+        "-fsS".to_string(),
+        "-X".to_string(),
+        "PUT".to_string(),
+        "--upload-file".to_string(),
+        shell_single_quote(file_path),
+    ];
+
+    let mut header_entries: Vec<(&str, &str)> = headers
+        .iter()
+        .filter_map(|(name, value)| value.as_str().map(|v| (name.as_str(), v)))
+        .collect();
+    header_entries.sort_by_key(|(a, _)| *a);
+
+    for (name, value) in header_entries {
+        parts.push("-H".to_string());
+        parts.push(shell_single_quote(&format!("{name}: {value}")));
+    }
+
+    parts.push(shell_single_quote(upload_url));
+    parts.join(" ")
+}
+
+/// Purely lexical secret/credential path check for hosted upload init: never
+/// invokes `std::fs::canonicalize` or any filesystem syscall on the gateway host.
+fn lexical_secret_path_rejection_reason(raw: &str) -> Option<String> {
+    for segment in raw.split(['/', '\\']) {
+        if mcp_client::SENSITIVE_DIR_NAMES.contains(&segment) {
+            return Some(format!("it lives inside a sensitive directory ({segment})"));
+        }
+    }
+    if let Some(filename) = basename_from_path(raw) {
+        if mcp_client::ContextStreamClient::should_skip_file(&filename, true) {
+            return Some(format!(
+                "'{filename}' matches the blocked-file filter (secrets, keys, archives, and binaries are never uploaded)"
+            ));
+        }
+    }
+    None
+}
+
+fn is_missing_size_bytes_error(err: &Error) -> bool {
+    match err {
+        Error::Http {
+            status, message, ..
+        } if *status == 400 || *status == 422 => {
+            message.to_ascii_lowercase().contains("size_bytes")
+        }
+        _ => false,
     }
 }
 

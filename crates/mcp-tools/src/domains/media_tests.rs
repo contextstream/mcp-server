@@ -619,12 +619,14 @@ mod constants_tests {
     #[test]
     fn test_valid_actions() {
         assert!(VALID_ACTIONS.contains(&"index"));
+        assert!(VALID_ACTIONS.contains(&"upload_url"));
+        assert!(VALID_ACTIONS.contains(&"complete_upload"));
         assert!(VALID_ACTIONS.contains(&"status"));
         assert!(VALID_ACTIONS.contains(&"search"));
         assert!(VALID_ACTIONS.contains(&"get_clip"));
         assert!(VALID_ACTIONS.contains(&"list"));
         assert!(VALID_ACTIONS.contains(&"delete"));
-        assert_eq!(VALID_ACTIONS.len(), 6);
+        assert_eq!(VALID_ACTIONS.len(), 8);
     }
 
     #[test]
@@ -708,10 +710,19 @@ mod registration_tests {
 
     #[test]
     fn test_media_actions_coverage() {
-        let all_actions = ["index", "status", "search", "get_clip", "list", "delete"];
+        let all_actions = [
+            "index",
+            "upload_url",
+            "complete_upload",
+            "status",
+            "search",
+            "get_clip",
+            "list",
+            "delete",
+        ];
         let output_formats = ["remotion", "ffmpeg", "raw"];
 
-        assert_eq!(all_actions.len(), 6);
+        assert_eq!(all_actions.len(), 8);
         assert_eq!(output_formats.len(), 3);
     }
 }

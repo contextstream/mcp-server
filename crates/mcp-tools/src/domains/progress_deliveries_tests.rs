@@ -3033,6 +3033,149 @@ async fn round7_released_frame_is_recovered_once_after_eviction() {
     );
 }
 
+/// The claim route of one delivery, as the mock matches it.
+fn claim_route(id: Uuid) -> &'static str {
+    Box::leak(format!("POST /deliveries/{id}/claim").into_boxed_str())
+}
+
+#[tokio::test]
+async fn round7_a_claimed_frame_stays_reserved_until_its_response_settles_it() {
+    // A claimed frame stays recorded as unshown until a response shows it,
+    // and a session that gets the delivery's reservation while the record
+    // says so takes the claim up again. The response that claimed it (a
+    // first claim, or one taken up again from the record) therefore keeps the
+    // reservation until it has settled the frame: a replica of the session
+    // that asks in between neither claims nor shows it. The API holds back
+    // the answer to that response's next claim, to keep it in between.
+    // (round7_released_frame_is_recovered_once_after_eviction hit this window
+    // by chance on a loaded host, and counted a third claim.)
+    for taken_up in [false, true] {
+        let f = Fixture::new();
+        let first = f.message();
+        let mut second = f.answer(json!([]));
+        let mut bytes = *f.delivery.as_bytes();
+        bytes[0] ^= 0x80; // another reservation bucket
+        let other = Uuid::from_bytes(bytes);
+        second["id"] = json!(other);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let api = Api::start_gated(
+            vec![
+                offered(vec![first.clone(), second.clone()]),
+                (
+                    claim_route(f.delivery),
+                    200,
+                    held_with("claimed", &first, TOKEN),
+                ),
+                (
+                    claim_route(other),
+                    200,
+                    held_with("claimed", &second, SECOND_TOKEN),
+                ),
+                (
+                    "GET /api/v1/run-progress/runs/",
+                    200,
+                    json!({"data":f.run_view("working",json!({}))}),
+                ),
+            ],
+            false,
+            None,
+            None,
+            Some((claim_route(other), gate.clone())),
+        )
+        .await;
+        let mut tool = f.tool(&api);
+        tool.deliveries = Arc::default();
+        let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
+        assert!(owner.bind(f.run, None, 0, None).await);
+        if taken_up {
+            // Claimed before, and its frame shown by no response.
+            assert!(
+                owner
+                    .bind_unshown(f.run, f.delivery, 0, Uuid::new_v4())
+                    .await
+            );
+        }
+        let mut replica = f.tool(&api);
+        replica.deliveries = Arc::default();
+        let get = json!({"action":"get", "run_id":f.run});
+        let claims_of = |id: Uuid| sent(&api, "POST", &format!("/{id}/claim")).len();
+
+        let claiming = tool.execute(get.clone());
+        tokio::pin!(claiming);
+        tokio::select! {
+            _ = &mut claiming => panic!("the second claim's answer is held back"),
+            _ = async { while claims_of(other) == 0 { tokio::time::sleep(Duration::from_millis(1)).await; } } => {}
+        }
+        // The first claim came back; its response has not settled it yet.
+        assert_eq!(claims_of(f.delivery), 1, "taken_up={taken_up}");
+        let meanwhile = replica.execute(get.clone()).await.unwrap();
+        assert!(
+            !text_of(&meanwhile).contains("[PERSON"),
+            "taken_up={taken_up}: {}",
+            text_of(&meanwhile)
+        );
+        assert_eq!(
+            claims_of(f.delivery),
+            1,
+            "taken_up={taken_up}: claimed again"
+        );
+
+        gate.add_permits(1);
+        let shown = text_of(&claiming.await.unwrap());
+        assert!(
+            shown.contains(&message_block(&f)),
+            "taken_up={taken_up}: {shown}"
+        );
+        assert!(
+            shown.contains("Which cache stays warm?"),
+            "taken_up={taken_up}"
+        );
+        assert!(!text_of(&replica.execute(get).await.unwrap()).contains("[PERSON"));
+        assert_eq!(claims_of(f.delivery), 1, "taken_up={taken_up}");
+        assert_eq!(claims_of(other), 1, "taken_up={taken_up}");
+    }
+}
+
+#[tokio::test]
+async fn round7_one_response_claims_two_deliveries_of_one_reservation_bucket() {
+    // The response holds each claimed delivery's reservation until it has
+    // settled the frames; a second delivery in a bucket it holds is claimed
+    // under that reservation, not left waiting for it.
+    let f = Fixture::new();
+    let first = f.message();
+    let mut second = f.answer(json!([]));
+    let mut bytes = *f.delivery.as_bytes();
+    bytes[15] ^= 1; // the same first byte: the same bucket
+    second["id"] = json!(Uuid::from_bytes(bytes));
+    let api = Api::start_in_turn(vec![
+        offered(vec![first.clone(), second.clone()]),
+        (CLAIM, 200, held_with("claimed", &first, TOKEN)),
+        (CLAIM, 200, held_with("claimed", &second, SECOND_TOKEN)),
+        (
+            "GET /api/v1/run-progress/runs/",
+            200,
+            json!({"data":f.run_view("working",json!({}))}),
+        ),
+    ])
+    .await;
+    let mut tool = f.tool(&api);
+    tool.deliveries = Arc::default();
+    let owner = tool.delivery_owner(f.workspace, false).await.unwrap();
+    assert!(owner.bind(f.run, None, 0, None).await);
+    let result = tool
+        .execute(json!({"action":"get", "run_id":f.run}))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.structured_content.unwrap()["deliveries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(sent(&api, "POST", "/claim").len(), 2);
+}
+
 #[tokio::test]
 async fn round7_existing_report_slot_cannot_start_a_ninth_pinned_owner() {
     with_caller(mcp_client::run_with_mcp_session_id(

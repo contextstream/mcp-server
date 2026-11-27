@@ -937,6 +937,42 @@ async fn each_write_posts_its_body_to_its_route() {
             says: vec!["2 row(s) and 1 column(s)", "- summary: Customs hold in Laredo"],
         },
         Case {
+            // The caller's own mail: the mailbox and every filter go as
+            // they were given.
+            arguments: json!({
+                "action": "run", "question_id": q.to_string(),
+                "source": {"kind": "mail", "address": "ada@acme.dev", "folder": "inbox", "query": "invoice",
+                           "type": "customer", "flagged": false, "priority": "high",
+                           "since": "2026-11-01", "unread": true, "from": "Grace Hopper"},
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/runs"),
+            body: json!({
+                "workspace_id": w,
+                "source": {"kind": "mail", "address": "ada@acme.dev", "folder": "inbox", "query": "invoice",
+                           "type": "customer", "flagged": false, "priority": "high",
+                           "since": "2026-11-01", "unread": true, "from": "Grace Hopper"},
+                "surface": "mcp",
+            }),
+            status: 202,
+            answer: json!({"run": f.run_view("queued", "mail"), "estimate": {"rows": 57}}),
+            says: vec!["started on 57 row(s)"],
+        },
+        Case {
+            // Only the mailbox: its inbox.
+            arguments: json!({
+                "action": "describe", "question_id": q.to_string(),
+                "source": {"kind": "Mail", "address": "ada@acme.dev"},
+            }),
+            method: "POST",
+            target: format!("/api/v1/questions/{q}/describe"),
+            body: json!({"workspace_id": w, "source": {"kind": "mail", "address": "ada@acme.dev"}}),
+            status: 200,
+            answer: json!({"rows": 57, "columns": [{"name": "subject", "samples": ["Invoice 1042"]}],
+                           "looks_at": ["subject"], "missing": []}),
+            says: vec!["57 row(s) and 1 column(s)", "- subject: Invoice 1042"],
+        },
+        Case {
             // A requirement check: the document goes as it was given.
             arguments: json!({
                 "action": "run", "question_id": q.to_string(),
@@ -1215,7 +1251,20 @@ async fn what_cannot_be_right_is_refused_before_anything_is_sent() {
         // one meant, and so is a field Jira lists do not take.
         (
             json!({"action": "run", "question_id": q, "source": {"kind": "Jira-Cloud"}}),
-            "source.kind \"Jira-Cloud\" is not one of: rows, csv, audience, sheet, excel, notion, linear, issues, jira. Did you mean \"jira\"?",
+            "source.kind \"Jira-Cloud\" is not one of: rows, csv, audience, sheet, excel, notion, linear, issues, jira, mail. Did you mean \"jira\"?",
+        ),
+        (
+            json!({"action": "run", "question_id": q, "source": {"kind": "Mailbox", "address": "ada@acme.dev"}}),
+            "source.kind \"Mailbox\" is not one of: rows, csv, audience, sheet, excel, notion, linear, issues, jira, mail. Did you mean \"mail\"?",
+        ),
+        (
+            json!({"action": "describe", "question_id": q, "source": {"kind": "mail"}}),
+            "missing field `address`",
+        ),
+        (
+            json!({"action": "run", "question_id": q,
+                   "source": {"kind": "mail", "address": "ada@acme.dev", "body": true}}),
+            "unknown field `body`",
         ),
         (
             json!({"action": "describe", "question_id": q, "source": {"kind": "jira", "project": "OPS"}}),
@@ -2028,6 +2077,89 @@ async fn requirement_check_and_watch_refusals_say_what_to_do_next() {
     }
 }
 
+#[tokio::test]
+async fn mail_refusals_say_what_to_do_next() {
+    let (q, r) = (Uuid::new_v4(), Uuid::new_v4());
+    let mail = json!({"kind": "mail", "address": "ada@acme.dev"});
+    let run = json!({"action": "run", "question_id": q.to_string(), "source": mail});
+    let describe = json!({"action": "describe", "question_id": q.to_string(), "source": mail});
+    let cases: Vec<(u16, Value, Value, Vec<String>)> = vec![
+        (
+            // Mail is read, never changed.
+            422,
+            refusal(
+                "VALIDATION_ERROR",
+                "A run over your mail is not written back: mail is read, never changed. Download its answers as a CSV. [NOT_WRITABLE]",
+            ),
+            json!({"action": "write_back", "question_id": q.to_string(), "run_id": r.to_string()}),
+            vec![
+                "[NOT_WRITABLE]".into(),
+                "A run over mail is never written back".into(),
+                format!("questions(action=\"export\", question_id=\"{q}\", run_id=\"{r}\")"),
+            ],
+        ),
+        (
+            // Mail questions are switched on apart from the others.
+            503,
+            refusal(
+                "SERVICE_UNAVAILABLE",
+                "Questions are not asked of a model here yet. [NOT_ASKING]",
+            ),
+            run.clone(),
+            vec![
+                "nothing was asked".into(),
+                "questions about mail are switched on apart from the others".into(),
+            ],
+        ),
+        (
+            // Only with the caller's own credential that may read their mail.
+            403,
+            refusal(
+                "FORBIDDEN",
+                "Mail is read only with your own sign-in. [MAIL_REFUSED]",
+            ),
+            run.clone(),
+            vec![
+                "[MAIL_REFUSED]".into(),
+                "with their own sign-in or key that may read it".into(),
+            ],
+        ),
+        (
+            404,
+            refusal("NOT_FOUND", "No such mailbox. [NO_MAILBOX]"),
+            describe.clone(),
+            vec![
+                "[NO_MAILBOX]".into(),
+                "address is one of your own mailboxes".into(),
+            ],
+        ),
+        (
+            // Lasting: asked once, not again.
+            503,
+            refusal(
+                "SERVICE_UNAVAILABLE",
+                "Mail is not set up here. [MAIL_UNAVAILABLE]",
+            ),
+            describe.clone(),
+            vec![
+                "[MAIL_UNAVAILABLE]".into(),
+                "Send the list another way".into(),
+            ],
+        ),
+    ];
+    for (status, answer, arguments, says) in cases {
+        let (error, requests) = refused_with(status, answer, arguments.clone()).await;
+        for words in &says {
+            assert!(
+                error.contains(words.as_str()),
+                "{arguments}: {words:?} not in {error}"
+            );
+        }
+        assert!(!error.contains(NOT_SWITCHED_ON), "{arguments}: {error}");
+        assert_eq!(requests.len(), 1, "{arguments} is not asked again");
+    }
+}
+
 #[test]
 fn the_watch_and_a_questions_checks_are_read_in_either_shape() {
     let question = Uuid::new_v4();
@@ -2325,6 +2457,13 @@ async fn only_not_switched_on_takes_the_tool_out() {
             404,
             router_404(),
             json!({"action": "checks", "question_id": q}),
+        ),
+        // Nor a mailbox that is not the caller's.
+        (
+            404,
+            refusal("NOT_FOUND", "No such mailbox. [NO_MAILBOX]"),
+            json!({"action": "describe", "question_id": q,
+                   "source": {"kind": "mail", "address": "someone@else.dev"}}),
         ),
         (
             403,

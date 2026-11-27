@@ -379,20 +379,23 @@ pub fn load_transcript_hook_config(
         .ok()
         .and_then(|v| nonempty_trimmed(&v));
 
-    let env_policy = (!hook_override_env.is_empty())
+    let env_hook_override = (!hook_override_env.is_empty())
         .then(|| std::env::var(hook_override_env).ok())
         .flatten()
-        .and_then(|v| parse_hook_bool(&v))
-        .or_else(|| {
-            std::env::var("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED")
-                .ok()
-                .and_then(|v| parse_hook_bool(&v))
-        })
-        .or_else(|| {
-            std::env::var("CONTEXTSTREAM_TRANSCRIPTS_ENABLED")
-                .ok()
-                .and_then(|v| parse_hook_bool(&v))
-        });
+        .and_then(|v| parse_hook_bool(&v));
+    let env_hook_transcripts = std::env::var("CONTEXTSTREAM_HOOK_TRANSCRIPTS_ENABLED")
+        .ok()
+        .and_then(|v| parse_hook_bool(&v));
+    let env_transcripts = std::env::var("CONTEXTSTREAM_TRANSCRIPTS_ENABLED")
+        .ok()
+        .and_then(|v| parse_hook_bool(&v));
+    let env_policy = env_hook_override.or_else(|| {
+        if env_hook_transcripts == Some(false) || env_transcripts == Some(false) {
+            Some(false)
+        } else {
+            env_hook_transcripts.or(env_transcripts)
+        }
+    });
 
     let mut seen_paths = std::collections::HashSet::new();
     let mut project_snapshots = Vec::new();

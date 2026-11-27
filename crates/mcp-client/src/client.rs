@@ -2040,13 +2040,14 @@ fn retry_permitted(is_write: bool, failure: AttemptFailure, idempotency_supporte
 /// is an answer, not an outage: it cannot change in the seconds a retry
 /// waits, and retrying it took 7 s per call (#458). So is a saved question's
 /// [`crate::questions::NOT_ASKING`]: answering is switched off where the API
-/// runs.
+/// runs; and [`crate::questions::MAIL_UNAVAILABLE`]: Mail is not set up there.
 fn error_reports_a_lasting_state(error: &Error) -> bool {
     matches!(
         error,
         Error::Http { status: 503, message, .. }
             if message.to_ascii_lowercase().contains("is not connected")
                 || message.contains(crate::questions::NOT_ASKING)
+                || message.contains(crate::questions::MAIL_UNAVAILABLE)
     )
 }
 
@@ -36407,6 +36408,16 @@ mod caller_bound_response_cache_tests {
         assert!(error_reports_a_lasting_state(&http(
             503,
             "Questions are not asked of a model here yet. [NOT_ASKING]"
+        )));
+        // A list of a person's mail where Mail is not set up; mail that
+        // could not be read just now is asked again.
+        assert!(error_reports_a_lasting_state(&http(
+            503,
+            "Mail is not set up here. [MAIL_UNAVAILABLE]"
+        )));
+        assert!(!error_reports_a_lasting_state(&http(
+            503,
+            "Your mail could not be read just now. Try again in a moment. [MAIL_NOT_READ]"
         )));
     }
 

@@ -2031,7 +2031,7 @@ fn contextstream_surface_nudge(
             if kind == "handoff" {
                 let capsule = contextstream_tool_name(editor, "capsule");
                 Some(format!(
-                    "Canonical handoff reminder: preserve verified facts, eliminated hypotheses, scope, branch/commit and validation state, blockers, and ordered next_steps. Omit unknown to_user_id. If the user requested a portable bundle/capsule/share link, additionally create {capsule}(action=\"create\", scope=\"session\", session_id=\"<current session id>\", purpose=\"handoff\"); do not create HANDOFF.md as a substitute."
+                    "Canonical handoff reminder: preserve verified facts, eliminated hypotheses, scope, branch/commit and validation state, blockers, and ordered next_steps. On a create or update the body fields are title, summary, scope, next_steps, open_questions, verified_facts, eliminated_hypotheses, blockers, validation and environment; anything else goes under metadata. Omit unknown to_user_id. If the user requested a portable bundle/capsule/share link, additionally create {capsule}(action=\"create\", scope=\"session\", session_id=\"<current session id>\", purpose=\"handoff\"); do not create HANDOFF.md as a substitute."
                 ))
             } else {
                 None

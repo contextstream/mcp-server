@@ -740,6 +740,17 @@ fn visibility_line(kind: &str, result: &Value) -> Option<&'static str> {
 /// How many ignored field names a reply lists before it counts the rest.
 const MAX_IGNORED_FIELDS_NAMED: usize = 12;
 
+/// The lists a handoff keeps in `metadata` under their own names: what the
+/// agent rules ask a handoff to carry. The API takes each as a body field of a
+/// create or an update (its `KEPT_IN_METADATA`) and answers them in `metadata`.
+const HANDOFF_KEPT_FIELDS: [&str; 5] = [
+    "verified_facts",
+    "eliminated_hypotheses",
+    "blockers",
+    "validation",
+    "environment",
+];
+
 /// The body fields the tool added to a create itself (the scope ids, the
 /// session mode's `is_personal`): in `sent` and not in what the caller gave.
 fn fields_added_by_tool(given: &[String], sent: &Value) -> Vec<String> {
@@ -804,9 +815,16 @@ fn ignored_fields_note(kind: &str, result: &Value, added_by_tool: &[String]) -> 
     } else {
         ("fields", "them")
     };
-    Some(format!(
+    let mut note = format!(
         "Not saved: {listed}. {article} {kind} has no such {fields}, so the API ignored {them} (ignored_fields)."
-    ))
+    );
+    if kind == "handoff" {
+        note.push_str(&format!(
+            " A handoff's own fields are title, summary, scope, next_steps, open_questions, artifacts, {}; send anything else under metadata with an update.",
+            HANDOFF_KEPT_FIELDS.join(", ")
+        ));
+    }
+    Some(note)
 }
 
 /// The lines every create and update reply ends with: the stored visibility,
@@ -892,7 +910,11 @@ fn format_entity_summary(kind: &str, result: &Value) -> String {
 /// The summary line names it; these lines carry the rest, so a client that
 /// shows only text (stdio sends no structured content) reads what it wrote: a
 /// handoff's summary, scope and next steps, a ticket's description, a
-/// release's environments. Each value is cut at 1,500 characters.
+/// release's environments. Each value is cut at 1,500 characters; a handoff's
+/// at 6,000, because a handoff is read to be acted on and a list of verified
+/// facts or next steps cut short is work lost. The lists a handoff keeps in
+/// `metadata` ([`HANDOFF_KEPT_FIELDS`]) get a line of their own, in that
+/// order, so none of them is cut with the rest of `metadata`.
 fn format_entity_fields(kind: &str, result: &Value) -> String {
     let item = extract_entity_object(kind, result);
     let Some(fields) = item.as_object() else {
@@ -903,12 +925,10 @@ fn format_entity_fields(kind: &str, result: &Value) -> String {
             .and_then(Value::as_str)
             .is_some_and(|value| !value.trim().is_empty())
     });
+    let max_chars = if kind == "handoff" { 6_000 } else { 1_500 };
     let mut lines = Vec::new();
-    for (name, value) in fields {
-        if matches!(name.as_str(), "id" | "status") || Some(name.as_str()) == title_field {
-            continue;
-        }
-        if let Some(rendered) = render_field_value(value) {
+    let mut push = |name: &str, value: &Value| {
+        if let Some(rendered) = render_field_value(value, max_chars) {
             // An indented block (a list, or text on several lines) starts under its name.
             if rendered.starts_with("  ") {
                 lines.push(format!("{name}:\n{rendered}"));
@@ -916,19 +936,42 @@ fn format_entity_fields(kind: &str, result: &Value) -> String {
                 lines.push(format!("{name}: {rendered}"));
             }
         }
+    };
+    for (name, value) in fields {
+        if matches!(name.as_str(), "id" | "status") || Some(name.as_str()) == title_field {
+            continue;
+        }
+        match value.as_object() {
+            Some(metadata) if kind == "handoff" && name == "metadata" => {
+                // A name the record has at its top level is shown from there.
+                let lifted =
+                    |key: &str| HANDOFF_KEPT_FIELDS.contains(&key) && !fields.contains_key(key);
+                for kept in HANDOFF_KEPT_FIELDS {
+                    if let Some(value) = metadata.get(kept).filter(|_| lifted(kept)) {
+                        push(kept, value);
+                    }
+                }
+                let rest: serde_json::Map<String, Value> = metadata
+                    .iter()
+                    .filter(|(key, _)| !lifted(key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                push(name, &Value::Object(rest));
+            }
+            _ => push(name, value),
+        }
     }
     lines.join("\n")
 }
 
-/// One field's value as text; `None` for null and empty values. A value on
-/// several lines comes back indented under its name.
-fn render_field_value(value: &Value) -> Option<String> {
-    const MAX_CHARS: usize = 1_500;
+/// One field's value as text, cut at `max_chars`; `None` for null and empty
+/// values. A value on several lines comes back indented under its name.
+fn render_field_value(value: &Value, max_chars: usize) -> Option<String> {
     let cut = |text: String| -> String {
-        if text.chars().count() <= MAX_CHARS {
+        if text.chars().count() <= max_chars {
             return text;
         }
-        let kept: String = text.chars().take(MAX_CHARS - 1).collect();
+        let kept: String = text.chars().take(max_chars - 1).collect();
         format!("{}…", kept.trim_end())
     };
     let indent = |text: &str| -> String {
@@ -1085,7 +1128,13 @@ const ENTITY_TOOL_REFERENCE: &str = "Structured taxonomy entities — tickets, h
                 'create a handoff' / 'prepare a handoff' / 'hand this over' / \
                 'continue with another agent or session' / 'package context for handoff' \
                 (kind=handoff, action=create, body={title, summary, scope, next_steps}; \
-                add to_user_id only when known and never invent it) · \
+                add to_user_id only when known and never invent it. A handoff also takes \
+                open_questions, artifacts, and the lists verified_facts, eliminated_hypotheses, \
+                blockers, validation (what was run, with results) and environment (gotchas): \
+                send each as its own body field; get returns them inside metadata, and an \
+                update that does not name one leaves it. Anything else (branch and commit \
+                status, ids) goes under metadata: any other body field is not saved, and the \
+                reply names it) · \
                 'create a ticket' / 'file a bug' / 'track a feature' / 'log a chore' / \
                 'assign a ticket' / 'link a doc or plan to a ticket' \
                 (kind=ticket, body.kind=bug|feature|task|chore|epic; \
@@ -1616,6 +1665,9 @@ impl ToolHandler for EntityTool {
                 "JSON body for create / update. Free-form; see API schema per kind. \
                  For kind=handoff create: title, summary, scope, and next_steps preserve the \
                  handoff; to_user_id is optional and must be omitted rather than invented. \
+                 A handoff also takes open_questions, artifacts and the lists verified_facts, \
+                 eliminated_hypotheses, blockers, validation and environment as body fields \
+                 (kept in metadata); anything else goes under metadata. \
                  For kind=ticket: assignees (hybrid user_id/email/handle plus name, entity_type human|agent|team; [] clears them) \
                  and linked_items (indexed refs: kind+id+title_snapshot+status_snapshot+updated_at; \
                  no URLs). Linked kinds: doc, diagram, plan, task, todo, handoff, runbook, capsule. \
@@ -2715,6 +2767,132 @@ mod tests {
             "{}",
             text.len()
         );
+    }
+
+    /// Ticket 2a36aaf4: the lists a handoff keeps in `metadata` each get a
+    /// line of their own on `get`, whole, instead of sharing one cut line of
+    /// JSON with every other metadata key.
+    #[test]
+    fn get_text_shows_a_handoffs_kept_lists_whole() {
+        let facts: Vec<String> = (1..=30)
+            .map(|n| {
+                format!("fact {n}: a verified fact long enough to fill most of a line of text")
+            })
+            .collect();
+        let handoff = serde_json::json!({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "title": "Hand off the gate",
+            "status": "pending",
+            "summary": "Gates pass; push is next.",
+            "metadata": {
+                "target_tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "environment": ["linux x86_64"],
+                "validation": ["cargo test: 12 passed"],
+                "blockers": [],
+                "eliminated_hypotheses": ["not the cache"],
+                "verified_facts": facts,
+            },
+        });
+        let text = format_entity_fields("handoff", &handoff);
+        // Thirty facts are over 1,500 characters: none is cut.
+        assert!(text.contains("verified_facts:\n  - fact 1: "), "{text}");
+        assert!(text.contains("  - fact 30: a verified fact"), "{text}");
+        assert!(!text.contains('…'), "{text}");
+        assert!(
+            text.contains("eliminated_hypotheses: not the cache"),
+            "{text}"
+        );
+        assert!(text.contains("validation: cargo test: 12 passed"), "{text}");
+        assert!(text.contains("environment: linux x86_64"), "{text}");
+        // An empty list has no line; the other keys stay under metadata.
+        assert!(!text.contains("blockers"), "{text}");
+        assert!(
+            text.contains(
+                "metadata: {\"target_tree\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+            ),
+            "{text}"
+        );
+        // In the order a reader wants them, whatever order the API answers in.
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {text}"))
+        };
+        assert!(at("verified_facts:") < at("eliminated_hypotheses:"));
+        assert!(at("eliminated_hypotheses:") < at("validation:"));
+        assert!(at("validation:") < at("environment:"));
+
+        // A handoff's own long field is not cut at 1,500 either, but is bounded.
+        let long = serde_json::json!({"title": "t", "summary": "x".repeat(4_000)});
+        let whole = format_entity_fields("handoff", &long);
+        assert!(whole.chars().count() > 4_000 && !whole.contains('…'));
+        let longer = serde_json::json!({"title": "t", "summary": "x".repeat(9_000)});
+        let cut = format_entity_fields("handoff", &longer);
+        assert!(
+            cut.ends_with('…') && cut.chars().count() < 6_100,
+            "{}",
+            cut.len()
+        );
+
+        // Only a handoff's metadata is read this way, and a name the record
+        // has at its top level is shown once, from there.
+        let ticket = serde_json::json!({"metadata": {"verified_facts": ["a"]}});
+        assert_eq!(
+            format_entity_fields("ticket", &ticket),
+            "metadata: {\"verified_facts\":[\"a\"]}"
+        );
+        let both = serde_json::json!({
+            "blockers": ["top level"],
+            "metadata": {"blockers": ["top level"]},
+        });
+        assert_eq!(
+            format_entity_fields("handoff", &both),
+            "blockers: top level\nmetadata: {\"blockers\":[\"top level\"]}"
+        );
+    }
+
+    /// A handoff's "Not saved" note says what a handoff does take and where
+    /// the rest belongs, so the agent's next call keeps it.
+    #[test]
+    fn a_handoffs_ignored_fields_note_says_where_the_rest_goes() {
+        let result = serde_json::json!({"id": "h1", "ignored_fields": ["repos", "linked_items"]});
+        let note = ignored_fields_note("handoff", &result, &[]).expect("a note");
+        assert!(
+            note.starts_with(
+                "Not saved: repos, linked_items. A handoff has no such fields, so the API ignored them (ignored_fields)."
+            ),
+            "{note}"
+        );
+        for field in HANDOFF_KEPT_FIELDS {
+            assert!(note.contains(field), "{field} in {note}");
+        }
+        assert!(
+            note.ends_with("send anything else under metadata with an update."),
+            "{note}"
+        );
+        assert!(ignored_fields_note("handoff", &serde_json::json!({"id": "h1"}), &[]).is_none());
+    }
+
+    /// The tool tells an agent which body fields carry what the rules ask a
+    /// handoff to preserve.
+    #[test]
+    fn the_reference_names_the_handoff_fields() {
+        let session = Arc::new(SessionManager::new(
+            ContextStreamClient::new(Config::default()),
+            Config::default(),
+        ));
+        let tool = EntityTool::new(ContextStreamClient::new(Config::default()), session);
+        let schema = tool.input_schema();
+        let reference = schema["properties"]["action"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        let body = schema["properties"]["body"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        for field in HANDOFF_KEPT_FIELDS {
+            assert!(reference.contains(field), "{field} in the reference");
+            assert!(body.contains(field), "{field} in body");
+        }
+        assert!(reference.contains("goes under metadata"), "{reference}");
     }
 
     #[test]

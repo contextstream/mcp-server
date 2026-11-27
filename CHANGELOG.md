@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.112
+
+- On the hosted gateway, `media(action="index", file_path=...)` now starts an upload that the client finishes itself instead of refusing the file. It returns the content id, a presigned upload URL with its headers, a ready-to-run `curl` command (the path quoted safely) and the `media(action="complete_upload", content_id=...)` call that starts indexing. Before, a hosted session could not put a local PDF, screenshot or recording into ContextStream media at all: the only advice was `external_url`, which a local file does not have. `media(action="upload_url")` starts the same upload without a path. Local sessions, and self-hosted gateways with `CONTEXTSTREAM_HTTP_LOCAL_FILES=allow`, upload the file directly as before.
+- Updates can change who sees an item. `update_diagram`, `update_doc`, `update_todo`, `update_task`, `update_event` and `update_node` now pass `is_personal` when it is given, so a personal item can be shared with the team. Before, the value was dropped and the item stayed personal, so agents made a team copy and left the personal one behind. The team listings (`team_tasks`, `team_todos`, `team_diagrams`, `team_docs`) work with an explicit `workspace_id` in any account mode; otherwise the error says how to switch.
+- Transcripts keep every prompt as typed, in order. A prompt in the middle of a session could go missing, and a short follow-up could be stored with words the user never typed. Prompts and replies now go through a per-session queue that is delivered in order and retried within the hook's time budget, and the stored text is what the user typed; the 16 KiB cap and the scrubbing are unchanged.
+- Ten timing-dependent tests are now deterministic.
+
 ## 1.0.111
 
 - The Claude Code hook now sends a check that stands beside something it does not follow. It used to leave a whole Bash line as typed when the line also held a here-document, a `$(…)`, a group in parentheses or braces, a comment, a background job or `if`/`for`, so a file edited from a here-document and then tested in one line, or `cd wt && (cargo check | grep error; cargo test | tail)`, never ran remotely. Measured on one busy machine over four days, a check was sent from 247 of the 1,116 lines that held one, and from 395 with this change. It now steps over those parts and wraps each check it finds, with the pipes, redirections and other commands around it as typed. Still left as typed: a command in the background, one that reads its input from a redirection, what a substitution holds, and a line with a `case`.

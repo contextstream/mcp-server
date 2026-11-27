@@ -1534,7 +1534,7 @@ fn the_schema_adds_loop_inputs_and_keeps_the_plan_inputs() {
     assert_eq!(
         properties["create"]["properties"]["assignees"]["items"]["properties"]["entity_type"]
             ["enum"],
-        json!(["human", "agent"])
+        json!(["human", "agent", "team"])
     );
     // The plan inputs are as they were.
     assert_eq!(

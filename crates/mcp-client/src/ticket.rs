@@ -482,6 +482,28 @@ mod tests {
     }
 
     #[test]
+    fn a_team_is_an_assignee_and_is_shown_as_one() {
+        // The API takes entity_type team (a CODEOWNERS team, named by its
+        // handle); only human and agent passed here.
+        let mut body = json!({
+            "assignees": [{"entity_type": "Team", "handle": " @example-org/platform "}]
+        });
+        normalize_ticket_body(&mut body).expect("a team is an assignee");
+        assert_eq!(
+            body["assignees"],
+            json!([{"entity_type": "team", "handle": "@example-org/platform"}])
+        );
+        assert_eq!(
+            format_ticket_assignee_summary(&body).as_deref(),
+            Some("assignees: @example-org/platform [team]")
+        );
+
+        let mut unknown = json!({"assignees": [{"entity_type": "group", "handle": "x"}]});
+        let refused = normalize_ticket_body(&mut unknown).unwrap_err().to_string();
+        assert!(refused.contains("human, agent, team"), "{refused}");
+    }
+
+    #[test]
     fn normalize_linked_items_canonicalizes_and_dedupes() {
         let mut body = json!({
             "linked_items": [

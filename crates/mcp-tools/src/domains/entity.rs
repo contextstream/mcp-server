@@ -2068,6 +2068,176 @@ mod tests {
         assert!(structured.get("linked_items").is_none());
     }
 
+    const REVIEW_ID: &str = "66666666-6666-6666-6666-666666666666";
+    const TEAM_HANDLE: &str = "@example-org/platform";
+
+    /// A review as the API answers a create or an update: `ignored_fields`
+    /// names the body fields a review does not have, and is left out when
+    /// there are none.
+    fn stored_review(ignored_fields: &[&str]) -> Value {
+        let mut review = serde_json::json!({
+            "id": REVIEW_ID,
+            "title": "Review the retry path",
+            "kind": "pr",
+            "status": "requested",
+            "workspace_id": WORKSPACE_ID,
+            "project_id": MCP_SERVER_PROJECT_ID,
+            "reviewer_ids": [],
+            "reviewers": [
+                {"entity_type": "team", "handle": TEAM_HANDLE},
+                {"entity_type": "human", "email": "ada@example.com"},
+            ],
+        });
+        if !ignored_fields.is_empty() {
+            review["ignored_fields"] = serde_json::json!(ignored_fields);
+        }
+        review
+    }
+
+    #[tokio::test]
+    async fn a_review_create_sends_reviewers_as_given_and_names_what_was_not_saved() {
+        // The API ignored `description` (a review has none) and the
+        // `is_personal` this tool adds to every create. Only the first is the
+        // caller's, and the reply said nothing about either.
+        let (tool, server) = entity_tool_with_http_sequence(vec![(
+            "201 Created",
+            stored_review(&["description", "is_personal"]),
+        )])
+        .await;
+        let reviewers = serde_json::json!([
+            {"entity_type": "team", "handle": TEAM_HANDLE},
+            {"email": "ada@example.com"},
+        ]);
+
+        let result = tool
+            .execute(serde_json::json!({
+                "kind": "review",
+                "action": "create",
+                "workspace_id": WORKSPACE_ID,
+                "project_id": MCP_SERVER_PROJECT_ID,
+                "body": {
+                    "title": "Review the retry path",
+                    "kind": "pr",
+                    "description": "Please look at the retry path.",
+                    "reviewers": reviewers,
+                }
+            }))
+            .await
+            .expect("create succeeds");
+
+        let requests = server.await.expect("entity request server");
+        assert!(
+            requests[0].starts_with("POST /api/v1/reviews "),
+            "{}",
+            requests[0]
+        );
+        assert_eq!(request_body(&requests[0])["reviewers"], reviewers);
+        let text = result_text(&result);
+        assert!(text.contains("Not saved: description."), "{text}");
+        assert!(text.contains("A review has no such field"), "{text}");
+        assert!(
+            !text.contains("is_personal"),
+            "a field the caller did not send is not the caller's to fix: {text}"
+        );
+        // The structured reply is the API's answer, unchanged.
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("structured reply");
+        assert_eq!(
+            structured["ignored_fields"],
+            serde_json::json!(["description", "is_personal"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_review_update_names_every_field_the_api_ignored() {
+        let (tool, server) = entity_tool_with_http_sequence(vec![
+            (
+                "200 OK",
+                stored_review(&["description", "is_personal", "reviewers[0].slug"]),
+            ),
+            ("200 OK", stored_review(&[])),
+        ])
+        .await;
+
+        let ignored = tool
+            .execute(serde_json::json!({
+                "kind": "review",
+                "action": "update",
+                "id": REVIEW_ID,
+                "body": {
+                    "description": "Please look at the retry path.",
+                    "is_personal": false,
+                    "reviewers": [
+                        {"entity_type": "team", "handle": TEAM_HANDLE, "slug": "platform"}
+                    ],
+                }
+            }))
+            .await
+            .expect("update succeeds");
+        let saved = tool
+            .execute(serde_json::json!({
+                "kind": "review",
+                "action": "update",
+                "id": REVIEW_ID,
+                "body": {"summary": "Please look at the retry path."}
+            }))
+            .await
+            .expect("update succeeds");
+
+        let requests = server.await.expect("entity request server");
+        assert!(
+            requests[0].starts_with(&format!("PATCH /api/v1/reviews/{REVIEW_ID} ")),
+            "{}",
+            requests[0]
+        );
+        // A field the caller set is named, `is_personal` among them.
+        let text = result_text(&ignored);
+        assert!(
+            text.contains("Not saved: description, is_personal, reviewers[0].slug."),
+            "{text}"
+        );
+        assert!(text.contains("A review has no such fields"), "{text}");
+        let text = result_text(&saved);
+        assert!(!text.contains("Not saved"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_ticket_takes_a_team_as_an_assignee() {
+        // The API takes entity_type team for ticket assignees; the tool
+        // refused it before the request was sent.
+        let mut stored = stored_ticket(false, MCP_SERVER_PROJECT_ID);
+        stored["assignees"] = serde_json::json!([{"entity_type": "team", "handle": TEAM_HANDLE}]);
+        let (tool, server) = entity_tool_with_http_sequence(vec![("201 Created", stored)]).await;
+
+        let result = tool
+            .execute(serde_json::json!({
+                "kind": "ticket",
+                "action": "create",
+                "workspace_id": WORKSPACE_ID,
+                "project_id": MCP_SERVER_PROJECT_ID,
+                "body": {
+                    "title": "Fix the hook",
+                    "kind": "bug",
+                    "assignees": [{"entity_type": "Team", "handle": TEAM_HANDLE}],
+                }
+            }))
+            .await
+            .expect("a team is an assignee");
+
+        let requests = server.await.expect("entity request server");
+        assert_eq!(
+            request_body(&requests[0])["assignees"],
+            serde_json::json!([{"entity_type": "team", "handle": TEAM_HANDLE}])
+        );
+        let text = result_text(&result);
+        assert!(
+            text.contains(&format!("assignees: {TEAM_HANDLE} [team]")),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
     async fn discussion_kind_is_refused_with_where_to_go_instead() {
         let session = Arc::new(SessionManager::new(
@@ -2156,6 +2326,50 @@ mod tests {
         ] {
             assert!(body.contains(field), "{field}: {body}");
         }
+    }
+
+    #[test]
+    fn the_tool_text_says_how_to_name_review_reviewers() {
+        // The text described ticket assignees only, so a caller asked to
+        // request a review guessed plain strings (the API answers 400), then
+        // entity_type human for a team.
+        let session = Arc::new(SessionManager::new(
+            ContextStreamClient::new(Config::default()),
+            Config::default(),
+        ));
+        let tool = EntityTool::new(ContextStreamClient::new(Config::default()), session);
+
+        // The description is sent with every request: one short hint, and it
+        // still fits the function-description limit.
+        let desc = tool.metadata().description.as_str();
+        assert!(desc.chars().count() <= 1024, "{}", desc.chars().count());
+        assert!(
+            desc.contains("'design review' (reviewers: [{entity_type: team, handle}, {email}])"),
+            "{desc}"
+        );
+
+        let schema = tool.input_schema();
+        let reference = schema["properties"]["action"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        for said in [
+            // The shape, and an example with a team handle and a person by email.
+            "body.reviewers=[{entity_type=human|agent|team, user_id?, email?, handle?, name?, role?}]",
+            "[{entity_type: team, handle: \"@example-org/platform\"}, {email: \"ada@example.com\"}]",
+            // Ticket assignees take a team too.
+            "entity_type=human|agent|team, role?}]",
+            "a team is {entity_type: team, handle}",
+            // What the API does not save is named in the reply.
+            "ignored_fields",
+        ] {
+            assert!(reference.contains(said), "{said}: {reference}");
+        }
+
+        let body = schema["properties"]["body"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(body.contains("entity_type human|agent|team"), "{body}");
+        assert!(body.contains("For kind=review: reviewers"), "{body}");
     }
 
     #[test]

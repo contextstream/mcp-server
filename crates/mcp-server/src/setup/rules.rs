@@ -4570,6 +4570,24 @@ mod tests {
     }
 
     #[test]
+    fn the_review_example_names_reviewers_as_objects() {
+        // The example showed only reviewer_ids (user ids), so a team or a
+        // person known by email had nowhere to go.
+        let rules = generate_rule_content(&Editor::Codex, None, None, RulesMode::Bootstrap);
+        let line = rules
+            .lines()
+            .find(|line| line.contains("entity(kind=\"review\", action=\"create\""))
+            .expect("the review example");
+        for said in [
+            "\"reviewers\": [",
+            "{\"entity_type\": \"team\", \"handle\": \"@example-org/platform\"}",
+            "{\"email\": \"ada@example.com\"}",
+        ] {
+            assert!(line.contains(said), "{said}: {line}");
+        }
+    }
+
+    #[test]
     fn copilot_skill_carries_the_same_canonical_handoff_policy() {
         let skill = build_copilot_skill_content();
         assert!(skill.contains(HANDOFF_GUIDANCE.trim()));

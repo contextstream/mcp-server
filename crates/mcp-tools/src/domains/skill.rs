@@ -118,9 +118,24 @@ const IMPORT_FORMATS: &[&str] = &[
     "zip",
 ];
 
+fn imported_skill_visibility(skill: &Value) -> Option<&str> {
+    if let Some(scope) = skill
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(scope);
+    }
+    skill
+        .get("is_personal")
+        .and_then(Value::as_bool)
+        .map(|personal| if personal { "personal" } else { "team" })
+}
+
 /// What an import did (#399): the counts (duplicates apart from skills the
-/// quality check refused), the skills created, and that drafts do not
-/// trigger until activated.
+/// quality check refused), the skills created with their stored status,
+/// visibility and project, and that drafts do not trigger until activated.
 fn import_result_text(result: &Value) -> String {
     let count = |key: &str| result.get(key).and_then(Value::as_u64).unwrap_or(0);
     let (imported, skipped, rejected) = (count("imported"), count("skipped"), count("rejected"));
@@ -141,7 +156,26 @@ fn import_result_text(result: &Value) -> String {
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("active");
-        text.push_str(&format!("\n- {name} ({status})"));
+        let mut details = Vec::new();
+        if let Some(visibility) = imported_skill_visibility(skill) {
+            details.push(format!("visibility={visibility}"));
+        }
+        if let Some(project_val) = skill.get("project_id") {
+            match project_val
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(project_id) => details.push(format!("project={project_id}")),
+                None if project_val.is_null() => details.push("project=none".to_string()),
+                None => {}
+            }
+        }
+        if details.is_empty() {
+            text.push_str(&format!("\n- {name} ({status})"));
+        } else {
+            text.push_str(&format!("\n- {name} ({status}) [{}]", details.join(", ")));
+        }
         if status.eq_ignore_ascii_case("draft") {
             drafts.push(name);
         }
@@ -1018,13 +1052,29 @@ impl SkillTool {
     }
 
     async fn handle_import(&self, input: &SkillInput) -> Result<ToolResult> {
-        // Read content from file_path if provided, otherwise use content field
-        let content = if let Some(file_path) = &input.file_path {
+        let non_empty_content = input
+            .content
+            .as_deref()
+            .filter(|c| !c.trim().is_empty())
+            .map(str::to_string);
+        let file_path = input
+            .file_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+
+        // When content is already provided, never read file_path from disk; on
+        // the hosted MCP gateway file_path is then treated strictly as
+        // source_file metadata instead of refusing.
+        let content = if let Some(content) = non_empty_content {
+            content
+        } else if let Some(file_path) = file_path {
             if !self.client.config().await.local_files_allowed() {
-                return Err(Error::Validation(
-                    "skill(action=\"import\", file_path=...) is disabled on the hosted MCP gateway because file_path reads the gateway host's own disk. Pass the skill text directly as `content` instead. (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)"
-                        .to_string(),
-                ));
+                let quoted_path = serde_json::to_string(file_path)
+                    .unwrap_or_else(|_| "\"<file_path>\"".to_string());
+                return Err(Error::Validation(format!(
+                    "skill(action=\"import\", file_path=...) is disabled on the hosted MCP gateway because file_path cannot read files from your machine (it would read the gateway host's own disk). Read the file on your own machine first, then call skill(action=\"import\", content=\"<file contents>\", source_file={quoted_path}) again (add scope=\"team\" or is_personal=false to share with the team). (A self-hosted local gateway may set CONTEXTSTREAM_HTTP_LOCAL_FILES=allow.)"
+                )));
             }
             // The file is read and sent to the server as a skill: not a credential
             // file, whatever it holds (mcp-server#469; `media index` has the same rule).
@@ -1063,15 +1113,48 @@ impl SkillTool {
             crate::input_shape::enum_argument("format", input.format.clone(), IMPORT_FORMATS)
                 .map_err(Error::Validation)?;
 
+        let session_state = self.session.state().await;
+        let explicit_workspace_id = Self::parse_uuid(&input.workspace_id, "workspace_id")?;
+        let workspace_id = explicit_workspace_id.or(session_state.workspace_id);
+        let explicit_project_id = Self::parse_uuid(&input.project_id, "project_id")?;
+        let project_id = match explicit_project_id {
+            Some(id) => Some(id),
+            None => match self.resolve_target_project_id(input).await? {
+                Some(id) => Some(id),
+                None => {
+                    let same_workspace = match (explicit_workspace_id, session_state.workspace_id) {
+                        (Some(explicit), Some(session_ws)) => explicit == session_ws,
+                        (Some(_), None) => false,
+                        (None, _) => true,
+                    };
+                    if same_workspace {
+                        session_state.project_id
+                    } else {
+                        None
+                    }
+                }
+            },
+        };
+        let source_file = input
+            .source_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| file_path.map(str::to_string));
+
         let result = self
             .client
             .import_skills(ImportSkillParams {
                 content,
                 format,
                 source_tool: input.source_tool.clone(),
-                source_file: input.source_file.clone().or(input.file_path.clone()),
+                source_file,
                 scope: input.scope.clone(),
-                workspace_id: self.resolve_workspace_id(&input.workspace_id).await,
+                is_personal: input.is_personal,
+                status: input.status.clone(),
+                workspace_id,
+                project_id,
             })
             .await?;
 
@@ -1588,13 +1671,13 @@ impl ToolHandler for SkillTool {
             )
             .string_enum(
                 "scope",
-                "Visibility scope. For action='share', only team or public are allowed.",
+                "Visibility scope ('personal', 'team', or 'public'; 'all' is for list). On import, defaults to 'personal' unless scope='team' or is_personal=false is passed. For action='share', only team or public are allowed.",
                 &["personal", "team", "public", "all"],
                 false,
             )
             .string_enum(
                 "status",
-                "Skill status. Defaults to 'active' on create when omitted; pass 'draft' to save as a draft.",
+                "Skill status. Defaults to 'active' on create and import when omitted; pass 'draft' to save as a draft.",
                 SKILL_STATUSES,
                 false,
             )
@@ -1603,14 +1686,26 @@ impl ToolHandler for SkillTool {
                 "Replacement skill (name or id), recorded when action='supersede'",
                 false,
             )
-            .boolean("is_personal", "Whether skill is personal", false)
+            .boolean(
+                "is_personal",
+                "Whether the skill is personal (private to you). On import, defaults to true (personal) unless is_personal=false or scope='team' is passed.",
+                false,
+            )
             .integer(
                 "priority",
                 "Skill priority 0-100 (higher = matched first)",
                 false,
             )
-            .string("content", "Content string for import", false)
-            .string("file_path", "Local file path for import", false)
+            .string(
+                "content",
+                "Skill content string for import (required on the hosted MCP gateway; pair with source_file for provenance).",
+                false,
+            )
+            .string(
+                "file_path",
+                "Local file path for import (local/stdio MCP only; on the hosted MCP gateway read the file locally and pass content plus source_file, or pass both content and file_path to use file_path as source_file metadata).",
+                false,
+            )
             .string_enum(
                 "format",
                 "Import/export format",
@@ -1649,7 +1744,7 @@ impl ToolHandler for SkillTool {
             )
             .string(
                 "project_id",
-                "Project ID (UUID). For project-scoped skills, pass the current project_id returned by init/context instead of guessing.",
+                "Project ID (UUID). On import, defaults to the session's current project_id when omitted. For project-scoped skills, pass the current project_id returned by init/context instead of guessing.",
                 false,
             )
             .string(

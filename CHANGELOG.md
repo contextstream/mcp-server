@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.114
+
+- Reviews say how to name reviewers. The `entity` tool now explains that `kind=review` takes `reviewers` as objects in the ticket-assignee shape, with an example of a team handle (`{entity_type: "team", handle: "@example-org/platform"}`) and a person by email, and that a CODEOWNERS team is `team`, never `human`. Before, an agent asked to "request a review from whoever owns it" guessed plain names (refused) and then tagged the team as a person. Reviewers are passed to the API as given.
+- Fields a review does not have are no longer dropped silently. Create and update replies end with "Not saved: ..." naming each field the API ignored (`ignored_fields`), for example `description` (a review's text is `summary`). A field the tool added itself, such as the session's `is_personal`, is not listed.
+- A team can be a ticket's assignee. `entity(kind="ticket")` and `session(action="attach_ticket", create=...)` accept `entity_type: "team"` (the API already did), and the ticket summary marks it `[team]`. The `session` and `session_read` schemas gain that one enum value.
+
 ## 1.0.113
 
 - Media can be shared with the team. `media(action="index")` (a URL, a local file, or the hosted upload plan), `media(action="upload_url")` and `media(action="complete_upload")` accept `is_personal`, store exactly one matching visibility, and say in the response which one was stored. The new `media(action="update")` changes an existing asset's visibility (and its title, description or tags) through the API's own permission checks and keeps its other tags. Before, every upload made through the MCP stayed personal and nothing could share it, so "index this so the team can find it" left the file visible to one person.

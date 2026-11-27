@@ -11,9 +11,12 @@ pub const LINKED_ITEM_KINDS: &[&str] = &[
 /// Canonical linked artifact kinds for plans.
 pub const PLAN_LINKED_ITEM_KINDS: &[&str] = &["doc", "diagram", "runbook", "handoff"];
 
-/// Assignee entity types: a person, or an agent
-/// (`{entity_type: "agent", handle: "cinder", name: "Cinder"}`).
-pub const ASSIGNEE_ENTITY_TYPES: &[&str] = &["human", "agent"];
+/// Assignee entity types: a person, an agent
+/// (`{entity_type: "agent", handle: "cinder", name: "Cinder"}`), or a team
+/// named by its handle (`{entity_type: "team", handle: "@example-org/platform"}`,
+/// as a CODEOWNERS file names one). The API takes the same three for review
+/// reviewers.
+pub const ASSIGNEE_ENTITY_TYPES: &[&str] = &["human", "agent", "team"];
 
 /// Summary of linked items on a ticket, grouped by kind.
 #[derive(Debug, Clone, Default)]
@@ -356,10 +359,10 @@ pub fn format_ticket_assignee_summary(item: &Value) -> Option<String> {
                 "{}{}{}",
                 label,
                 role,
-                if entity_type == "agent" {
-                    " [agent]"
-                } else {
-                    ""
+                match entity_type {
+                    "agent" => " [agent]",
+                    "team" => " [team]",
+                    _ => "",
                 }
             ))
         })

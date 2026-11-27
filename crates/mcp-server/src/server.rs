@@ -3756,8 +3756,11 @@ mod tests {
             // Advanced for `is_personal` on the captures, which the API
             // accepts and the tool dropped. Additive only
             // (is_personal_only_adds_to_the_capture_schemas).
+            // Advanced for a team as a loop ticket's assignee: `team` joins
+            // `create.assignees[].entity_type`, as the API takes it. Additive
+            // only (a_team_assignee_only_adds_to_the_loop_ticket_schemas).
             "session",
-            "33c854921599cc43aac6915a0d557f5c9cea5d63b96c56d212a456c0902397ef",
+            "8a4b30126d8332181735686dbcc1dd5e8d9b09395577b75a5f616f27e5315c12",
         ),
         (
             // Advanced for `is_personal`, as for `session`.
@@ -3775,8 +3778,9 @@ mod tests {
             // Advanced for the tickets on a loop: loop_tickets and the two
             // ticket inputs, and `channel`. Additive only, as for `session`.
             // Advanced for `is_personal`, which a twin lists as its tool does.
+            // Advanced for the `team` assignee type, as for `session`.
             "session_read",
-            "6fcd7a4a8dccdcd04a7137cc68afdc22beb165d66af13c5106252e429c9ba979",
+            "2146249e48fbbeef30b06f38aad8413e797848730890ab835a68fb838329d73d",
         ),
         (
             "session_remember",
@@ -4162,6 +4166,52 @@ mod tests {
         tools
     }
 
+    /// `tools` as they were before a team could have a loop's new ticket:
+    /// without `team` in the `create.assignees[].entity_type` of `session`
+    /// and `session_read`.
+    fn before_team_assignees(mut tools: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        for tool in &mut tools {
+            if tool["name"] != "session" && tool["name"] != "session_read" {
+                continue;
+            }
+            let last = tool["inputSchema"]["properties"]["create"]["properties"]["assignees"]
+                ["items"]["properties"]["entity_type"]["enum"]
+                .as_array_mut()
+                .expect("assignee entity types")
+                .pop();
+            assert_eq!(last, Some(serde_json::json!("team")), "{}", tool["name"]);
+        }
+        tools
+    }
+
+    #[test]
+    fn a_team_assignee_only_adds_to_the_loop_ticket_schemas() {
+        // The API takes entity_type team for a ticket's assignees, so a
+        // loop's new ticket can name one: one more value in
+        // `create.assignees[].entity_type`. Without it both schemas are
+        // exactly the contracts they had before.
+        let tools = before_team_assignees(contextstream_tools_list(
+            &test_registry(Config::default()),
+            None,
+        ));
+        for (name, before) in [
+            (
+                "session",
+                "33c854921599cc43aac6915a0d557f5c9cea5d63b96c56d212a456c0902397ef",
+            ),
+            (
+                "session_read",
+                "6fcd7a4a8dccdcd04a7137cc68afdc22beb165d66af13c5106252e429c9ba979",
+            ),
+        ] {
+            assert_eq!(
+                schema_contract_hash(&tool_by_name(&tools, name)["inputSchema"]),
+                before,
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn loop_ticket_inputs_only_add_to_the_session_schemas() {
         // Contract v1.3 added three ticket actions and three parameters to
@@ -4256,7 +4306,7 @@ mod tests {
         // an agent's is_personal although the API takes it. Advertising it
         // added one optional boolean; without it each schema is exactly the
         // contract it had before.
-        let tools = tools_before_remote_checks();
+        let tools = before_team_assignees(tools_before_remote_checks());
         for (name, before) in [
             (
                 "session",

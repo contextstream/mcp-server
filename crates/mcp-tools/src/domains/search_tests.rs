@@ -1450,7 +1450,7 @@ mod tokenizer_wire_tests {
             exact_match_boost: None,
             hot_paths_identity: None,
         };
-        let proxy = build_search_cache_key_with_tokenizer(
+        let proxy = search_cache_key_at(
             None,
             None,
             &input,
@@ -1460,8 +1460,9 @@ mod tokenizer_wire_tests {
             None,
             None,
             "mcp-wire-tokenizer-v1:o200k:proxy",
+            0,
         );
-        let exact = build_search_cache_key_with_tokenizer(
+        let exact = search_cache_key_at(
             None,
             None,
             &input,
@@ -1471,6 +1472,7 @@ mod tokenizer_wire_tests {
             None,
             None,
             "mcp-wire-tokenizer-v1:o200k:enforce:exact",
+            0,
         );
         assert_ne!(proxy, exact);
         assert!(proxy.starts_with("search:v5:"));
@@ -1748,16 +1750,17 @@ mod auto_mode_tests {
         resolve_mode, resolve_output_preferences, resolve_search_content_max_chars,
         resolve_search_context_lines, resolve_search_limit, resolve_search_offset,
         response_generation_consistency, result_has_artifact_like_path, run_search_for_mode,
-        scoped_session_folder_path, search_cache, search_response_structured_value,
-        search_tool_result_wire_budget, sha256_hex_bytes, should_allow_workspace_scope_fallback,
-        should_append_index_health_footer, should_apply_local_enrichment,
-        should_fetch_graph_enrichment, should_fetch_project_map_route_hint,
-        should_filter_artifact_paths, should_retry_keyword_with_semantic,
-        should_retry_keyword_with_symbol_modes, should_surface_index_health_before_results,
-        suggest_output_format, targeted_local_delta, targeted_payload_content_bytes, which_rg,
-        ApiIndexHint, DirtyFileHint, IndexHealth, LocalEnrichDiagnostic, LocalIndexEntry,
-        ResolvedSearchCacheShapers, SearchInput, SearchMode, GRAPH_ENRICHMENT_TIMEOUT,
-        MAX_VALID_SEARCH_CURSOR_BYTES, SEARCH_STRUCTURED_OUTPUT_BUDGET_MIN,
+        scoped_session_folder_path, search_cache, search_cache_key_at,
+        search_response_structured_value, search_tool_result_wire_budget, sha256_hex_bytes,
+        should_allow_workspace_scope_fallback, should_append_index_health_footer,
+        should_apply_local_enrichment, should_fetch_graph_enrichment,
+        should_fetch_project_map_route_hint, should_filter_artifact_paths,
+        should_retry_keyword_with_semantic, should_retry_keyword_with_symbol_modes,
+        should_surface_index_health_before_results, suggest_output_format, targeted_local_delta,
+        targeted_payload_content_bytes, which_rg, ApiIndexHint, DirtyFileHint, IndexHealth,
+        LocalEnrichDiagnostic, LocalIndexEntry, ResolvedSearchCacheShapers, SearchInput,
+        SearchMode, GRAPH_ENRICHMENT_TIMEOUT, MAX_VALID_SEARCH_CURSOR_BYTES,
+        SEARCH_STRUCTURED_OUTPUT_BUDGET_MIN,
     };
     use super::{should_prefer_semantic_results, should_retry_semantic_fallback};
     use super::{RecordingHttpResponse, SearchParams};
@@ -2279,14 +2282,28 @@ mod auto_mode_tests {
 
     // #487: what linked workspaces add to a search follows the links, so a change of
     // a link must not leave the process replaying an answer cached under the old one.
+    // The link generations are given, not moved: the process's own count is read by
+    // every test that builds a key, and moving it broke their comparisons.
     #[test]
     fn the_search_cache_key_follows_the_links_of_workspaces() {
         let input = base_input("revoke_fn");
-        let key = || cache_key(None, None, &input, SearchMode::Keyword, None);
-        let before = key();
-        assert_eq!(before, key(), "the same link state gives the same key");
-        mcp_client::note_knowledge_link_change_for_test();
-        assert_ne!(before, key(), "a link change gives another key");
+        let shapers = cache_shapers(&input, 25, 800);
+        let key = |links| {
+            search_cache_key_at(
+                None,
+                None,
+                &input,
+                SearchMode::Keyword,
+                None,
+                &shapers,
+                None,
+                None,
+                "test-wire-tokenizer-namespace",
+                links,
+            )
+        };
+        assert_eq!(key(7), key(7), "the same link state gives the same key");
+        assert_ne!(key(7), key(8), "a link change gives another key");
     }
 
     #[test]

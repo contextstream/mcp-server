@@ -384,6 +384,35 @@ fn build_search_cache_key_with_tokenizer(
     checkout_identity: Option<&str>,
     tokenizer_cache_namespace: &str,
 ) -> String {
+    search_cache_key_at(
+        workspace_id,
+        explicit_project_id,
+        input,
+        mode,
+        resolved_guided_grounding_handle,
+        shapers,
+        index_freshness,
+        checkout_identity,
+        tokenizer_cache_namespace,
+        mcp_client::knowledge_link_generation(),
+    )
+}
+
+/// [`build_search_cache_key_with_tokenizer`] at the given count of this
+/// process's link changes (`mcp_client::knowledge_link_generation`).
+#[allow(clippy::too_many_arguments)]
+fn search_cache_key_at(
+    workspace_id: Option<Uuid>,
+    explicit_project_id: Option<Uuid>,
+    input: &SearchInput,
+    mode: SearchMode,
+    resolved_guided_grounding_handle: Option<&str>,
+    shapers: &ResolvedSearchCacheShapers,
+    index_freshness: Option<chrono::DateTime<chrono::Utc>>,
+    checkout_identity: Option<&str>,
+    tokenizer_cache_namespace: &str,
+    knowledge_links: u64,
+) -> String {
     let workspace = workspace_id.map(|id| id.to_string());
     let project = explicit_project_id.map(|id| id.to_string());
     let limit = shapers.limit.map(|value| value.to_string());
@@ -428,7 +457,7 @@ fn build_search_cache_key_with_tokenizer(
     append_cache_text(
         &mut canonical,
         "knowledge_links",
-        Some(&mcp_client::knowledge_link_generation().to_string()),
+        Some(&knowledge_links.to_string()),
     );
     append_cache_text(&mut canonical, "workspace_id", workspace.as_deref());
     append_cache_text(&mut canonical, "project_id", project.as_deref());
@@ -509,6 +538,9 @@ fn build_search_cache_key_with_tokenizer(
     format!("search:v5:{}", sha256_hex_bytes(&canonical))
 }
 
+/// The key at a fixed link generation. The process's own count moves whenever
+/// any test changes a link, and a key read on either side of that change
+/// differs, so a test that compares two keys does not read it.
 #[cfg(test)]
 fn build_search_cache_key(
     workspace_id: Option<Uuid>,
@@ -520,7 +552,7 @@ fn build_search_cache_key(
     index_freshness: Option<chrono::DateTime<chrono::Utc>>,
     checkout_identity: Option<&str>,
 ) -> String {
-    build_search_cache_key_with_tokenizer(
+    search_cache_key_at(
         workspace_id,
         explicit_project_id,
         input,
@@ -530,6 +562,7 @@ fn build_search_cache_key(
         index_freshness,
         checkout_identity,
         "test-wire-tokenizer-namespace",
+        0,
     )
 }
 

@@ -334,6 +334,95 @@ async fn http_gateway_media_index_file_path_returns_upload_plan_without_reading_
 }
 
 #[tokio::test]
+async fn http_gateway_media_index_file_path_with_is_personal_false_sends_team_visibility_without_reading_disk(
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let seen_bodies = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let seen_clone = seen_bodies.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let seen_clone = seen_clone.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let body = loop {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap_or(0);
+                    if count == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        let len: usize = head
+                            .lines()
+                            .filter_map(|l| l.split_once(':'))
+                            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, v)| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break buf[end + 4..end + 4 + len].to_vec();
+                        }
+                    }
+                };
+                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
+                    seen_clone.lock().unwrap().push(parsed);
+                }
+                let payload = json!({
+                    "success": true,
+                    "data": {
+                        "content_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "upload_url": "https://storage.example.test/presigned",
+                        "headers": {"Content-Type": "text/plain"},
+                        "expires_in_seconds": 600
+                    }
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let cfg = Config {
+        api_url: base_url,
+        api_key: Some("test-api-key".to_string()),
+        allow_header_auth: true,
+        is_http_transport: true,
+        http_local_files: false,
+        ..Config::default()
+    };
+    let (_, media, _) = build_tools(cfg);
+    let result = media
+        .execute(json!({
+            "action": "index",
+            "file_path": "/etc/hostname",
+            "content_type": "document",
+            "size_bytes": 16,
+            "is_personal": false,
+            "workspace_id": TEST_WS
+        }))
+        .await
+        .expect("hosted media index with is_personal=false should return upload plan");
+
+    task.abort();
+
+    let bodies = seen_bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "only uploads/init should run: {bodies:?}");
+    assert_eq!(bodies[0]["tags"], json!(["visibility:team"]));
+    let text = result_text(Ok(result));
+    assert!(text.contains("visibility: team"), "got: {text}");
+}
+
+#[tokio::test]
 async fn http_gateway_client_media_index_refusal_names_upload_path() {
     let client = ContextStreamClient::new(gateway_config(true, false));
     let err = client

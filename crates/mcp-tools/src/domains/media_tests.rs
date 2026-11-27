@@ -1401,7 +1401,10 @@ mod hosted_upload_plan_tests {
                         let (status, payload) = handler(&line, &body, &server_base);
                         let reason = match status {
                             200 => "OK",
+                            201 => "Created",
                             400 => "Bad Request",
+                            403 => "Forbidden",
+                            404 => "Not Found",
                             422 => "Unprocessable Entity",
                             _ => "Error",
                         };
@@ -1979,6 +1982,641 @@ mod hosted_upload_plan_tests {
         assert!(
             !logs.contains(secret_token),
             "presigned URL secret must never appear in logs: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_index_is_personal_sets_single_visibility_tag_and_reports_visibility() {
+        let server = MediaStubServer::start(|line, body, _base| {
+            if line.starts_with(&format!(
+                "POST /api/v1/workspaces/{TEST_WS}/content/external "
+            )) {
+                let req: Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+                let tags = req["tags"].as_array().cloned().unwrap_or_default();
+                let is_personal = !tags.iter().any(|t| t.as_str() == Some("visibility:team"));
+                (
+                    201,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "id": TEST_CONTENT_ID,
+                            "status": "processing",
+                            "filename": "vendor-contract.pdf",
+                            "content_type": "document",
+                            "tags": tags,
+                            "is_personal": is_personal
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (
+                    400,
+                    json!({"error": {"message": format!("unexpected: {line}")}}).to_string(),
+                )
+            }
+        })
+        .await;
+
+        let (tool, _) = build_tool(&server.base_url, true, false);
+
+        // 1. is_personal=false replaces any existing visibility:* tag with a single visibility:team.
+        let team_res = tool
+            .execute(json!({
+                "action": "index",
+                "external_url": "https://cdn.example.test/vendor-contract.pdf",
+                "content_type": "document",
+                "tags": ["contract", "visibility:personal", "visibility:team"],
+                "is_personal": false,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("external index with is_personal=false should succeed");
+        let team_text = result_text(&team_res);
+        assert!(
+            team_text.contains("visibility: team") && team_text.contains("is_personal: false"),
+            "response must state team visibility was stored: {team_text}"
+        );
+
+        // 2. is_personal=true replaces any existing visibility:* tag with a single visibility:personal.
+        let personal_res = tool
+            .execute(json!({
+                "action": "index",
+                "external_url": "https://cdn.example.test/private-note.pdf",
+                "content_type": "document",
+                "tags": ["draft", "visibility:team"],
+                "is_personal": true,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("external index with is_personal=true should succeed");
+        let personal_text = result_text(&personal_res);
+        assert!(
+            personal_text.contains("visibility: personal")
+                && personal_text.contains("is_personal: true"),
+            "response must state personal visibility was stored: {personal_text}"
+        );
+
+        // 3. Omitting is_personal keeps default behavior (no visibility tag injected) and reports stored visibility.
+        let default_res = tool
+            .execute(json!({
+                "action": "index",
+                "external_url": "https://cdn.example.test/default-doc.pdf",
+                "content_type": "document",
+                "tags": ["reference"],
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("external index without is_personal should succeed");
+        let default_text = result_text(&default_res);
+        assert!(
+            default_text.contains("visibility: personal")
+                && default_text.contains("is_personal: true"),
+            "response must report default personal visibility: {default_text}"
+        );
+
+        let recorded = server.recorded();
+        assert_eq!(recorded.len(), 3);
+        let body_team: Value = serde_json::from_slice(&recorded[0].body).unwrap();
+        assert_eq!(body_team["tags"], json!(["contract", "visibility:team"]));
+        let body_personal: Value = serde_json::from_slice(&recorded[1].body).unwrap();
+        assert_eq!(
+            body_personal["tags"],
+            json!(["draft", "visibility:personal"])
+        );
+        let body_default: Value = serde_json::from_slice(&recorded[2].body).unwrap();
+        assert_eq!(body_default["tags"], json!(["reference"]));
+    }
+
+    #[tokio::test]
+    async fn local_file_index_is_personal_sets_single_visibility_tag_and_reports_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("vendor-contract.pdf");
+        std::fs::write(&file, b"%PDF-1.7\nteam contract\n").unwrap();
+        let file_str = file.to_string_lossy().to_string();
+
+        let last_tags: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let tags_store = last_tags.clone();
+
+        let server = MediaStubServer::start(move |line, body, base| {
+            if line.contains("/content/uploads/init") {
+                let req: Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+                let tags: Vec<String> = req["tags"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                *tags_store.lock().unwrap() = tags;
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "content_id": TEST_CONTENT_ID,
+                            "upload_url": format!("{base}/put-target"),
+                            "headers": {"Content-Type": "application/pdf"},
+                            "expires_in_seconds": 300
+                        }
+                    })
+                    .to_string(),
+                )
+            } else if line.starts_with("PUT /put-target ") {
+                (200, "{}".to_string())
+            } else if line.contains("/complete-upload") {
+                let tags = tags_store.lock().unwrap().clone();
+                let is_personal = !tags.iter().any(|t| t == "visibility:team");
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "id": TEST_CONTENT_ID,
+                            "status": "processing",
+                            "tags": tags,
+                            "is_personal": is_personal
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (400, "{}".to_string())
+            }
+        })
+        .await;
+
+        let (tool, session) = build_tool(&server.base_url, false, false);
+        session
+            .update_scope(
+                Some(Uuid::parse_str(TEST_WS).unwrap()),
+                None,
+                Some(dir.path().to_string_lossy().to_string()),
+            )
+            .await;
+
+        let result = tool
+            .execute(json!({
+                "action": "index",
+                "file_path": file_str,
+                "content_type": "document",
+                "tags": ["contract", "visibility:personal"],
+                "is_personal": false,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("local file index with is_personal=false should succeed");
+
+        let recorded = server.recorded();
+        assert_eq!(recorded.len(), 3);
+        let init_body: Value = serde_json::from_slice(&recorded[0].body).unwrap();
+        assert_eq!(init_body["tags"], json!(["contract", "visibility:team"]));
+
+        let text = result_text(&result);
+        assert!(
+            text.contains("visibility: team") && text.contains("is_personal: false"),
+            "local index response must report team visibility: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_index_and_upload_url_is_personal_sets_visibility_tag_and_reports_visibility() {
+        let server = MediaStubServer::start(|line, _body, _base| {
+            if line.contains("/content/uploads/init") {
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "content_id": TEST_CONTENT_ID,
+                            "upload_url": "https://storage.example.test/put/contract",
+                            "headers": {"Content-Type": "application/pdf"},
+                            "expires_in_seconds": 600
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (400, "{}".to_string())
+            }
+        })
+        .await;
+
+        let (tool, _) = build_tool(&server.base_url, true, false);
+
+        // Hosted index with local file_path + is_personal=false (team-shared).
+        let hosted_res = tool
+            .execute(json!({
+                "action": "index",
+                "file_path": "/nonexistent/Downloads/vendor-contract.pdf",
+                "content_type": "document",
+                "size_bytes": 4096,
+                "tags": ["contract", "visibility:personal"],
+                "is_personal": false,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("hosted index with is_personal=false should return upload plan");
+
+        let hosted_structured = hosted_res.structured_content.as_ref().unwrap();
+        assert_eq!(hosted_structured["visibility"], "team");
+        assert_eq!(hosted_structured["is_personal"], false);
+        let hosted_text = result_text(&hosted_res);
+        assert!(
+            hosted_text.contains("visibility: team") && hosted_text.contains("is_personal: false"),
+            "hosted upload plan must report team visibility: {hosted_text}"
+        );
+
+        // Explicit upload_url with is_personal=true (personal, replacing visibility:team).
+        let upload_res = tool
+            .execute(json!({
+                "action": "upload_url",
+                "filename": "draft-notes.pdf",
+                "content_type": "document",
+                "size_bytes": 1024,
+                "tags": ["visibility:team", "notes"],
+                "is_personal": true,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("upload_url with is_personal=true should succeed");
+
+        let upload_structured = upload_res.structured_content.as_ref().unwrap();
+        assert_eq!(upload_structured["visibility"], "personal");
+        assert_eq!(upload_structured["is_personal"], true);
+        let upload_text = result_text(&upload_res);
+        assert!(
+            upload_text.contains("visibility: personal")
+                && upload_text.contains("is_personal: true"),
+            "upload_url response must report personal visibility: {upload_text}"
+        );
+
+        // Explicit upload_url without is_personal keeps default (no visibility tag injected, personal).
+        let default_res = tool
+            .execute(json!({
+                "action": "upload_url",
+                "filename": "plain.pdf",
+                "content_type": "document",
+                "size_bytes": 512,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("upload_url without is_personal should succeed");
+        let default_structured = default_res.structured_content.as_ref().unwrap();
+        assert_eq!(default_structured["visibility"], "personal");
+        assert_eq!(default_structured["is_personal"], true);
+
+        let recorded = server.recorded();
+        assert_eq!(recorded.len(), 3);
+        let hosted_init: Value = serde_json::from_slice(&recorded[0].body).unwrap();
+        assert_eq!(hosted_init["tags"], json!(["contract", "visibility:team"]));
+        let upload_init: Value = serde_json::from_slice(&recorded[1].body).unwrap();
+        assert_eq!(upload_init["tags"], json!(["notes", "visibility:personal"]));
+        let default_init: Value = serde_json::from_slice(&recorded[2].body).unwrap();
+        assert_eq!(default_init["tags"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn complete_upload_accepts_is_personal_and_reports_stored_visibility() {
+        let server = MediaStubServer::start(|line, body, _base| {
+            if line.starts_with(&format!(
+                "POST /api/v1/workspaces/{TEST_WS}/content/{TEST_CONTENT_ID}/complete-upload "
+            )) {
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "id": TEST_CONTENT_ID,
+                            "status": "processing",
+                            "filename": "vendor-contract.pdf",
+                            "content_type": "document",
+                            "tags": ["contract", "visibility:personal"],
+                            "is_personal": true
+                        }
+                    })
+                    .to_string(),
+                )
+            } else if line.starts_with(&format!(
+                "PUT /api/v1/workspaces/{TEST_WS}/content/{TEST_CONTENT_ID} "
+            )) {
+                let req: Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+                let tags = req["tags"].as_array().cloned().unwrap_or_default();
+                let is_personal = !tags.iter().any(|t| t.as_str() == Some("visibility:team"));
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "id": TEST_CONTENT_ID,
+                            "status": "processing",
+                            "filename": "vendor-contract.pdf",
+                            "content_type": "document",
+                            "tags": tags,
+                            "is_personal": is_personal
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (
+                    400,
+                    json!({"error": {"message": format!("unexpected: {line}")}}).to_string(),
+                )
+            }
+        })
+        .await;
+
+        let (tool, _) = build_tool(&server.base_url, true, false);
+
+        // 1. complete_upload with is_personal=false updates visibility via PUT preserving existing tags.
+        let team_res = tool
+            .execute(json!({
+                "action": "complete_upload",
+                "content_id": TEST_CONTENT_ID,
+                "is_personal": false,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("complete_upload with is_personal=false should succeed");
+        let team_text = result_text(&team_res);
+        assert!(
+            team_text.contains("visibility: team") && team_text.contains("is_personal: false"),
+            "complete_upload response must report team visibility: {team_text}"
+        );
+
+        let recorded = server.recorded();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "expected complete-upload POST followed by content PUT: {recorded:?}"
+        );
+        assert!(recorded[0].line.starts_with(&format!(
+            "POST /api/v1/workspaces/{TEST_WS}/content/{TEST_CONTENT_ID}/complete-upload "
+        )));
+        assert!(recorded[1].line.starts_with(&format!(
+            "PUT /api/v1/workspaces/{TEST_WS}/content/{TEST_CONTENT_ID} "
+        )));
+        let put_body: Value = serde_json::from_slice(&recorded[1].body).unwrap();
+        assert_eq!(put_body["tags"], json!(["contract", "visibility:team"]));
+
+        // 2. complete_upload without is_personal makes no PUT and reports stored visibility.
+        let plain_res = tool
+            .execute(json!({
+                "action": "complete_upload",
+                "content_id": TEST_CONTENT_ID,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("complete_upload without is_personal should succeed");
+        let plain_text = result_text(&plain_res);
+        assert!(
+            plain_text.contains("visibility: personal") && plain_text.contains("is_personal: true"),
+            "complete_upload response must report personal visibility: {plain_text}"
+        );
+        assert_eq!(
+            server.recorded().len(),
+            3,
+            "omitted is_personal must not issue a PUT"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_action_changes_existing_asset_visibility_and_preserves_other_tags() {
+        let stored_tags = Arc::new(Mutex::new(vec![
+            "contract".to_string(),
+            format!("project:{TEST_PROJECT}"),
+            "visibility:personal".to_string(),
+        ]));
+        let tags_for_server = stored_tags.clone();
+
+        let server = MediaStubServer::start(move |line, body, _base| {
+            let content_path = format!("/api/v1/workspaces/{TEST_WS}/content/{TEST_CONTENT_ID} ");
+            if line.starts_with(&format!("GET {content_path}")) {
+                let tags = tags_for_server.lock().unwrap().clone();
+                let is_personal = !tags.iter().any(|t| t == "visibility:team");
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "id": TEST_CONTENT_ID,
+                            "status": "indexed",
+                            "filename": "vendor-contract.pdf",
+                            "content_type": "document",
+                            "tags": tags,
+                            "is_personal": is_personal
+                        }
+                    })
+                    .to_string(),
+                )
+            } else if line.starts_with(&format!("PUT {content_path}")) {
+                let req: Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+                let new_tags: Vec<String> = req["tags"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_else(|| tags_for_server.lock().unwrap().clone());
+                *tags_for_server.lock().unwrap() = new_tags.clone();
+                let is_personal = !new_tags.iter().any(|t| t == "visibility:team");
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "id": TEST_CONTENT_ID,
+                            "status": "indexed",
+                            "filename": "vendor-contract.pdf",
+                            "content_type": "document",
+                            "tags": new_tags,
+                            "is_personal": is_personal
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (
+                    400,
+                    json!({"error": {"message": format!("unexpected: {line}")}}).to_string(),
+                )
+            }
+        })
+        .await;
+
+        let (tool, _) = build_tool(&server.base_url, true, false);
+
+        // 1. Promote personal asset -> team-visible, preserving existing tags and system project tag.
+        let share_res = tool
+            .execute(json!({
+                "action": "update",
+                "content_id": TEST_CONTENT_ID,
+                "is_personal": false,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("update with is_personal=false should succeed");
+        let share_text = result_text(&share_res);
+        assert!(
+            share_text.contains("visibility: team") && share_text.contains("is_personal: false"),
+            "update response must report team visibility: {share_text}"
+        );
+        assert_eq!(
+            *stored_tags.lock().unwrap(),
+            vec![
+                "contract".to_string(),
+                format!("project:{TEST_PROJECT}"),
+                "visibility:team".to_string(),
+            ]
+        );
+
+        // 2. Restrict team asset -> personal, stripping visibility:team so only visibility:personal remains.
+        let restrict_res = tool
+            .execute(json!({
+                "action": "update",
+                "content_id": TEST_CONTENT_ID,
+                "is_personal": true,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect("update with is_personal=true should succeed");
+        let restrict_text = result_text(&restrict_res);
+        assert!(
+            restrict_text.contains("visibility: personal")
+                && restrict_text.contains("is_personal: true"),
+            "update response must report personal visibility: {restrict_text}"
+        );
+        assert_eq!(
+            *stored_tags.lock().unwrap(),
+            vec![
+                "contract".to_string(),
+                format!("project:{TEST_PROJECT}"),
+                "visibility:personal".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_action_respects_api_permission_errors_and_validates_inputs() {
+        let server = MediaStubServer::start(|line, _body, _base| {
+            if line.starts_with("GET ") {
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "id": TEST_CONTENT_ID,
+                            "status": "indexed",
+                            "tags": ["contract", "visibility:team"],
+                            "is_personal": false
+                        }
+                    })
+                    .to_string(),
+                )
+            } else if line.starts_with("PUT ") {
+                (
+                    403,
+                    json!({
+                        "success": false,
+                        "error": {
+                            "code": "FORBIDDEN",
+                            "message": "No write access to workspace"
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (400, "{}".to_string())
+            }
+        })
+        .await;
+
+        let (tool, _) = build_tool(&server.base_url, true, false);
+
+        // API 403 must propagate directly.
+        let forbidden = tool
+            .execute(json!({
+                "action": "update",
+                "content_id": TEST_CONTENT_ID,
+                "is_personal": true,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect_err("API 403 must fail update")
+            .to_string();
+        assert!(
+            forbidden.contains("No write access") || forbidden.contains("403"),
+            "expected API permission error, got: {forbidden}"
+        );
+
+        // Missing content_id fails validation.
+        let missing_id = tool
+            .execute(json!({
+                "action": "update",
+                "is_personal": false,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect_err("update without content_id must fail")
+            .to_string();
+        assert!(missing_id.contains("content_id"), "got: {missing_id}");
+
+        // No fields to update fails validation.
+        let empty_update = tool
+            .execute(json!({
+                "action": "update",
+                "content_id": TEST_CONTENT_ID,
+                "workspace_id": TEST_WS
+            }))
+            .await
+            .expect_err("update with no fields must fail")
+            .to_string();
+        assert!(
+            empty_update.contains("is_personal"),
+            "expected error listing updatable fields, got: {empty_update}"
+        );
+    }
+
+    #[test]
+    fn metadata_and_schema_document_is_personal_and_update_action() {
+        let client = create_mock_client();
+        let session = create_mock_session(&client);
+        let tool = MediaTool::new(client, session);
+
+        let desc = &tool.metadata().description;
+        assert!(desc.contains("update"), "desc: {desc}");
+        assert!(desc.contains("is_personal"), "desc: {desc}");
+
+        let schema = tool.input_schema();
+        let props = schema["properties"].as_object().unwrap();
+        let actions: Vec<&str> = props["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(actions.contains(&"update"), "actions: {actions:?}");
+
+        let is_personal = props
+            .get("is_personal")
+            .expect("schema must expose is_personal");
+        assert_eq!(is_personal["type"], "boolean");
+        let is_personal_desc = is_personal["description"].as_str().unwrap_or_default();
+        assert!(
+            is_personal_desc.contains("visibility:team")
+                || is_personal_desc.contains("team")
+                || is_personal_desc.contains("personal"),
+            "is_personal description should explain visibility semantics: {is_personal_desc}"
+        );
+        assert!(
+            is_personal_desc.contains("index")
+                && is_personal_desc.contains("upload_url")
+                && is_personal_desc.contains("complete_upload")
+                && is_personal_desc.contains("update"),
+            "is_personal description should name supported actions: {is_personal_desc}"
         );
     }
 }

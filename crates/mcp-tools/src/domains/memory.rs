@@ -4391,8 +4391,14 @@ impl MemoryTool {
         .await
     }
 
-    /// Fetch an entity type across all team workspaces (up to 10), merge and sort results.
-    async fn fetch_team_entity<F>(&self, fetcher: F) -> Result<serde_json::Value>
+    /// Fetch an entity type for an explicit workspace (in any account mode) or across
+    /// all team workspaces (up to 10) when team mode is active, then merge and sort results.
+    async fn fetch_team_entity<F>(
+        &self,
+        action: &str,
+        explicit_workspace_id: Option<Uuid>,
+        fetcher: F,
+    ) -> Result<serde_json::Value>
     where
         F: Fn(
             ContextStreamClient,
@@ -4401,32 +4407,40 @@ impl MemoryTool {
             Box<dyn std::future::Future<Output = mcp_types::Result<serde_json::Value>> + Send>,
         >,
     {
-        if !self.session.team_features_enabled().await {
-            return Ok(serde_json::json!({
-                "items": [],
-                "message": "Team features require an active team execution mode and team membership."
-            }));
-        }
-
-        let workspaces = self
-            .client
-            .list_workspaces(None, Some(100))
-            .await
-            .unwrap_or_default();
-
         let mut all_items: Vec<serde_json::Value> = Vec::new();
-        for ws in workspaces.iter().take(10) {
-            if let Ok(result) = fetcher(self.client.clone(), ws.id).await {
-                if let Some(arr) = extract_collection_array(&result) {
-                    for item in arr {
-                        let mut item = item.clone();
-                        if let Some(obj) = item.as_object_mut() {
-                            obj.insert(
-                                "workspace_name".to_string(),
-                                serde_json::Value::String(ws.name.clone()),
-                            );
+        let workspaces_searched: usize;
+
+        if let Some(ws_id) = explicit_workspace_id {
+            let result = fetcher(self.client.clone(), ws_id).await?;
+            if let Some(arr) = extract_collection_array(&result) {
+                all_items.extend(arr.iter().cloned());
+            }
+            workspaces_searched = 1;
+        } else {
+            if !self.session.team_features_enabled().await {
+                return Err(team_mode_required_error(action, true));
+            }
+
+            let workspaces = self
+                .client
+                .list_workspaces(None, Some(100))
+                .await
+                .unwrap_or_default();
+
+            workspaces_searched = workspaces.len().min(10);
+            for ws in workspaces.iter().take(10) {
+                if let Ok(result) = fetcher(self.client.clone(), ws.id).await {
+                    if let Some(arr) = extract_collection_array(&result) {
+                        for item in arr {
+                            let mut item = item.clone();
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert(
+                                    "workspace_name".to_string(),
+                                    serde_json::Value::String(ws.name.clone()),
+                                );
+                            }
+                            all_items.push(item);
                         }
-                        all_items.push(item);
                     }
                 }
             }
@@ -4451,8 +4465,20 @@ impl MemoryTool {
         Ok(serde_json::json!({
             "items": all_items,
             "total": total,
-            "workspaces_searched": workspaces.len().min(10),
+            "workspaces_searched": workspaces_searched,
         }))
+    }
+}
+
+fn team_mode_required_error(action: &str, supports_workspace_id: bool) -> Error {
+    if supports_workspace_id {
+        Error::Validation(format!(
+            "{action} requires an explicit workspace_id or active team mode. Pass workspace_id to list a workspace's team items in any mode, or switch to team mode with session(action=\"set_account_mode\", account_mode=\"team\")."
+        ))
+    } else {
+        Error::Validation(format!(
+            "{action} requires active team mode. Switch to team mode with session(action=\"set_account_mode\", account_mode=\"team\")."
+        ))
     }
 }
 
@@ -4507,7 +4533,7 @@ const MEMORY_TOOL_DESCRIPTION: &str = "Persistent memory storage — docs, runbo
 
 /// Complete tool reference, advertised on the main parameter; see
 /// [`crate::schema::with_full_reference`].
-const MEMORY_TOOL_REFERENCE: &str = "Persistent memory storage — docs, runbooks, specs, ADRs, RFCs, decisions, lessons, preferences, tasks, todos, knowledge nodes, transcripts. NOT for codebase/file search.\n\n⚠️ FINDING A DOC, RUNBOOK, SPEC, OR ARCHITECTURE NOTE? USE THIS TOOL — NOT `find`, `ls`, `grep`, or filesystem searches. ContextStream docs/runbooks/specs/decisions/lessons live ONLY in this tool's storage (Postgres + indexes), NEVER on disk under ~/.claude, /tmp, or the project tree. If the user mentions 'the doc on X', 'our runbook for Y', 'the design spec', 'the ADR/RFC', 'a postmortem', 'the architecture note', 'why we decided Z' — go through:\n  · memory(action=\"search\", query=\"…\") — hybrid across docs + nodes (try this first when unsure)\n  · memory(action=\"list_docs\", query=\"…\") then memory(action=\"get_doc\", doc_id=\"<id-or-title>\")\n  · memory(action=\"decisions\", query=\"…\") for past architectural decisions\n  · session(action=\"recall\", query=\"…\") if it might be in past-session transcripts\nFalling back to filesystem tools to find a ContextStream doc is wrong — the doc is not on disk.\n\nCodebase / source / files? Use the `search` tool, not memory.\n\nPlans? Use session(action=\"capture_plan\") instead of memory(action=\"create_event\", event_type=\"plan\"). Plan tasks should be created with plan_id, plan_step_id, priority/status, and a short description.\n\nDISTINCT FROM (don't use memory for these):\n· entity(kind=ticket|handoff|incident|release|experiment|goal|key_result|sprint|review|risk|backlog_view) — structured taxonomy entities with their own status timelines and per-kind fields. When the user says 'create a ticket', 'file a bug', 'create a handoff', 'log an incident', 'track this release' — that's `entity`, not memory(create_task).\n· session(action=capture_lesson|capture|recall|capture_plan) — lessons / decisions / snapshots / plans tied to the current session.\n· capsule(...) — portable context bundles for cross-agent handoffs.\n\nThis tool's `create_task` is a lightweight project-tracking todo with priority/status — NOT a 'ticket'. This tool's `create_task` should include plan_id and plan_step_id when the task belongs to a plan. This tool's `create_doc(doc_type=runbook)` is a versioned markdown doc — NOT a 'handoff'.\n\nNode actions: create_node, get_node, update_node, list_nodes, supersede_node (a *_id argument takes an id or a title: get/update take a title that names one record; delete, supersede and complete need an id or the exact title; anything else returns a [CANDIDATES] list and changes nothing). Query actions: search (searches memory nodes and relevant docs together, not code), decisions (typed envelope: query, category, sort=recency|relevance, status=active|superseded|disputed|verified|all, since, offset, limit), timeline, summary. Decision actions: create_decision (title, content, rationale, alternatives, scope, confidence, supersedes, category, tags), decision_action (decision_id or lookup text + decision_action=supersede|dispute|verify|invalidate|choose_successor, successor_id, reason). Event actions: create_event, get_event, update_event, list_events, distill_event, import_batch. Task actions: create_task, get_task, update_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo, complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram (diagram_type values: flowchart, sequence, class, er, gantt, mindmap, pie, other — use sequence for API/request flows and er for data models). Doc actions: create_doc, list_docs, get_doc, update_doc, create_roadmap (doc_type values: roadmap, spec, runbook, adr, rfc, postmortem, retro, release_notes, playbook, prd, user_story, persona, interview, design_spec, critique, glossary, oncall_schedule, slo, q_and_a, changelog, style_guide, general — `get_doc` accepts ID or natural-language title query; to change part of a doc, `update_doc` takes ops=[...] (append, prepend, replace_section, str_replace) instead of the whole content). Transcript actions: list_transcripts, get_transcript, search_transcripts, search_archive. `search_archive` queries the cold storage tier for transcripts past the hot-retention window (remote/hosted deployments only). Team actions: team_tasks, team_todos, team_diagrams, team_docs.";
+const MEMORY_TOOL_REFERENCE: &str = "Persistent memory storage — docs, runbooks, specs, ADRs, RFCs, decisions, lessons, preferences, tasks, todos, knowledge nodes, transcripts. NOT for codebase/file search.\n\n⚠️ FINDING A DOC, RUNBOOK, SPEC, OR ARCHITECTURE NOTE? USE THIS TOOL — NOT `find`, `ls`, `grep`, or filesystem searches. ContextStream docs/runbooks/specs/decisions/lessons live ONLY in this tool's storage (Postgres + indexes), NEVER on disk under ~/.claude, /tmp, or the project tree. If the user mentions 'the doc on X', 'our runbook for Y', 'the design spec', 'the ADR/RFC', 'a postmortem', 'the architecture note', 'why we decided Z' — go through:\n  · memory(action=\"search\", query=\"…\") — hybrid across docs + nodes (try this first when unsure)\n  · memory(action=\"list_docs\", query=\"…\") then memory(action=\"get_doc\", doc_id=\"<id-or-title>\")\n  · memory(action=\"decisions\", query=\"…\") for past architectural decisions\n  · session(action=\"recall\", query=\"…\") if it might be in past-session transcripts\nFalling back to filesystem tools to find a ContextStream doc is wrong — the doc is not on disk.\n\nCodebase / source / files? Use the `search` tool, not memory.\n\nPlans? Use session(action=\"capture_plan\") instead of memory(action=\"create_event\", event_type=\"plan\"). Plan tasks should be created with plan_id, plan_step_id, priority/status, and a short description.\n\nDISTINCT FROM (don't use memory for these):\n· entity(kind=ticket|handoff|incident|release|experiment|goal|key_result|sprint|review|risk|backlog_view) — structured taxonomy entities with their own status timelines and per-kind fields. When the user says 'create a ticket', 'file a bug', 'create a handoff', 'log an incident', 'track this release' — that's `entity`, not memory(create_task).\n· session(action=capture_lesson|capture|recall|capture_plan) — lessons / decisions / snapshots / plans tied to the current session.\n· capsule(...) — portable context bundles for cross-agent handoffs.\n\nThis tool's `create_task` is a lightweight project-tracking todo with priority/status — NOT a 'ticket'. This tool's `create_task` should include plan_id and plan_step_id when the task belongs to a plan. This tool's `create_doc(doc_type=runbook)` is a versioned markdown doc — NOT a 'handoff'.\n\nNode actions: create_node, get_node, update_node, list_nodes, supersede_node (a *_id argument takes an id or a title: get/update take a title that names one record; delete, supersede and complete need an id or the exact title; anything else returns a [CANDIDATES] list and changes nothing). Query actions: search (searches memory nodes and relevant docs together, not code), decisions (typed envelope: query, category, sort=recency|relevance, status=active|superseded|disputed|verified|all, since, offset, limit), timeline, summary. Decision actions: create_decision (title, content, rationale, alternatives, scope, confidence, supersedes, category, tags), decision_action (decision_id or lookup text + decision_action=supersede|dispute|verify|invalidate|choose_successor, successor_id, reason). Event actions: create_event, get_event, update_event, list_events, distill_event, import_batch. Task actions: create_task, get_task, update_task, list_tasks, reorder_tasks. Todo actions: create_todo, list_todos, get_todo, update_todo (pass is_personal=true|false to change visibility), complete_todo. Diagram actions: create_diagram, list_diagrams, get_diagram, update_diagram (pass is_personal=true|false to change visibility; diagram_type values: flowchart, sequence, class, er, gantt, mindmap, pie, other — use sequence for API/request flows and er for data models). Doc actions: create_doc, list_docs, get_doc, update_doc (pass is_personal=true|false to change visibility; doc_type values: roadmap, spec, runbook, adr, rfc, postmortem, retro, release_notes, playbook, prd, user_story, persona, interview, design_spec, critique, glossary, oncall_schedule, slo, q_and_a, changelog, style_guide, general — `get_doc` accepts ID or natural-language title query; to change part of a doc, `update_doc` takes ops=[...] (append, prepend, replace_section, str_replace) instead of the whole content), create_roadmap. Transcript actions: list_transcripts, get_transcript, search_transcripts, search_archive. `search_archive` queries the cold storage tier for transcripts past the hot-retention window (remote/hosted deployments only). Team actions: team_tasks, team_todos, team_diagrams, team_docs, team_discussions, team_transcript_topics (pass workspace_id to list a workspace's team items in any account mode, or switch with session(action=\"set_account_mode\", account_mode=\"team\")).";
 
 impl MemoryTool {
     async fn execute_action(&self, input: Value) -> Result<ToolResult> {
@@ -4555,15 +4581,21 @@ impl MemoryTool {
             }
         });
 
+        // Preserve what the caller explicitly passed before applying account-mode defaults:
+        // update actions only send is_personal when the caller set it, and their title lookups
+        // must not filter by the new visibility value being applied.
+        let explicit_is_personal = input.is_personal;
         // Lookups by reference filter on the caller's own is_personal; creates and lists take
         // the account mode's default below.
         let lookup_is_personal = crate::domains::account_mode::lookup_is_personal(
-            input.is_personal,
+            explicit_is_personal,
             state.team_context_degraded,
         );
+        let update_lookup_is_personal =
+            crate::domains::account_mode::lookup_is_personal(None, state.team_context_degraded);
         input.is_personal = crate::domains::account_mode::resolve_is_personal(
             state.active_execution_mode,
-            input.is_personal,
+            explicit_is_personal,
             state.team_context_degraded,
         );
 
@@ -6020,12 +6052,12 @@ impl MemoryTool {
                     .list_todos(ListTodosParams {
                         workspace_id,
                         project_id,
-                        // `todo_status` and `todo_priority` are the new
-                        // values here, not filters: the todo being changed
-                        // does not have them yet.
+                        // `todo_status`, `todo_priority`, and `is_personal` are
+                        // the new values here, not filters: the todo being
+                        // changed does not have them yet.
                         status: None,
                         priority: None,
-                        is_personal: lookup_is_personal,
+                        is_personal: update_lookup_is_personal,
                         scope: input.scope.clone(),
                         query: Some(todo_lookup.clone()),
                         created_after: None,
@@ -6061,6 +6093,7 @@ impl MemoryTool {
                     due_at: input.due_at,
                     clear_due_at: input.clear_due_at,
                     status: input.todo_status,
+                    is_personal: explicit_is_personal,
                 };
                 let mut result = self
                     .client
@@ -6370,7 +6403,8 @@ impl MemoryTool {
                     .list_diagrams(
                         workspace_id,
                         project_id,
-                        lookup_is_personal,
+                        // `is_personal` is the new visibility here, not a filter.
+                        update_lookup_is_personal,
                         Some(100),
                         input.diagram_type.clone(),
                     )
@@ -6392,6 +6426,7 @@ impl MemoryTool {
                     content: input.content,
                     diagram_type: input.diagram_type,
                     metadata: input.metadata,
+                    is_personal: explicit_is_personal,
                 };
                 let mut result = self
                     .client
@@ -6658,9 +6693,9 @@ impl MemoryTool {
                     workspace_id,
                     project_id,
                     doc_id.trim(),
-                    // `doc_type` is the new type here, not a filter.
+                    // `doc_type` and `is_personal` are the new values here, not filters.
                     None,
-                    lookup_is_personal,
+                    update_lookup_is_personal,
                     LookupAction::UPDATE,
                     "update_doc",
                 )
@@ -6706,6 +6741,7 @@ impl MemoryTool {
                     title: input.title,
                     content,
                     doc_type: input.doc_type,
+                    is_personal: explicit_is_personal,
                 };
                 let mut result = self
                     .client
@@ -7318,7 +7354,7 @@ impl MemoryTool {
             // === Team Actions ===
             "team_tasks" => {
                 let items = self
-                    .fetch_team_entity(|client, ws_id| {
+                    .fetch_team_entity("team_tasks", explicit_workspace_id, |client, ws_id| {
                         let status = input.task_status.clone();
                         let limit = input.limit;
                         Box::pin(async move {
@@ -7333,7 +7369,7 @@ impl MemoryTool {
             }
             "team_todos" => {
                 let items = self
-                    .fetch_team_entity(|client, ws_id| {
+                    .fetch_team_entity("team_todos", explicit_workspace_id, |client, ws_id| {
                         let status = input.todo_status.clone();
                         let priority = input.todo_priority.clone();
                         let query = input.query.clone();
@@ -7376,11 +7412,11 @@ impl MemoryTool {
             }
             "team_diagrams" => {
                 let items = self
-                    .fetch_team_entity(|client, ws_id| {
+                    .fetch_team_entity("team_diagrams", explicit_workspace_id, |client, ws_id| {
                         let limit = input.limit;
                         Box::pin(async move {
                             client
-                                .list_diagrams(Some(ws_id), None, None, limit, None)
+                                .list_diagrams(Some(ws_id), None, Some(false), limit, None)
                                 .await
                         })
                     })
@@ -7390,12 +7426,19 @@ impl MemoryTool {
             }
             "team_docs" => {
                 let mut items = self
-                    .fetch_team_entity(|client, ws_id| {
+                    .fetch_team_entity("team_docs", explicit_workspace_id, |client, ws_id| {
                         let doc_type = input.doc_type.clone();
                         let limit = input.limit;
                         Box::pin(async move {
                             client
-                                .list_doc_summaries(Some(ws_id), None, doc_type, None, None, limit)
+                                .list_doc_summaries(
+                                    Some(ws_id),
+                                    None,
+                                    doc_type,
+                                    Some(false),
+                                    None,
+                                    limit,
+                                )
                                 .await
                         })
                     })
@@ -7405,11 +7448,8 @@ impl MemoryTool {
                 Ok(ToolResult::with_structured(text, items))
             }
             "team_discussions" => {
-                if !self.session.team_features_enabled().await {
-                    return Ok(ToolResult::with_structured(
-                        "Team discussions require active team mode and team membership.".to_string(),
-                        serde_json::json!({ "items": [] }),
-                    ));
+                if explicit_workspace_id.is_none() && !self.session.team_features_enabled().await {
+                    return Err(team_mode_required_error("team_discussions", true));
                 }
                 let query = input.query.clone();
                 let limit = input.limit;
@@ -7431,10 +7471,7 @@ impl MemoryTool {
                     )
                 })?;
                 if !self.session.team_features_enabled().await {
-                    return Ok(ToolResult::with_structured(
-                        "Team transcript topic signals require active team mode.".to_string(),
-                        serde_json::json!({ "items": [], "content_shared": false }),
-                    ));
+                    return Err(team_mode_required_error("team_transcript_topics", false));
                 }
                 let signals = self
                     .client
@@ -7836,7 +7873,7 @@ impl ToolHandler for MemoryTool {
             // Personal flag
             .boolean(
                 "is_personal",
-                "Mark as personal (for create/list on todos, diagrams, docs; create_event; create_decision). Omit for the default.",
+                "Visibility flag: true for personal, false for team-visible (for create/update/list on todos, diagrams, docs; create_event; create_decision). On update_todo/update_diagram/update_doc, pass explicitly to change visibility or omit to leave unchanged.",
                 false,
             )
             .build()
@@ -8092,6 +8129,11 @@ pub fn register_memory_tools(
                         "style_guide",
                         "general",
                     ],
+                    false,
+                )
+                .boolean(
+                    "is_personal",
+                    "Change visibility: true for personal, false for team-visible (omit to leave unchanged)",
                     false,
                 )
                 .build(),

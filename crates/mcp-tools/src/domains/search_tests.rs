@@ -122,6 +122,21 @@ fn spawn_search_recording_server(
     std::sync::mpsc::Receiver<(String, String)>,
     std::thread::JoinHandle<()>,
 ) {
+    let holds = responses.iter().map(|_| None).collect();
+    spawn_search_recording_server_holding(responses, holds)
+}
+
+/// [`spawn_search_recording_server`], where the answer to the n-th request
+/// also waits for `holds[n]`, when there is one, to send or be dropped: an
+/// answer the test lets go of only when it chooses, instead of after a time.
+fn spawn_search_recording_server_holding(
+    responses: Vec<RecordingHttpResponse>,
+    holds: Vec<Option<std::sync::mpsc::Receiver<()>>>,
+) -> (
+    String,
+    std::sync::mpsc::Receiver<(String, String)>,
+    std::thread::JoinHandle<()>,
+) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -132,7 +147,7 @@ fn spawn_search_recording_server(
     let (sender, receiver) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         let mut workers = Vec::new();
-        for response_spec in responses {
+        for (response_spec, hold) in responses.into_iter().zip(holds) {
             let (mut stream, _) = listener.accept().expect("accept search request");
             let sender = sender.clone();
             workers.push(std::thread::spawn(move || {
@@ -185,6 +200,9 @@ fn spawn_search_recording_server(
                     }
                 }
 
+                if let Some(hold) = hold {
+                    let _ = hold.recv();
+                }
                 if !response_spec.delay.is_zero() {
                     std::thread::sleep(response_spec.delay);
                 }
@@ -210,6 +228,23 @@ fn spawn_search_recording_server(
         }
     });
     (format!("http://{addr}"), receiver, handle)
+}
+
+/// The next request the recording server saw, read on a blocking thread: the
+/// runtime must go on running the call that sends it, on a clock a test may
+/// have stopped. The minute is only there so a broken call fails the test
+/// rather than hang it.
+async fn next_recorded_request(
+    requests: std::sync::mpsc::Receiver<(String, String)>,
+) -> (String, String, std::sync::mpsc::Receiver<(String, String)>) {
+    tokio::task::spawn_blocking(move || {
+        let (line, body) = requests
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the request reaches the recording server");
+        (line, body, requests)
+    })
+    .await
+    .expect("recorded request reader")
 }
 
 // ============================================================================
@@ -335,6 +370,7 @@ mod search_mode_tests {
 
 mod guided_search_tests {
     use super::*;
+    use crate::testing::{within_real_time, FrozenClock};
     use serde_json::Value;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -641,31 +677,44 @@ mod guided_search_tests {
             query_time_ms: Some(2),
             ..Default::default()
         };
-        let guided_delay = std::time::Duration::from_secs(1);
-        let (base_url, requests, server) = spawn_search_recording_server(vec![
-            RecordingHttpResponse {
-                expected_path: "/search/guided",
-                status: 200,
-                body: guided_success_body(workspace_id, project_id, None),
-                delay: guided_delay,
-            },
-            RecordingHttpResponse {
-                expected_path: "/search/hybrid",
-                status: 200,
-                body: serde_json::to_string(&hybrid_response).unwrap(),
-                delay: std::time::Duration::ZERO,
-            },
-        ]);
+        // The guided answer is held until the call is over: the call cannot
+        // wait for it and still come back.
+        let (release_guided_answer, guided_answer_held) = std::sync::mpsc::channel();
+        let (base_url, requests, server) = spawn_search_recording_server_holding(
+            vec![
+                RecordingHttpResponse {
+                    expected_path: "/search/guided",
+                    status: 200,
+                    body: guided_success_body(workspace_id, project_id, None),
+                    delay: std::time::Duration::ZERO,
+                },
+                RecordingHttpResponse {
+                    expected_path: "/search/hybrid",
+                    status: 200,
+                    body: serde_json::to_string(&hybrid_response).unwrap(),
+                    delay: std::time::Duration::ZERO,
+                },
+            ],
+            vec![Some(guided_answer_held), None],
+        );
         let (tool, _session) = guided_tool_with_base_url(base_url);
         let mut input = legacy_learning_input("auth middleware");
         input.mode = Some("guided".to_string());
 
-        // Guided always times out (its answer waits a second; its share is
-        // 25 ms) and hybrid keeps nearly the whole 10 s: a 25 ms total left
-        // hybrid about 4 ms, which a busy host sometimes missed (2026-11-02).
+        // Guided times out after its 25 ms share and hybrid keeps nearly the
+        // whole 10 s. On the system clock a busy host spent the whole share
+        // before the guided request was sent (the server then saw it cut off,
+        // or saw hybrid's first) and once left hybrid only 4 ms (2026-11-02).
+        // On the stopped clock the share ends when the test moves the clock,
+        // after the guided request has arrived, and hybrid's window cannot
+        // run out while its answer is on the way.
+        let clock = FrozenClock::stop();
+        let primary = std::time::Duration::from_millis(25);
         let total = std::time::Duration::from_secs(10);
-        let result = tool
-            .execute_guided_search_with_budget(
+        let budget =
+            GuidedExecutionBudget::with_primary(tokio::time::Instant::now(), primary, total);
+        let call = tokio::spawn(async move {
+            tool.execute_guided_search_with_budget(
                 &input,
                 Some(workspace_id),
                 Some(project_id),
@@ -673,14 +722,22 @@ mod guided_search_tests {
                 None,
                 false,
                 "guided-timeout-fallback".to_string(),
-                GuidedExecutionBudget::with_primary(
-                    std::time::Instant::now(),
-                    std::time::Duration::from_millis(25),
-                    total,
-                ),
+                budget,
             )
             .await
+        });
+        let (guided_line, guided_body, requests) = next_recorded_request(requests).await;
+        // A millisecond past the share: tokio rounds a timer's deadline up to
+        // the next millisecond.
+        let moved = primary + std::time::Duration::from_millis(1);
+        tokio::time::advance(moved).await;
+        let result = within_real_time(std::time::Duration::from_secs(60), "the guided call", call)
+            .await
+            .expect("guided call task")
             .expect("guided timeout should serve hybrid fallback");
+        let (hybrid_line, hybrid_body, _requests) = next_recorded_request(requests).await;
+        drop(release_guided_answer);
+        drop(clock);
         assert_eq!(
             result.structured_content.as_ref().unwrap()["fallback_used"],
             true
@@ -696,17 +753,12 @@ mod guided_search_tests {
             latency <= total.as_millis() as i64,
             "reported latency must fall within the single caller-supplied deadline: {latency} ms"
         );
-        assert!(
-            latency < guided_delay.as_millis() as i64,
-            "hybrid served without waiting for the timed-out guided answer: {latency} ms"
+        assert_eq!(
+            latency,
+            moved.as_millis() as i64,
+            "hybrid served when the guided share ran out, without waiting for the guided answer"
         );
 
-        let (guided_line, guided_body) = requests
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("record timed-out guided request");
-        let (hybrid_line, hybrid_body) = requests
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("record hybrid fallback request");
         assert!(guided_line.contains("/search/guided"));
         assert!(hybrid_line.contains("/search/hybrid"));
         let guided_body: Value = serde_json::from_str(&guided_body).unwrap();
@@ -1054,7 +1106,7 @@ mod guided_search_tests {
         assert!(serde_json::to_vec(&result).unwrap().len() <= search_tool_result_wire_budget());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn guided_handler_entry_deadline_charges_prework_and_delayed_primary() {
         let hybrid_response = SearchResponse {
             results: vec![SearchResult {
@@ -1068,56 +1120,80 @@ mod guided_search_tests {
             query_time_ms: Some(1),
             ..Default::default()
         };
-        let (base_url, requests, server) = spawn_search_recording_server(vec![
-            RecordingHttpResponse {
-                expected_path: "/search/guided",
-                status: 200,
-                body: guided_success_body(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), None),
-                // This would fit a newly-reset 960ms primary clock, but cannot
-                // fit the ~260ms left after the injected 700ms handler prework.
-                // (Ten times the first scale: at 120ms, hybrid's 18ms window
-                // was a race on a busy host, 2026-11-02.)
-                delay: std::time::Duration::from_millis(500),
-            },
-            RecordingHttpResponse {
-                expected_path: "/search/hybrid",
-                status: 200,
-                body: serde_json::to_string(&hybrid_response).unwrap(),
-                delay: std::time::Duration::ZERO,
-            },
-        ]);
+        // The guided answer is held until the call is over.
+        let (release_guided_answer, guided_answer_held) = std::sync::mpsc::channel();
+        let (base_url, requests, server) = spawn_search_recording_server_holding(
+            vec![
+                RecordingHttpResponse {
+                    expected_path: "/search/guided",
+                    status: 200,
+                    body: guided_success_body(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), None),
+                    delay: std::time::Duration::ZERO,
+                },
+                RecordingHttpResponse {
+                    expected_path: "/search/hybrid",
+                    status: 200,
+                    body: serde_json::to_string(&hybrid_response).unwrap(),
+                    delay: std::time::Duration::ZERO,
+                },
+            ],
+            vec![Some(guided_answer_held), None],
+        );
         let (tool, _) = guided_tool_with_base_url(base_url);
         let tool = tool.with_guided_test_delays(
             std::time::Duration::from_millis(700),
             std::time::Duration::ZERO,
         );
-        let started = std::time::Instant::now();
-        let result = tool
-            .execute_with_guided_timeout(
+        // A 1200 ms handler budget gives the guided request until 960 ms from
+        // handler entry, hybrid until 1140 ms, finalization until 1200 ms. On
+        // the system clock a busy host missed hybrid's 180 ms window (or the
+        // handler deadline cut the fallback off) even at ten times the first
+        // scale (2026-11-02, 2026-11-27). On the stopped clock each deadline
+        // passes only when the test moves the clock there.
+        let clock = FrozenClock::stop();
+        let started = tokio::time::Instant::now();
+        let call = tokio::spawn(async move {
+            tool.execute_with_guided_timeout(
                 json!({"query": "handler-entry-budget", "mode": "guided"}),
                 std::time::Duration::from_millis(1_200),
             )
             .await
-            .expect("bounded handler should preserve hybrid evidence");
-        let wall = started.elapsed();
+        });
+        // Let the handler start, and wait out its 700 ms of prework (and the
+        // millisecond tokio rounds a timer's deadline up to).
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(701)).await;
+        let (guided_line, _, requests) = next_recorded_request(requests).await;
+        assert!(guided_line.contains("/search/guided"));
+        // The guided request may wait only until 960 ms, 259 ms on (and a
+        // millisecond for the rounding). A clock reset after the prework would
+        // let it wait until 1660 ms, and the call would not come back.
+        tokio::time::advance(std::time::Duration::from_millis(260)).await;
+        let result = within_real_time(
+            std::time::Duration::from_secs(60),
+            "the call (its guided request outlived the share left after the prework)",
+            call,
+        )
+        .await
+        .expect("handler call task")
+        .expect("bounded handler should preserve hybrid evidence");
+        let (hybrid_line, _, _requests) = next_recorded_request(requests).await;
+        assert!(hybrid_line.contains("/search/hybrid"));
+        let elapsed = started.elapsed();
+        drop(release_guided_answer);
+        drop(clock);
         let structured = result.structured_content.as_ref().unwrap();
         assert_eq!(structured["fallback_used"], true);
         assert_eq!(structured["results"][0]["file_path"], "src/bounded.rs");
         assert!(
-            wall <= std::time::Duration::from_millis(1_700),
-            "single 1200ms deadline escaped in wall time: {wall:?}"
+            elapsed <= std::time::Duration::from_millis(1_200),
+            "single 1200ms deadline escaped: {elapsed:?}"
         );
+        let total = structured["total_latency_ms"].as_i64().unwrap_or_default();
         assert!(
-            structured["total_latency_ms"].as_i64().unwrap_or_default() <= 1_600,
-            "reported total must include prework without resetting the clock"
+            (960..=1_200).contains(&total),
+            "reported total must include prework without resetting the clock: {total} ms"
         );
-
-        assert!(requests
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .is_ok());
-        assert!(requests
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .is_ok());
         server.join().expect("bounded Guided server should finish");
     }
 
@@ -1450,7 +1526,7 @@ mod tokenizer_wire_tests {
             exact_match_boost: None,
             hot_paths_identity: None,
         };
-        let proxy = build_search_cache_key_with_tokenizer(
+        let proxy = search_cache_key_at(
             None,
             None,
             &input,
@@ -1460,8 +1536,9 @@ mod tokenizer_wire_tests {
             None,
             None,
             "mcp-wire-tokenizer-v1:o200k:proxy",
+            0,
         );
-        let exact = build_search_cache_key_with_tokenizer(
+        let exact = search_cache_key_at(
             None,
             None,
             &input,
@@ -1471,6 +1548,7 @@ mod tokenizer_wire_tests {
             None,
             None,
             "mcp-wire-tokenizer-v1:o200k:enforce:exact",
+            0,
         );
         assert_ne!(proxy, exact);
         assert!(proxy.starts_with("search:v5:"));
@@ -1748,16 +1826,17 @@ mod auto_mode_tests {
         resolve_mode, resolve_output_preferences, resolve_search_content_max_chars,
         resolve_search_context_lines, resolve_search_limit, resolve_search_offset,
         response_generation_consistency, result_has_artifact_like_path, run_search_for_mode,
-        scoped_session_folder_path, search_cache, search_response_structured_value,
-        search_tool_result_wire_budget, sha256_hex_bytes, should_allow_workspace_scope_fallback,
-        should_append_index_health_footer, should_apply_local_enrichment,
-        should_fetch_graph_enrichment, should_fetch_project_map_route_hint,
-        should_filter_artifact_paths, should_retry_keyword_with_semantic,
-        should_retry_keyword_with_symbol_modes, should_surface_index_health_before_results,
-        suggest_output_format, targeted_local_delta, targeted_payload_content_bytes, which_rg,
-        ApiIndexHint, DirtyFileHint, IndexHealth, LocalEnrichDiagnostic, LocalIndexEntry,
-        ResolvedSearchCacheShapers, SearchInput, SearchMode, GRAPH_ENRICHMENT_TIMEOUT,
-        MAX_VALID_SEARCH_CURSOR_BYTES, SEARCH_STRUCTURED_OUTPUT_BUDGET_MIN,
+        scoped_session_folder_path, search_cache, search_cache_key_at,
+        search_response_structured_value, search_tool_result_wire_budget, sha256_hex_bytes,
+        should_allow_workspace_scope_fallback, should_append_index_health_footer,
+        should_apply_local_enrichment, should_fetch_graph_enrichment,
+        should_fetch_project_map_route_hint, should_filter_artifact_paths,
+        should_retry_keyword_with_semantic, should_retry_keyword_with_symbol_modes,
+        should_surface_index_health_before_results, suggest_output_format, targeted_local_delta,
+        targeted_payload_content_bytes, which_rg, ApiIndexHint, DirtyFileHint, IndexHealth,
+        LocalEnrichDiagnostic, LocalIndexEntry, ResolvedSearchCacheShapers, SearchInput,
+        SearchMode, GRAPH_ENRICHMENT_TIMEOUT, MAX_VALID_SEARCH_CURSOR_BYTES,
+        SEARCH_STRUCTURED_OUTPUT_BUDGET_MIN,
     };
     use super::{should_prefer_semantic_results, should_retry_semantic_fallback};
     use super::{RecordingHttpResponse, SearchParams};
@@ -2279,14 +2358,28 @@ mod auto_mode_tests {
 
     // #487: what linked workspaces add to a search follows the links, so a change of
     // a link must not leave the process replaying an answer cached under the old one.
+    // The link generations are given, not moved: the process's own count is read by
+    // every test that builds a key, and moving it broke their comparisons.
     #[test]
     fn the_search_cache_key_follows_the_links_of_workspaces() {
         let input = base_input("revoke_fn");
-        let key = || cache_key(None, None, &input, SearchMode::Keyword, None);
-        let before = key();
-        assert_eq!(before, key(), "the same link state gives the same key");
-        mcp_client::note_knowledge_link_change_for_test();
-        assert_ne!(before, key(), "a link change gives another key");
+        let shapers = cache_shapers(&input, 25, 800);
+        let key = |links| {
+            search_cache_key_at(
+                None,
+                None,
+                &input,
+                SearchMode::Keyword,
+                None,
+                &shapers,
+                None,
+                None,
+                "test-wire-tokenizer-namespace",
+                links,
+            )
+        };
+        assert_eq!(key(7), key(7), "the same link state gives the same key");
+        assert_ne!(key(7), key(8), "a link change gives another key");
     }
 
     #[test]

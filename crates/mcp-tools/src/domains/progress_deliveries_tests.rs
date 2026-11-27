@@ -2738,6 +2738,14 @@ async fn check_paused_answers(hosted: bool, prior_binding: bool) {
         .with_max_level(tracing::Level::WARN)
         .with_writer(std::sync::Mutex::new(log.reopen().unwrap()))
         .finish();
+    // tracing remembers, per call site, whether any subscriber wants its
+    // events. While only one dispatcher is registered it asks the thread that
+    // first reaches the site, so a parallel test reaching the refusal's
+    // warning first, on a thread with no subscriber
+    // (round7_existing_report_slot_cannot_start_a_ninth_pinned_owner), had it
+    // remembered as wanted by none and this thread's warnings were dropped.
+    // With a second one registered, tracing asks every registered dispatcher.
+    let _second_dispatcher = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     // The default tokio test runtime stays on this thread across awaits.
     let _guard = tracing::subscriber::set_default(subscriber);
     for args in [

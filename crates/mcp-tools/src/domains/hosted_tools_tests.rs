@@ -14,18 +14,34 @@ struct Seen {
 
 type Respond = dyn Fn(&str, &str, &Value) -> (u16, String) + Send + Sync;
 
+/// A stand-in API's address, and the path every request to it starts with.
+///
+/// The address is this stub's alone, not just its port. The product keeps a
+/// caller's remote-check state per caller and API address (a credit refusal,
+/// a settings change, an unreachable catalog: files under `~/.contextstream`
+/// that later processes read for three minutes), the tests here call as one
+/// account, and the system hands a finished test's port to the next server
+/// that asks. At a bare `http://127.0.0.1:<port>` a stub could inherit an
+/// earlier test's credit refusal, in this run or in the one before.
+fn stub_address(listener: &tokio::net::TcpListener) -> (String, String) {
+    let base = format!("/stub-{}", uuid::Uuid::new_v4().simple());
+    let url = format!("http://{}{base}", listener.local_addr().unwrap());
+    (url, base)
+}
+
 /// A stand-in server: each request is answered with `respond(method, path, body)`.
 async fn stub(respond: Arc<Respond>) -> (String, Arc<StdMutex<Vec<Seen>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (url, base) = stub_address(&listener);
     let seen = Arc::new(StdMutex::new(Vec::new()));
     let log = seen.clone();
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
             let respond = respond.clone();
             let log = log.clone();
+            let base = base.clone();
             tokio::spawn(async move {
-                let Some(request) = read_request(&mut socket).await else {
+                let Some(request) = read_request(&mut socket, &base).await else {
                     return;
                 };
                 let (status, body) = respond(&request.method, &request.path, &request.body);
@@ -42,7 +58,9 @@ async fn stub(respond: Arc<Respond>) -> (String, Arc<StdMutex<Vec<Seen>>>) {
     (url, seen)
 }
 
-async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Seen> {
+/// The request on `socket`, when it is for the stub at `base` (see
+/// [`stub_address`]); anything else is not this test's and gets no answer.
+async fn read_request(socket: &mut tokio::net::TcpStream, base: &str) -> Option<Seen> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 8192];
     let header_end = loop {
@@ -77,14 +95,14 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Seen> {
     let mut parts = head.lines().next()?.split_whitespace();
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
-    let path = target.split('?').next().unwrap_or("").to_string();
+    let path = target.split('?').next().unwrap_or("").strip_prefix(base)?;
     let query = target
         .split_once('?')
         .map(|(_, q)| q.to_string())
         .unwrap_or_default();
     Some(Seen {
         method,
-        path: path.strip_prefix("/api/v1").unwrap_or(&path).to_string(),
+        path: path.strip_prefix("/api/v1").unwrap_or(path).to_string(),
         query,
         body: serde_json::from_slice(&buffer[header_end..]).unwrap_or(Value::Null),
     })
@@ -863,10 +881,11 @@ async fn a_declined_run_includes_the_workers_reason_in_text_and_structured_conte
 #[tokio::test]
 async fn a_service_that_cannot_be_reached_or_ends_early_is_handed_back_the_same_way() {
     // Nothing listens at the first address; the second service ends the call without a result.
-    let closed = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        format!("ws://{}/v1/run", listener.local_addr().unwrap())
-    };
+    // The first is a bound socket that never listens, held to the end: connections to it are
+    // refused, and no parallel test's server is given its port, as a dropped listener's can be.
+    let held = tokio::net::TcpSocket::new_v4().unwrap();
+    held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let closed = format!("ws://{}/v1/run", held.local_addr().unwrap());
     let (ends, _) = frames_service(vec![Step::Json(json!({"type": "info"})), Step::Close]).await;
     for (address, expect) in [
         (closed, "could not be reached"),
@@ -896,6 +915,7 @@ async fn a_service_that_cannot_be_reached_or_ends_early_is_handed_back_the_same_
             "{message}"
         );
     }
+    drop(held);
 }
 
 #[tokio::test]
@@ -1663,13 +1683,14 @@ type StubResponder = Arc<
 
 async fn stub_with_headers(respond: StubResponder) -> (String, Arc<StdMutex<Vec<StubReq>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (url, base) = stub_address(&listener);
     let seen = Arc::new(StdMutex::new(Vec::new()));
     let log = seen.clone();
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
             let respond = respond.clone();
             let log = log.clone();
+            let base = base.clone();
             tokio::spawn(async move {
                 let mut buffer = Vec::new();
                 let mut chunk = [0u8; 8192];
@@ -1707,10 +1728,12 @@ async fn stub_with_headers(respond: StubResponder) -> (String, Arc<StdMutex<Vec<
                 let mut parts = head.lines().next().unwrap_or("").split_whitespace();
                 let method = parts.next().unwrap_or("").to_string();
                 let target = parts.next().unwrap_or("").to_string();
-                let path = target.split('?').next().unwrap_or("").to_string();
+                let Some(path) = target.split('?').next().unwrap_or("").strip_prefix(&base) else {
+                    return;
+                };
                 let req = StubReq {
                     method,
-                    path: path.strip_prefix("/api/v1").unwrap_or(&path).to_string(),
+                    path: path.strip_prefix("/api/v1").unwrap_or(path).to_string(),
                     headers,
                     body: serde_json::from_slice(&buffer[header_end..]).unwrap_or(Value::Null),
                 };

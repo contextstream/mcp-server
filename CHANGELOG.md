@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.113
+
+- Media can be shared with the team. `media(action="index")` (a URL, a local file, or the hosted upload plan), `media(action="upload_url")` and `media(action="complete_upload")` accept `is_personal`, store exactly one matching visibility, and say in the response which one was stored. The new `media(action="update")` changes an existing asset's visibility (and its title, description or tags) through the API's own permission checks and keeps its other tags. Before, every upload made through the MCP stayed personal and nothing could share it, so "index this so the team can find it" left the file visible to one person.
+- Skill import passes on where the skills belong. `skill(action="import")` now sends `project_id` (the session's project when none is given), `is_personal` and `status` to the API, and the result says which visibility, project and status were stored. On the hosted gateway a bare `file_path` is still refused, because the gateway cannot read your machine, and the message now says exactly what to do instead: read the file locally and call again with `content` and `source_file`. When both `content` and `file_path` are given, `file_path` is kept as the source name instead of being refused.
+
 ## 1.0.112
 
 - On the hosted gateway, `media(action="index", file_path=...)` now starts an upload that the client finishes itself instead of refusing the file. It returns the content id, a presigned upload URL with its headers, a ready-to-run `curl` command (the path quoted safely) and the `media(action="complete_upload", content_id=...)` call that starts indexing. Before, a hosted session could not put a local PDF, screenshot or recording into ContextStream media at all: the only advice was `external_url`, which a local file does not have. `media(action="upload_url")` starts the same upload without a path. Local sessions, and self-hosted gateways with `CONTEXTSTREAM_HTTP_LOCAL_FILES=allow`, upload the file directly as before.

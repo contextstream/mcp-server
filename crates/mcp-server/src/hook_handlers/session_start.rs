@@ -230,7 +230,7 @@ pub async fn handle() -> Result<()> {
 }
 
 const CURSOR_REMOTE_CHECKS_HINT: &str = "\n\n⚡ Remote checks (MachineStream) are enabled for this account: wrap supported test, lint, type-check, and build shell commands with `contextstream-mcp run -- <command>` (e.g. `contextstream-mcp run -- npm test`).";
-const CLAUDE_REMOTE_CHECKS_HINT: &str = "\n\n⚡ Remote checks (MachineStream) are enabled for this account: supported test, lint, type-check, and build commands run remotely via the Bash hook even if the language toolchain (such as Rust/cargo, Node, Python, or Go) is not installed locally. Run checks normally through Bash (do not skip them just because a local toolchain is absent). For Rust verification, prefer `cargo check`, `cargo clippy`, or `cargo test` (which run remotely) rather than `cargo build` (which stays local).";
+const CLAUDE_REMOTE_CHECKS_HINT: &str = "\n\n⚡ Remote checks (MachineStream) are enabled for this account: supported test, lint, type-check, and build commands run remotely via the Bash hook even if the language toolchain (such as Rust/cargo, Node, Python, or Go) is not installed locally. Run checks normally through Bash (do not skip them just because a local toolchain is absent). For Rust verification, prefer `cargo check`, `cargo clippy`, or `cargo test` (which run remotely) rather than `cargo build` (which stays local). To keep one command on this machine, write `CONTEXTSTREAM_HOSTED_TOOLS=off` before it.";
 
 const SESSION_HINTS_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
 

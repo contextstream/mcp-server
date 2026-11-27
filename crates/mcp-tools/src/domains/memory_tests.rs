@@ -24,13 +24,20 @@ fn create_mock_session(client: &ContextStreamClient) -> Arc<mcp_session::Session
 
 mod degraded_memory_search_tests {
     use super::{MemorySearchTool, TestFixtures, ToolHandler};
+    use crate::testing::{within_real_time, FrozenClock};
     use mcp_client::ContextStreamClient;
     use mcp_types::tool::ContentItem;
     use serde_json::json;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // These tests run on a stopped clock (`FrozenClock`): the tool gives the
+    // docs lookup 1.5 s of the system clock, and a stalled host spent that
+    // while this test's own server waited to answer (2026-11-26).
 
     #[tokio::test]
     async fn memory_api_failure_preserves_scoped_docs_fallback_without_retrying() {
+        let _clock = FrozenClock::stop();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind memory fallback listener");
@@ -84,15 +91,17 @@ mod degraded_memory_search_tests {
         // The attempts are counted where they are sent: a retry counts even
         // when it comes after the server above has answered its three requests
         // and gone. A one-second bound on the call measured the machine
-        // instead; this one only keeps a call that hangs from hanging the test.
-        let (result, sent) = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
+        // instead; this one only keeps a call that hangs from hanging the test
+        // (on the stopped clock, a retry that first waits out a backoff is
+        // such a call).
+        let (result, sent) = within_real_time(
+            Duration::from_secs(60),
+            "the memory fallback",
             mcp_client::run_counting_api_calls(
                 tool.execute(json!({"query": "replica lag", "limit": 5})),
             ),
         )
-        .await
-        .expect("memory fallback must come back");
+        .await;
         let result = result.expect("scoped docs fallback must remain a successful tool result");
         assert_eq!(
             sent.calls, 3,
@@ -134,17 +143,23 @@ mod degraded_memory_search_tests {
 
     #[tokio::test]
     async fn nested_api_degradation_is_propagated_and_not_cached() {
+        let _clock = FrozenClock::stop();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind degraded API listener");
         let addr = listener.local_addr().expect("degraded API listener addr");
+        // The server answers until the test has made both calls and says so.
+        // (It used to stop after two idle seconds of the system clock.)
+        let (calls_made, server_stops) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let mut request_lines = Vec::new();
+            tokio::pin!(server_stops);
             loop {
-                let accepted =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
-                        .await;
-                let Ok(Ok((mut socket, _))) = accepted else {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    _ = &mut server_stops => break,
+                };
+                let Ok((mut socket, _)) = accepted else {
                     break;
                 };
                 let mut buffer = vec![0u8; 32 * 1024];
@@ -202,7 +217,9 @@ mod degraded_memory_search_tests {
             "project_id": project_id,
             "limit": 5
         });
-        let (first, second) =
+        let (first, second) = within_real_time(
+            Duration::from_secs(60),
+            "the two memory searches",
             mcp_client::run_with_session_key(mcp_types::SessionKey::Local, || async {
                 let first = tool
                     .execute(input.clone())
@@ -213,8 +230,12 @@ mod degraded_memory_search_tests {
                     .await
                     .expect("second API-degraded result");
                 (first, second)
-            })
-            .await;
+            }),
+        )
+        .await;
+        calls_made
+            .send(())
+            .expect("the degraded API server is still answering");
 
         for result in [&first, &second] {
             let text = match &result.content[0] {
@@ -244,6 +265,7 @@ mod degraded_memory_search_tests {
 
     #[tokio::test]
     async fn slow_docs_cannot_extend_the_memory_search_deadline() {
+        let _clock = FrozenClock::stop();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind slow docs listener");
@@ -299,17 +321,37 @@ mod degraded_memory_search_tests {
         config.api_url = format!("http://{addr}");
         config.api_key = Some("test-key".to_string());
         let tool = MemorySearchTool::new(ContextStreamClient::new(config));
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+        let call = tokio::spawn(async move {
             tool.execute(json!({
                 "query": "bounded docs",
                 "workspace_id": uuid::Uuid::new_v4(),
                 "project_id": uuid::Uuid::new_v4(),
                 "limit": 5
-            })),
+            }))
+            .await
+        });
+        // Both requests are on the server: memory is answered, and the docs
+        // answer is ten seconds away. With the clock moved three seconds on and
+        // no further, the call must come back.
+        let mut request_lines = Vec::new();
+        for _ in 0..2 {
+            let line = within_real_time(
+                Duration::from_secs(60),
+                "a memory search request",
+                request_rx.recv(),
+            )
+            .await
+            .expect("record request");
+            request_lines.push(line);
+        }
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let result = within_real_time(
+            Duration::from_secs(60),
+            "slow docs must remain inside the absolute tool deadline: the call",
+            call,
         )
         .await
-        .expect("slow docs must remain inside the absolute tool deadline")
+        .expect("memory search task")
         .expect("healthy memory results must survive a docs timeout");
 
         let text = match &result.content[0] {
@@ -326,10 +368,6 @@ mod degraded_memory_search_tests {
         assert_eq!(structured["memory_results"].as_array().unwrap().len(), 1);
 
         server.await.expect("slow docs acceptor");
-        let mut request_lines = Vec::new();
-        while let Ok(line) = request_rx.try_recv() {
-            request_lines.push(line);
-        }
         assert!(request_lines
             .iter()
             .any(|line| line.starts_with("POST /api/v1/memory/search ")));

@@ -10339,12 +10339,16 @@ fn guided_finalization_reserve(total: Duration) -> Duration {
 /// Guided request may consume at most 80% (capped so hybrid retains <=1s), and
 /// hybrid must stop before the small finalization reserve. No phase is allowed
 /// to reset either deadline after handler prework has already elapsed.
+///
+/// It reads the runtime's clock (`tokio::time`), the clock its timeouts wait
+/// on. That is the system clock, except in a test that stops the runtime's
+/// clock to make these deadlines pass exactly when it says.
 #[derive(Debug, Clone, Copy)]
 struct GuidedExecutionBudget {
-    started: Instant,
-    primary_deadline: Instant,
-    fallback_deadline: Instant,
-    deadline: Instant,
+    started: tokio::time::Instant,
+    primary_deadline: tokio::time::Instant,
+    fallback_deadline: tokio::time::Instant,
+    deadline: tokio::time::Instant,
     total: Duration,
     #[cfg(test)]
     prework_delay: Duration,
@@ -10353,7 +10357,7 @@ struct GuidedExecutionBudget {
 }
 
 impl GuidedExecutionBudget {
-    fn new(started: Instant, total: Duration) -> Self {
+    fn new(started: tokio::time::Instant, total: Duration) -> Self {
         let primary_deadline = started + guided_primary_budget(total);
         let deadline = started + total;
         let fallback_deadline = deadline
@@ -10379,7 +10383,7 @@ impl GuidedExecutionBudget {
     /// and on the 24-core lane host its request sometimes never left
     /// (2026-11-02).
     #[cfg(test)]
-    fn with_primary(started: Instant, primary: Duration, total: Duration) -> Self {
+    fn with_primary(started: tokio::time::Instant, primary: Duration, total: Duration) -> Self {
         let mut budget = Self::new(started, total);
         budget.primary_deadline = started + primary.min(total);
         budget.fallback_deadline = budget.fallback_deadline.max(budget.primary_deadline);
@@ -10395,16 +10399,17 @@ impl GuidedExecutionBudget {
 
     fn primary_remaining(self) -> Duration {
         self.primary_deadline
-            .saturating_duration_since(Instant::now())
+            .saturating_duration_since(tokio::time::Instant::now())
     }
 
     fn fallback_remaining(self) -> Duration {
         self.fallback_deadline
-            .saturating_duration_since(Instant::now())
+            .saturating_duration_since(tokio::time::Instant::now())
     }
 
     fn remaining(self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
     }
 
     fn elapsed_ms(self) -> i64 {
@@ -10961,7 +10966,7 @@ impl SearchTool {
             checkout_scope,
             use_search_cache,
             cache_key,
-            GuidedExecutionBudget::new(Instant::now(), guided_request_timeout),
+            GuidedExecutionBudget::new(tokio::time::Instant::now(), guided_request_timeout),
         )
         .await
     }
@@ -11622,7 +11627,7 @@ impl SearchTool {
     async fn execute_inner(
         &self,
         input: SearchInput,
-        handler_started: Instant,
+        handler_started: tokio::time::Instant,
         guided_budget: Option<GuidedExecutionBudget>,
     ) -> Result<ToolResult> {
         // Validate the explicit protocol hint before index/network side effects.
@@ -14617,7 +14622,7 @@ impl SearchTool {
     ) -> Result<ToolResult> {
         // This is deliberately the first operation at the public handler
         // boundary: JSON decoding and every subsequent prework await count.
-        let handler_started = Instant::now();
+        let handler_started = tokio::time::Instant::now();
         let mut input: SearchInput =
             serde_json::from_value(input).map_err(|e| Error::Validation(e.to_string()))?;
         // An output_format the API cannot read came back as its raw
@@ -14650,7 +14655,7 @@ impl SearchTool {
         );
         let timeout_input = input.clone();
         match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(budget.deadline),
+            budget.deadline,
             self.execute_inner(input, handler_started, Some(budget)),
         )
         .await

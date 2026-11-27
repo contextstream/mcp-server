@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.111
+
+- The Claude Code hook now sends a check that stands beside something it does not follow. It used to leave a whole Bash line as typed when the line also held a here-document, a `$(…)`, a group in parentheses or braces, a comment, a background job or `if`/`for`, so a file edited from a here-document and then tested in one line, or `cd wt && (cargo check | grep error; cargo test | tail)`, never ran remotely. Measured on one busy machine over four days, a check was sent from 247 of the 1,116 lines that held one, and from 395 with this change. It now steps over those parts and wraps each check it finds, with the pipes, redirections and other commands around it as typed. Still left as typed: a command in the background, one that reads its input from a redirection, what a substitution holds, and a line with a `case`.
+- A line that names the switch as off runs entirely on this machine: `CONTEXTSTREAM_HOSTED_TOOLS=off cargo test`, or the same with `CONTEXTSTREAM_REMOTE_CHECKS`, the name agents tend to write, whether before the command or exported earlier in the line. `contextstream-mcp run` reads both names in its environment too. Before, the hook read only its own environment, so a switch written on the command was ignored and the command was sent. The session notice now says how to keep one command local.
+
 ## 1.0.110
 
 - With transcripts on, the Stop hook now adds the agent's final reply to the session's transcript (scrubbed, at most 16 KiB), so `get_transcript`, `search_transcripts`, `recall` and the daily recaps see both sides of a session; before, a transcript kept only the person's prompts. With transcripts off the hook adds nothing, and it never fails because of this.

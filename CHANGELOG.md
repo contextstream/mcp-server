@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.110
+
+- With transcripts on, the Stop hook now adds the agent's final reply to the session's transcript (scrubbed, at most 16 KiB), so `get_transcript`, `search_transcripts`, `recall` and the daily recaps see both sides of a session; before, a transcript kept only the person's prompts. With transcripts off the hook adds nothing, and it never fails because of this.
+- The `questions` tool (listed only where saved questions are switched on) can run a saved question over the Jira issues the workspace keeps in sync and check a document (text, a Google Doc or a Word file) against requirements, with each answer quoting the passage it rests on. New actions `watch`, `checks` and `take_check` read the nightly watch, list a question's re-checks and take one.
+
 ## 1.0.109
 
 - A refresh in a repository whose ContextStream entries hold their key by reference (`${CONTEXTSTREAM_API_KEY}`, `{env:…}`) no longer writes the running account into it without a word. It creates another editor's project entry (such as `.cursor/mcp.json`) with this run's key only when this run's own API shows that this run's key can see the workspace or project the repository names (in `.contextstream/config.json` or its entries' workspace and project ids); otherwise it asks on a terminal, or skips it and says why. The same check decides whether such an entry that runs no binary gets this home's `headersHelper`. An entry with a key held by reference keeps its installation id as written, and `doctor` no longer requires that id to be this installation's. No refresh points a ContextStream binary outside any home (such as `/usr/local/bin/contextstream-mcp`) at a home's binary.

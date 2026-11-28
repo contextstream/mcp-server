@@ -32,6 +32,12 @@
 //!   `progress`.
 //! - **Turn state.** When the model's turn ends, the session's runs wait on a
 //!   person (no question text); the next prompt or tool call says working.
+//! - **A run the server gave up.** The server ends a run that says it works
+//!   and has reported nothing for two hours, whatever heartbeats arrive (a
+//!   turn that was cut short leaves such a run). The keep-alive is answered
+//!   that the run is lost: the run is kept and no longer beaten, and the
+//!   session's next prompt or tool call says it works again, which brings it
+//!   back. A run someone ended by its own word is dropped as before.
 //! - **A coarse step.** Only after ten minutes without a step from the model:
 //!   one of the fixed sentences in [`super::run_step_labels`], picked by the
 //!   tool's name. On the session's own run, while the model has reported
@@ -333,6 +339,12 @@ pub(crate) struct Run {
     /// again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub project_declined: bool,
+    /// The server ended the run as lost while this session still beat for
+    /// it: it had said it worked and reported nothing for two hours. The run
+    /// is kept, with no more heartbeats, and is said again the next time the
+    /// session is at work ([`SessionFile::revive`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub given_up: bool,
 }
 
 /// What the hooks keep about one host session.
@@ -554,6 +566,10 @@ impl SessionFile {
 
     fn end(&mut self, index: usize, sentence: &str) {
         let run = self.runs.remove(index);
+        // The server already ended a run it gave up: nothing to add.
+        if run.given_up {
+            return;
+        }
         if let Some(mut body) = self.base(&run) {
             body.insert("status".into(), json!("stopped"));
             body.insert("summary".into(), json!(sentence));
@@ -584,10 +600,18 @@ impl SessionFile {
         self.pending.clear();
     }
 
-    /// The session is at work again: runs the hooks set waiting say working.
+    /// The session is at work again: runs the hooks set waiting say working,
+    /// and so do its runs the server gave up meanwhile.
     fn resume(&mut self) {
         for index in 0..self.runs.len() {
-            if self.runs[index].owner.is_some() || !self.runs[index].hook_waiting {
+            if self.runs[index].owner.is_some() {
+                continue;
+            }
+            if self.runs[index].given_up {
+                self.revive(index);
+                continue;
+            }
+            if !self.runs[index].hook_waiting {
                 continue;
             }
             self.runs[index].hook_waiting = false;
@@ -596,6 +620,28 @@ impl SessionFile {
                 body.insert("waiting".into(), Value::Null);
                 self.queue(body);
             }
+        }
+    }
+
+    /// The server gave the run `ident` up as lost while this session beat
+    /// for it. The run is kept and gets no more heartbeats: one more would
+    /// change nothing, and dropping it would leave the session on no floor
+    /// when it works again.
+    pub(crate) fn server_gave_up(&mut self, ident: &str) {
+        for run in self.runs.iter_mut().filter(|run| run_ident(run) == ident) {
+            run.given_up = true;
+        }
+    }
+
+    /// Work reaches a run the server gave up: it says it works, which is a
+    /// report, and a report brings a lost run back.
+    fn revive(&mut self, index: usize) {
+        self.runs[index].given_up = false;
+        self.runs[index].hook_waiting = false;
+        if let Some(mut body) = self.base(&self.runs[index]) {
+            body.insert("status".into(), json!("working"));
+            body.insert("waiting".into(), Value::Null);
+            self.queue(body);
         }
     }
 
@@ -624,6 +670,10 @@ impl SessionFile {
             own
         };
         for index in targets {
+            // A tool call for a run the server gave up: the run is at work.
+            if self.runs[index].given_up {
+                self.revive(index);
+            }
             let run = &self.runs[index];
             if run.model_waiting || run.hook_waiting {
                 continue;
@@ -742,7 +792,8 @@ impl SessionFile {
         }
         for index in 0..self.runs.len() {
             let run = &self.runs[index];
-            if run.owner.is_some() || run.hook_waiting || run.model_waiting {
+            // A run the server gave up says nothing until it works again.
+            if run.owner.is_some() || run.hook_waiting || run.model_waiting || run.given_up {
                 continue;
             }
             self.runs[index].hook_waiting = true;
@@ -992,8 +1043,10 @@ impl SessionFile {
             self.runs[index].offer_project = self.project_in(&workspace_id, scope);
         }
         let run = &mut self.runs[index];
-        // The model reported on it: the run is the model's.
+        // The model reported on it: the run is the model's, and a report
+        // brought it back if the server had given it up.
         run.unreported = false;
+        run.given_up = false;
         if run_id.is_some() {
             run.run_id = run_id;
         }
@@ -2128,6 +2181,13 @@ fn answer_says_ended(answer: &Value) -> bool {
         )
 }
 
+/// Whether the API's answer says the server's own watchdog ended the run as
+/// lost (`lost`), not its emitter.
+fn answer_says_lost(answer: &Value) -> bool {
+    let view = answer.get("run").unwrap_or(answer);
+    view.get("lost").and_then(Value::as_bool) == Some(true)
+}
+
 fn run_ident(run: &Run) -> String {
     run.run_id
         .clone()
@@ -2231,6 +2291,11 @@ async fn beat(path: &Path, cwd: &str) {
         }
         let mut refused = false;
         for run in &file.runs {
+            // No heartbeat for a run the server gave up: its heartbeats were
+            // arriving when it did, and one more changes nothing.
+            if run.given_up {
+                continue;
+            }
             let ident = run_ident(run);
             let waits = run.hook_waiting || run.model_waiting;
             let Some((body, offers)) = file.signal(run) else {
@@ -2267,7 +2332,12 @@ async fn beat(path: &Path, cwd: &str) {
                 Sent::Ok(answer) => {
                     failures = 0;
                     last_sent.insert(ident.clone(), now_ms());
-                    if answer_says_ended(&answer) {
+                    if answer_says_lost(&answer) {
+                        // The server gave the run up while we beat for it.
+                        // It is kept, unbeaten, until the session works
+                        // again; dropped, nothing would report it again.
+                        update(path, |file: &mut SessionFile| file.server_gave_up(&ident));
+                    } else if answer_says_ended(&answer) {
                         // Someone ended the run by its own word: it is not ours
                         // to keep alive.
                         update(path, |file: &mut SessionFile| {

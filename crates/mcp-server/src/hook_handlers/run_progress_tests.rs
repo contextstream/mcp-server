@@ -325,6 +325,92 @@ fn the_turn_ending_waits_on_a_person_and_work_resumes_it() {
     assert!(busy.pending.is_empty());
 }
 
+/// The server ends a run that says it works and reported nothing for two
+/// hours, whatever heartbeats arrive. A session whose turn was cut short has
+/// such a run, and its keep-alive is then answered that the run is lost.
+/// Dropped, nothing would report the run again when the session went back to
+/// work, so it is kept, unbeaten, and says it works at the next sign of work.
+#[test]
+fn a_run_the_server_gave_up_is_kept_and_says_it_works_when_the_session_does() {
+    let mut file = known();
+    file.ticket_changed(
+        &main_agent(),
+        &ticket("in_progress"),
+        &Scope::default(),
+        1_000,
+    );
+    take(&mut file);
+    assert_eq!(file.runs.len(), 1);
+    let ident = run_ident(&file.runs[0]);
+
+    let lost =
+        json!({"run": {"run_id": RUN, "state": "failed", "liveness": "ended", "lost": true}});
+    assert!(answer_says_lost(&lost) && answer_says_ended(&lost));
+    // An end by the emitter's own word is not the server giving up.
+    let stopped = answer(&ticket_key(), "stopped");
+    assert!(answer_says_ended(&stopped) && !answer_says_lost(&stopped));
+
+    file.server_gave_up(&ident);
+    assert_eq!(file.runs.len(), 1);
+    assert!(file.runs[0].given_up);
+    assert!(file.pending.is_empty());
+    // The flag is kept across the state file.
+    let kept: SessionFile = serde_json::from_value(serde_json::to_value(&file).unwrap()).unwrap();
+    assert!(kept.runs[0].given_up);
+
+    // A turn's end says nothing of it.
+    file.turn_ended(2_000);
+    assert!(file.pending.is_empty());
+
+    // The person prompts: the run says it works, once.
+    file.prompt_submitted(3_000);
+    let sent = take(&mut file);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["status"], json!("working"));
+    assert!(sent[0]["waiting"].is_null());
+    assert!(!file.runs[0].given_up);
+    file.tool_started(&main_agent(), "Bash", 4_000);
+    assert!(file.pending.is_empty());
+
+    // Given up again; this time a tool call is the first sign of work.
+    file.server_gave_up(&ident);
+    file.tool_started(&main_agent(), "Bash", 5_000);
+    let sent = take(&mut file);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["status"], json!("working"));
+    assert!(!file.runs[0].given_up);
+
+    // A subagent with no run of its own works for the session's run.
+    file.server_gave_up(&ident);
+    file.tool_started(&explore(), "Read", 6_000);
+    let sent = take(&mut file);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["status"], json!("working"));
+    assert!(!file.runs[0].given_up);
+
+    // The model's own report brought it back: nothing more to say.
+    file.server_gave_up(&ident);
+    let input = json!({"ticket_id": TICKET, "step": "Reading the checkout page"});
+    file.model_reported(
+        &input,
+        &answer(&ticket_key(), "working"),
+        &Scope::default(),
+        7_000,
+    );
+    assert!(!file.runs[0].given_up);
+    assert!(file.pending.is_empty());
+
+    // The session ends while the run is given up: the server already ended
+    // it, so no fixed sentence is written over that. (The report gave the
+    // run its id, which is what it is known by from then on.)
+    let ident = run_ident(&file.runs[0]);
+    file.server_gave_up(&ident);
+    assert!(file.runs[0].given_up);
+    file.end_all(SESSION_ENDED);
+    assert!(file.runs.is_empty());
+    assert!(file.pending.is_empty());
+}
+
 #[test]
 fn a_coarse_step_comes_only_after_ten_minutes_without_one_from_the_model() {
     let mut file = known();

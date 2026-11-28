@@ -113,6 +113,52 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+async fn review_page_counts_decisions_and_sure_spot_checks_without_changing_rows_or_cursor() {
+    let fixture = Fixture::new();
+    let rows = json!([
+        {"trust":"check","state":"answered","called":null},
+        {"trust":null,"state":"not_answered","called":null},
+        {"trust":"sure","spot_check":true,"called":null},
+        {"trust":"sure","spot_check":true,"called":null},
+        {"trust":"sure","spot_check":true,"called":null},
+        {"trust":"sure","spot_check":true,"called":null}
+    ]);
+    let answer = json!({"rows": rows, "next": 15});
+    let api = Api::start(vec![(
+        "GET /api/v1/questions",
+        200,
+        envelope(answer.clone()),
+    )])
+    .await;
+    let tool = fixture.tool(&api);
+    for which in ["all", "check"] {
+        let result = tool
+            .execute(json!({
+                "action": "results", "question_id": fixture.question, "run_id": fixture.run,
+                "which": which, "after": 9
+            }))
+            .await
+            .expect("results");
+        let text = text_of(&result);
+        let mut content = result.structured_content.expect("structured rows");
+        if which == "check" {
+            let review = content
+                .as_object_mut()
+                .unwrap()
+                .remove("review")
+                .expect("page summary");
+            assert_eq!(review["needs_decision"], 2);
+            assert_eq!(review["sure_spot_checks"], 4);
+            assert_eq!(review["already_reviewed"], 0);
+            let summary = review["summary"].as_str().unwrap();
+            assert!(summary.contains("4 to confirm (Sure spot checks)"));
+            assert!(text.contains(summary));
+        }
+        assert_eq!(content, answer);
+    }
+}
+
 fn envelope(data: Value) -> Value {
     json!({"success": true, "data": data})
 }
@@ -422,6 +468,7 @@ async fn each_read_calls_its_route_with_the_sessions_workspace() {
                 "next": 12,
             }),
             says: vec![
+                "0 to decide (Check or unanswered), 1 to confirm (Sure spot checks), 1 already reviewed",
                 "- #11 acme: no (Check: close call); the person's call: yes",
                 "- #12 row-0a1b2c3d4e5f: yes (Sure); spot check [company=Initech]",
                 "after=12",

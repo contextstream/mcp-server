@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.115
+
+- Handoffs list the fields they keep, including verified facts, eliminated hypotheses, blockers, validation and environment. Reading a handoff displays each of those lists on its own line, with up to 6,000 characters per value.
+- Saved-question review pages explain how many rows need a decision, how many Sure answers were selected for a spot check, and how many already have a person’s call. The summary appears in the text and in the structured `review` field when requesting `questions(action="results", which="check")`.
+
 ## 1.0.114
 
 - Reviews say how to name reviewers. The `entity` tool now explains that `kind=review` takes `reviewers` as objects in the ticket-assignee shape, with an example of a team handle (`{entity_type: "team", handle: "@example-org/platform"}`) and a person by email, and that a CODEOWNERS team is `team`, never `human`. Before, an agent asked to "request a review from whoever owns it" guessed plain names (refused) and then tagged the team as a person. Reviewers are passed to the API as given.
